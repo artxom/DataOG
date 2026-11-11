@@ -1,9 +1,10 @@
-"""华为 DWS 字段贯标与无损转换工具 - Web 服务端与控制台入口.
+"""DataOG 多功能数据工程与数据治理一体化工作台 - FastAPI 微内核服务端入口.
 
 启动后：
 1. 自动禁用 Windows CMD 控制台快速编辑模式 (QuickEdit Mode)，防止鼠标点击黑窗口挂起服务进程
-2. 纯净初始化（无内置演示沙盒假数据，本地持久化保存 DWS 账号密码）
-3. 自动检测可用本地端口（默认 127.0.0.1:18080）并打开浏览器
+2. 初始化全局共享微内核底座 PlatformContext（自动无损迁移旧版 dws_migrator_state.db 至 dataog_state.db）
+3. 挂载平台公共路由 (/api/platform) 与三大高内聚业务插件模块 (/api/modules/*)
+4. 严格绑定本地 127.0.0.1，注入安全响应头并自动打开默认浏览器
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ def get_bundle_dir() -> str:
 
 
 def resolve_static_dir() -> str:
-    """按优先级探测包含完整 index.html 与 app.js 的静态文件目录，避免空目录导致 404."""
+    """按优先级探测包含完整 index.html 与前端入口脚本的静态文件目录，避免空目录导致 404."""
     candidates: List[str] = []
     if getattr(sys, "frozen", False):
         if hasattr(sys, "_MEIPASS"):
@@ -64,11 +65,10 @@ def resolve_static_dir() -> str:
     candidates.append(os.path.join(os.getcwd(), "static"))
 
     for cand in candidates:
-        if (
-            os.path.isdir(cand)
-            and os.path.isfile(os.path.join(cand, "index.html"))
-            and os.path.isfile(os.path.join(cand, "app.js"))
-        ):
+        has_entry_js = os.path.isfile(os.path.join(cand, "js", "main.js")) or os.path.isfile(
+            os.path.join(cand, "app.js")
+        )
+        if os.path.isdir(cand) and os.path.isfile(os.path.join(cand, "index.html")) and has_entry_js:
             return cand
 
     for cand in candidates:
@@ -105,12 +105,11 @@ try:
     import multipart  # noqa: F401
     import openpyxl  # noqa: F401
     import psycopg2  # noqa: F401
+    import pymysql  # noqa: F401
     import uvicorn
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse, Response
-    from starlette.routing import Mount, Route
-    from starlette.staticfiles import StaticFiles
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse, Response
+    from fastapi.staticfiles import StaticFiles
 
     from core.cross_env_engine import CrossEnvCompareEngine
     from core.dws_engine import DWSMigratorEngine
@@ -119,11 +118,15 @@ try:
         generate_template_excel,
         parse_excel_checklist,
     )
-    from core.state_store import StateStore
+    from core.platform.context import PlatformContext
+    from core.platform.router import router as platform_router
+    from modules.cross_comparator.router import router as cross_comparator_router
+    from modules.ddl_translator.router import router as ddl_translator_router
+    from modules.standard_migrator.router import router as standard_migrator_router
 except BaseException:
     err_text = traceback.format_exc()
     print("=" * 74)
-    print("  [严重错误] 程序初始化导入依赖模块失败！")
+    print("  [严重错误] DataOG 程序初始化导入依赖模块失败！")
     print("=" * 74)
     print(err_text)
     try:
@@ -157,7 +160,7 @@ def setup_console_logging() -> logging.Logger:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
-    log = logging.getLogger("dws_migrator")
+    log = logging.getLogger("dataog")
     log.setLevel(logging.INFO)
     if not log.handlers:
         console_handler = SafeConsoleStreamHandler(sys.stdout)
@@ -165,14 +168,14 @@ def setup_console_logging() -> logging.Logger:
         log.addHandler(console_handler)
 
         try:
-            log_file = os.path.join(get_runtime_data_dir(), "dws_service.log")
+            log_file = os.path.join(get_runtime_data_dir(), "dataog_service.log")
             file_handler = logging.FileHandler(log_file, encoding="utf-8")
             file_handler.setFormatter(formatter)
             log.addHandler(file_handler)
         except Exception:
             pass
 
-    for uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "dws_migrator"):
         uv_log = logging.getLogger(uv_name)
         uv_log.handlers = log.handlers
         uv_log.setLevel(logging.INFO)
@@ -185,10 +188,22 @@ logger = setup_console_logging()
 
 FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    '<rect width="64" height="64" rx="14" fill="#2563eb"/>'
+    '<rect width="64" height="64" rx="14" fill="#1d4ed8"/>'
     '<text x="50%" y="55%" dominant-baseline="middle" text-anchor="middle" '
-    'fill="#ffffff" font-family="sans-serif" font-weight="800" font-size="22">DWS</text>'
+    'fill="#ffffff" font-family="sans-serif" font-weight="800" font-size="22">OG</text>'
     "</svg>"
+)
+
+_SECURITY_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self' data:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'none'; "
+    "frame-ancestors 'none'"
 )
 
 
@@ -206,17 +221,78 @@ def find_available_port(host: str = "127.0.0.1", preferred_port: int = 18080) ->
         return int(sock.getsockname()[1])
 
 
-def create_app(db_path: Optional[str] = None) -> Starlette:
+def create_app(db_path: Optional[str] = None) -> FastAPI:
     if not db_path:
-        db_path = os.path.join(get_runtime_data_dir(), "dws_migrator_state.db")
+        db_path = os.path.join(get_runtime_data_dir(), "dataog_state.db")
 
-    store = StateStore(db_path)
+    ctx = PlatformContext(db_path=db_path)
+    ctx.register_module_manifest(
+        module_id="standard_migrator",
+        title="单库落标贯标台",
+        subtitle="物理列序保序重建、Kahn 拓扑改名与多线程批量落标",
+        api_prefix="/api/modules/standard_migrator",
+    )
+    ctx.register_module_manifest(
+        module_id="cross_comparator",
+        title="跨环境三栏数标比对",
+        subtitle="来源库 × 数据标准 × 目标库 16:9 三方映射与闭环推送",
+        api_prefix="/api/modules/cross_comparator",
+    )
+    ctx.register_module_manifest(
+        module_id="ddl_translator",
+        title="跨方言 DDL 与视图穿透",
+        subtitle="多方言建表 DDL 互译与上游视图四层血缘自动穿透",
+        api_prefix="/api/modules/ddl_translator",
+    )
+
+    store = ctx.store
     engine = DWSMigratorEngine(store)
     cross_engine = CrossEnvCompareEngine(store, engine)
 
     # 清理旧版本遗留的内置沙盒假数据，确保纯净初始化
     if store.get_meta("current_excel_name") == "内置示例_DWS贯标清单.xlsx":
         store.clear_items()
+
+    app = FastAPI(
+        title="DataOG Workbench",
+        description="类 DataGrip / DBeaver 一体化数据工程与数据治理微内核工作台",
+        version="2.0.0",
+        docs_url="/api/docs",
+        redoc_url=None,
+        openapi_url="/api/openapi.json",
+    )
+    app.state.platform_ctx = ctx
+    app.state.store = store
+    app.state.engine = engine
+    app.state.cross_engine = cross_engine
+
+    @app.middleware("http")
+    async def security_headers_and_csrf_middleware(request: Request, call_next):
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.url.path.startswith("/api/"):
+            sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+            if sec_fetch_site and sec_fetch_site not in ("same-origin", "same-site", "none"):
+                return JSONResponse(
+                    status_code=403,
+                    content={"ok": False, "error": "禁止跨站伪造请求 (Cross-Site Request Blocked)"},
+                )
+
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault("Permissions-Policy", "camera=(), geolocation=(), microphone=()")
+        response.headers.setdefault("Content-Security-Policy", _SECURITY_CSP)
+        return response
+
+    # 注册平台公共底座路由与三大独立插件模块路由
+    app.include_router(platform_router)
+    app.include_router(standard_migrator_router)
+    app.include_router(cross_comparator_router)
+    app.include_router(ddl_translator_router)
+
+    # =========================================================================
+    # 向后兼容 v1.0.0 历史 API 路由（共享同一底层 PlatformStateStore）
+    # =========================================================================
 
     def _build_full_state_dict(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -233,10 +309,12 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             payload.update(extra)
         return payload
 
-    async def api_bootstrap(_request: Request) -> JSONResponse:
+    @app.get("/api/bootstrap", include_in_schema=False)
+    async def api_bootstrap() -> JSONResponse:
         data = await anyio.to_thread.run_sync(_build_full_state_dict)
         return JSONResponse(data)
 
+    @app.post("/api/connection", include_in_schema=False)
     async def api_configure_connection(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
@@ -251,6 +329,22 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
                     password=str(body.get("password", "")),
                     sslmode=str(body.get("sslmode", "prefer")),
                 )
+                prof = ctx.connection_hub.save_profile(
+                    {
+                        "connection_id": "conn_migrator_default",
+                        "name": f"贯标目标库 ({body.get('host', '')}/{body.get('dbname', '')})",
+                        "driver_kind": "NATIVE",
+                        "db_type": "DWS",
+                        "host": str(body.get("host", "")),
+                        "port": int(body.get("port", 8000)),
+                        "database": str(body.get("dbname", "")),
+                        "username": str(body.get("user", "")),
+                        "password": str(body.get("password", "")),
+                        "default_schema": str(conn_res.get("current_schema") or "public"),
+                        "sslmode": str(body.get("sslmode", "prefer")),
+                    }
+                )
+                store.set_meta("migrator_active_connection_id", prof.connection_id)
                 if store.list_items():
                     engine.sync_all_items_with_db()
                 return _build_full_state_dict({"connection_result": conn_res})
@@ -261,7 +355,8 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             logger.error("配置数据库连接异常: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    async def api_discover_catalog(_request: Request) -> JSONResponse:
+    @app.get("/api/catalog", include_in_schema=False)
+    async def api_discover_catalog() -> JSONResponse:
         try:
             def _do_discover() -> Dict[str, Any]:
                 cat = engine.discover_database_catalog()
@@ -276,6 +371,7 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             logger.error("读取目标库表目录失败: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.post("/api/catalog/load", include_in_schema=False)
     async def api_load_catalog_tables(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
@@ -305,7 +401,8 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             logger.error("从目标库加载表结构失败: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    async def api_clear_items(_request: Request) -> JSONResponse:
+    @app.post("/api/items/clear", include_in_schema=False)
+    async def api_clear_items() -> JSONResponse:
         def _do_clear_items() -> Dict[str, Any]:
             store.clear_items()
             store.add_log("INFO", "清空清单", "已清空当前工作台中的字段清单。")
@@ -314,29 +411,21 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         res = await anyio.to_thread.run_sync(_do_clear_items)
         return JSONResponse(res)
 
+    @app.post("/api/excel/upload", include_in_schema=False)
     async def api_upload_excel(request: Request) -> JSONResponse:
         try:
-            logger.info("收到 Excel 贯标清单上传请求，正在解析...")
             form = await request.form()
             upload_file = form.get("file")
             if upload_file is None or not hasattr(upload_file, "read"):
-                return JSONResponse(
-                    status_code=400, content={"detail": "未接收到上传的 Excel 文件"}
-                )
-            safe_filename = os.path.basename(
-                getattr(upload_file, "filename", "") or "checklist.xlsx"
-            )
+                return JSONResponse(status_code=400, content={"detail": "未接收到上传的 Excel 文件"})
+            safe_filename = os.path.basename(getattr(upload_file, "filename", "") or "checklist.xlsx")
             content = await upload_file.read()
             raw_default_schema = str(form.get("default_schema") or "").strip()
             default_table = str(form.get("default_table") or "").strip()
 
             def _do_parse_and_sync() -> Dict[str, Any]:
                 conn_info = engine.get_public_conn_info()
-                effective_schema = (
-                    raw_default_schema
-                    or conn_info.get("current_schema")
-                    or "public"
-                )
+                effective_schema = raw_default_schema or conn_info.get("current_schema") or "public"
                 parsed_items = parse_excel_checklist(
                     content=content,
                     filename=safe_filename,
@@ -349,21 +438,11 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
                 if engine.is_configured():
                     try:
                         engine.sync_all_items_with_db()
-                        sync_msg += "，并已完成与华为 DWS 数据库联动比对！"
+                        sync_msg += "，并已完成与数据库联动比对！"
                     except Exception as sync_exc:
-                        logger.warning("导入 Excel 后自动比对数据库报错: %s", sync_exc)
                         store.add_log("ERROR", "数据库比对", f"清单已导入，但连接数据库比对失败: {sync_exc}")
                         sync_msg += f"（注意：数据库联动比对未完成: {sync_exc}）"
-                else:
-                    sync_msg += "（请点击「数据库连接设置」连接华为 DWS 以核验表结构）"
-
-                logger.info(sync_msg)
-                return _build_full_state_dict(
-                    {
-                        "imported_count": len(parsed_items),
-                        "message": sync_msg,
-                    }
-                )
+                return _build_full_state_dict({"imported_count": len(parsed_items), "message": sync_msg})
 
             res = await anyio.to_thread.run_sync(_do_parse_and_sync)
             return JSONResponse(res)
@@ -372,7 +451,8 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             store.add_log("ERROR", "Excel导入", f"导入失败: {exc}")
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    async def api_download_template(_request: Request) -> Response:
+    @app.get("/api/excel/template", include_in_schema=False)
+    async def api_download_template() -> Response:
         data = await anyio.to_thread.run_sync(generate_template_excel)
         encoded_name = quote("DWS字段贯标标准模板.xlsx")
         headers = {
@@ -384,12 +464,9 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             headers=headers,
         )
 
-    async def api_export_report(_request: Request) -> Response:
-        def _do_export() -> bytes:
-            items = store.list_items()
-            return export_report_excel(items)
-
-        data = await anyio.to_thread.run_sync(_do_export)
+    @app.get("/api/excel/export", include_in_schema=False)
+    async def api_export_report() -> Response:
+        data = await anyio.to_thread.run_sync(lambda: export_report_excel(store.list_items()))
         encoded_name = quote("DWS字段贯标执行结果报告.xlsx")
         headers = {
             "Content-Disposition": f"attachment; filename=\"dws_migration_report.xlsx\"; filename*=UTF-8''{encoded_name}",
@@ -400,27 +477,26 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             headers=headers,
         )
 
-    async def api_sync_with_db(_request: Request) -> JSONResponse:
+    @app.post("/api/sync", include_in_schema=False)
+    async def api_sync_with_db() -> JSONResponse:
         try:
             def _do_sync() -> Dict[str, Any]:
                 if not engine.is_configured():
-                    raise RuntimeError("尚未配置华为 DWS 数据库连接，请先点击「数据库连接设置」")
+                    raise RuntimeError("尚未配置目标数据库连接")
                 engine.sync_all_items_with_db()
                 return _build_full_state_dict()
 
             res = await anyio.to_thread.run_sync(_do_sync)
             return JSONResponse(res)
         except Exception as exc:
-            logger.error("同步数据库元数据失败: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.get("/api/table/inspect", include_in_schema=False)
     async def api_inspect_table(request: Request) -> JSONResponse:
         try:
             schema_name = request.query_params.get("schema_name", "public")
             table_name = request.query_params.get("table_name", "")
-            keep_backup = (
-                request.query_params.get("keep_backup", "true").lower() != "false"
-            )
+            keep_backup = request.query_params.get("keep_backup", "true").lower() != "false"
 
             def _do_inspect() -> Dict[str, Any]:
                 all_items = store.list_items()
@@ -442,6 +518,7 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         except Exception as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.post("/api/execute/direct", include_in_schema=False)
     async def api_execute_direct(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
@@ -450,10 +527,7 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             max_workers = int(body.get("max_workers") or 5)
             keep_backup = bool(body.get("keep_backup", True))
             if not item_ids:
-                return JSONResponse(
-                    status_code=400,
-                    content={"detail": "请至少选择一条待执行的字段记录"},
-                )
+                return JSONResponse(status_code=400, content={"detail": "请至少选择一条待执行的字段记录"})
 
             def _do_exec_direct() -> Dict[str, Any]:
                 batch_res = engine.execute_batch_items(
@@ -468,6 +542,7 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         except Exception as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.post("/api/execute/rebuild", include_in_schema=False)
     async def api_execute_rebuild(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
@@ -491,17 +566,15 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         except Exception as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    async def api_get_logs(_request: Request) -> JSONResponse:
-        def _do_get_logs() -> Dict[str, Any]:
-            return {
-                "logs": store.list_logs(limit=150),
-                "summary": store.get_summary(),
-            }
-
-        res = await anyio.to_thread.run_sync(_do_get_logs)
+    @app.get("/api/logs", include_in_schema=False)
+    async def api_get_logs() -> JSONResponse:
+        res = await anyio.to_thread.run_sync(
+            lambda: {"logs": store.list_logs(limit=150), "summary": store.get_summary()}
+        )
         return JSONResponse(res)
 
-    async def api_clear_logs(_request: Request) -> JSONResponse:
+    @app.post("/api/logs/clear", include_in_schema=False)
+    async def api_clear_logs() -> JSONResponse:
         def _do_clear() -> Dict[str, Any]:
             store.clear_logs()
             store.add_log("INFO", "系统控制台", "已清空历史操作日志。")
@@ -510,11 +583,8 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         res = await anyio.to_thread.run_sync(_do_clear)
         return JSONResponse(res)
 
-    # =========================================================================
-    # 跨环境三栏数标比对中心 (Source DB × Data Standard × Target DB) API 路由
-    # =========================================================================
-
-    async def api_cross_overview(request: Request) -> JSONResponse:
+    @app.get("/api/cross/overview", include_in_schema=False)
+    async def api_cross_overview_legacy(request: Request) -> JSONResponse:
         try:
             table_key = request.query_params.get("table_key", "")
             res = await anyio.to_thread.run_sync(
@@ -522,9 +592,9 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             )
             return JSONResponse(res)
         except Exception as exc:
-            logger.error("获取跨环境比对总览失败: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.post("/api/cross/connection", include_in_schema=False)
     async def api_cross_configure_connection(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
@@ -550,9 +620,9 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             res = await anyio.to_thread.run_sync(_do_cfg_conn)
             return JSONResponse(res)
         except Exception as exc:
-            logger.error("配置跨环境数据库连接失败: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.get("/api/cross/compare", include_in_schema=False)
     async def api_cross_compare_table(request: Request) -> JSONResponse:
         try:
             table_key = request.query_params.get("table_key", "")
@@ -562,7 +632,6 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             tgt_table = request.query_params.get("target_table")
             if not table_key:
                 raise ValueError("请指定要查看的标准表名称 (table_key)")
-
             res = await anyio.to_thread.run_sync(
                 lambda: cross_engine.compare_single_table(
                     table_key,
@@ -576,6 +645,7 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         except Exception as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.post("/api/cross/bindings/save", include_in_schema=False)
     async def api_cross_save_bindings(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
@@ -587,9 +657,8 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             )
             if not std_table_key:
                 raise ValueError("请先在来源库或目标库中选择/输入要读取的表名或视图名")
-
-            def _do_save_bind() -> Dict[str, Any]:
-                return cross_engine.save_table_and_column_bindings(
+            res = await anyio.to_thread.run_sync(
+                lambda: cross_engine.save_table_and_column_bindings(
                     std_table_key=std_table_key,
                     source_schema=str(body.get("source_schema") or ""),
                     source_table=str(body.get("source_table") or ""),
@@ -597,12 +666,12 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
                     target_table=str(body.get("target_table") or ""),
                     column_bindings=body.get("column_bindings") or [],
                 )
-
-            res = await anyio.to_thread.run_sync(_do_save_bind)
+            )
             return JSONResponse(res)
         except Exception as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.post("/api/cross/standard/upload", include_in_schema=False)
     async def api_cross_upload_standard(request: Request) -> JSONResponse:
         try:
             form = await request.form()
@@ -613,22 +682,22 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
                 getattr(upload_file, "filename", "") or "data_standard.xlsx"
             )
             content = await upload_file.read()
-
             res = await anyio.to_thread.run_sync(
                 lambda: cross_engine.import_bindings_from_file(content, safe_filename)
             )
             return JSONResponse(res)
         except Exception as exc:
-            logger.error("上传跨环境数标或绑定包失败: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    async def api_cross_sync_from_workbench(_request: Request) -> JSONResponse:
+    @app.post("/api/cross/standard/sync-from-workbench", include_in_schema=False)
+    async def api_cross_sync_from_workbench() -> JSONResponse:
         try:
             res = await anyio.to_thread.run_sync(cross_engine.sync_standards_from_workbench)
             return JSONResponse(res)
         except Exception as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.post("/api/cross/push-to-workbench", include_in_schema=False)
     async def api_cross_push_to_workbench(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
@@ -644,7 +713,8 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         except Exception as exc:
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    async def api_cross_export_json(_request: Request) -> Response:
+    @app.get("/api/cross/bindings/export.json", include_in_schema=False)
+    async def api_cross_export_json() -> Response:
         bundle = await anyio.to_thread.run_sync(store.export_cross_bindings_bundle)
         raw_bytes = json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
         encoded_name = quote("跨环境数标三方绑定配置包.json")
@@ -653,6 +723,7 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
         }
         return Response(content=raw_bytes, media_type="application/json; charset=utf-8", headers=headers)
 
+    @app.get("/api/cross/bindings/export.xlsx", include_in_schema=False)
     async def api_cross_export_excel(request: Request) -> Response:
         table_key = request.query_params.get("table_key", "").strip() or None
         data = await anyio.to_thread.run_sync(
@@ -668,13 +739,13 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             headers=headers,
         )
 
+    @app.post("/api/cross/ddl/translate", include_in_schema=False)
     async def api_cross_translate_ddl(request: Request) -> JSONResponse:
         try:
             raw_body = await request.body()
             body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-
-            def _do_translate() -> Dict[str, Any]:
-                return cross_engine.translate_table_ddl(
+            res = await anyio.to_thread.run_sync(
+                lambda: cross_engine.translate_table_ddl(
                     source_role=str(body.get("source_role") or "source"),
                     source_schema=str(body.get("source_schema") or ""),
                     source_table=str(body.get("source_table") or ""),
@@ -686,17 +757,18 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
                     std_table_key=str(body.get("std_table_key") or ""),
                     view_sql=str(body.get("view_sql") or ""),
                 )
-
-            res = await anyio.to_thread.run_sync(_do_translate)
+            )
             return JSONResponse(res)
         except Exception as exc:
-            logger.error("跨环境建表 DDL 导出与方言翻译失败: %s", exc)
             return JSONResponse(status_code=400, content={"detail": str(exc)})
 
-    async def route_favicon(_request: Request) -> Response:
+    @app.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
+    async def route_favicon() -> Response:
         return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
-    async def route_well_known(_request: Request) -> Response:
+    @app.api_route("/.well-known/{rest_of_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def route_well_known(rest_of_path: str) -> Response:
+        _ = rest_of_path
         return Response(status_code=204)
 
     static_dir = resolve_static_dir()
@@ -705,46 +777,12 @@ def create_app(db_path: Optional[str] = None) -> Starlette:
             f"未找到前端静态资源目录 static ({static_dir})，请确保使用 python build_exe.py 完整打包！"
         )
 
-    routes = [
-        Route("/favicon.ico", route_favicon, methods=["GET", "HEAD"]),
-        Route("/.well-known/{rest_of_path:path}", route_well_known, methods=["GET", "HEAD"]),
-        Route("/api/bootstrap", api_bootstrap, methods=["GET"]),
-        Route("/api/connection", api_configure_connection, methods=["POST"]),
-        Route("/api/catalog", api_discover_catalog, methods=["GET"]),
-        Route("/api/catalog/load", api_load_catalog_tables, methods=["POST"]),
-        Route("/api/items/clear", api_clear_items, methods=["POST"]),
-        Route("/api/excel/upload", api_upload_excel, methods=["POST"]),
-        Route("/api/excel/template", api_download_template, methods=["GET"]),
-        Route("/api/excel/export", api_export_report, methods=["GET"]),
-        Route("/api/sync", api_sync_with_db, methods=["POST"]),
-        Route("/api/table/inspect", api_inspect_table, methods=["GET"]),
-        Route("/api/execute/direct", api_execute_direct, methods=["POST"]),
-        Route("/api/execute/rebuild", api_execute_rebuild, methods=["POST"]),
-        Route("/api/logs", api_get_logs, methods=["GET"]),
-        Route("/api/logs/clear", api_clear_logs, methods=["POST"]),
-        # 跨环境三栏数标比对中心 API
-        Route("/api/cross/overview", api_cross_overview, methods=["GET"]),
-        Route("/api/cross/connection", api_cross_configure_connection, methods=["POST"]),
-        Route("/api/cross/compare", api_cross_compare_table, methods=["GET"]),
-        Route("/api/cross/bindings/save", api_cross_save_bindings, methods=["POST"]),
-        Route("/api/cross/standard/upload", api_cross_upload_standard, methods=["POST"]),
-        Route("/api/cross/standard/sync-from-workbench", api_cross_sync_from_workbench, methods=["POST"]),
-        Route("/api/cross/push-to-workbench", api_cross_push_to_workbench, methods=["POST"]),
-        Route("/api/cross/bindings/export.json", api_cross_export_json, methods=["GET"]),
-        Route("/api/cross/bindings/export.xlsx", api_cross_export_excel, methods=["GET"]),
-        Route("/api/cross/ddl/translate", api_cross_translate_ddl, methods=["POST"]),
-        Mount("/", app=StaticFiles(directory=static_dir, html=True), name="static"),
-    ]
-
-    app = Starlette(debug=False, routes=routes)
-    app.state.store = store
-    app.state.engine = engine
-    app.state.cross_engine = cross_engine
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
     return app
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="华为 DWS 字段贯标与无损转换控制台")
+    parser = argparse.ArgumentParser(description="DataOG 多功能数据工程与数据治理一体化工作台")
     parser.add_argument(
         "--port", type=int, default=18080, help="本地 Web 监听端口 (默认 18080)"
     )
@@ -773,13 +811,13 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  华为云 GaussDB(DWS) 字段贯标与保序转换工具")
+    print("  DataOG v2.0.0 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")
-    print(f"  [*] 本地 Web 控制台地址 : {url}")
+    print(f"  [*] 本地 IDE 工作台地址 : {url}")
     print(
-        f"  [*] 本地数据存储路径    : {os.path.join(get_runtime_data_dir(), 'dws_migrator_state.db')}"
+        f"  [*] 本地状态库存储路径  : {os.path.join(get_runtime_data_dir(), 'dataog_state.db')}"
     )
     print("  [*] 按 Ctrl + C 可安全停止服务并退出。")
     print("=" * 74)
