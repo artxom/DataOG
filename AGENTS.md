@@ -1,41 +1,48 @@
-# DataOG 项目记忆与架构工程规范 (AGENTS.md)
+# Data.O.G 项目记忆与架构工程规范 (AGENTS.md)
 
 ## 1. 项目定位与核心对标
-- **项目名称**：**DataOG**（远程仓库：`https://github.com/artxom/DataOG.git`）。
-- **产品形态**：基于 Python Web 技术栈构建的**类 DBeaver / DataGrip 体验的多功能数据工程与数据治理“瑞士军刀”一体化工作台**（支持 macOS / Windows 本地与内网运行，支持一键打包为独立 Windows `.exe`）。
+- **官方品牌名称**：**`Data.O.G`**（GitHub 远程仓库：`https://github.com/artxom/DataOG.git`，Windows 独立打包文件名保持 `DataOG.exe`）。
+- **产品形态**：基于 Python Web 技术栈构建的 **macOS 桌面级极简美学 × 多功能数据工程与数据治理“瑞士军刀”一体化系统**（支持 macOS / Windows 本地与内网运行，支持一键打包为独立 Windows `.exe`）。
 - **核心设计哲学**：
-  1. **强底座共享**：连接数据库、加载自定义驱动、执行基础数据查询、采集并缓存核心库表字段元数据属于**平台级公共能力**，连接一次、全平台所有子模块零延迟共享。
-  2. **高内聚插件化**：具体业务场景（单库落标贯标、跨环境三栏数标比对、跨方言 DDL 翻译与视图穿透，以及未来新增的数据工具）一律作为**相互独立的插件模块**挂载，拥有独立路由与独立前端视图，复用统一 UI 组件库与全局元数据中枢。
+  1. **强底座共享**：连接数据库、加载自定义 JDBC 驱动、执行基础数据查询、采集缓存库表字段元数据、管理 AI 大模型 API（DeepSeek / Gemini / OpenAI 兼容网关）及持久化本地壁纸与自定义图标，均属于**平台级公共能力**，配置一次、全平台所有子模块零延迟共享。
+  2. **macOS 桌面化模块隔离**：界面严禁堆砌冗长解释性副标题与版本号噪音；桌面提供独立超椭圆应用图标与真实红黄绿窗口生命周期（关闭重置状态、最小化停靠右下角毛玻璃小抽屉保留现场、最大化全屏切换），每个业务模块各自独立定制演进，后端模块间严格零私有互引。
 
 ## 2. 核心分层与模块化铁律
-所有代码设计与功能迭代必须严格遵循 **「平台微内核底座 (`core/platform/`) + 统一 IDE 工作台外壳 (`static/js/ui/` & `shell`) + 独立业务功能模块 (`modules/<module_id>/`)」** 架构：
+所有代码设计与功能迭代必须严格遵循 **「平台微内核底座 (`core/platform/`) + macOS 桌面窗口外壳与公共组件 (`static/js/`) + 独立业务功能模块 (`modules/<module_id>/`)」** 架构：
 
-### 2.1 全局数据底座层 (`core/platform/`)
-严禁任何业务模块私自管理数据库账号密码或重复编写系统目录查询 SQL，一律通过 `PlatformContext` 依赖注入调用底座四大中枢：
+### 2.1 全局共享底座层 (`core/platform/`)
+严禁任何业务模块私自管理数据库密码或 AI API Key、或重复编写系统目录查询 SQL，一律通过 `PlatformContext` 依赖注入调用底座六大中枢：
 1. **双轨驱动引擎与全局连接中心 (`DriverManager` & `ConnectionHub`)**：
    - **内置原生通道（免 Java 开箱即用）**：内置纯 Python / 主流 DB-API 驱动（`psycopg2` 覆盖 PG/华为 DWS/openGauss/金仓、`PyMySQL` 覆盖 MySQL/OceanBase/Doris/StarRocks/TiDB、标准库 `sqlite3`、纯 Python `InceptorThriftClient` 覆盖星环 Inceptor/Hive）。
    - **自定义 JDBC 扩展通道（用户上传 `.jar` 驱动）**：支持用户在界面上传标准 JDBC `.jar` 驱动包（安全隔离存放于非静态目录 `data/drivers/`，校验文件头与 SHA-256 指纹），通过按需懒加载的 `JPype1` + 独立 `URLClassLoader` 连接达梦 DM8、Oracle、DB2、GBase 等任意数据库（未安装 JRE 时绝不影响内置原生驱动正常启动运行）。
    - **全局连接池 (`ConnectionHub`)**：统一管理命名数据源档案（Connection Profiles），所有模块通过 `connection_id` 引用。
 2. **全局元数据共享中枢 (`MetadataHub`)**：
-   - 统一标准化元数据模型：`Catalog/Schema` → `Table/View/MatView` → `ColumnMeta`（物理列序 `ordinal_position`、原始类型与归一化类型、非空、默认值、注释、主键/索引、分布键/分桶键、分区键）。
-   - **双层探查与本地持久化缓存**：针对深度适配库（DWS/PG/Inceptor/MySQL）使用定制高性能探查器；针对任意自定义 JDBC 驱动库自动回退使用标准 `java.sql.DatabaseMetaData` 通用探查器；采集结果持久化缓存至本地 SQLite 元数据索引表，支持增量刷新与全文检索，供全平台所有功能模块直接读取。
+   - 统一标准化元数据模型：`Catalog/Schema` → `Table/View/MatView` → `ColumnMeta`（物理列序 `ordinal_position`、原始类型与归一化类型、非空 `is_not_null`、默认值、注释、主键/索引、分布键/分桶键、分区键）。
+   - **双层探查与本地持久化缓存**：针对深度适配库（DWS/PG/Inceptor/MySQL）使用定制高性能探查器；针对任意自定义 JDBC 驱动库自动回退使用标准 `java.sql.DatabaseMetaData` 通用探查器；采集结果持久化缓存至本地 SQLite 元数据索引表，支持增量刷新与 `⌘K` Spotlight 全局秒级检索。
 3. **通用数据查询与预览中心 (`QueryEngine`)**：
-   - 提供跨驱动统一的 SQL 查询与表数据快速预览能力，输出标准 `QueryResult`（列头类型描述、行集、耗时、安全行数截断如默认 `LIMIT 500`、查询超时保护）。
-4. **通用方言、血缘与基础设施 (`Dialects` / `StateStore` / `TaskLogger` / `ExcelIO`)**：
-   - 统一提供 SQL 标识符清洗、跨方言类型归一化与转换矩阵、上游视图四层递归血缘穿透解析、SQLite WAL 模块表幂等注册迁移、多线程作业池、实时增量日志流及 Excel 导入导出基础能力。
+   - 提供跨驱动统一的 SQL 查询与表数据快速预览能力，输出标准 `QueryResult`（列头类型描述、行集、耗时、默认 `LIMIT 500`/上限 `5000` 安全截断、查询超时保护、CSV/Excel 导出）。
+4. **AI 大模型统一接入中枢 (`LLMHub`)**：
+   - 参考 Cherry Studio 多服务商范式，采用官方 `openai` SDK 统一兼容协议管理 `llm_providers` 表，内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关预设，支持连通性检测、远端模型拉取（自动剥离 Gemini `models/` 前缀）与结构化 JSON 输出。
+5. **本地壁纸与自定义图标资源中心 (`AssetStore`)**：
+   - 支持用户上传自定义桌面壁纸（支持 `铺满`/`适应`）、`Data.O.G` 软件主图标（同步动态覆盖 `/favicon.ico`）及四大桌面模块图标；严格执行光栅图像魔数头白名单（PNG/JPEG/WebP/GIF，阻断 SVG 脚本）、UUID 随机重命名落盘于 `data/assets/` 并持久化映射至 `data/dataog_state.db`。
+6. **通用方言、血缘与基础设施 (`Dialects` / `StateStore` / `ExcelIO`)**：
+   - 统一提供 SQL 标识符清洗、跨方言类型归一化与转换矩阵、上游视图四层递归血缘穿透解析、SQLite WAL 模块表幂等注册迁移与 Excel 导入导出基础能力。
 
-### 2.2 后端模块化路由与前端 IDE 式工作台 (`modules/` & `static/`)
-- **后端技术选型**：采用 **`FastAPI` + `Pydantic` + `Uvicorn`**（平滑兼容底层 Starlette）。每个业务模块位于独立的 `modules/<module_id>/` 目录（含 `router.py`、`schemas.py`、`service.py`），通过 `APIRouter` 注册至 `/api/modules/<module_id>`，模块之间严禁相互私有导入，跨模块协作（如从三栏比对推送改造项至贯标执行台）一律经由底座定义的数据契约或状态存储接口完成。
-- **前端统一 IDE 交互架构（零 Node 构建链）**：
-  - 采用浏览器原生 **ES Modules (`<script type="module">`)** + 统一 CSS Design Tokens（支持亮暗双主题），不引入 Webpack/Vite 等前端重型编译链，保持静态资源零构建运行与 PyInstaller 直接打包能力。
-  - **界面标准骨架**：`[最左侧 Activity Bar 模块图标栏]` + `[左侧可折叠 Database Navigator 全局数据库目录树]` + `[右侧 Module Workspace 模块专属画布与上下文工具栏]` + `[底部可折叠全局任务与 SQL 日志面板]`。
-  - **公共 UI 组件库 (`static/js/ui/`)**：所有模块统一复用标准组件（`DataGrid` 数据网格、`ObjectPicker` 库表级联选择器、`SqlCodeBox` SQL 编辑预览框、`Modal`、`Toast`、`SplitPane`），确保全应用视觉与交互高度一致，并严格使用 `textContent` / `createElement` 等安全 DOM 操作杜绝 XSS。
+### 2.2 后端模块化路由与前端 macOS 桌面工作台 (`modules/` & `static/`)
+- **后端技术选型**：采用 **`FastAPI` + `Pydantic` + `Uvicorn`**。每个业务模块位于独立的 `modules/<module_id>/` 目录（含 `router.py`、`schemas.py`、`service.py`），通过 `APIRouter` 注册至 `/api/modules/<module_id>`，模块之间严禁相互私有导入，跨模块协作一律经由底座定义的数据契约或状态存储接口完成。
+- **前端 macOS 桌面级架构（零 Node 构建链）**：
+  - 采用浏览器原生 **ES Modules (`<script type="module">`)** + CSS `light-dark()` / `color-scheme` 明暗双主题令牌，不引入 Webpack/Vite 等编译链，保持静态资源零构建运行与 PyInstaller 直接打包能力。
+  - **macOS 桌面与窗口语义**：
+    - 顶部 28px 毛玻璃菜单栏（`Data.O.G` 品牌归位、活动应用名、AI 状态指示、`⌘K` Spotlight 搜索、运行日志弹窗、深浅色切换、实时时钟）。
+    - 桌面四大独立应用图标：**`系统配置`** (`settings`)、**`数据探查`** (`explorer`)、**`数据标准`** (`standard`：整合 `贯标` | `比对`)、**`多邻国`** (`polyglot`：整合 `智能命名` | `方言翻译`)。
+    - 左上角红黄绿三键语义：🔴 **关闭 (`✕`)** 回到桌面并彻底销毁重置当前工具运行时状态；🟡 **最小化 (`−`)** 缩略停靠至屏幕右下角毛玻璃小抽屉（100% 保留内存 DOM、光标与未保存输入，点击抽屉即刻恢复工作现场）；🟢 **最大化 (`+`)** 切换常规窗口与全屏沉浸工作态。
+  - **公共 UI 组件库 (`static/js/ui/`)**：统一复用 `DatabaseTree`、`DataGrid`、`ObjectPicker`、`SqlCodeBox`、`Modal`（原生 `<dialog>` + 坐标判定轻关闭兜底）、`Toast`、`SplitPane`，严格使用 `textContent` / `createElement` 等安全 DOM 操作杜绝 XSS。
 
 ## 3. 安全、数据兼容与跨平台打包红线
-- **安全与本地隔离**：默认仅监听 `127.0.0.1:18080`（启用 CSP 与 `Sec-Fetch-Site` 跨站请求防护）；`data/*.db`、`data/*.log` 及用户上传的驱动目录 `data/drivers/` 必须被 `.gitignore` 排除，严禁将任何数据库密码或本地状态提交至 Git；所有接口返回与日志输出必须脱敏密码；`.jar` 驱动上传严格限制大小、校验 `PK\x03\x04` 魔数头、拦截 POSIX/Windows 路径穿越并校验 SHA-256 指纹。
+- **安全与本地隔离**：默认仅监听 `127.0.0.1:18080`（启用 CSP 与 `Sec-Fetch-Site` 跨站请求防护）；`data/*.db`、`data/*.log`、驱动目录 `data/drivers/` 及个性化图片目录 `data/assets/` 必须被 `.gitignore` 排除，严禁将任何数据库密码、AI API Key 或本地状态提交至 Git；所有接口返回与日志输出必须脱敏密码与密钥；`.jar` 驱动与壁纸/图标上传均须严格限制体积、校验二进制魔数头并校验 `realpath` 目录边界防路径穿越，资产读取响应强制携带 `X-Content-Type-Options: nosniff` 与独立 `sandbox` CSP。
 - **前端零 XSS 与非阻塞交互红线**：前端代码严禁出现 `innerHTML`、`outerHTML`、`insertAdjacentHTML` 及阻塞式 `window.alert`/`confirm`/`prompt`，统一通过 `static/js/core/dom.js` 安全节点工厂与原生 `<dialog>` (`Modal`) 渲染（由单测静态扫描强制守卫）。
-- **状态库前后向无损兼容**：运行时状态库统一为 `data/dataog_state.db`（启动时自动从历史 `dws_migrator_state.db` 及 `dws_conn_saved` / `dws_connection_config` / `cross_source_conn` / `cross_target_conn` 无损迁移为命名数据源档案）；所有 SQLite 表结构演进必须通过 `register_table_schema` 幂等列自检机制（新增列带安全 `DEFAULT`），保障跨分支切换与版本回退零报错。
-- **Windows `.exe` 与冻结态自检保障**：保留 Windows CMD 快速编辑模式禁用（防点击挂起）、标准流 UTF-8 重配置（防 `cp1252`/`gbk` 编码崩溃）、静态目录多路径探测、多线程 JPype `attachThreadToJVM()` 及 PyInstaller 隔离构建保护；模块零互引校验需同时兼容源码 AST 与 PyInstaller 冻结态 `pkgutil` + `dis` 字节码自省，确保 `DataOG.exe --test` 独立自检通过。新增任何第三方依赖前必须先通过依赖安全扫描校验。
+- **状态库前后向无损兼容**：运行时状态库统一为 `data/dataog_state.db`（启动时自动从历史 `dws_migrator_state.db` 及旧版连接键值无损迁移为命名数据源档案）；所有 SQLite 表结构演进必须通过 `register_table_schema` 幂等列自检机制（新增列带安全 `DEFAULT`），保障跨分支切换与版本回退零报错。
+- **Windows `.exe` 与冻结态自检保障**：保留 Windows CMD 快速编辑模式禁用（防点击挂起）、标准流 UTF-8 重配置（防 `cp1252`/`gbk` 编码崩溃）、静态目录多路径探测、多线程 JPype `attachThreadToJVM()` 及 PyInstaller 隔离构建保护（收集 `openai` / `httpx` 子模块）；模块零互引校验兼容源码 AST 与冻结态 `pkgutil` + `dis` 字节码自省，确保 `DataOG.exe --test` 独立自检通过。
 
 ## 4. 工程交付闭环：文档同步、GitHub Flow 与最佳实践（强制执行）
 每次完成任何开发、重构、缺陷修复或工程变更任务时，**必须完整执行以下「文档同步 + 规范提交 + GitHub 远端闭环」流程**，不得遗漏：
@@ -52,28 +59,31 @@
    - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
 
 ## 5. 当前代码基线快照（供下次会话快速定位）
-- **当前主干里程碑版本**：`v2.0.0`（`main` 分支已同步至 `origin/main`，GitHub Release `v2.0.0` 已发布含 `DataOG-Windows-x64-v2.0.0.zip`）。
+- **当前主干里程碑版本**：`v2.1.0`（官方品牌名 `Data.O.G`，`main` 分支与 `v2.1.0` 里程碑标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI 微内核入口（`create_app`、UTF-8 流保护、Windows 防挂起、安全头/CSRF 中间件、挂载平台路由与三大插件模块路由，并保留 `/api/*` 脱敏兼容路由）。
-  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后打包 `dist/DataOG/DataOG.exe`（含 `--hidden-import=unittest.mock` 与 `--collect-submodules=httpx` 保障冻结态 `--test` 自检）。
+  - `app.py`：FastAPI `2.1.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、安全头/CSRF 中间件、挂载平台路由与三大插件模块路由，并保留 `/api/*` 脱敏兼容路由）。
+  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后打包 `dist/DataOG/DataOG.exe`（含 `openai` / `httpx` 子模块收集与 `data/assets` 目录初始化，保障冻结态 `--test` 自检）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
   - `context.py` (`PlatformContext`) / `router.py` / `schemas.py` / `models.py`
-  - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，核心表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_env_standards`、`cross_table_mappings`、`cross_column_bindings`、`execution_logs`)
-  - `driver_manager.py` & `inceptor_client.py` (`DriverManager`，双轨驱动：`NATIVE` 原生通道覆盖 `DWS`/`PGSQL`/`INCEPTOR`/`MYSQL`/`SQLITE`；`JDBC` 通道按需懒加载 `JPype1` + `URLClassLoader` 覆盖 `DM8`/`KINGBASE`/`ORACLE`/`DB2`/`GBASE` 及自定义 `.jar`)
-  - `connection_hub.py` (`ConnectionHub`，统一 `connection_id` 档案管理、密码脱敏与连接会话上下文)
-  - `metadata_hub.py` (`MetadataHub`，定制探查器 + `DatabaseMetaData` 通用回退、四层视图穿透、SQLite 元数据索引与全局搜索)
-  - `query_engine.py` & `excel_io.py` (`QueryEngine`，默认 `LIMIT 500`/上限 `5000` SQL 下推截断 + JDBC `setMaxRows`、耗时统计、CSV/XLSX 导出)
-  - `dialects/`：`identifiers.py`、`types.py`、`dws_ddl.py`、`ddl_builder.py`、`view_lineage.py`（底层核心算法亦兼容复用于 `core/dws_engine.py` 与 `core/cross_env_engine.py`）
+  - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，核心表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_env_standards`、`cross_table_mappings`、`cross_column_bindings`、`execution_logs`)
+  - `asset_store.py` (`AssetStore`，管理壁纸预设、本地上传壁纸、`Data.O.G` 主图标与四大模块自定义图标持久化至 `data/assets/`，挂载 `/appearance*` 与 `/assets/{asset_name}`)
+  - `llm_hub.py` (`LLMHub`，OpenAI 兼容协议统一接入 DeepSeek、Google Gemini 与自定义网关，挂载 `/llm/providers*`、`/llm/test`、`/llm/models`)
+  - `driver_manager.py` & `inceptor_client.py` (`DriverManager`，双轨驱动：`NATIVE` + 按需懒加载 `JDBC`)
+  - `connection_hub.py` / `metadata_hub.py` / `query_engine.py` / `excel_io.py` / `dialects/`
 - **独立业务插件模块 (`modules/`，严格零跨模块互引)**：
   - `modules/standard_migrator/`（`/api/modules/standard_migrator`）：单库批量落标贯标执行台（`DIRECT_ALTER` / `TABLE_REBUILD` 物理列保序迁移、Kahn 拓扑改名、分区继承、并发作业池）。
-  - `modules/cross_comparator/`（`/api/modules/cross_comparator`）：16:9 跨环境三栏数标比对中心（三方双向桥接绑定、Excel/JSON 导入导出、实时差异计算并一键推送至贯标台）。
-  - `modules/ddl_translator/`（`/api/modules/ddl_translator`）：跨方言建表 DDL 翻译与四层递归视图血缘穿透器。
-- **前端原生 ES Modules IDE 工作台 (`static/`)**：
-  - `index.html`、`css/tokens.css`（明暗双主题变量）、`css/workbench.css`、`js/main.js`
+  - `modules/cross_comparator/`（`/api/modules/cross_comparator`）：跨环境三栏数标比对中心（三方双向桥接绑定、Excel/JSON 导入导出、一键推送至贯标台）。
+  - `modules/ddl_translator/`（`/api/modules/ddl_translator`）：支撑「多邻国」模块，含 `POST /naming`（AI 大模型 + 内置 170+ 数仓标准词根双驱动智能命名与建表草稿生成）与 `POST /translate`（数据源库表/粘贴 `CREATE TABLE` 或 `VIEW`/自由异构 SQL 跨方言互译、四层递归视图穿透与 `AST+AI` 语法适配）。
+- **前端原生 ES Modules macOS 桌面工作台 (`static/`)**：
+  - `index.html`、`css/tokens.css`（明暗双主题与内置壁纸变量）、`css/workbench.css`、`js/main.js`（macOS 桌面、红黄绿窗口控制器、右下角最小化抽屉、`⌘K` Spotlight、日志控制台）
   - 核心层 `js/core/`：`api.js`、`dom.js`、`state.js`
   - 公共组件 `js/ui/`：`database_tree.js`、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`modal.js`、`toast.js`、`split_pane.js`
-  - 模块视图 `js/views/`：`connections_view.js`、`sql_console_view.js`、`standard_migrator_view.js`、`cross_comparator_view.js`、`ddl_translator_view.js`
-- **全量自动化测试套件 (`tests/`，当前共 24 项测试全绿)**：
-  - `tests/test_core.py`：保留并验证单库保序重建、拓扑改名、分区继承、三栏比对、DDL 互译与四层视图穿透核心引擎测试。
-  - `tests/test_platform.py`：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`QueryEngine` 安全截断与导出。
-  - `tests/test_modules_and_api.py`：验证 FastAPI 全路由契约、跨环境推送贯标闭环、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
+  - 四大桌面应用视图 `js/views/`：
+    - **系统配置**：`settings_view.js` + `connections_view.js`（外观与图标 / 数据库连接 / JDBC 驱动 / AI 模型）
+    - **数据探查**：`sql_console_view.js`
+    - **数据标准**：`standard_view.js` + `standard_migrator_view.js` + `cross_comparator_view.js`（贯标 | 比对）
+    - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
+- **全量自动化测试套件 (`tests/`，当前共 27 项测试全绿)**：
+  - `tests/test_core.py`（13 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、DDL 互译与四层视图穿透核心引擎。
+  - `tests/test_platform.py`（8 项）：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` DeepSeek/Gemini 密钥脱敏与模型同步。
+  - `tests/test_modules_and_api.py`（6 项）：验证 FastAPI 全路由契约、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、跨环境推送贯标闭环、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。

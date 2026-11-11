@@ -9,6 +9,7 @@ import glob
 import importlib
 import importlib.util
 import io
+import json
 import os
 import pkgutil
 import re
@@ -18,6 +19,7 @@ import tempfile
 import types
 import unittest
 import zipfile
+from unittest import mock
 
 import openpyxl
 from fastapi.testclient import TestClient
@@ -521,6 +523,175 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                     bad_hits.append(f"{rel_jf}:{lineno} 命中阻塞式弹窗调用: {stripped}")
 
         self.assertEqual(bad_hits, [], f"前端静态安全扫描未通过: {bad_hits}")
+
+    def test_appearance_llm_and_polyglot_endpoints_end_to_end(self) -> None:
+        """端到端验证 v2.1.0：Data.O.G 外观与自定义图标持久化、LLM 路由及多邻国智能命名与 AI 方言适配."""
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(
+                db_path=os.path.join(tmpdir, "dataog_state.db"),
+                drivers_dir=os.path.join(tmpdir, "drivers"),
+                assets_dir=os.path.join(tmpdir, "assets"),
+            )
+            app = create_app(ctx=ctx)
+            client = TestClient(app)
+
+            # 1. Bootstrap 验证官方品牌名 Data.O.G 与四大桌面架构支撑数据
+            boot = client.get("/api/platform/bootstrap").json()
+            self.assertEqual(boot["brand_name"], "Data.O.G")
+            self.assertIn("appearance", boot)
+            self.assertIn("llm_providers", boot)
+            self.assertIn("llm_models", boot)
+
+            # 2. 外观壁纸与软件/模块图标上传、安全响应头与 /favicon.ico 动态覆盖
+            r_bad_svg = client.post(
+                "/api/platform/appearance/upload",
+                files={"file": ("evil.svg", b"<svg onload=alert(1)>", "image/svg+xml")},
+                data={"slot": "wallpaper"},
+            )
+            self.assertEqual(r_bad_svg.status_code, 400)
+
+            up_brand = client.post(
+                "/api/platform/appearance/upload",
+                files={"file": ("brand.png", png_bytes, "image/png")},
+                data={"slot": "brand"},
+            ).json()
+            self.assertTrue(up_brand["ok"])
+            brand_url = up_brand["appearance"]["brand_icon_url"]
+            self.assertTrue(brand_url.startswith("/api/platform/assets/"))
+
+            r_asset = client.get(brand_url)
+            self.assertEqual(r_asset.status_code, 200)
+            self.assertEqual(r_asset.headers.get("X-Content-Type-Options"), "nosniff")
+            self.assertIn("sandbox", r_asset.headers.get("Content-Security-Policy", ""))
+
+            # 路径穿越资产请求必须返回 404
+            self.assertEqual(client.get("/api/platform/assets/not_valid_name.png").status_code, 404)
+
+            # /favicon.ico 应动态返回刚上传的 PNG 品牌图标，重置后恢复默认 SVG
+            r_fav_png = client.get("/favicon.ico")
+            self.assertEqual(r_fav_png.headers.get("content-type"), "image/png")
+            client.post("/api/platform/appearance/reset", json={"slot": "brand"})
+            r_fav_svg = client.get("/favicon.ico")
+            self.assertIn("image/svg+xml", r_fav_svg.headers.get("content-type", ""))
+
+            # 3. 多邻国智能命名：未配密钥时自动回退本地 170+ 数仓标准词根并输出建表草稿
+            r_local_naming = client.post(
+                "/api/modules/ddl_translator/naming",
+                json={
+                    "text": "客户唯一标识\n累计交易金额\n是否实名认证",
+                    "granularity": "column",
+                    "naming_style": "snake_case",
+                    "table_prefix": "dwd",
+                    "use_abbrev": True,
+                    "target_dialect": "DWS",
+                    "use_ai": True,
+                },
+            ).json()
+            self.assertTrue(r_local_naming["ok"])
+            self.assertFalse(r_local_naming["ai_used"])
+            by_cn = {it["cn"]: it for it in r_local_naming["items"]}
+            self.assertEqual(by_cn["客户唯一标识"]["en"], "cust_uniq_id")
+            self.assertEqual(by_cn["累计交易金额"]["en"], "cum_txn_amt")
+            self.assertEqual(by_cn["累计交易金额"]["type"], "NUMERIC(18,2)")
+            self.assertIn("CREATE TABLE", r_local_naming["ddl_preview"])
+
+            # 4. 配置 DeepSeek API Key（验证密钥脱敏）并测试 AI 驱动智能命名与 AI 跨方言翻译
+            secret_key = "sk-live-deepseek-test-key-999999"
+            r_save_llm = client.put(
+                "/api/platform/llm/providers/deepseek",
+                json={
+                    "name": "DeepSeek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": secret_key,
+                    "default_model": "deepseek-chat",
+                    "models": ["deepseek-chat", "deepseek-reasoner"],
+                    "enabled": True,
+                    "is_default": True,
+                },
+            )
+            self.assertEqual(r_save_llm.status_code, 200)
+            self.assertNotIn(secret_key, r_save_llm.text)
+            self.assertTrue(r_save_llm.json()["provider"]["has_api_key"])
+
+            with mock.patch.object(
+                ctx.llm_hub,
+                "chat_completion",
+                return_value={
+                    "provider_id": "deepseek",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-chat",
+                    "content": json.dumps(
+                        [
+                            {
+                                "cn": "个人信贷合同明细表",
+                                "en": "rtl_loan_ctrct_dtl",
+                                "type": "TABLE",
+                                "note": "AI信贷词根",
+                            }
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 42.5,
+                },
+            ):
+                r_ai_naming = client.post(
+                    "/api/modules/ddl_translator/naming",
+                    json={
+                        "text": "个人信贷合同明细表",
+                        "granularity": "table",
+                        "naming_style": "snake_case",
+                        "table_prefix": "dwd",
+                        "use_ai": True,
+                        "provider_id": "deepseek",
+                        "model": "deepseek-chat",
+                    },
+                ).json()
+                self.assertTrue(r_ai_naming["ok"])
+                self.assertTrue(r_ai_naming["ai_used"])
+                self.assertEqual(r_ai_naming["items"][0]["en"], "dwd_rtl_loan_ctrct_dtl")
+
+            # 5. 多邻国方言翻译：支持直接粘贴 CREATE TABLE SQL 翻译 + AI 深度语法适配 (AST+AI)
+            sample_ct = """
+            CREATE TABLE ods.t_cust_bal (
+                cust_id VARCHAR(64) PRIMARY KEY COMMENT '客户编号',
+                bal_amt DECIMAL(18,2) COMMENT '账户余额'
+            );
+            """
+            with mock.patch.object(
+                ctx.llm_hub,
+                "chat_completion",
+                return_value={
+                    "provider_id": "deepseek",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-chat",
+                    "content": json.dumps(
+                        {
+                            "target_sql": "CREATE TABLE ods.t_cust_bal (\n    cust_id VARCHAR(64) NOT NULL,\n    bal_amt NUMERIC(18,2)\n) WITH (ORIENTATION = COLUMN) DISTRIBUTE BY HASH(cust_id);",
+                            "notes": ["已切换为 DWS 列存并按主键 cust_id 哈希分布"],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 68.0,
+                },
+            ):
+                r_ai_tr = client.post(
+                    "/api/modules/ddl_translator/translate",
+                    json={
+                        "source_mode": "sql_text",
+                        "sql_text": sample_ct,
+                        "target_dialect": "DWS",
+                        "storage_mode": "DWS_COLUMN",
+                        "ai_assist": True,
+                        "provider_id": "deepseek",
+                        "model": "deepseek-chat",
+                    },
+                ).json()
+                self.assertTrue(r_ai_tr["ok"])
+                self.assertEqual(r_ai_tr["engine_mode"], "AST+AI")
+                self.assertTrue(r_ai_tr["ai_used"])
+                self.assertIn("ORIENTATION = COLUMN", r_ai_tr["target_ddl"])
+                self.assertEqual(len(r_ai_tr["column_mappings"]), 2)
 
 
 if __name__ == "__main__":
