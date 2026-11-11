@@ -4,117 +4,117 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="light dark" />
-  <title>DataOG v2.0.0 — 多功能数据工程与数据治理一体化工作台</title>
-  <link rel="icon" href="/favicon.ico" type="image/svg+xml" />
+  <title>Data.O.G</title>
+  <link id="dynamic-favicon" rel="icon" href="/favicon.ico" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div id="ide-app" class="ide-shell">
-    <!-- 顶部全局 IDE 状态与快速检索栏 -->
-    <header class="ide-topbar" role="banner">
-      <div class="ide-brand">
-        <span class="ide-logo-mark" aria-hidden="true">OG</span>
-        <div class="ide-brand-text">
-          <span class="ide-brand-title">DataOG</span>
-          <span class="ide-brand-badge">v2.0.0 Workbench</span>
-        </div>
+  <div id="os-root" class="os-shell" data-wallpaper="default">
+    <!-- 顶部 28px macOS 全局毛玻璃菜单栏 -->
+    <header id="os-menubar" class="os-menubar" role="banner">
+      <div class="menubar-left">
+        <button id="btn-menubar-home" type="button" class="menubar-brand-btn" title="显示桌面">
+          <span id="menubar-brand-icon" class="menubar-brand-icon" aria-hidden="true"></span>
+          <span class="menubar-brand-name">Data.O.G</span>
+        </button>
+        <span id="menubar-active-app" class="menubar-active-app">桌面</span>
       </div>
 
-      <search class="ide-global-search-wrap">
+      <div class="menubar-right">
+        <button id="btn-menubar-ai" type="button" class="menubar-pill-btn" title="配置 AI 模型">
+          <span id="menubar-ai-dot" class="dot dot-muted"></span>
+          <span id="menubar-ai-label">AI 未配密钥</span>
+        </button>
+        <button id="btn-menubar-search" type="button" class="menubar-icon-btn" title="全局检索元数据 (⌘K)" aria-label="全局检索元数据">
+          <span id="menubar-icon-search"></span>
+          <span class="menubar-kbd">⌘K</span>
+        </button>
+        <button id="btn-menubar-logs" type="button" class="menubar-icon-btn" title="运行日志与 SQL 审计" aria-label="运行日志">
+          <span id="menubar-icon-logs"></span>
+          <span id="menubar-log-badge" class="menubar-count-dot" hidden>0</span>
+        </button>
+        <button id="btn-toggle-theme" type="button" class="menubar-icon-btn" title="切换外观模式" aria-label="切换深浅色模式">
+          <span id="menubar-theme-label">自动</span>
+        </button>
+        <time id="menubar-clock" class="menubar-clock">--:--</time>
+      </div>
+    </header>
+
+    <!-- macOS 桌面层：品牌徽记 + 四大独立模块超椭圆图标 -->
+    <main id="desktop-surface" class="desktop-surface" aria-label="Data.O.G 桌面">
+      <div class="desktop-center-stage">
+        <div class="desktop-brand-hero">
+          <div id="desktop-brand-emblem" class="desktop-brand-emblem" aria-hidden="true"></div>
+          <h1 class="desktop-brand-title">Data.O.G</h1>
+        </div>
+
+        <nav id="desktop-icon-grid" class="desktop-icon-grid" aria-label="桌面应用模块"></nav>
+      </div>
+    </main>
+
+    <!-- 活动模块窗口挂载层 -->
+    <section id="window-host" class="window-host" hidden aria-live="polite"></section>
+
+    <!-- 屏幕右下角毛玻璃最小化小抽屉（保留挂起工作状态，点击即刻恢复） -->
+    <aside id="minimized-drawer" class="corner-drawer" hidden aria-label="已最小化的工作窗口"></aside>
+  </div>
+
+  <!-- Spotlight 全局秒级元数据检索 (<dialog>) -->
+  <dialog id="spotlight-modal" class="mac-dialog spotlight-dialog" closedby="any" aria-labelledby="spotlight-title">
+    <div class="dialog-sheet">
+      <header class="spotlight-bar">
+        <h2 id="spotlight-title" class="sr-only">全局库表与字段检索</h2>
         <input
-          id="global-meta-search-input"
-          class="ide-global-search-input"
+          id="spotlight-input"
+          class="spotlight-input"
           type="search"
           autocomplete="off"
           autocorrect="off"
           autocapitalize="none"
           spellcheck="false"
-          placeholder="全局秒级检索已缓存的表名 / 视图名 / 字段名 / 中文注释 (Enter 搜索)..."
-          aria-label="全局元数据检索"
+          placeholder="搜索已缓存的表名、视图名、字段名或中文注释..."
+          aria-label="搜索表名、视图名、字段名或注释"
         />
-        <button id="btn-global-meta-search" type="button" class="btn btn-sm btn-ghost">检索元数据</button>
-      </search>
-
-      <div class="ide-topbar-actions">
-        <span id="jre-runtime-pill" class="status-pill status-pill-muted" title="JDBC 扩展通道 JRE 运行时状态">JRE 检测中</span>
-        <button id="btn-toggle-theme" type="button" class="btn btn-sm btn-ghost" title="切换界面主题 (跟随系统 / 浅色 / 深色)">
-          主题: 自动
-        </button>
-        <button id="btn-refresh-platform" type="button" class="btn btn-sm btn-secondary" title="重新同步全局连接与日志状态">
-          刷新工作台
-        </button>
-      </div>
-    </header>
-
-    <!-- 主体区域：Activity Bar + 左侧可折叠 Database Navigator + 右侧独立模块工作区 -->
-    <div class="ide-body" id="ide-body">
-      <nav class="ide-activity-bar" aria-label="功能模块切换栏">
-        <div class="activity-group-top" id="activity-nav-top"></div>
-        <div class="activity-group-bottom" id="activity-nav-bottom"></div>
-      </nav>
-
-      <aside id="left-navigator-pane" class="ide-navigator-pane" aria-label="全局数据库目录导航树">
-        <div id="database-tree-mount" class="navigator-inner"></div>
-      </aside>
-
-      <div
-        id="splitter-left-nav"
-        class="ide-splitter ide-splitter-vertical"
-        role="separator"
-        aria-orientation="vertical"
-        aria-label="调整左侧数据库目录树宽度"
-        tabindex="0"
-      ></div>
-
-      <main id="module-workspace" class="ide-workspace" role="main" aria-live="polite"></main>
+        <button id="spotlight-close" type="button" class="mac-btn mac-btn-ghost">关闭</button>
+      </header>
+      <div id="spotlight-results" class="spotlight-results"></div>
     </div>
+  </dialog>
 
-    <!-- 底部可拖拽高度调节条 -->
-    <div
-      id="splitter-bottom-drawer"
-      class="ide-splitter ide-splitter-horizontal"
-      role="separator"
-      aria-orientation="horizontal"
-      aria-label="调整底部全局任务与 SQL 日志面板高度"
-      tabindex="0"
-    ></div>
-
-    <!-- 底部可折叠全局任务与 SQL 日志抽屉 -->
-    <section id="bottom-log-drawer" class="ide-bottom-drawer" aria-label="全局任务与 SQL 执行日志抽屉">
-      <div class="drawer-header">
-        <div class="drawer-title-group">
-          <button id="btn-toggle-drawer" type="button" class="btn btn-xs btn-ghost">折叠/展开日志</button>
-          <span class="drawer-title">全局任务与 SQL 审计日志</span>
-          <span id="log-count-badge" class="badge badge-neutral">0</span>
-        </div>
-        <div class="drawer-actions">
-          <select id="log-level-filter" class="input input-xs" aria-label="按日志级别过滤">
-            <option value="ALL">全部级别</option>
-            <option value="INFO">INFO 正常</option>
-            <option value="WARN">WARN 警告</option>
-            <option value="ERROR">ERROR 异常</option>
-          </select>
-          <button id="btn-refresh-logs" type="button" class="btn btn-xs btn-ghost">刷新</button>
-          <button id="btn-clear-logs" type="button" class="btn btn-xs btn-ghost">清空日志</button>
-        </div>
-      </div>
-      <div id="drawer-log-list" class="drawer-body" tabindex="0" role="log"></div>
-    </section>
-  </div>
-
-  <!-- 标准语义化模态对话框 (<dialog>) -->
-  <dialog id="global-modal" class="ide-dialog" closedby="any" aria-labelledby="global-modal-title">
-    <div class="dialog-panel">
+  <!-- 全局任务与 SQL 审计控制台弹窗 (<dialog>) -->
+  <dialog id="logs-modal" class="mac-dialog logs-dialog" closedby="any" aria-labelledby="logs-modal-title">
+    <div class="dialog-sheet">
       <header class="dialog-header">
-        <h2 id="global-modal-title" class="dialog-title">系统提示</h2>
-        <button id="global-modal-close" type="button" class="btn btn-xs btn-ghost" aria-label="关闭弹窗">关闭</button>
+        <h2 id="logs-modal-title" class="dialog-title">执行日志</h2>
+        <div class="dialog-header-actions">
+          <select id="log-level-filter" class="mac-input mac-input-sm" aria-label="日志级别过滤">
+            <option value="ALL">全部</option>
+            <option value="INFO">INFO</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+          </select>
+          <button id="btn-refresh-logs" type="button" class="mac-btn mac-btn-sm">刷新</button>
+          <button id="btn-clear-logs" type="button" class="mac-btn mac-btn-sm">清空</button>
+          <button id="logs-modal-close" type="button" class="mac-btn mac-btn-sm mac-btn-ghost">关闭</button>
+        </div>
+      </header>
+      <div id="drawer-log-list" class="logs-body" tabindex="0" role="log"></div>
+    </div>
+  </dialog>
+
+  <!-- 通用模态确认与表单弹窗 (<dialog>) -->
+  <dialog id="global-modal" class="mac-dialog" closedby="any" aria-labelledby="global-modal-title">
+    <div class="dialog-sheet">
+      <header class="dialog-header">
+        <h2 id="global-modal-title" class="dialog-title">提示</h2>
+        <button id="global-modal-close" type="button" class="mac-btn mac-btn-sm mac-btn-ghost" aria-label="关闭弹窗">关闭</button>
       </header>
       <div id="global-modal-body" class="dialog-body"></div>
       <footer id="global-modal-footer" class="dialog-footer"></footer>
     </div>
   </dialog>
 
-  <!-- 全局轻提示栈 (Toast) -->
+  <!-- 顶部胶囊轻提示栈 (Toast) -->
   <div id="toast-root" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
 
   <script type="module" src="/js/main.js"></script>

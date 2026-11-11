@@ -1,8 +1,8 @@
-# DataOG v2.0.0 — 类 DBeaver / DataGrip 底座的多功能数据工程瑞士军刀
+# Data.O.G v2.1.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
-**DataOG** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的**多功能数据工程与数据治理一体化工作台**。
+**Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
-它结合了 **DBeaver / DataGrip 式的核心数据底座**（双轨制广泛数据库连接、支持用户界面上传标准 JDBC `.jar` 驱动、全局持久化元数据缓存图谱、轻量 SQL 查询与表数据浏览）与 **面向企业级数仓实战的可插拔专业工具箱**（单库物理保序批量贯标、16:9 跨环境三栏数标比对、跨方言 DDL 翻译与四层视图血缘穿透），既可在 macOS / Windows 浏览器中提供统一现代的明暗双色 IDE 交互体验，又支持一键打包为独立免安装 Windows `DataOG.exe` 桌面程序。
+系统以 **“强共享平台底座 + 独立定制化桌面应用模块”** 为核心设计：底层一次配置数据库连接、JDBC 驱动与 AI 大模型（内置 **DeepSeek** 与 **Google Gemini** 接入），全平台零延迟共享元数据与智能能力；前端采用克制干练的 macOS 桌面与窗口交互体系，支持自定义桌面壁纸与软件/模块图标本地持久化，并可一键打包为独立免安装 Windows `DataOG.exe` 程序。
 
 - **GitHub 仓库**：https://github.com/artxom/DataOG
 - **项目架构记忆与工程规范**：详见 [AGENTS.md](./AGENTS.md)
@@ -10,31 +10,26 @@
 
 ---
 
-## 一、核心架构设计：强底座共享 × 独立插件化模块
+## 一、macOS 桌面级交互与四大核心模块
 
-DataOG 采用 **「`core/platform/` 四大全局平台中枢 + `static/js/` 统一 IDE 工作台外壳 + `modules/*` 独立插件化业务模块」** 分层架构，数据库“一次连接、元数据全局零延迟共享”，业务模块间零私有互引：
+### 1. 桌面窗口控制语义（红黄绿三键）
+- **顶部 28px 毛玻璃全局菜单栏**：提供 `Data.O.G` 快速显示桌面、当前活动应用指示、AI 模型状态胶囊、`⌘K` Spotlight 秒级库表字段检索、SQL 执行审计日志弹窗、自动/浅色/深色外观切换与实时时钟。
+- 🔴 **关闭 (`✕`)**：关闭当前窗口返回桌面，并**彻底销毁重置当前工具的运行时界面状态**（下次打开恢复初始干净状态，已落盘的 SQLite 配置数据不受影响）。
+- 🟡 **最小化 (`−`)**：将当前工作窗口缩略停靠至**屏幕右下角毛玻璃小抽屉**，**100% 保留内存 DOM、未提交的编辑内容与滚动位置**；点击右下角小抽屉卡片即可瞬间恢复回离开前的工作现场。
+- 🟢 **最大化 (`+`)**（或双击窗口标题栏）：在常规留白桌面窗口与全屏沉浸工作区之间平滑切换。
 
-### 1. DataOG 全局核心微内核底座 (`core/platform/`)
-1. **双轨驱动引擎与全局连接中心 (`driver_manager.py` & `connection_hub.py`)**
-   - **内置 Python 原生驱动通道（免 Java 开箱即用）**：开箱直接支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL (`PGSQL`)**、**星环 Transwarp (`Inceptor`/Hive)**（内置纯 Python HiveServer2 Thrift 协议客户端）、**MySQL / OceanBase / Doris / StarRocks / TiDB (`PyMySQL`)**、**SQLite (`sqlite3`)**。
-   - **自定义 JDBC `.jar` 驱动扩展通道**：内置达梦 `DM8`、人大金仓 `KingbaseES`、Oracle、DB2、GBase 模板，支持用户在界面上传标准 JDBC `.jar` 驱动包（安全隔离存放于 `data/drivers/`，自动校验 ZIP/JAR 魔数头、路径穿越防护与 SHA-256 指纹），按需懒加载 `JPype1` + 独立 `URLClassLoader`（未安装 JRE 时绝不影响内置原生驱动正常运行）。
-2. **状态库无损迁移与模块幂等演进 (`storage.py`)**
-   - 运行时状态库统一升级为 `data/dataog_state.db`；启动时自动检测旧版 `data/dws_migrator_state.db` 及历史连接键值（`dws_conn_saved`、`dws_connection_config`、`cross_source_conn`、`cross_target_conn`），无损迁移为全局命名数据源档案，并支持模块级 SQLite 表幂等列自检。
-3. **全局持久化元数据共享中枢 (`metadata_hub.py`)**
-   - 对深度适配库走定制高性能探查，对任意自定义 JDBC 库自动回退至标准 `java.sql.DatabaseMetaData` 通用探查，将 `Schema → 表/视图 → 字段/类型/注释/主键/分布键/分区键` 持久化缓存至本地 SQLite 索引表，支持增量刷新与全局关键词秒级检索。
-4. **通用简单查询引擎与方言血缘库 (`query_engine.py` & `dialects/`)**
-   - 提供跨驱动统一的 SQL 查询与双击表节点快速预览能力（默认 `LIMIT 500` 安全截断、耗时毫秒统计、超时保护、CSV / Excel `.xlsx` 导出），以及标识符清洗、跨方言类型归一化矩阵与上游视图四层递归血缘穿透解析。
-
-### 2. 类 DataGrip 统一 IDE 工作台与三大独立插件模块 (`modules/` & `static/`)
-- **零 Node 构建链前端**：原生 `<script type="module">` + 明暗双色 CSS Design Tokens（支持跟随系统/浅色/深色切换）+ 严格安全 DOM 渲染（零 `innerHTML`）。
-- **标准 IDE 骨架**：`[最左 Activity Bar 模块图标栏]` + `[左侧可折叠 Database Navigator 全局数据库目录树]` + `[右侧模块专属工作区与上下文工具栏]` + `[底部可折叠全局任务与 SQL 审计日志抽屉]`。
-- **公共组件库 (`static/js/ui/`)**：`DataGrid`、`DatabaseTree`、`ObjectPicker`、`SqlCodeBox`、`Modal`（原生 `<dialog>`）、`Toast`、`SplitPane`。
-- **内置与插件模块矩阵**：
-  - `connections`：**全局数据源与双轨驱动中心**（支持上传管理 `.jar` 驱动包）
-  - `sql_console`：**轻量 SQL 查询与表数据浏览台**（双击左侧树表/视图节点直接预览数据、字段结构与原始 DDL）
-  - `modules/standard_migrator/`：**单库批量落标贯标执行台**（100% 保留 `DIRECT_ALTER` / `TABLE_REBUILD` 物理列保序迁移、Kahn 拓扑改名排序、分区边界继承与多线程并发）
-  - `modules/cross_comparator/`：**16:9 跨环境三栏数标比对中心**（来源库 × 数据标准 × 目标库 三方双向桥接绑定、Excel/JSON 导入导出、一键推送待改造项至贯标台闭环）
-  - `modules/ddl_translator/`：**跨方言建表 DDL 翻译与四层视图穿透器**（独立一级模块，覆盖 DWS / PGSQL / Inceptor / MySQL / DM8 / Oracle / SQLite 建表互译与四层递归视图血缘穿透）
+### 2. 桌面四大独立功能模块
+1. **系统配置 (`settings`)**
+   - **外观与图标**：内置多款亮暗自适应壁纸预设，支持上传本地自定义桌面壁纸（支持 `铺满` / `适应`）、上传自定义 `Data.O.G` 软件主图标（同步更新浏览器 Favicon）以及四大模块自定义图标，全部安全持久化保存于本地 `data/assets/`。
+   - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
+   - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
+2. **数据探查 (`explorer`)**
+   - 无框 Finder 风格数据库目录树 + 沉浸式 SQL 编辑器（`⌘+Enter` 执行）+ `结果` / `结构` / `DDL` 三合一面板，默认安全行数截断保护，支持一键导出 CSV / Excel `.xlsx` 或将当前表直接送入「多邻国」。
+3. **数据标准 (`standard`)**
+   - 顶栏分段切换 **`贯标` | `比对`**：整合单库物理列序保持批量贯标执行台（`DIRECT_ALTER` / `TABLE_REBUILD`、Kahn 拓扑改名排序、分区边界继承、多线程并发）与跨环境三栏数标比对中心（来源库 × 数据标准 × 目标库双向桥接，一键推送待改规则至贯标执行）。
+4. **多邻国 (`polyglot`)**
+   - **智能命名**：输入中文表名或字段名清单，结合系统配置中的大模型 API（未配密钥时自动回退内置 170+ 金融与通用数仓标准词根引擎），按命名规范（`snake_case` / `UPPER_SNAKE` / `camelCase`、数仓分层前缀 `ods_/dwd_/dws_/ads_/dim_`、标准词根缩写）生成标准英文名、推荐 SQL 类型与建表草稿。
+   - **方言翻译**：支持从已连数据库表/视图、数据标准或直接粘贴 `CREATE TABLE` / `CREATE VIEW` / 异构查询 SQL，转换为目标数据库方言（`DWS` / `PGSQL` / `INCEPTOR` / `MYSQL` / `DM8` / `ORACLE` / `SQLITE`），融合确定性四层递归视图血缘穿透 AST 引擎与大模型 `AI 语法适配`。
 
 ---
 
@@ -42,9 +37,11 @@ DataOG 采用 **「`core/platform/` 四大全局平台中枢 + `static/js/` 统�
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 微内核入口（安全响应头、UTF-8/Windows 防挂起、路由装配）
+├── app.py                        # FastAPI 2.1.0 微内核入口（安全响应头、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
+│   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
+│   │   ├── llm_hub.py            # DeepSeek / Gemini / OpenAI 兼容协议多服务商大模型中枢
 │   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载）
 │   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文
 │   │   ├── metadata_hub.py       # 双层元数据探查器与本地 SQLite 缓存检索中枢
@@ -53,14 +50,14 @@ DataOG/
 │   │   └── dialects/             # 标识符清洗、类型映射矩阵、DDL 生成与四层视图血缘穿透
 │   ├── dws_engine.py             # 单库保序重建、Kahn 拓扑改名与分区继承核心引擎
 │   └── cross_env_engine.py       # 跨环境数标匹配、差异分类与桥接计算核心引擎
-├── modules/                      # 相互独立的插件化业务模块（零跨模块私有导入）
-│   ├── standard_migrator/        # /api/modules/standard_migrator 单库批量落标贯标台
-│   ├── cross_comparator/         # /api/modules/cross_comparator  16:9 跨环境三栏数标比对中心
-│   └── ddl_translator/           # /api/modules/ddl_translator    跨方言建表翻译与视图穿透器
-├── static/                       # 零 Node 构建链原生 ES Modules 前端 IDE 工作台
-│   ├── css/                      # tokens.css（明暗双主题变量）与 workbench.css（IDE 骨架样式）
-│   └── js/                       # core/（API/DOM/状态）、ui/（公共组件库）、views/（五大业务视图）
-├── tests/                        # 全量自动化测试门禁（核心算法 / 平台底座 / 模块隔离与安全扫描）
+├── modules/                      # 相互独立的插件化业务模块（严格零跨模块私有导入）
+│   ├── standard_migrator/        # /api/modules/standard_migrator 单库批量落标贯标引擎
+│   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境三栏数标比对引擎
+│   └── ddl_translator/           # /api/modules/ddl_translator    多邻国（智能命名 + 跨方言翻译）
+├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
+│   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
+│   └── js/                       # main.js（桌面与窗口管理器）、core/、ui/、views/（四大模块视图）
+├── tests/                        # 27 项全量自动化测试（核心算法 / 平台底座 / 模块隔离与安全扫描）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 自动化门禁打包脚本
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -72,25 +69,26 @@ DataOG/
 
 | 里程碑版本 | 分支演进 | 核心交付物 |
 | :--- | :--- | :--- |
-| **`v1.0.0`**（已完成） | `main` | 完成单库保序贯标、16:9 三栏跨环境数标比对、多方言 DDL 翻译与视图穿透核心算法基线 |
-| **`v2.0.0`**（当前正式版） | `refactor/dataog-workbench` → `main` | 完成 `FastAPI` 微内核升级、四大全局底座 (`DriverManager` / `ConnectionHub` / `MetadataHub` / `QueryEngine`)、`modules/*` 三大插件解耦、类 DataGrip 原生 ES Module 工作台与 `DataOG.exe` 正式版打包流水线 |
+| **`v1.0.0`** | `main` | 单库保序贯标、16:9 三栏跨环境数标比对、多方言 DDL 翻译与四层视图穿透核心算法基线 |
+| **`v2.0.0`** | `refactor/dataog-workbench` → `main` | `FastAPI` 微内核升级、四大全局数据底座、`modules/*` 插件解耦与 `DataOG.exe` 打包流水线 |
+| **`v2.1.0`**（当前正式版） | `feat/macos-desktop-v2.1` → `main` | 品牌升级 **`Data.O.G`**，全面重塑 **macOS 桌面与红黄绿窗口体系（含右下角最小化抽屉）**，拆解为 **系统配置 / 数据探查 / 数据标准 / 多邻国** 四大模块，新增本地自定义壁纸图标存储与 DeepSeek / Gemini 大模型接入 |
 
 ---
 
-## 四、本地运行、测试打包与工程协作规范
+## 四、本地运行与打包指引
 
 ### 1. 开发环境启动与全量自动化测试门禁
 ```bash
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（24 项核心引擎、平台底座、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（27 项核心引擎、平台底座、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检
 python3 app.py --test
 
-# 启动本地 IDE 工作台（严格监听 http://127.0.0.1:18080）
+# 启动本地 Data.O.G 桌面工作台（严格监听 http://127.0.0.1:18080）
 python3 app.py
 ```
 
@@ -99,7 +97,3 @@ python3 app.py
 # 双击 build_windows.bat 或直接执行打包脚本（打包前自动运行全量单测门禁，产出于 dist/DataOG/DataOG.exe）
 python build_exe.py
 ```
-
-### 3. 持续演进与 GitHub 提交最佳实践
-- **文档同步闭环**：每次完成功能开发、架构调整或缺陷修复，均同步更新 [AGENTS.md](./AGENTS.md)（最新架构基线与会话交接记忆）、[README.md](./README.md) 与 [CHANGELOG.md](./CHANGELOG.md)。
-- **GitHub Flow 与门禁**：从 `main` 切分语义化工作分支（`feat/*`、`fix/*`、`refactor/*`、`docs/*`），采用原子化 Conventional Commits 提交，通过本地全量单测与 `python3 app.py --test` 双门禁后合并回 `main`、清理临时分支并同步推送到 GitHub `origin` 触发 CI 验证。

@@ -7,28 +7,39 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import Request
 
+from core.platform.asset_store import AssetStore
 from core.platform.connection_hub import ConnectionHub
 from core.platform.driver_manager import DriverManager
+from core.platform.llm_hub import LLMHub
 from core.platform.metadata_hub import MetadataHub
 from core.platform.query_engine import QueryEngine
 from core.platform.storage import PlatformStateStore
 
 
 class PlatformContext:
-    """向全平台路由与独立业务模块统一注入四大公共底座能力."""
+    """向全平台路由与独立业务模块统一注入公共底座能力."""
 
-    def __init__(self, db_path: str, drivers_dir: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        drivers_dir: Optional[str] = None,
+        assets_dir: Optional[str] = None,
+    ) -> None:
         abs_db = os.path.abspath(db_path)
         self.data_dir = os.path.dirname(abs_db)
         os.makedirs(self.data_dir, exist_ok=True)
         eff_drivers_dir = drivers_dir or os.path.join(self.data_dir, "drivers")
+        eff_assets_dir = assets_dir or os.path.join(self.data_dir, "assets")
         os.makedirs(eff_drivers_dir, exist_ok=True)
+        os.makedirs(eff_assets_dir, exist_ok=True)
 
         self.store = PlatformStateStore(abs_db)
         self.driver_manager = DriverManager(self.store, drivers_dir=eff_drivers_dir)
         self.connection_hub = ConnectionHub(self.store, self.driver_manager)
         self.metadata_hub = MetadataHub(self.store, self.connection_hub)
         self.query_engine = QueryEngine(self.store, self.connection_hub)
+        self.asset_store = AssetStore(self.store, assets_dir=eff_assets_dir)
+        self.llm_hub = LLMHub(self.store)
         self._registered_modules: List[Dict[str, str]] = []
 
     def register_module_manifest(
@@ -63,13 +74,17 @@ class PlatformContext:
                 "tables": cat["tables"],
             }
         return {
-            "app_name": "DataOG",
-            "version": "2.0.0",
+            "app_name": "Data.O.G",
+            "brand_name": "Data.O.G",
+            "version": "2.1.0",
+            "appearance": self.asset_store.get_public_appearance(),
             "connections": connections,
             "catalog_trees": trees_summary,
             "drivers": [d.to_dict() for d in self.store.list_jdbc_drivers()],
             "driver_templates": self.driver_manager.list_templates(),
             "java_runtime": self.driver_manager.get_java_runtime_status(),
+            "llm_providers": self.llm_hub.list_providers(),
+            "llm_models": self.llm_hub.list_available_models(),
             "modules": list(self._registered_modules),
             "logs": self.store.list_logs(limit=150),
         }

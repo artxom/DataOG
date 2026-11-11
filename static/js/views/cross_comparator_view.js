@@ -1,21 +1,21 @@
 /**
- * DataOG 独立业务插件视图 2：16:9 跨环境三栏数标比对中心 (modules/cross_comparator)
- * 支持：
- * - 左栏（任意来源库表/自动穿透视图） × 中栏（数据标准与双向字段映射桥） × 右栏（任意目标库合规核验）
- * - Excel 数标 / JSON 三方绑定包导入导出
- * - 一键将未达标改造项推送至单库贯标执行台形成治理闭环，或联动唤起跨方言 DDL 翻译器
+ * Data.O.G 数据标准子面板 B：跨环境三栏比对 (CrossComparatorView)
+ * 左栏（来源库表/四层视图穿透） × 中栏（数据标准与双向桥接） × 右栏（目标库合规核验）
  */
 
 import { crossApi } from "../core/api.js";
-import { badge, clearEl, el, pickLocalFile } from "../core/dom.js";
+import { badge, clearEl, el, pickLocalFile, statusDot } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
 import { Toast } from "../ui/toast.js";
 
 export class CrossComparatorView {
-  constructor() {
+  constructor({ onPushToMigrator = null, onStateUpdate = null } = {}) {
+    this.onPushToMigrator = onPushToMigrator;
+    this.onStateUpdate = onStateUpdate;
     this.overview = null;
     this.activeTableKey = "";
+    this.loadedOnce = false;
     this.draftTableBind = {
       source_schema: "",
       source_table: "",
@@ -23,14 +23,14 @@ export class CrossComparatorView {
       target_table: "",
     };
     this.draftColBindings = new Map();
-    this.root = el("div", { className: "module-page" });
+
+    this.root = el("div", {
+      style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
+    });
   }
 
-  async mount(container, context = null) {
-    clearEl(container, this.root);
-    if (context?.tableKey) {
-      this.activeTableKey = context.tableKey;
-    }
+  async ensureLoaded(force = false) {
+    if (this.loadedOnce && !force) return;
     await this.loadOverview(this.activeTableKey, false);
   }
 
@@ -60,24 +60,24 @@ export class CrossComparatorView {
   async loadOverview(tableKey = "", forceRefresh = false) {
     try {
       const res = await crossApi.getOverview(tableKey, forceRefresh);
+      this.loadedOnce = true;
       this.overview = res;
       this.activeTableKey = res.active_table_key || "";
       this._hydrateDraftFromComparison(res.active_comparison);
-      if (res.warning) Toast.warn(res.warning);
-      else if (res.message) Toast.success(res.message);
       this.render();
+      this.onStateUpdate?.();
     } catch (err) {
-      Toast.error(`加载跨环境比对状态失败: ${err.message}`);
+      Toast.error(err.message);
     }
   }
 
-  async _saveCurrentBindings(forceRefresh = false) {
+  async saveCurrentBindings(forceRefresh = false) {
     const key =
       this.activeTableKey ||
       this.draftTableBind.source_table ||
       this.draftTableBind.target_table;
     if (!key) {
-      Toast.warn("请先选择标准表或在左右栏输入要绑定的来源表/目标表名");
+      Toast.warn("请先选择标准表或输入来源/目标表名");
       return;
     }
     try {
@@ -93,14 +93,15 @@ export class CrossComparatorView {
       this.overview = res;
       this.activeTableKey = res.active_table_key || key;
       this._hydrateDraftFromComparison(res.active_comparison);
-      Toast.success(res.message || "三方表与字段桥接关系已保存");
+      Toast.success("桥接已保存");
       this.render();
+      this.onStateUpdate?.();
     } catch (err) {
       Toast.error(err.message);
     }
   }
 
-  _autoMatchColumnsByName() {
+  autoMatchColumnsByName() {
     const comp = this.overview?.active_comparison;
     if (!comp) return;
     const srcCols = new Map((comp.source_panel?.columns || []).map((c) => [c.column_name.toLowerCase(), c.column_name]));
@@ -124,157 +125,25 @@ export class CrossComparatorView {
         }
       }
     }
-    Toast.info(`已完成智能同名/原名字段自动匹配（命中 ${matched} 处桥接），点击「保存桥接并刷新比对」生效`);
+    Toast.info(`已匹配 ${matched} 处同名字段`);
     this.render();
   }
 
-  render() {
-    const ov = this.overview || {
-      connections: [],
-      tables: [],
-      source_connection: {},
-      target_connection: {},
-      standard_meta: {},
-      active_comparison: null,
-    };
-    const conns = ov.connections?.length ? ov.connections : store.state.connections || [];
-    const comp = ov.active_comparison;
+  renderHeaderActions() {
+    const ov = this.overview || { tables: [] };
 
-    const makeRoleConnSelect = (role, currentId, labelText) =>
-      el(
-        "label",
-        { style: { display: "inline-flex", alignItems: "center", gap: "5px", fontSize: "12px" } },
-        el("span", { style: { fontWeight: "600", color: "var(--text-secondary)" }, text: labelText }),
-        el(
-          "select",
-          {
-            className: "input input-sm",
-            onChange: async (e) => {
-              try {
-                const res = await crossApi.bindRole({
-                  role,
-                  connection_id: e.target.value,
-                  active_table_key: this.activeTableKey,
-                  auto_refresh: true,
-                });
-                this.overview = res;
-                this._hydrateDraftFromComparison(res.active_comparison);
-                if (res.warning) Toast.warn(res.warning);
-                else if (res.message) Toast.success(res.message);
-                this.render();
-              } catch (err) {
-                Toast.error(err.message);
-              }
-            },
-          },
-          [
-            el("option", { value: "", text: `-- 选择${labelText} --` }),
-            ...conns.map((c) => {
-              const o = el("option", { value: c.connection_id, text: `${c.name} [${c.db_type}]` });
-              if (c.connection_id === currentId) o.selected = true;
-              return o;
-            }),
-          ]
-        )
-      );
-
-    const toolbar = el(
-      "div",
-      { className: "module-toolbar" },
-      el(
-        "div",
-        { className: "module-toolbar-left" },
-        el("h1", { className: "module-title", text: "跨环境三栏数标比对中心" }),
-        makeRoleConnSelect("source", ov.source_connection?.connection_id || "", "左栏来源库"),
-        makeRoleConnSelect("target", ov.target_connection?.connection_id || "", "右栏目标库")
-      ),
-      el(
-        "div",
-        { className: "module-toolbar-right" },
-        el("button", {
-          type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "导入数标/绑定包 (.xlsx/.json)",
-          onClick: async () => {
-            const f = await pickLocalFile(".xlsx,.json");
-            if (!f) return;
-            try {
-              const res = await crossApi.uploadStandard(f);
-              this.overview = res;
-              this.activeTableKey = res.active_table_key || "";
-              this._hydrateDraftFromComparison(res.active_comparison);
-              Toast.success(res.message || "数标或绑定配置导入成功");
-              this.render();
-            } catch (err) {
-              Toast.error(err.message);
-            }
-          },
-        }),
-        el("button", {
-          type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "从贯标台同步数标",
-          onClick: async () => {
-            try {
-              const res = await crossApi.syncFromMigrator();
-              this.overview = res;
-              this.activeTableKey = res.active_table_key || "";
-              this._hydrateDraftFromComparison(res.active_comparison);
-              Toast.success(res.message || "已同步执行台数标清单");
-              this.render();
-            } catch (err) {
-              Toast.error(err.message);
-            }
-          },
-        }),
-        el("button", {
-          type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "导出 JSON 绑定包",
-          onClick: () => crossApi.exportJson().catch((e) => Toast.error(e.message)),
-        }),
-        el("button", {
-          type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "导出三方比对 Excel",
-          onClick: () => crossApi.exportExcel(this.activeTableKey).catch((e) => Toast.error(e.message)),
-        }),
-        el("button", {
-          type: "button",
-          className: "btn btn-sm btn-primary",
-          text: "推送未达标项至贯标台 →",
-          onClick: async () => {
-            const ok = await Modal.confirm({
-              title: "推送待改造字段至单库贯标执行台",
-              message: "将把目标库中未达标的字段改造规则一键写入「单库落标贯标台」并切换过去执行，是否确认？",
-              confirmText: "推送并打开贯标台",
-            });
-            if (!ok) return;
-            try {
-              const res = await crossApi.pushToMigrator(this.activeTableKey);
-              Toast.success(res.message || `已推送 ${res.pushed_count ?? 0} 条改造项`);
-              store.navigateTo("standard_migrator");
-            } catch (err) {
-              Toast.error(err.message);
-            }
-          },
-        })
-      )
-    );
-
-    // 表级选择与桥接控制栏
     const tableSelect = el(
       "select",
       {
-        className: "input input-sm",
-        style: { minWidth: "220px" },
+        className: "mac-input mac-input-sm",
+        "aria-label": "选择标准表",
         onChange: (e) => {
           this.activeTableKey = e.target.value;
           this.loadOverview(this.activeTableKey, false);
         },
       },
       [
-        el("option", { value: "", text: "-- 选择数据标准表对象 --" }),
+        el("option", { value: "", text: "选择标准表" }),
         ...(ov.tables || []).map((t) => {
           const o = el("option", {
             value: t.std_table_key,
@@ -286,65 +155,157 @@ export class CrossComparatorView {
       ]
     );
 
-    const bridgeBar = el(
+    return el(
       "div",
-      { className: "card", style: { display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: "8px" } },
+      { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
+      tableSelect,
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm",
+        text: "导入数标",
+        onClick: async () => {
+          const f = await pickLocalFile(".xlsx,.json");
+          if (!f) return;
+          try {
+            const res = await crossApi.uploadStandard(f);
+            this.overview = res;
+            this.activeTableKey = res.active_table_key || "";
+            this._hydrateDraftFromComparison(res.active_comparison);
+            Toast.success("已导入");
+            this.render();
+            this.onStateUpdate?.();
+          } catch (err) {
+            Toast.error(err.message);
+          }
+        },
+      }),
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm",
+        text: "同名桥接",
+        onClick: () => this.autoMatchColumnsByName(),
+      }),
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm",
+        text: "保存桥接",
+        onClick: () => this.saveCurrentBindings(true),
+      }),
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm mac-btn-primary",
+        text: "推送贯标 →",
+        onClick: async () => {
+          const ok = await Modal.confirm({
+            title: "推送至贯标",
+            message: "将当前目标库未达标的改造规则写入「贯标」并切换执行，是否继续？",
+            confirmText: "推送并切换",
+          });
+          if (!ok) return;
+          try {
+            const res = await crossApi.pushToMigrator(this.activeTableKey);
+            Toast.success(`已推送 ${res.pushed_count ?? 0} 条规则`);
+            this.onPushToMigrator?.();
+          } catch (err) {
+            Toast.error(err.message);
+          }
+        },
+      })
+    );
+  }
+
+  _makeRoleConnSelect(role, currentId, placeholder) {
+    const conns = this.overview?.connections?.length
+      ? this.overview.connections
+      : store.state.connections || [];
+
+    return el(
+      "select",
+      {
+        className: "mac-input mac-input-sm",
+        style: { flex: "1", minWidth: "110px" },
+        onChange: async (e) => {
+          try {
+            const res = await crossApi.bindRole({
+              role,
+              connection_id: e.target.value,
+              active_table_key: this.activeTableKey,
+              auto_refresh: true,
+            });
+            this.overview = res;
+            this._hydrateDraftFromComparison(res.active_comparison);
+            this.render();
+          } catch (err) {
+            Toast.error(err.message);
+          }
+        },
+      },
+      [
+        el("option", { value: "", text: placeholder }),
+        ...conns.map((c) => {
+          const o = el("option", { value: c.connection_id, text: `${c.name} · ${c.db_type}` });
+          if (c.connection_id === currentId) o.selected = true;
+          return o;
+        }),
+      ]
+    );
+  }
+
+  render() {
+    const ov = this.overview || { active_comparison: null };
+    const comp = ov.active_comparison;
+    const sum = comp?.summary || {};
+
+    const subbar = el(
+      "div",
+      { className: "mac-subbar" },
       el(
         "div",
-        { style: { display: "flex", alignItems: "center", flexWrap: "wrap", gap: "6px" } },
-        el("span", { style: { fontWeight: "700" }, text: "当前比对标准表:" }),
-        tableSelect,
-        el("input", {
-          className: "input input-sm",
-          style: { width: "105px" },
-          placeholder: "来源Schema",
-          value: this.draftTableBind.source_schema,
-          onInput: (e) => (this.draftTableBind.source_schema = e.target.value.trim()),
-        }),
-        el("input", {
-          className: "input input-sm",
-          style: { width: "145px" },
-          placeholder: "来源表/视图名",
-          value: this.draftTableBind.source_table,
-          onInput: (e) => (this.draftTableBind.source_table = e.target.value.trim()),
-        }),
-        el("span", { text: "↔" }),
-        el("input", {
-          className: "input input-sm",
-          style: { width: "105px" },
-          placeholder: "目标Schema",
-          value: this.draftTableBind.target_schema,
-          onInput: (e) => (this.draftTableBind.target_schema = e.target.value.trim()),
-        }),
-        el("input", {
-          className: "input input-sm",
-          style: { width: "145px" },
-          placeholder: "目标表名",
-          value: this.draftTableBind.target_table,
-          onInput: (e) => (this.draftTableBind.target_table = e.target.value.trim()),
-        })
+        { className: "mac-subbar-group", style: { gap: "14px" } },
+        statusDot(`合规 ${sum.compliant ?? 0}`, "success"),
+        statusDot(`待改 ${sum.target_pending ?? 0}`, "warn"),
+        statusDot(`缺失 ${sum.missing ?? 0}`, "danger")
       ),
       el(
         "div",
-        { style: { display: "flex", gap: "6px", flexWrap: "wrap" } },
+        { className: "mac-subbar-group" },
         el("button", {
           type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "同名自动桥接",
-          onClick: () => this._autoMatchColumnsByName(),
+          className: "btn btn-xs",
+          text: "同步贯标清单",
+          onClick: async () => {
+            try {
+              const res = await crossApi.syncFromMigrator();
+              this.overview = res;
+              this.activeTableKey = res.active_table_key || "";
+              this._hydrateDraftFromComparison(res.active_comparison);
+              Toast.success("已同步");
+              this.render();
+              this.onStateUpdate?.();
+            } catch (err) {
+              Toast.error(err.message);
+            }
+          },
         }),
         el("button", {
           type: "button",
-          className: "btn btn-sm btn-primary",
-          text: "保存桥接并刷新比对",
-          onClick: () => this._saveCurrentBindings(true),
+          className: "btn btn-xs",
+          text: "Excel",
+          onClick: () => crossApi.exportExcel(this.activeTableKey).catch((e) => Toast.error(e.message)),
         }),
         el("button", {
           type: "button",
-          className: "btn btn-sm btn-ghost",
-          text: "跨方言翻译 DDL →",
+          className: "btn btn-xs",
+          text: "JSON",
+          onClick: () => crossApi.exportJson().catch((e) => Toast.error(e.message)),
+        }),
+        el("button", {
+          type: "button",
+          className: "btn btn-xs btn-ghost",
+          text: "送入多邻国 →",
           onClick: () =>
-            store.navigateTo("ddl_translator", {
+            store.openApp("polyglot", {
+              mode: "dialect",
               connectionId: ov.source_connection?.connection_id || "",
               schemaName: this.draftTableBind.source_schema,
               tableName: this.draftTableBind.source_table,
@@ -354,19 +315,9 @@ export class CrossComparatorView {
       )
     );
 
-    if (!comp) {
-      const emptyCard = el("div", {
-        className: "card grid-empty",
-        text: "请先导入数据标准 Excel 清单（或从贯标执行台同步），也可以在上方输入来源表名/目标表名后点击「保存桥接并刷新比对」直接开启三栏比对！",
-      });
-      clearEl(this.root, toolbar, el("div", { className: "module-content" }, bridgeBar, emptyCard));
-      return;
-    }
-
-    const srcPanel = comp.source_panel || {};
-    const stdPanel = comp.standard_panel || {};
-    const tgtPanel = comp.target_panel || {};
-    const sum = comp.summary || {};
+    const srcPanel = comp?.source_panel || {};
+    const stdPanel = comp?.standard_panel || {};
+    const tgtPanel = comp?.target_panel || {};
 
     const srcDatalist = el(
       "datalist",
@@ -379,7 +330,7 @@ export class CrossComparatorView {
       (tgtPanel.columns || []).map((c) => el("option", { value: c.column_name }))
     );
 
-    // 左栏：来源库表/视图列
+    // 左栏：来源库（连接与表选择直接融入栏头）
     const leftLane = el(
       "section",
       { className: "tri-lane" },
@@ -388,18 +339,31 @@ export class CrossComparatorView {
         { className: "tri-lane-header" },
         el(
           "div",
-          { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
-          el("strong", { text: `左栏 · 来源库 (${srcPanel.db_type || "未绑定"})` }),
-          badge(`${srcPanel.object_type || "TABLE"} · ${(srcPanel.columns || []).length}列`, srcPanel.exists ? "info" : "warn")
+          { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px" } },
+          el("strong", { text: "来源" }),
+          this._makeRoleConnSelect("source", ov.source_connection?.connection_id || "", "选择来源库")
         ),
-        el("div", {
-          style: { fontSize: "11.5px", color: "var(--text-secondary)" },
-          text: `${srcPanel.schema_name || "-"}.${srcPanel.table_name || "-"}`,
-        }),
+        el(
+          "div",
+          { style: { display: "flex", gap: "5px" } },
+          el("input", {
+            className: "mac-input input-xs",
+            style: { width: "90px" },
+            placeholder: "Schema",
+            value: this.draftTableBind.source_schema,
+            onInput: (e) => (this.draftTableBind.source_schema = e.target.value.trim()),
+          }),
+          el("input", {
+            className: "mac-input input-xs",
+            style: { flex: "1" },
+            placeholder: "来源表 / 视图",
+            value: this.draftTableBind.source_table,
+            onInput: (e) => (this.draftTableBind.source_table = e.target.value.trim()),
+          })
+        ),
         (srcPanel.penetrated_base_tables || []).length
-          ? badge(`已四层血缘穿透基表: ${srcPanel.penetrated_base_tables.join(", ")}`, "success")
-          : null,
-        srcPanel.error ? badge(`探查异常: ${srcPanel.error}`, "danger") : null
+          ? badge(`穿透: ${srcPanel.penetrated_base_tables.join(", ")}`, "info")
+          : null
       ),
       el(
         "div",
@@ -412,20 +376,19 @@ export class CrossComparatorView {
                 el(
                   "div",
                   { style: { display: "flex", justifyContent: "space-between", gap: "6px" } },
-                  el("strong", { style: { fontFamily: "var(--font-mono)" }, text: `${c.ordinal_position}. ${c.column_name}` }),
-                  badge(c.data_type, "neutral")
+                  el("span", { className: "mono", style: { fontWeight: "600" }, text: c.column_name }),
+                  el("span", { className: "mono", style: { fontSize: "11px", color: "var(--os-muted)" }, text: c.data_type })
                 ),
-                c.lineage_source
-                  ? el("div", { style: { fontSize: "11px", color: "var(--status-info)" }, text: `穿透源: ${c.lineage_source}` })
-                  : null,
-                el("div", { style: { fontSize: "11px", color: "var(--text-secondary)" }, text: c.column_comment || "无字段注释" })
+                c.column_comment
+                  ? el("div", { style: { fontSize: "11px", color: "var(--os-text-secondary)" }, text: c.column_comment })
+                  : null
               )
             )
-          : el("div", { className: "grid-empty", text: "未读取到来源库表字段（请确认已选择左栏连接且表存在）" })
+          : el("div", { className: "grid-empty", text: "选择来源库与表后点击右上角「保存桥接」" })
       )
     );
 
-    // 中栏：数据标准中枢与左右双向字段桥接
+    // 中栏：数据标准与双向桥接
     const centerLane = el(
       "section",
       { className: "tri-lane" },
@@ -434,76 +397,74 @@ export class CrossComparatorView {
         { className: "tri-lane-header" },
         el(
           "div",
-          { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "4px" } },
-          el("strong", { text: `中栏 · 数据标准与双向桥接 (${(stdPanel.columns || []).length}项)` }),
-          el(
-            "div",
-            { style: { display: "flex", gap: "4px" } },
-            badge(`合规 ${sum.compliant ?? 0}`, "success"),
-            badge(`待改造 ${sum.target_pending ?? 0}`, "warn"),
-            badge(`缺失 ${sum.missing ?? 0}`, "danger")
-          )
+          { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+          el("strong", { text: "数据标准" }),
+          badge(`${(stdPanel.columns || []).length} 项`, "neutral")
         )
       ),
       el(
         "div",
         { className: "tri-lane-body" },
-        (stdPanel.columns || []).map((sc) => {
-          const draft = this.draftColBindings.get(sc.std_col_name) || {
-            id: sc.id ?? 0,
-            std_col_name: sc.std_col_name,
-            orig_col_name: sc.orig_col_name || sc.std_col_name,
-            std_col_type: sc.std_col_type || "",
-            std_col_comment: sc.std_col_comment || "",
-            bound_source_col: sc.effective_source_col || "",
-            bound_target_col: sc.effective_target_col || "",
-          };
-          const tgtTone =
-            sc.target_status === "COMPLIANT"
-              ? "success"
-              : sc.target_status === "PENDING_MIGRATION"
-              ? "warn"
-              : "danger";
-          return el(
-            "div",
-            { className: "spine-row-card" },
-            el(
-              "div",
-              { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "6px" } },
-              el("strong", { style: { fontFamily: "var(--font-mono)" }, text: `${sc.std_col_name} (${sc.std_col_type})` }),
-              badge(sc.target_status === "COMPLIANT" ? "目标已合规" : sc.target_detail || sc.target_status, tgtTone)
-            ),
-            el("div", { style: { fontSize: "11.5px", color: "var(--text-secondary)" }, text: sc.std_col_comment || "无标准注释" }),
-            el(
-              "div",
-              { className: "spine-bridge-inputs" },
-              el("input", {
-                className: "input input-xs",
-                list: "cross-src-cols-dl",
-                placeholder: "← 绑定来源库字段",
-                value: draft.bound_source_col,
-                onInput: (e) => {
-                  draft.bound_source_col = e.target.value.trim();
-                  this.draftColBindings.set(sc.std_col_name, draft);
-                },
-              }),
-              el("input", {
-                className: "input input-xs",
-                list: "cross-tgt-cols-dl",
-                placeholder: "绑定目标库字段 →",
-                value: draft.bound_target_col,
-                onInput: (e) => {
-                  draft.bound_target_col = e.target.value.trim();
-                  this.draftColBindings.set(sc.std_col_name, draft);
-                },
-              })
-            )
-          );
-        })
+        (stdPanel.columns || []).length
+          ? (stdPanel.columns || []).map((sc) => {
+              const draft = this.draftColBindings.get(sc.std_col_name) || {
+                id: sc.id ?? 0,
+                std_col_name: sc.std_col_name,
+                orig_col_name: sc.orig_col_name || sc.std_col_name,
+                std_col_type: sc.std_col_type || "",
+                std_col_comment: sc.std_col_comment || "",
+                bound_source_col: sc.effective_source_col || "",
+                bound_target_col: sc.effective_target_col || "",
+              };
+              const tgtTone =
+                sc.target_status === "COMPLIANT"
+                  ? "success"
+                  : sc.target_status === "PENDING_MIGRATION"
+                  ? "warn"
+                  : "danger";
+              return el(
+                "div",
+                { className: "spine-row-card" },
+                el(
+                  "div",
+                  { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "6px" } },
+                  el("span", { className: "mono", style: { fontWeight: "600" }, text: `${sc.std_col_name} · ${sc.std_col_type}` }),
+                  statusDot(sc.target_status === "COMPLIANT" ? "达标" : sc.target_detail || "待改", tgtTone)
+                ),
+                sc.std_col_comment
+                  ? el("div", { style: { fontSize: "11px", color: "var(--os-text-secondary)" }, text: sc.std_col_comment })
+                  : null,
+                el(
+                  "div",
+                  { className: "spine-bridge-inputs" },
+                  el("input", {
+                    className: "mac-input input-xs mono",
+                    list: "cross-src-cols-dl",
+                    placeholder: "← 来源字段",
+                    value: draft.bound_source_col,
+                    onInput: (e) => {
+                      draft.bound_source_col = e.target.value.trim();
+                      this.draftColBindings.set(sc.std_col_name, draft);
+                    },
+                  }),
+                  el("input", {
+                    className: "mac-input input-xs mono",
+                    list: "cross-tgt-cols-dl",
+                    placeholder: "目标字段 →",
+                    value: draft.bound_target_col,
+                    onInput: (e) => {
+                      draft.bound_target_col = e.target.value.trim();
+                      this.draftColBindings.set(sc.std_col_name, draft);
+                    },
+                  })
+                )
+              );
+            })
+          : el("div", { className: "grid-empty", text: "点击右上角「导入数标」或「同步贯标清单」" })
       )
     );
 
-    // 右栏：目标库合规核验
+    // 右栏：目标库（连接与表选择直接融入栏头）
     const rightLane = el(
       "section",
       { className: "tri-lane" },
@@ -512,15 +473,28 @@ export class CrossComparatorView {
         { className: "tri-lane-header" },
         el(
           "div",
-          { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
-          el("strong", { text: `右栏 · 目标库 (${tgtPanel.db_type || "未绑定"})` }),
-          badge(`${tgtPanel.object_type || "TABLE"} · ${(tgtPanel.columns || []).length}列`, tgtPanel.exists ? "success" : "warn")
+          { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "6px" } },
+          el("strong", { text: "目标" }),
+          this._makeRoleConnSelect("target", ov.target_connection?.connection_id || "", "选择目标库")
         ),
-        el("div", {
-          style: { fontSize: "11.5px", color: "var(--text-secondary)" },
-          text: `${tgtPanel.schema_name || "-"}.${tgtPanel.table_name || "-"}`,
-        }),
-        tgtPanel.error ? badge(`探查异常: ${tgtPanel.error}`, "danger") : null
+        el(
+          "div",
+          { style: { display: "flex", gap: "5px" } },
+          el("input", {
+            className: "mac-input input-xs",
+            style: { width: "90px" },
+            placeholder: "Schema",
+            value: this.draftTableBind.target_schema,
+            onInput: (e) => (this.draftTableBind.target_schema = e.target.value.trim()),
+          }),
+          el("input", {
+            className: "mac-input input-xs",
+            style: { flex: "1" },
+            placeholder: "目标表名",
+            value: this.draftTableBind.target_table,
+            onInput: (e) => (this.draftTableBind.target_table = e.target.value.trim()),
+          })
+        )
       ),
       el(
         "div",
@@ -532,37 +506,34 @@ export class CrossComparatorView {
                   ? "success"
                   : c.compliance_status === "PENDING_MIGRATION"
                   ? "warn"
-                  : "neutral";
+                  : "muted";
               return el(
                 "div",
                 { className: "spine-row-card" },
                 el(
                   "div",
                   { style: { display: "flex", justifyContent: "space-between", gap: "6px" } },
-                  el("strong", { style: { fontFamily: "var(--font-mono)" }, text: `${c.ordinal_position}. ${c.column_name}` }),
-                  badge(c.data_type, "neutral")
+                  el("span", { className: "mono", style: { fontWeight: "600" }, text: c.column_name }),
+                  el("span", { className: "mono", style: { fontSize: "11px", color: "var(--os-muted)" }, text: c.data_type })
                 ),
                 el(
                   "div",
-                  { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "4px" } },
-                  el("span", { style: { fontSize: "11px", color: "var(--text-secondary)" }, text: c.column_comment || "无注释" }),
-                  badge(c.compliance_status === "COMPLIANT" ? "达标" : c.compliance_detail || "未绑定", tone)
+                  { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                  el("span", { style: { fontSize: "11px", color: "var(--os-text-secondary)" }, text: c.column_comment || "-" }),
+                  statusDot(c.compliance_status === "COMPLIANT" ? "达标" : c.compliance_detail || "未绑定", tone)
                 )
               );
             })
-          : el("div", { className: "grid-empty", text: "未读取到目标库表字段（或目标表尚待新建）" })
+          : el("div", { className: "grid-empty", text: "选择目标库与表后点击「保存桥接」" })
       )
     );
 
-    const content = el(
-      "div",
-      { className: "module-content" },
-      bridgeBar,
+    clearEl(
+      this.root,
+      subbar,
       srcDatalist,
       tgtDatalist,
       el("div", { className: "tri-compare-grid" }, leftLane, centerLane, rightLane)
     );
-
-    clearEl(this.root, toolbar, content);
   }
 }

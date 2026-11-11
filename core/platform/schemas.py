@@ -49,3 +49,26 @@ class QueryExportPayload(BaseModel):
     format: str = "csv"
     title: str = "查询结果"
     limit: int = Field(default=1000, ge=1, le=5000)
+
+
+class AppearanceUpdatePayload(BaseModel):
+    wallpaper_id: Optional[str] = None
+    wallpaper_fit: Optional[str] = None
+
+
+class AppearanceResetPayload(BaseModel):
+    slot: str = "wallpaper"
+
+
+class LLMProviderPayload(BaseModel):
+    provider_id: Optional[str] = None
+    name: Optional[str] = None
+    provider_type: Optional[str] = None
+    enabled: Optional[bool] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    clear_api_key: bool = False
+    default_model: Optional[str] = None
+    models: Optional[List[str]] = None
+    is_default: Optional[bool] = None
+

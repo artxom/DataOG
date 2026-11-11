@@ -20,7 +20,14 @@ import sqlite3
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.platform.models import ColumnMeta, ConnectionProfile, DriverPackage, SchemaMeta, TableMeta
+from core.platform.models import (
+    ColumnMeta,
+    ConnectionProfile,
+    DriverPackage,
+    LLMProviderProfile,
+    SchemaMeta,
+    TableMeta,
+)
 
 logger = logging.getLogger("dataog")
 
@@ -214,6 +221,20 @@ class PlatformStateStore:
                     bound_target_col TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS llm_providers (
+                    provider_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    provider_type TEXT NOT NULL DEFAULT 'OPENAI_COMPATIBLE',
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    base_url TEXT NOT NULL DEFAULT '',
+                    api_key TEXT NOT NULL DEFAULT '',
+                    default_model TEXT NOT NULL DEFAULT '',
+                    models_json TEXT NOT NULL DEFAULT '[]',
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    extra_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
             self._ensure_schema_columns(conn)
@@ -335,6 +356,17 @@ class PlatformStateStore:
                 ("std_col_comment", "TEXT NOT NULL DEFAULT ''"),
                 ("bound_source_col", "TEXT NOT NULL DEFAULT ''"),
                 ("bound_target_col", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "llm_providers": [
+                ("provider_type", "TEXT NOT NULL DEFAULT 'OPENAI_COMPATIBLE'"),
+                ("enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("base_url", "TEXT NOT NULL DEFAULT ''"),
+                ("api_key", "TEXT NOT NULL DEFAULT ''"),
+                ("default_model", "TEXT NOT NULL DEFAULT ''"),
+                ("models_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("is_default", "INTEGER NOT NULL DEFAULT 0"),
+                ("extra_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
         }
         for table_name, col_defs in expected_columns.items():
@@ -1895,3 +1927,118 @@ class PlatformStateStore:
             "column_count": len(c_rows),
             "standard_filename": std_fn,
         }
+
+    # =========================================================================
+    # 全局 AI 大模型服务商档案 (LLMProviderProfile) 持久化
+    # =========================================================================
+
+    @staticmethod
+    def _row_to_llm_provider(row: sqlite3.Row) -> LLMProviderProfile:
+        try:
+            models = json.loads(row["models_json"] or "[]")
+            if not isinstance(models, list):
+                models = []
+        except Exception:
+            models = []
+        try:
+            extra = json.loads(row["extra_json"] or "{}")
+            if not isinstance(extra, dict):
+                extra = {}
+        except Exception:
+            extra = {}
+        return LLMProviderProfile(
+            provider_id=row["provider_id"],
+            name=row["name"],
+            provider_type=row["provider_type"] or "OPENAI_COMPATIBLE",
+            enabled=bool(row["enabled"]),
+            base_url=row["base_url"] or "",
+            api_key=row["api_key"] or "",
+            default_model=row["default_model"] or "",
+            models=[str(m).strip() for m in models if str(m).strip()],
+            is_default=bool(row["is_default"]),
+            extra=extra,
+            updated_at=row["updated_at"] or "",
+        )
+
+    def list_llm_providers(self) -> List[LLMProviderProfile]:
+        with self._lock, self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM llm_providers
+                ORDER BY
+                    CASE provider_id
+                        WHEN 'deepseek' THEN 1
+                        WHEN 'gemini' THEN 2
+                        WHEN 'custom' THEN 3
+                        ELSE 10
+                    END ASC,
+                    name ASC
+                """
+            ).fetchall()
+            return [self._row_to_llm_provider(r) for r in rows]
+
+    def get_llm_provider(self, provider_id: str) -> Optional[LLMProviderProfile]:
+        if not provider_id:
+            return None
+        with self._lock, self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM llm_providers WHERE provider_id = ?",
+                (provider_id,),
+            ).fetchone()
+            return self._row_to_llm_provider(row) if row else None
+
+    def upsert_llm_provider(self, profile: LLMProviderProfile) -> LLMProviderProfile:
+        now = self._now_str()
+        models_json = json.dumps(list(profile.models or []), ensure_ascii=False)
+        extra_json = json.dumps(dict(profile.extra or {}), ensure_ascii=False)
+        with self._lock, self._get_conn() as conn:
+            if profile.is_default:
+                conn.execute(
+                    "UPDATE llm_providers SET is_default = 0 WHERE provider_id != ?",
+                    (profile.provider_id,),
+                )
+            conn.execute(
+                """
+                INSERT INTO llm_providers (
+                    provider_id, name, provider_type, enabled,
+                    base_url, api_key, default_model, models_json,
+                    is_default, extra_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider_id) DO UPDATE SET
+                    name = excluded.name,
+                    provider_type = excluded.provider_type,
+                    enabled = excluded.enabled,
+                    base_url = excluded.base_url,
+                    api_key = excluded.api_key,
+                    default_model = excluded.default_model,
+                    models_json = excluded.models_json,
+                    is_default = excluded.is_default,
+                    extra_json = excluded.extra_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    profile.provider_id,
+                    profile.name,
+                    profile.provider_type,
+                    1 if profile.enabled else 0,
+                    profile.base_url,
+                    profile.api_key,
+                    profile.default_model,
+                    models_json,
+                    1 if profile.is_default else 0,
+                    extra_json,
+                    now,
+                ),
+            )
+            conn.commit()
+        return self.get_llm_provider(profile.provider_id) or profile
+
+    def delete_llm_provider(self, provider_id: str) -> bool:
+        with self._lock, self._get_conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM llm_providers WHERE provider_id = ?",
+                (provider_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+

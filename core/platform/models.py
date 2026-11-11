@@ -172,3 +172,48 @@ class QueryResult:
             "affected_rows": self.affected_rows,
             "message": self.message,
         }
+
+
+def mask_secret_key(secret: str) -> str:
+    """对敏感 API 密钥进行不可逆前端脱敏显示."""
+    raw = (secret or "").strip()
+    if not raw:
+        return ""
+    if len(raw) <= 8:
+        return "••••••••"
+    return f"{raw[:4]}••••••••{raw[-4:]}"
+
+
+@dataclass
+class LLMProviderProfile:
+    """全局 AI 大模型服务商配置档案（OpenAI 兼容协议统一管理）."""
+
+    provider_id: str
+    name: str
+    provider_type: str = "OPENAI_COMPATIBLE"  # DEEPSEEK | GEMINI | OPENAI_COMPATIBLE
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    default_model: str = ""
+    models: List[str] = field(default_factory=list)
+    is_default: bool = False
+    extra: Dict[str, Any] = field(default_factory=dict)
+    updated_at: str = ""
+
+    def to_public_dict(self) -> Dict[str, Any]:
+        """输出严格脱敏后的前端安全字典（绝不明文回传 api_key）."""
+        return {
+            "provider_id": self.provider_id,
+            "name": self.name,
+            "provider_type": self.provider_type,
+            "enabled": bool(self.enabled),
+            "base_url": self.base_url,
+            "has_api_key": bool(self.api_key),
+            "api_key_masked": mask_secret_key(self.api_key),
+            "default_model": self.default_model,
+            "models": list(self.models or []),
+            "is_default": bool(self.is_default),
+            "extra": dict(self.extra or {}),
+            "updated_at": self.updated_at,
+        }
+

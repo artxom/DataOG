@@ -26,6 +26,7 @@ import openpyxl
 
 from core.platform.context import PlatformContext
 from core.platform.driver_manager import JdbcConnectionAdapter
+from core.platform.llm_hub import LLMHub, extract_json_payload
 from core.platform.storage import PlatformStateStore
 
 
@@ -489,6 +490,163 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
                 cur.execute("SELECT 1", timeout_sec=15, max_rows=201)
             fake_stmt.setQueryTimeout.assert_called_once_with(15)
             fake_stmt.setMaxRows.assert_called_once_with(201)
+
+    def test_asset_store_wallpaper_and_icons_magic_bytes_security_and_persistence(self) -> None:
+        """验证 AssetStore 光栅魔数头校验、SVG/路径穿越阻断、旧文件清理与跨重启持久化."""
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+        jpg_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+        webp_bytes = b"RIFF\x24\x00\x00\x00WEBP" + b"\x00" * 24
+        gif_bytes = b"GIF89a" + b"\x00" * 24
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "dataog_state.db")
+            assets_dir = os.path.join(tmpdir, "assets")
+            ctx = PlatformContext(db_path=db_path, assets_dir=assets_dir)
+            ast_store = ctx.asset_store
+
+            # 1. 阻断 SVG / HTML 脚本伪装与非法槽位
+            with self.assertRaises(ValueError):
+                ast_store.save_uploaded_asset(
+                    slot="wallpaper",
+                    filename="xss.svg",
+                    content=b"<svg onload='alert(1)'></svg>",
+                )
+            with self.assertRaises(ValueError):
+                ast_store.save_uploaded_asset(
+                    slot="brand",
+                    filename="disguised.png",
+                    content=b"<html><script>alert(1)</script></html>",
+                )
+            with self.assertRaises(ValueError):
+                ast_store.save_uploaded_asset(
+                    slot="app:unknown_module",
+                    filename="ok.png",
+                    content=png_bytes,
+                )
+
+            # 2. 上传壁纸、主品牌图标与模块图标（覆盖 PNG / JPG / WebP / GIF）
+            s1 = ast_store.save_uploaded_asset(slot="wallpaper", filename="desk.png", content=png_bytes)
+            self.assertEqual(s1["wallpaper_id"], "custom")
+            first_wp_name = s1["custom_wallpaper_url"].rsplit("/", 1)[-1]
+            self.assertTrue(os.path.isfile(os.path.join(assets_dir, first_wp_name)))
+
+            # 替换壁纸时自动清理旧壁纸文件
+            s2 = ast_store.save_uploaded_asset(slot="wallpaper", filename="desk2.jpg", content=jpg_bytes)
+            second_wp_name = s2["custom_wallpaper_url"].rsplit("/", 1)[-1]
+            self.assertNotEqual(first_wp_name, second_wp_name)
+            self.assertFalse(os.path.isfile(os.path.join(assets_dir, first_wp_name)))
+            self.assertTrue(os.path.isfile(os.path.join(assets_dir, second_wp_name)))
+
+            ast_store.save_uploaded_asset(slot="brand", filename="logo.webp", content=webp_bytes)
+            s_icons = ast_store.save_uploaded_asset(slot="app:polyglot", filename="poly.gif", content=gif_bytes)
+            self.assertTrue(s_icons["brand_icon_url"].endswith(".webp"))
+            self.assertTrue(s_icons["app_icons"]["polyglot"].endswith(".gif"))
+
+            # 3. 路径穿越读取必须返回 None
+            self.assertIsNone(ast_store.read_asset_bytes("../dataog_state.db"))
+            self.assertIsNone(ast_store.read_asset_bytes("..\\dataog_state.db"))
+            self.assertIsNone(ast_store.read_asset_bytes("not_a_uuid.png"))
+
+            # 4. 重新打开 PlatformContext 验证持久化，随后执行重置确认磁盘清理
+            ctx_reopen = PlatformContext(db_path=db_path, assets_dir=assets_dir)
+            re_state = ctx_reopen.asset_store.get_public_appearance()
+            self.assertEqual(re_state["wallpaper_id"], "custom")
+            self.assertIn("polyglot", re_state["app_icons"])
+            fav = ctx_reopen.asset_store.read_brand_favicon()
+            self.assertIsNotNone(fav)
+            self.assertEqual(fav[1], "image/webp")
+
+            cleared = ctx_reopen.asset_store.reset_slot("all")
+            self.assertEqual(cleared["wallpaper_id"], "default")
+            self.assertEqual(cleared["custom_wallpaper_url"], "")
+            self.assertEqual(cleared["brand_icon_url"], "")
+            self.assertEqual(cleared["app_icons"], {})
+            self.assertEqual(os.listdir(assets_dir), [])
+
+    def test_llm_hub_presets_secret_masking_and_mock_openai_client(self) -> None:
+        """验证 LLMHub 内置 DeepSeek/Gemini 预设、API Key 严格脱敏与 OpenAI 兼容协议客户端."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = PlatformStateStore(os.path.join(tmpdir, "dataog_state.db"))
+
+            class _FakeCompletions:
+                def create(self, **kwargs: Any) -> Any:
+                    msg = mock.MagicMock()
+                    msg.content = f"OK:{kwargs.get('model')}"
+                    choice = mock.MagicMock()
+                    choice.message = msg
+                    resp = mock.MagicMock()
+                    resp.choices = [choice]
+                    return resp
+
+            class _FakeModels:
+                def list(self) -> Any:
+                    m1 = mock.MagicMock()
+                    m1.id = "models/gemini-2.5-flash"
+                    m2 = mock.MagicMock()
+                    m2.id = "models/gemini-2.5-pro"
+                    res = mock.MagicMock()
+                    res.data = [m1, m2]
+                    return res
+
+            class _FakeOpenAIClient:
+                def __init__(self) -> None:
+                    self.chat = mock.MagicMock()
+                    self.chat.completions = _FakeCompletions()
+                    self.models = _FakeModels()
+
+            hub = LLMHub(store, client_factory=lambda _prof, _timeout: _FakeOpenAIClient())
+
+            # 1. 验证内置 DeepSeek 与 Google Gemini 预设及禁止删除保护
+            providers = {p["provider_id"]: p for p in hub.list_providers()}
+            self.assertIn("deepseek", providers)
+            self.assertIn("gemini", providers)
+            self.assertEqual(providers["deepseek"]["base_url"], "https://api.deepseek.com")
+            self.assertIn("generativelanguage.googleapis.com/v1beta/openai/", providers["gemini"]["base_url"])
+            with self.assertRaises(ValueError):
+                hub.delete_provider("deepseek")
+
+            # 2. 非法协议与内嵌凭据 URL 拦截
+            with self.assertRaises(ValueError):
+                hub.save_provider({"provider_id": "deepseek", "base_url": "file:///etc/passwd"})
+            with self.assertRaises(ValueError):
+                hub.save_provider({"provider_id": "deepseek", "base_url": "https://u:p@api.deepseek.com"})
+
+            # 3. 保存密钥后公开接口严格脱敏，且留空或回传掩码时原密钥不丢失
+            raw_secret = "sk-deepseek-super-secret-987654"
+            hub.save_provider(
+                {
+                    "provider_id": "deepseek",
+                    "name": "DeepSeek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": raw_secret,
+                    "default_model": "deepseek-chat",
+                    "enabled": True,
+                    "is_default": True,
+                }
+            )
+            pub_list = hub.list_providers()
+            self.assertNotIn(raw_secret, json.dumps(pub_list))
+            ds_pub = next(p for p in pub_list if p["provider_id"] == "deepseek")
+            self.assertTrue(ds_pub["has_api_key"])
+            self.assertIn("••••", ds_pub["api_key_masked"])
+
+            # 回传掩码或空字符串保持原密钥不变
+            hub.save_provider({"provider_id": "deepseek", "api_key": ds_pub["api_key_masked"]})
+            self.assertEqual(store.get_llm_provider("deepseek").api_key, raw_secret)
+            hub.save_provider({"provider_id": "deepseek", "api_key": ""})
+            self.assertEqual(store.get_llm_provider("deepseek").api_key, raw_secret)
+
+            # 4. 连通测试、Gemini 模型前缀自动剥离与 JSON 提取器验证
+            ping = hub.test_provider({"provider_id": "deepseek"})
+            self.assertTrue(ping["ok"])
+            self.assertEqual(ping["reply_preview"], "OK:deepseek-chat")
+
+            hub.save_provider({"provider_id": "gemini", "api_key": "AIzaSyDummyGeminiKey123456"})
+            fetched = hub.fetch_models({"provider_id": "gemini"})
+            self.assertEqual(fetched["models"], ["gemini-2.5-flash", "gemini-2.5-pro"])
+
+            parsed_json = extract_json_payload("输出结果如下：\n```json\n[{\"cn\":\"客户号\",\"en\":\"cust_no\"}]\n```")
+            self.assertEqual(parsed_json[0]["en"], "cust_no")
 
 
 if __name__ == "__main__":
