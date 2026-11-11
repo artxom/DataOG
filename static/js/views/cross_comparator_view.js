@@ -46,6 +46,7 @@ export class CrossComparatorView {
     };
     for (const sc of comp.standard_panel?.columns || []) {
       this.draftColBindings.set(sc.std_col_name, {
+        id: sc.id ?? 0,
         std_col_name: sc.std_col_name,
         orig_col_name: sc.orig_col_name || sc.std_col_name,
         std_col_type: sc.std_col_type || "",
@@ -449,6 +450,11 @@ export class CrossComparatorView {
         { className: "tri-lane-body" },
         (stdPanel.columns || []).map((sc) => {
           const draft = this.draftColBindings.get(sc.std_col_name) || {
+            id: sc.id ?? 0,
+            std_col_name: sc.std_col_name,
+            orig_col_name: sc.orig_col_name || sc.std_col_name,
+            std_col_type: sc.std_col_type || "",
+            std_col_comment: sc.std_col_comment || "",
             bound_source_col: sc.effective_source_col || "",
             bound_target_col: sc.effective_target_col || "",
           };

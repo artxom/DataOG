@@ -128,7 +128,15 @@ function initBottomLogDrawer(splitters) {
     if (!listEl || !countBadge) return;
     const allLogs = store.state.logs || [];
     const level = levelSelect?.value || "ALL";
-    const filtered = level === "ALL" ? allLogs : allLogs.filter((l) => (l.level || "").toUpperCase() === level);
+    const filtered =
+      level === "ALL"
+        ? allLogs
+        : allLogs.filter((l) => {
+            const lv = (l.level || "").toUpperCase();
+            if (level === "INFO") return lv === "INFO" || lv === "SUCCESS";
+            if (level === "WARN") return lv === "WARN" || lv === "WARNING";
+            return lv === level;
+          });
     countBadge.textContent = String(allLogs.length);
 
     if (!filtered.length) {
@@ -143,7 +151,14 @@ function initBottomLogDrawer(splitters) {
       listEl,
       filtered.map((item) => {
         const lvl = (item.level || "INFO").toUpperCase();
-        const tone = lvl === "ERROR" ? "danger" : lvl === "WARN" ? "warn" : "info";
+        const tone =
+          lvl === "ERROR"
+            ? "danger"
+            : lvl === "WARN" || lvl === "WARNING"
+            ? "warn"
+            : lvl === "SUCCESS"
+            ? "success"
+            : "info";
         return el(
           "div",
           { className: "log-entry" },
@@ -303,7 +318,7 @@ function initGlobalMetadataSearch() {
 
   btn?.addEventListener("click", runSearch);
   input?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && !e.isComposing) {
       e.preventDefault();
       runSearch();
     }
@@ -353,10 +368,11 @@ async function bootstrapWorkbench() {
   const syncJrePill = () => {
     const pill = document.getElementById("jre-runtime-pill");
     if (!pill) return;
-    const jre = store.state.javaRuntime || { available: false };
-    pill.textContent = jre.available ? "双轨引擎: 原生 + JDBC 就绪" : "双轨引擎: 原生免Java就绪";
-    pill.className = `status-pill ${jre.available ? "status-pill-ok" : "status-pill-muted"}`;
-    pill.title = jre.message || "";
+    const jre = store.state.javaRuntime || {};
+    const ready = Boolean(jre.jdbc_extension_ready ?? jre.available);
+    pill.textContent = ready ? "双轨引擎: 原生 + JDBC 就绪" : "双轨引擎: 原生免Java就绪";
+    pill.className = `status-pill ${ready ? "status-pill-ok" : "status-pill-muted"}`;
+    pill.title = jre.note || jre.message || "";
   };
 
   store.subscribe((_s, reason) => {

@@ -4,19 +4,26 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dis
 import glob
+import importlib
+import importlib.util
 import io
 import os
+import pkgutil
 import re
 import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 import zipfile
 
 import openpyxl
 from fastapi.testclient import TestClient
 
-from app import create_app
+from app import create_app, resolve_static_dir
+from core.platform.context import PlatformContext
 
 
 def _build_mini_jar() -> bytes:
@@ -281,39 +288,209 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertEqual(rep_resp.status_code, 200)
 
     def test_plugin_modules_strict_zero_cross_import_isolation(self) -> None:
-        """架构铁律校验：扫描 modules/* 下全部 Python AST，确保模块之间零相互私有导入."""
+        """架构铁律校验：扫描 modules/* 下全部 Python AST（或打包态字节码），确保模块之间零相互私有导入."""
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         modules_root = os.path.join(project_root, "modules")
         py_files = glob.glob(os.path.join(modules_root, "**", "*.py"), recursive=True)
-        self.assertGreaterEqual(len(py_files), 9)
 
         violations = []
-        for path in py_files:
-            rel = os.path.relpath(path, modules_root)
-            parts = rel.split(os.sep)
-            if len(parts) < 2:
-                continue
-            own_module = parts[0]
-            with open(path, encoding="utf-8") as fh:
-                tree = ast.parse(fh.read(), filename=path)
-            for node in ast.walk(tree):
-                imported_names = []
-                if isinstance(node, ast.Import):
-                    imported_names.extend(alias.name for alias in node.names)
-                elif isinstance(node, ast.ImportFrom) and node.module:
-                    imported_names.append(node.module)
-                for imp in imported_names:
-                    if imp.startswith("modules."):
-                        target_mod = imp.split(".")[1]
-                        if target_mod != own_module:
-                            violations.append(f"{rel} 违规导入了其他插件模块 {imp}")
+        if py_files:
+            self.assertGreaterEqual(len(py_files), 9)
+            for path in py_files:
+                rel = os.path.relpath(path, modules_root)
+                parts = rel.split(os.sep)
+                if len(parts) < 2:
+                    continue
+                own_module = parts[0]
+                with open(path, encoding="utf-8") as fh:
+                    tree = ast.parse(fh.read(), filename=path)
+                for node in ast.walk(tree):
+                    imported_names = []
+                    if isinstance(node, ast.Import):
+                        imported_names.extend(alias.name for alias in node.names)
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        imported_names.append(node.module)
+                    for imp in imported_names:
+                        if imp.startswith("modules."):
+                            target_mod = imp.split(".")[1]
+                            if target_mod != own_module:
+                                violations.append(f"{rel} 违规导入了其他插件模块 {imp}")
+        else:
+            # PyInstaller 冻结态下 .py 已编译进入 PYZ，递归扫描全部模块与函数字节码指令
+            import modules as modules_pkg
+
+            def _iter_code_imports(code_obj: types.CodeType):
+                for instr in dis.get_instructions(code_obj):
+                    if instr.opname == "IMPORT_NAME" and isinstance(instr.argval, str):
+                        yield instr.argval
+                for const in code_obj.co_consts:
+                    if isinstance(const, types.CodeType):
+                        yield from _iter_code_imports(const)
+
+            inspected_count = 0
+            for mod_info in pkgutil.walk_packages(modules_pkg.__path__, "modules."):
+                parts = mod_info.name.split(".")
+                if len(parts) < 3:
+                    continue
+                own_module = parts[1]
+                mod_obj = importlib.import_module(mod_info.name)
+                inspected_count += 1
+                code_roots: list[types.CodeType] = []
+                spec = importlib.util.find_spec(mod_info.name)
+                if spec and spec.loader and hasattr(spec.loader, "get_code"):
+                    top_code = spec.loader.get_code(mod_info.name)
+                    if isinstance(top_code, types.CodeType):
+                        code_roots.append(top_code)
+                if not code_roots:
+                    for obj in vars(mod_obj).values():
+                        code_obj = getattr(obj, "__code__", None)
+                        if isinstance(code_obj, types.CodeType):
+                            code_roots.append(code_obj)
+                for root_code in code_roots:
+                    for imp in _iter_code_imports(root_code):
+                        if imp.startswith("modules.") and imp.split(".")[1] != own_module:
+                            violations.append(f"{mod_info.name} 违规导入了其他插件模块 {imp}")
+            self.assertGreaterEqual(inspected_count, 9)
 
         self.assertEqual(violations, [], f"发现违反插件隔离铁律的跨模块导入: {violations}")
 
+    def test_rebuild_preview_schema_inheritance_live_cross_save_and_password_masking(self) -> None:
+        """回归验证：重建预览无 AttributeError、清单上传继承连接默认 Schema、在线三栏桥接无 ID 保存推送与旧接口密码脱敏."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_sqlite = os.path.join(tmpdir, "live_src.sqlite")
+            tgt_sqlite = os.path.join(tmpdir, "live_tgt.sqlite")
+            with contextlib.closing(sqlite3.connect(src_sqlite)) as conn:
+                conn.execute("CREATE TABLE t_loan (loan_id VARCHAR(64), amt DECIMAL(18,2))")
+                conn.commit()
+            with contextlib.closing(sqlite3.connect(tgt_sqlite)) as conn:
+                conn.execute("CREATE TABLE t_loan (old_loan_id VARCHAR(20), amt DECIMAL(18,2))")
+                conn.commit()
+
+            ctx = PlatformContext(
+                db_path=os.path.join(tmpdir, "dataog_state.db"),
+                drivers_dir=os.path.join(tmpdir, "drivers"),
+            )
+            ctx.store.save_meta(
+                "dws_conn_saved",
+                {
+                    "configured": True,
+                    "host": "10.0.0.9",
+                    "port": 8000,
+                    "dbname": "dwsdb",
+                    "user": "dbadmin",
+                    "password": "TopSecretValue!2026",
+                },
+            )
+            app = create_app(ctx=ctx)
+            client = TestClient(app)
+
+            # 1. 旧版 /api/bootstrap 绝不明文回传密码
+            legacy_boot = client.get("/api/bootstrap").json()
+            self.assertNotIn("password", legacy_boot["connection"])
+            self.assertTrue(legacy_boot["connection"]["has_saved_password"])
+
+            src_cid = client.post(
+                "/api/platform/connections",
+                json={"name": "直连来源库", "db_type": "SQLITE", "sqlite_path": src_sqlite},
+            ).json()["connection"]["connection_id"]
+            tgt_cid = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "直连目标库",
+                    "db_type": "SQLITE",
+                    "sqlite_path": tgt_sqlite,
+                    "default_schema": "main",
+                },
+            ).json()["connection"]["connection_id"]
+
+            # 2. 未导入 Excel 时，直接在三栏比对中保存无正数 ID 的草稿桥接并推送至贯标台
+            client.post(
+                "/api/modules/cross_comparator/bind-role",
+                json={"role": "source", "connection_id": src_cid, "auto_refresh": True},
+            )
+            client.post(
+                "/api/modules/cross_comparator/bind-role",
+                json={"role": "target", "connection_id": tgt_cid, "auto_refresh": True},
+            )
+            save_res = client.post(
+                "/api/modules/cross_comparator/bindings/save",
+                json={
+                    "std_table_key": "t_loan",
+                    "source_schema": "main",
+                    "source_table": "t_loan",
+                    "target_schema": "main",
+                    "target_table": "t_loan",
+                    "column_bindings": [
+                        {
+                            "std_col_name": "loan_id",
+                            "orig_col_name": "loan_id",
+                            "std_col_type": "VARCHAR(64)",
+                            "bound_source_col": "loan_id",
+                            "bound_target_col": "old_loan_id",
+                        },
+                        {
+                            "std_col_name": "amt",
+                            "orig_col_name": "amt",
+                            "std_col_type": "DECIMAL(18,2)",
+                            "bound_source_col": "amt",
+                            "bound_target_col": "amt",
+                        },
+                    ],
+                    "force_refresh": True,
+                },
+            ).json()
+            self.assertTrue(save_res["ok"])
+            saved_cols = {
+                c["std_col_name"]: c
+                for c in save_res["active_comparison"]["standard_panel"]["columns"]
+            }
+            self.assertEqual(saved_cols["loan_id"]["bound_target_col"], "old_loan_id")
+
+            push_res = client.post(
+                "/api/modules/cross_comparator/push-to-migrator",
+                json={"std_table_key": "t_loan"},
+            ).json()
+            self.assertTrue(push_res["ok"])
+            self.assertEqual(push_res["pushed_count"], 2)
+
+            # 3. 贯标台同步并生成整表保序重建 SQL 预览（无 AttributeError，包含 rebuild_sql 与 column_count）
+            client.post(
+                "/api/modules/standard_migrator/bind-connection",
+                json={"connection_id": tgt_cid, "auto_sync": True},
+            )
+            preview_res = client.post(
+                "/api/modules/standard_migrator/rebuild/preview",
+                json={"schema_name": "main", "table_name": "t_loan", "keep_backup": True},
+            ).json()
+            self.assertTrue(preview_res["ok"])
+            self.assertEqual(preview_res["column_count"], 2)
+            self.assertIn("CREATE TABLE", preview_res["rebuild_sql"])
+            self.assertIn("loan_id", preview_res["sql_preview"])
+
+            # 4. 上传不含模式名列的 Excel 清单时自动继承当前绑定连接的 default_schema
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(["表名", "原字段名", "标准字段名", "目标类型"])
+            ws.append(["t_loan", "old_loan_id", "loan_id", "VARCHAR(64)"])
+            buf = io.BytesIO()
+            wb.save(buf)
+            up_no_schema = client.post(
+                "/api/modules/standard_migrator/checklist/upload",
+                files={
+                    "file": (
+                        "no_schema.xlsx",
+                        buf.getvalue(),
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                },
+            ).json()
+            self.assertTrue(up_no_schema["ok"])
+            self.assertEqual(up_no_schema["items"][0]["schema_name"], "main")
+
     def test_frontend_static_files_zero_xss_sinks_and_zero_blocking_dialogs(self) -> None:
         """前端安全红线校验：确保所有原生 ES Module 与 HTML 零 innerHTML/outerHTML/阻塞弹窗/内联脚本."""
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        static_root = os.path.join(project_root, "static")
+        static_root = resolve_static_dir()
+        project_root = os.path.dirname(static_root)
 
         with open(os.path.join(static_root, "index.html"), encoding="utf-8") as fh:
             index_html = fh.read()

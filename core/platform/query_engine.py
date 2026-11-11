@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import re
 import threading
 import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 from core.platform.connection_hub import ConnectionHub
-from core.platform.dialects import quote_dialect_ident, validate_identifier
+from core.platform.dialects import (
+    quote_dialect_ident,
+    strip_sql_comments_preserve_literals,
+    validate_identifier,
+)
 from core.platform.driver_manager import JdbcConnectionAdapter
 from core.platform.excel_io import export_tabular_csv_bytes, export_tabular_xlsx_bytes
 from core.platform.inceptor_client import InceptorThriftClient
@@ -57,6 +62,30 @@ class QueryEngine:
         except (TypeError, ValueError):
             n = DEFAULT_QUERY_LIMIT
         return max(1, min(MAX_ALLOWED_QUERY_LIMIT, n))
+
+    @staticmethod
+    def _build_bounded_select_sql(sql: str, db_type: str, cap: int) -> str:
+        """在不破坏原语义的前提下，对未显式声明 LIMIT 的单条纯查询 SELECT 自动追加行数保护上限."""
+        dialect = (db_type or "").strip().upper()
+        if dialect not in ("DWS", "PGSQL", "KINGBASE", "MYSQL", "SQLITE", "DM8", "GBASE"):
+            return sql
+        stripped = strip_sql_comments_preserve_literals(sql).strip()
+        while stripped.endswith(";"):
+            stripped = stripped[:-1].rstrip()
+        if not stripped or ";" in stripped:
+            return sql
+        if not re.match(r"^(?:SELECT|WITH)\b", stripped, flags=re.IGNORECASE):
+            return sql
+        if re.search(
+            r"\b(?:INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|TRUNCATE|INTO|LIMIT|FETCH\s+(?:FIRST|NEXT)|ROWNUM|FOR\s+(?:UPDATE|SHARE))\b",
+            stripped,
+            flags=re.IGNORECASE,
+        ):
+            return sql
+        raw_no_semi = sql.rstrip()
+        while raw_no_semi.endswith(";"):
+            raw_no_semi = raw_no_semi[:-1].rstrip()
+        return f"{raw_no_semi}\nLIMIT {int(cap)}"
 
     def execute_sql(
         self,
@@ -165,6 +194,9 @@ class QueryEngine:
         if profile.db_type == "ORACLE":
             display_sql = f"SELECT * FROM {target_ref} WHERE ROWNUM <= {safe_limit}"
             probe_sql = f"SELECT * FROM {target_ref} WHERE ROWNUM <= {safe_limit + 1}"
+        elif profile.db_type == "DB2":
+            display_sql = f"SELECT * FROM {target_ref} FETCH FIRST {safe_limit} ROWS ONLY"
+            probe_sql = f"SELECT * FROM {target_ref} FETCH FIRST {safe_limit + 1} ROWS ONLY"
         else:
             display_sql = f"SELECT * FROM {target_ref} LIMIT {safe_limit}"
             probe_sql = f"SELECT * FROM {target_ref} LIMIT {safe_limit + 1}"
@@ -242,7 +274,7 @@ class QueryEngine:
         timeout_sec: int,
     ) -> Tuple[List[QueryColumn], List[List[Any]], bool, int]:
         with conn.cursor() as cur:
-            cur.execute(sql, timeout_sec=timeout_sec)
+            cur.execute(sql, timeout_sec=timeout_sec, max_rows=safe_limit + 1)
             if cur.description:
                 q_cols = [
                     QueryColumn(name=str(d[0]), data_type=str(d[1] or ""))
@@ -277,7 +309,8 @@ class QueryEngine:
                         conn.rollback()
                     except Exception:
                         pass
-            cur.execute(sql)
+            bounded_sql = self._build_bounded_select_sql(sql, profile.db_type, safe_limit + 1)
+            cur.execute(bounded_sql)
             if cur.description:
                 q_cols = [
                     QueryColumn(name=str(d[0]), data_type=str(d[1].__name__ if hasattr(d[1], "__name__") else ""))

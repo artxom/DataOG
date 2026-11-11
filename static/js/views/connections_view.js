@@ -207,7 +207,11 @@ export class ConnectionsView {
   render() {
     const conns = store.state.connections || [];
     const drivers = store.state.drivers || [];
-    const jre = store.state.javaRuntime || { available: false, message: "" };
+    const rawJre = store.state.javaRuntime || {};
+    const jre = {
+      available: Boolean(rawJre.jdbc_extension_ready ?? rawJre.available),
+      message: rawJre.note || rawJre.message || "",
+    };
     const f = this.formState;
     const isSqlite = f.db_type === "SQLITE";
     const isInceptor = f.db_type === "INCEPTOR";

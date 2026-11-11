@@ -14,6 +14,10 @@ on:
 permissions:
   contents: write
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 jobs:
   unit-tests:
     name: DataOG 全量自动化测试与启动自检
@@ -60,6 +64,9 @@ jobs:
 
       - name: 执行 PyInstaller 打包脚本
         run: python build_exe.py
+
+      - name: 验证打包后的 DataOG.exe 内置自检通过
+        run: dist\DataOG\DataOG.exe --test
 
       - name: 压缩可执行程序目录
         shell: pwsh

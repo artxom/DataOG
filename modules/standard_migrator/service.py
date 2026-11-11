@@ -137,12 +137,31 @@ class StandardMigratorService:
         state["message"] = f"已完成 {len(items)} 条字段规则的库内元数据实时比对核验"
         return state
 
-    def upload_excel_checklist(self, filename: str, content: bytes) -> Dict[str, Any]:
+    def upload_excel_checklist(
+        self,
+        filename: str,
+        content: bytes,
+        default_schema: str = "",
+        default_table: str = "",
+    ) -> Dict[str, Any]:
         validate_xlsx_bytes(filename, content)
-        parsed_items = parse_excel_checklist(content, filename)
-        self.ctx.store.replace_all_items(parsed_items, filename, preserve_history=True)
-
         prof = self._sync_engine_with_active_profile()
+        eff_schema = (
+            (default_schema or "").strip()
+            or (prof.default_schema.strip() if prof and prof.default_schema else "")
+            or "public"
+        )
+        parsed_items = parse_excel_checklist(
+            content,
+            filename,
+            default_schema=eff_schema,
+            default_table=(default_table or "").strip(),
+        )
+        self.ctx.store.replace_all_items(parsed_items, filename, preserve_history=True)
+        self.ctx.store.replace_cross_standards(
+            parsed_items, filename, preserve_bindings=True
+        )
+
         sync_warning = ""
         if prof:
             try:
@@ -247,7 +266,7 @@ class StandardMigratorService:
         item_ids: Optional[List[int]] = None,
         keep_backup: bool = True,
     ) -> Dict[str, Any]:
-        self._sync_engine_with_active_profile()
+        prof = self._sync_engine_with_active_profile()
         all_items = self.ctx.store.list_items()
         if item_ids:
             id_set = {int(x) for x in item_ids}
@@ -260,9 +279,28 @@ class StandardMigratorService:
                 and it["table_name"].lower() == table_name.lower()
                 and it["status"] != "COMPLETED"
             ]
+
+        meta_override = None
+        if prof and not (
+            prof.db_type in ("DWS", "PGSQL", "KINGBASE")
+            and prof.host
+            and prof.driver_track == "NATIVE"
+        ):
+            meta_override = self.ctx.metadata_hub.get_table_metadata(
+                prof.connection_id,
+                schema_name=schema_name,
+                table_name=table_name,
+                force_refresh=False,
+            )
+
         plan = self.engine.build_table_rebuild_sql_preview(
-            schema_name, table_name, tbl_items, keep_backup=keep_backup
+            schema_name,
+            table_name,
+            tbl_items,
+            keep_backup=keep_backup,
+            table_meta_override=meta_override,
         )
+        t_meta_info = plan.get("table_meta") or {}
         return {
             "ok": True,
             "schema_name": plan["schema_name"],
@@ -270,7 +308,11 @@ class StandardMigratorService:
             "tmp_table_name": plan["tmp_table_name"],
             "bak_table_name": plan["bak_table_name"],
             "sql_preview": plan["sql_preview"],
-            "column_count": len(plan["table_meta"].columns),
+            "rebuild_sql": plan["sql_preview"],
+            "column_count": int(plan.get("total_columns") or 0),
+            "distribute_clause": t_meta_info.get("distribute_clause", ""),
+            "partition_clause": t_meta_info.get("partition_clause", ""),
+            "column_order_comparison": plan.get("column_order_comparison", []),
         }
 
     def execute_rebuild(

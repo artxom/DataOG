@@ -435,6 +435,61 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             ws = wb.active
             self.assertEqual(ws.max_row, 11)  # 1 表头 + 10 数据行
 
+    def test_jar_backslash_zip_slip_jvm_thread_attach_and_bounded_query_pushdown(self) -> None:
+        """回归验证：反斜杠路径穿越拦截、JRE 状态双字段契约、跨线程 attachThreadToJVM 与无界 SELECT 保护."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(
+                db_path=os.path.join(tmpdir, "dataog_state.db"),
+                drivers_dir=os.path.join(tmpdir, "drivers"),
+            )
+            dm = ctx.driver_manager
+
+            # 1. Windows 风格反斜杠路径穿越与盘符注入在任意 OS 上均被拦截
+            for evil_entry in ("foo\\..\\", "foo\\..\\..\\evil.class", "C:/evil.class"):
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w") as zf:
+                    zf.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")
+                    zf.writestr(evil_entry, b"\xca\xfe\xba\xbe")
+                with self.assertRaises(ValueError):
+                    dm.validate_and_inspect_jar_bytes("evil.jar", buf.getvalue())
+
+            # 2. JRE 状态同时暴露 jdbc_extension_ready/note 与 available/message
+            jre_status = dm.get_java_runtime_status()
+            self.assertIn("jdbc_extension_ready", jre_status)
+            self.assertIn("available", jre_status)
+            self.assertEqual(jre_status["available"], jre_status["jdbc_extension_ready"])
+            self.assertEqual(jre_status["message"], jre_status["note"])
+
+            # 3. 多线程调用 _ensure_jvm_started 时自动为未挂载工作线程执行 attachThreadToJVM
+            fake_jpype = mock.MagicMock()
+            fake_jpype.isJVMStarted.return_value = True
+            fake_jpype.isThreadAttachedToJVM.return_value = False
+            with mock.patch.dict("sys.modules", {"jpype": fake_jpype}):
+                ret_jpype = dm._ensure_jvm_started()
+                self.assertIs(ret_jpype, fake_jpype)
+                fake_jpype.attachThreadToJVM.assert_called_once()
+
+            # 4. QueryEngine 无界 SELECT 自动追加 LIMIT 保护，且不破坏已有 LIMIT / EXPLAIN
+            qe = ctx.query_engine
+            bounded = qe._build_bounded_select_sql("SELECT * FROM big_tbl;", "PGSQL", 501)
+            self.assertTrue(bounded.endswith("LIMIT 501"))
+            unchanged = qe._build_bounded_select_sql("SELECT * FROM big_tbl LIMIT 10;", "PGSQL", 501)
+            self.assertEqual(unchanged, "SELECT * FROM big_tbl LIMIT 10;")
+            explain_sql = qe._build_bounded_select_sql("EXPLAIN SELECT * FROM big_tbl", "PGSQL", 501)
+            self.assertEqual(explain_sql, "EXPLAIN SELECT * FROM big_tbl")
+
+            # 5. JdbcCursorAdapter.execute 支持 max_rows 向下传递至 Statement.setMaxRows
+            fake_jdbc_conn = mock.MagicMock()
+            fake_stmt = mock.MagicMock()
+            fake_stmt.execute.return_value = False
+            fake_stmt.getUpdateCount.return_value = 0
+            fake_jdbc_conn.createStatement.return_value = fake_stmt
+            jdbc_adapter = JdbcConnectionAdapter(fake_jdbc_conn)
+            with jdbc_adapter.cursor() as cur:
+                cur.execute("SELECT 1", timeout_sec=15, max_rows=201)
+            fake_stmt.setQueryTimeout.assert_called_once_with(15)
+            fake_stmt.setMaxRows.assert_called_once_with(201)
+
 
 if __name__ == "__main__":
     unittest.main()

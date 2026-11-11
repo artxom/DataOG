@@ -42,6 +42,18 @@ def disable_windows_console_quick_edit() -> None:
         pass
 
 
+def ensure_utf8_console_streams() -> None:
+    """确保 Windows / CI 重定向控制台下标准输出流支持 UTF-8 中文输出而不抛 UnicodeEncodeError."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+ensure_utf8_console_streams()
 disable_windows_console_quick_edit()
 
 
@@ -221,11 +233,14 @@ def find_available_port(host: str = "127.0.0.1", preferred_port: int = 18080) ->
         return int(sock.getsockname()[1])
 
 
-def create_app(db_path: Optional[str] = None) -> FastAPI:
-    if not db_path:
-        db_path = os.path.join(get_runtime_data_dir(), "dataog_state.db")
-
-    ctx = PlatformContext(db_path=db_path)
+def create_app(
+    db_path: Optional[str] = None,
+    ctx: Optional[PlatformContext] = None,
+) -> FastAPI:
+    if ctx is None:
+        if not db_path:
+            db_path = os.path.join(get_runtime_data_dir(), "dataog_state.db")
+        ctx = PlatformContext(db_path=db_path)
     ctx.register_module_manifest(
         module_id="standard_migrator",
         title="单库落标贯标台",
@@ -294,9 +309,16 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
     # 向后兼容 v1.0.0 历史 API 路由（共享同一底层 PlatformStateStore）
     # =========================================================================
 
+    def _safe_legacy_conn_info() -> Dict[str, Any]:
+        info = dict(engine.get_public_conn_info())
+        has_pwd = bool(info.pop("password", ""))
+        info["has_saved_password"] = has_pwd
+        info["password_masked"] = "******" if has_pwd else ""
+        return info
+
     def _build_full_state_dict(extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
-            "connection": engine.get_public_conn_info(),
+            "connection": _safe_legacy_conn_info(),
             "excel_meta": {
                 "filename": store.get_meta("current_excel_name", "未导入"),
                 "imported_at": store.get_meta("imported_at", ""),
@@ -362,7 +384,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                 cat = engine.discover_database_catalog()
                 return {
                     "catalog": cat,
-                    "connection": engine.get_public_conn_info(),
+                    "connection": _safe_legacy_conn_info(),
                 }
 
             res = await anyio.to_thread.run_sync(_do_discover)
