@@ -163,11 +163,15 @@ class QueryEngine:
             target_ref = q_table
 
         if profile.db_type == "ORACLE":
-            preview_sql = f"SELECT * FROM {target_ref} WHERE ROWNUM <= {safe_limit}"
+            display_sql = f"SELECT * FROM {target_ref} WHERE ROWNUM <= {safe_limit}"
+            probe_sql = f"SELECT * FROM {target_ref} WHERE ROWNUM <= {safe_limit + 1}"
         else:
-            preview_sql = f"SELECT * FROM {target_ref} LIMIT {safe_limit}"
+            display_sql = f"SELECT * FROM {target_ref} LIMIT {safe_limit}"
+            probe_sql = f"SELECT * FROM {target_ref} LIMIT {safe_limit + 1}"
 
-        return self.execute_sql(connection_id, preview_sql, limit=safe_limit)
+        res = self.execute_sql(connection_id, probe_sql, limit=safe_limit)
+        res.sql = display_sql
+        return res
 
     @staticmethod
     def export_result_bytes(

@@ -149,7 +149,7 @@ function initBottomLogDrawer(splitters) {
           { className: "log-entry" },
           el("span", { className: "log-time", text: item.created_at || "" }),
           badge(lvl, tone),
-          el("span", { className: "log-cat", text: `[${item.category || "系统"}]` }),
+          el("span", { className: "log-cat", text: `[${item.target || item.category || "系统"}]` }),
           el(
             "div",
             { className: "log-msg" },
@@ -221,9 +221,12 @@ function initGlobalMetadataSearch() {
         },
         columns: [
           {
-            key: "hit_type",
+            key: "hit_kind",
             label: "命中级别",
-            render: (r) => badge(r.hit_type === "COLUMN" ? "字段命中" : "表/视图命中", r.hit_type === "COLUMN" ? "info" : "success"),
+            render: (r) => {
+              const kind = r.hit_kind || r.hit_type || "TABLE";
+              return badge(kind === "COLUMN" ? "字段命中" : "表/视图命中", kind === "COLUMN" ? "info" : "success");
+            },
           },
           {
             key: "connection_id",
@@ -243,7 +246,7 @@ function initGlobalMetadataSearch() {
           {
             key: "comment",
             label: "中文注释",
-            render: (r) => r.column_comment || r.table_comment || "-",
+            render: (r) => r.comment || r.column_comment || r.table_comment || "-",
           },
           {
             key: "jump",

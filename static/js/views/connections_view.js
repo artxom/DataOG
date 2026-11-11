@@ -80,7 +80,8 @@ export class ConnectionsView {
       this.formState.default_schema = tpl.default_schema || "";
     }
     if (this.formState.driver_track === "JDBC") {
-      this.formState.jdbc_driver_class = tpl.driver_class || this.formState.jdbc_driver_class || "";
+      this.formState.jdbc_driver_class =
+        tpl.jdbc_driver_class || tpl.driver_class || this.formState.jdbc_driver_class || "";
       const urlTpl = tpl.jdbc_url_template || "jdbc:vendor://{host}:{port}/{dbname}";
       this.formState.jdbc_url = urlTpl
         .replace("{host}", this.formState.host || "127.0.0.1")
@@ -148,7 +149,7 @@ export class ConnectionsView {
       Toast.info("正在执行驱动握手与连通性测试...", 2000);
       const res = await platformApi.testUnsavedConnection(payload);
       Toast.success(
-        `${res.message || "连接成功"} ${res.server_version ? "— " + res.server_version : ""} (${res.latency_ms ?? 0}ms)`
+        `${res.message || "连接成功"} ${res.server_version ? "— " + res.server_version : ""} (${res.elapsed_ms ?? res.latency_ms ?? 0}ms)`
       );
     } catch (err) {
       Toast.error(`连接测试失败: ${err.message}`);
@@ -191,8 +192,9 @@ export class ConnectionsView {
       store.updateDrivers(res.drivers);
       if (res.driver && !this.formState.jdbc_driver_id) {
         this.formState.jdbc_driver_id = res.driver.driver_id;
-        if (res.driver.driver_classes?.length && !this.formState.jdbc_driver_class) {
-          this.formState.jdbc_driver_class = res.driver.driver_classes[0];
+        const clsHint = res.driver.driver_class_hint || res.driver.driver_classes?.[0] || "";
+        if (clsHint && !this.formState.jdbc_driver_class) {
+          this.formState.jdbc_driver_class = clsHint;
         }
       }
       Toast.success(res.message || "驱动上传成功");
@@ -281,7 +283,7 @@ export class ConnectionsView {
                 onClick: async () => {
                   try {
                     const r = await platformApi.testSavedConnection(c.connection_id);
-                    Toast.success(`${r.message || "连通正常"} (${r.latency_ms ?? 0}ms)`);
+                    Toast.success(`${r.message || "连通正常"} (${r.elapsed_ms ?? r.latency_ms ?? 0}ms)`);
                   } catch (err) {
                     Toast.error(err.message);
                   }
@@ -374,8 +376,9 @@ export class ConnectionsView {
           onChange: (e) => {
             f.jdbc_driver_id = e.target.value;
             const found = drivers.find((d) => d.driver_id === f.jdbc_driver_id);
-            if (found && found.driver_classes?.length && !f.jdbc_driver_class) {
-              f.jdbc_driver_class = found.driver_classes[0];
+            const clsHint = found?.driver_class_hint || found?.driver_classes?.[0] || "";
+            if (clsHint && !f.jdbc_driver_class) {
+              f.jdbc_driver_class = clsHint;
               this.render();
             }
           },
@@ -383,7 +386,7 @@ export class ConnectionsView {
         [
           el("option", { value: "", text: "-- 请选择已上传的 JDBC .jar 驱动包 --" }),
           ...drivers.map((d) => {
-            const o = el("option", { value: d.driver_id, text: `${d.name} (${d.filename})` });
+            const o = el("option", { value: d.driver_id, text: `${d.name} (${d.file_name || d.filename || "driver.jar"})` });
             if (d.driver_id === f.jdbc_driver_id) o.selected = true;
             return o;
           }),
@@ -479,7 +482,7 @@ export class ConnectionsView {
               ),
               el("div", {
                 style: { fontSize: "11px", color: "var(--text-secondary)", marginTop: "3px", fontFamily: "var(--font-mono)" },
-                text: `Driver类: ${(d.driver_classes || []).join(", ") || "需手动填写类名"} | SHA-256: ${(d.sha256 || "").slice(0, 16)}...`,
+                text: `Driver类: ${d.driver_class_hint || (d.driver_classes || []).join(", ") || "需手动填写类名"} | SHA-256: ${(d.sha256 || "").slice(0, 16)}...`,
               })
             ),
             el("button", {

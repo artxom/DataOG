@@ -89,8 +89,9 @@ export class SqlConsoleView {
       ]);
       this.lastResult = previewRes.result;
       this.lastTableMeta = metaRes?.table || null;
-      if (this.lastResult?.executed_sql) {
-        this.sqlBox.setValue(this.lastResult.executed_sql);
+      const shownSql = this.lastResult?.sql || this.lastResult?.executed_sql;
+      if (shownSql) {
+        this.sqlBox.setValue(shownSql);
       }
       this.render();
     } catch (err) {
@@ -251,7 +252,7 @@ export class SqlConsoleView {
             { style: { marginLeft: "auto", display: "flex", gap: "6px", alignItems: "center" } },
             badge(`耗时 ${this.lastResult.elapsed_ms ?? 0} ms`, "info"),
             this.lastResult.truncated
-              ? badge(`已触发安全行数截断 (LIMIT ${this.lastResult.limit})`, "warn")
+              ? badge(`已触发安全行数截断 (LIMIT ${this.lastResult.limit_applied ?? this.lastResult.limit ?? this.limit})`, "warn")
               : badge("完整返回", "success")
           )
         : null
@@ -291,6 +292,8 @@ export class SqlConsoleView {
       }
     } else if (this.activeTab === "structure") {
       const colsMeta = this.lastTableMeta?.columns || [];
+      const distSet = new Set((this.lastTableMeta?.distribute_keys || []).map((k) => String(k).toLowerCase()));
+      const partSet = new Set((this.lastTableMeta?.partition_keys || []).map((k) => String(k).toLowerCase()));
       const structGrid = new DataGrid({
         ariaLabel: "表字段元数据明细",
         columns: [
@@ -298,18 +301,19 @@ export class SqlConsoleView {
           { key: "column_name", label: "字段名" },
           { key: "data_type", label: "数据类型" },
           {
-            key: "not_null",
+            key: "is_not_null",
             label: "非空",
-            render: (r) => (r.not_null ? badge("NOT NULL", "warn") : "可空"),
+            render: (r) => (r.is_not_null || r.not_null ? badge("NOT NULL", "warn") : "可空"),
           },
           {
             key: "keys",
             label: "主键 / 分布键 / 分区键",
             render: (r) => {
               const tags = [];
+              const low = String(r.column_name || "").toLowerCase();
               if (r.is_primary_key) tags.push(badge("PK", "info"));
-              if (r.is_distribute_key) tags.push(badge("分布键", "warn"));
-              if (r.is_partition_key) tags.push(badge("分区键", "success"));
+              if (r.is_distribute_key || distSet.has(low)) tags.push(badge("分布键", "warn"));
+              if (r.is_partition_key || partSet.has(low)) tags.push(badge("分区键", "success"));
               return tags.length ? el("div", { style: { display: "flex", gap: "4px" } }, tags) : "-";
             },
           },

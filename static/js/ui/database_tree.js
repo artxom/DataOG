@@ -108,7 +108,14 @@ export class DatabaseTree {
     if (!this.tableColumnsCache.has(key)) {
       try {
         const res = await platformApi.getTableDetail(connId, schemaName, tableName, false);
-        this.tableColumnsCache.set(key, res.table?.columns || []);
+        const distSet = new Set((res.table?.distribute_keys || []).map((k) => String(k).toLowerCase()));
+        const partSet = new Set((res.table?.partition_keys || []).map((k) => String(k).toLowerCase()));
+        const cols = (res.table?.columns || []).map((c) => ({
+          ...c,
+          is_distribute_key: distSet.has(String(c.column_name || "").toLowerCase()),
+          is_partition_key: partSet.has(String(c.column_name || "").toLowerCase()),
+        }));
+        this.tableColumnsCache.set(key, cols);
       } catch (err) {
         Toast.error(`读取字段详情失败: ${err.message}`);
       }

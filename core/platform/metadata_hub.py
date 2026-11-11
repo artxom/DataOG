@@ -887,6 +887,15 @@ class MetadataHub:
             is_pk = int(ir[5] or 0) > 0
             if is_pk:
                 pk_cols.append(c_name)
+            inline_comm = ""
+            if raw_sql and obj_type == "TABLE":
+                m_comm = re.search(
+                    rf'^\s*["`]?{re.escape(c_name)}["`]?\b[^\n]*?--\s*(.+?)\s*$',
+                    raw_sql,
+                    flags=re.MULTILINE | re.IGNORECASE,
+                )
+                if m_comm:
+                    inline_comm = m_comm.group(1).strip()
             cols.append(
                 ColumnMeta(
                     ordinal_position=idx,
@@ -894,7 +903,7 @@ class MetadataHub:
                     data_type=c_type,
                     is_not_null=bool(ir[3]),
                     column_default=str(ir[4]) if ir[4] is not None else None,
-                    column_comment="",
+                    column_comment=inline_comm,
                     is_primary_key=is_pk,
                 )
             )
