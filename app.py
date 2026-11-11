@@ -333,18 +333,18 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
                     {
                         "connection_id": "conn_migrator_default",
                         "name": f"贯标目标库 ({body.get('host', '')}/{body.get('dbname', '')})",
-                        "driver_kind": "NATIVE",
+                        "driver_track": "NATIVE",
                         "db_type": "DWS",
                         "host": str(body.get("host", "")),
                         "port": int(body.get("port", 8000)),
-                        "database": str(body.get("dbname", "")),
-                        "username": str(body.get("user", "")),
+                        "dbname": str(body.get("dbname", "")),
+                        "user": str(body.get("user", "")),
                         "password": str(body.get("password", "")),
                         "default_schema": str(conn_res.get("current_schema") or "public"),
                         "sslmode": str(body.get("sslmode", "prefer")),
                     }
                 )
-                store.set_meta("migrator_active_connection_id", prof.connection_id)
+                store.save_meta("migrator_connection_id", prof.connection_id)
                 if store.list_items():
                     engine.sync_all_items_with_db()
                 return _build_full_state_dict({"connection_result": conn_res})

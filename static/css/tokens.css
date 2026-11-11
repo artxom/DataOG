@@ -1,0 +1,99 @@
+/* DataOG v2.0.0 — 全局明暗双色 Design Tokens */
+:root {
+  color-scheme: light dark;
+
+  /* 基础画布与表面层级 */
+  --bg-app: light-dark(#f3f5f9, #0d1117);
+  --bg-surface: light-dark(#ffffff, #161b22);
+  --bg-surface-alt: light-dark(#f8fafc, #1c222d);
+  --bg-elevated: light-dark(#ffffff, #212836);
+  --bg-activity-bar: light-dark(#0f172a, #090d13);
+  --bg-topbar: light-dark(#ffffff, #121721);
+  --bg-code: light-dark(#f6f8fa, #0b0f16);
+  --bg-hover: light-dark(#eef2f7, #262f3f);
+  --bg-selected: light-dark(#e0ebff, #1c3259);
+
+  /* 文本色彩阶梯 */
+  --text-primary: light-dark(#0f172a, #e6edf3);
+  --text-secondary: light-dark(#475569, #9da7b3);
+  --text-muted: light-dark(#64748b, #7d8590);
+  --text-inverse: #ffffff;
+
+  /* 边框与分割线 */
+  --border-subtle: light-dark(#e2e8f0, #2a3342);
+  --border-strong: light-dark(#cbd5e1, #3b4659);
+
+  /* 主品牌色与语义状态色 */
+  --accent-primary: light-dark(#2563eb, #3b82f6);
+  --accent-primary-hover: light-dark(#1d4ed8, #60a5fa);
+  --accent-soft: light-dark(#dbeafe, rgba(59, 130, 246, 0.18));
+
+  --status-success: light-dark(#15803d, #3fb950);
+  --status-success-bg: light-dark(#dcfce7, rgba(63, 185, 80, 0.16));
+
+  --status-warn: light-dark(#b45309, #d29922);
+  --status-warn-bg: light-dark(#fef3c7, rgba(210, 153, 34, 0.18));
+
+  --status-danger: light-dark(#b91c1c, #f85149);
+  --status-danger-bg: light-dark(#fee2e2, rgba(248, 81, 73, 0.16));
+
+  --status-info: light-dark(#0369a1, #58a6ff);
+  --status-info-bg: light-dark(#e0f2fe, rgba(88, 166, 255, 0.16));
+
+  /* 尺寸与圆角规范 */
+  --topbar-height: 46px;
+  --activity-bar-width: 56px;
+  --nav-pane-width: 288px;
+  --drawer-height: 185px;
+
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  --shadow-sm: light-dark(
+    0 1px 2px rgba(15, 23, 42, 0.06),
+    0 1px 3px rgba(0, 0, 0, 0.4)
+  );
+  --shadow-lg: light-dark(
+    0 14px 34px rgba(15, 23, 42, 0.16),
+    0 16px 40px rgba(0, 0, 0, 0.65)
+  );
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
+
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+/* 针对显式切换 meta[name="color-scheme"] 或 data-theme 的强制配色同步 */
+:root:has(> head > meta[name="color-scheme"][content="light"]),
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root:has(> head > meta[name="color-scheme"][content="dark"]),
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  background: var(--bg-app);
+}
