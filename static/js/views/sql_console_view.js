@@ -1,38 +1,51 @@
 /**
- * DataOG 内置核心视图 2：轻量 SQL 查询与表数据浏览台 (QueryEngine + MetadataHub)
- * 支持：
- * - 双击左侧全局目录树任意表/视图自动预览前 200 行数据、字段明细与原始建表/视图 DDL
- * - 自定义 SQL 查询执行（默认安全截断 LIMIT 500、耗时毫秒统计、超时保护）
- * - 结果集一键导出为 CSV 或 Excel (.xlsx)
+ * Data.O.G 桌面模块 2：数据探查 (SqlConsoleView)
+ * 无框 Finder 风格左侧数据库目录树 + 沉浸式 SQL 编辑器 + 结果/结构/DDL 标签面板
  */
 
 import { platformApi } from "../core/api.js";
-import { badge, clearEl, el } from "../core/dom.js";
+import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";
+import { DatabaseTree } from "../ui/database_tree.js";
 import { ObjectPicker } from "../ui/object_picker.js";
 import { SqlCodeBox } from "../ui/sql_code_box.js";
 import { Toast } from "../ui/toast.js";
 
 export class SqlConsoleView {
   constructor() {
-    this.connectionId = "";
+    this.connectionId = store.state.connections[0]?.connection_id || "";
     this.schemaName = "";
     this.tableName = "";
-    this.limit = 500;
+    this.limit = 200;
     this.activeTab = "rows"; // rows | structure | ddl
+    this.sidebarVisible = true;
     this.lastResult = null;
     this.lastTableMeta = null;
+    this.refreshHeader = null;
+
+    this.treeHost = el("aside", { className: "mac-sidebar mac-sidebar-wide" });
+    this.dbTree = new DatabaseTree(this.treeHost, {
+      onPreviewTable: ({ connectionId, schemaName, tableName }) => {
+        this.connectionId = connectionId;
+        this.schemaName = schemaName;
+        this.tableName = tableName;
+        this.picker.setValue({ connectionId, schemaName, tableName });
+        this.previewSelectedTable();
+      },
+    });
 
     this.sqlBox = new SqlCodeBox({
-      title: "SQL 查询编辑器 (默认安全保护截断，支持 SELECT / SHOW / EXPLAIN / PRAGMA)",
-      value: "SELECT 1 AS hello_dataog;",
-      minHeight: "120px",
-      filename: "dataog_query.sql",
+      title: "SQL",
+      value: "SELECT 1;",
+      frameless: true,
+      minHeight: "128px",
+      filename: "query.sql",
       onRun: (sql) => this.runSql(sql),
     });
 
     this.picker = new ObjectPicker({
+      connectionId: this.connectionId,
       onChange: ({ connectionId, schemaName, tableName }) => {
         this.connectionId = connectionId;
         this.schemaName = schemaName;
@@ -40,24 +53,93 @@ export class SqlConsoleView {
       },
     });
 
-    this.root = el("div", { className: "module-page" });
+    this.rightPane = el("div", { className: "mac-pane", style: { overflow: "hidden" } });
+    this.root = el("div", { className: "mac-split-view" });
   }
 
-  async mount(container, context = null) {
+  destroy() {
+    this.dbTree.destroy();
+  }
+
+  getHeaderParts() {
+    this.picker.renderOptions();
+    const summaryText = this.tableName ? `${this.tableName}` : "SQL 查询";
+    store.setAppSummary("explorer", summaryText);
+
+    const limitSelect = el(
+      "select",
+      {
+        className: "mac-input mac-input-sm",
+        "aria-label": "最大行数",
+        onChange: (e) => {
+          this.limit = Number(e.target.value) || 200;
+        },
+      },
+      [100, 200, 500, 1000, 2000].map((n) => {
+        const o = el("option", { value: String(n), text: `${n} 行` });
+        if (this.limit === n) o.selected = true;
+        return o;
+      })
+    );
+
+    const center = el(
+      "div",
+      { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm mac-btn-ghost",
+        title: "显示/隐藏目录树",
+        onClick: () => {
+          this.sidebarVisible = !this.sidebarVisible;
+          this.render();
+        },
+      }, svgIcon("sidebar", 14)),
+      this.picker.root,
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm",
+        text: "预览",
+        onClick: () => this.previewSelectedTable(),
+      })
+    );
+
+    const right = el(
+      "div",
+      { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
+      limitSelect,
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm",
+        text: "CSV",
+        onClick: () => this.exportResult("csv"),
+      }),
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm",
+        text: "Excel",
+        onClick: () => this.exportResult("xlsx"),
+      }),
+      el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm mac-btn-primary",
+        text: "执行",
+        onClick: () => this.runSql(this.sqlBox.getValue()),
+      })
+    );
+
+    return { center, right };
+  }
+
+  async mount(container, context = null, refreshHeader = null) {
+    this.refreshHeader = refreshHeader;
     clearEl(container, this.root);
+
     if (!this.connectionId && store.state.connections.length > 0) {
       this.connectionId = store.state.connections[0].connection_id;
     }
-
-    if (context?.connectionId) {
-      this.connectionId = context.connectionId;
-    }
-    if (context?.schemaName !== undefined) {
-      this.schemaName = context.schemaName;
-    }
-    if (context?.tableName !== undefined) {
-      this.tableName = context.tableName;
-    }
+    if (context?.connectionId) this.connectionId = context.connectionId;
+    if (context?.schemaName !== undefined) this.schemaName = context.schemaName;
+    if (context?.tableName !== undefined) this.tableName = context.tableName;
 
     this.picker.setValue({
       connectionId: this.connectionId,
@@ -66,6 +148,7 @@ export class SqlConsoleView {
     });
 
     this.render();
+    this.refreshHeader?.();
 
     if (context?.action === "preview_table" && this.connectionId && this.tableName) {
       await this.previewSelectedTable();
@@ -75,7 +158,7 @@ export class SqlConsoleView {
   async previewSelectedTable() {
     const { connectionId, schemaName, tableName } = this.picker.getValue();
     if (!connectionId || !tableName) {
-      Toast.warn("请先选择数据源连接与表名/视图名");
+      Toast.warn("请选择连接与表名");
       return;
     }
     this.connectionId = connectionId;
@@ -91,11 +174,12 @@ export class SqlConsoleView {
       this.lastTableMeta = metaRes?.table || null;
       const shownSql = this.lastResult?.sql || this.lastResult?.executed_sql;
       if (shownSql) {
-        this.sqlBox.setValue(shownSql);
+        this.sqlBox.setValue(shownSql, `${schemaName ? schemaName + "." : ""}${tableName}`);
       }
       this.render();
+      this.refreshHeader?.();
     } catch (err) {
-      Toast.error(`预览表数据失败: ${err.message}`);
+      Toast.error(err.message);
     }
   }
 
@@ -103,24 +187,24 @@ export class SqlConsoleView {
     const { connectionId } = this.picker.getValue();
     const effConnId = connectionId || this.connectionId;
     if (!effConnId) {
-      Toast.warn("请先在工具栏选择一个目标数据源连接");
+      Toast.warn("请先选择连接");
       return;
     }
     if (!sqlText || !sqlText.trim()) {
-      Toast.warn("请输入要执行的 SQL 查询语句");
+      Toast.warn("请输入 SQL");
       return;
     }
     try {
       const res = await platformApi.executeSql({
         connection_id: effConnId,
         sql: sqlText,
-        limit: Number(this.limit) || 500,
+        limit: Number(this.limit) || 200,
         timeout_sec: 30,
       });
       this.lastResult = res.result;
       this.activeTab = "rows";
-      Toast.success(`查询完成：返回 ${res.result.row_count} 行 (${res.result.elapsed_ms} ms)`);
       this.render();
+      this.refreshHeader?.();
     } catch (err) {
       Toast.error(err.message);
     }
@@ -128,12 +212,12 @@ export class SqlConsoleView {
 
   async exportResult(fmt) {
     if (!this.lastResult || !(this.lastResult.columns || []).length) {
-      Toast.warn("当前没有可导出的查询结果集");
+      Toast.warn("暂无结果可导出");
       return;
     }
     try {
       const colNames = this.lastResult.columns.map((c) => (typeof c === "string" ? c : c.name));
-      const title = this.tableName || "sql_query_result";
+      const title = this.tableName || "query_result";
       await platformApi.exportQuery(
         {
           columns: colNames,
@@ -143,69 +227,52 @@ export class SqlConsoleView {
         },
         `${title}.${fmt}`
       );
-      Toast.success(`已导出 ${fmt.toUpperCase()} 文件`);
+      Toast.success(`已导出 .${fmt}`);
     } catch (err) {
-      Toast.error(`导出失败: ${err.message}`);
+      Toast.error(err.message);
     }
   }
 
   render() {
-    this.picker.renderOptions();
+    const tabDefs = [
+      { id: "rows", label: this.lastResult ? `结果 (${this.lastResult.row_count})` : "结果" },
+      { id: "structure", label: this.lastTableMeta ? `结构 (${(this.lastTableMeta.columns || []).length})` : "结构" },
+      { id: "ddl", label: "DDL" },
+    ];
 
-    const limitSelect = el(
-      "select",
-      {
-        className: "input input-sm",
-        "aria-label": "最大返回行数限制",
-        onChange: (e) => {
-          this.limit = Number(e.target.value) || 500;
-        },
-      },
-      [100, 200, 500, 1000, 2000].map((n) => {
-        const o = el("option", { value: String(n), text: `LIMIT ${n} 行` });
-        if (this.limit === n) o.selected = true;
-        return o;
-      })
-    );
-
-    const toolbar = el(
+    const tabsBar = el(
       "div",
-      { className: "module-toolbar" },
-      el(
-        "div",
-        { className: "module-toolbar-left" },
-        el("h1", { className: "module-title", text: "SQL 查询与表数据浏览台" }),
-        this.picker.root,
+      { className: "content-tablist", role: "tablist", "aria-label": "查询结果视图" },
+      ...tabDefs.map((t) =>
         el("button", {
           type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "预览表数据与结构",
-          onClick: () => this.previewSelectedTable(),
+          role: "tab",
+          className: "content-tab",
+          "aria-selected": String(this.activeTab === t.id),
+          text: t.label,
+          onClick: () => {
+            this.activeTab = t.id;
+            this.render();
+          },
         })
       ),
       el(
         "div",
-        { className: "module-toolbar-right" },
-        limitSelect,
-        el("button", {
-          type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "导出 CSV",
-          onClick: () => this.exportResult("csv"),
-        }),
-        el("button", {
-          type: "button",
-          className: "btn btn-sm btn-secondary",
-          text: "导出 Excel",
-          onClick: () => this.exportResult("xlsx"),
-        }),
+        { style: { marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: "10px" } },
+        this.lastResult
+          ? statusDot(
+              `${this.lastResult.elapsed_ms ?? 0} ms${this.lastResult.truncated ? " · 已截断" : ""}`,
+              this.lastResult.truncated ? "warn" : "success"
+            )
+          : null,
         this.tableName
           ? el("button", {
               type: "button",
-              className: "btn btn-sm btn-ghost",
-              text: "翻译此对象 DDL →",
+              className: "btn btn-xs btn-ghost",
+              text: "送入多邻国 →",
               onClick: () =>
-                store.navigateTo("ddl_translator", {
+                store.openApp("polyglot", {
+                  mode: "dialect",
                   connectionId: this.connectionId,
                   schemaName: this.schemaName,
                   tableName: this.tableName,
@@ -215,55 +282,12 @@ export class SqlConsoleView {
       )
     );
 
-    // 结果集 / 结构 / DDL 三标签面板
-    const tabsBar = el(
-      "div",
-      { className: "tabs-bar" },
-      el("button", {
-        type: "button",
-        className: `tab-btn ${this.activeTab === "rows" ? "is-active" : ""}`,
-        text: `数据结果集 ${this.lastResult ? `(${this.lastResult.row_count} 行)` : ""}`,
-        onClick: () => {
-          this.activeTab = "rows";
-          this.render();
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: `tab-btn ${this.activeTab === "structure" ? "is-active" : ""}`,
-        text: `字段结构与键属性 ${this.lastTableMeta ? `(${(this.lastTableMeta.columns || []).length} 列)` : ""}`,
-        onClick: () => {
-          this.activeTab = "structure";
-          this.render();
-        },
-      }),
-      el("button", {
-        type: "button",
-        className: `tab-btn ${this.activeTab === "ddl" ? "is-active" : ""}`,
-        text: "对象原始建表 / 视图 DDL",
-        onClick: () => {
-          this.activeTab = "ddl";
-          this.render();
-        },
-      }),
-      this.lastResult
-        ? el(
-            "div",
-            { style: { marginLeft: "auto", display: "flex", gap: "6px", alignItems: "center" } },
-            badge(`耗时 ${this.lastResult.elapsed_ms ?? 0} ms`, "info"),
-            this.lastResult.truncated
-              ? badge(`已触发安全行数截断 (LIMIT ${this.lastResult.limit_applied ?? this.lastResult.limit ?? this.limit})`, "warn")
-              : badge("完整返回", "success")
-          )
-        : null
-    );
-
-    let tabBody;
+    let tabPanelBody;
     if (this.activeTab === "rows") {
       if (!this.lastResult) {
-        tabBody = el("div", {
+        tabPanelBody = el("div", {
           className: "grid-empty",
-          text: "双击左侧目录树中的任意表/视图，或在上方输入 SQL 按 Cmd/Ctrl+Enter 即可查看查询结果",
+          text: "点击左侧表名预览，或输入 SQL 按 ⌘+Enter 执行",
         });
       } else {
         const cols = (this.lastResult.columns || []).map((c, colIdx) => {
@@ -274,40 +298,34 @@ export class SqlConsoleView {
             render: (row) => {
               const v = Array.isArray(row) ? row[colIdx] : row?.[colName];
               if (v === null || v === undefined) {
-                return el("span", { style: { color: "var(--text-muted)", fontStyle: "italic" }, text: "NULL" });
+                return el("span", { style: { color: "var(--os-muted)" }, text: "NULL" });
               }
               return String(v);
             },
           };
         });
-        const grid = new DataGrid({
-          ariaLabel: "SQL 查询结果集",
+        tabPanelBody = new DataGrid({
+          ariaLabel: "查询结果",
           columns: cols,
           rows: this.lastResult.rows || [],
           rowKey: (_r, idx) => String(idx),
-          emptyText: "查询执行成功，当前条件下返回 0 行记录",
-          maxHeight: "52vh",
-        });
-        tabBody = grid.root;
+          emptyText: "0 行记录",
+        }).root;
       }
     } else if (this.activeTab === "structure") {
       const colsMeta = this.lastTableMeta?.columns || [];
       const distSet = new Set((this.lastTableMeta?.distribute_keys || []).map((k) => String(k).toLowerCase()));
       const partSet = new Set((this.lastTableMeta?.partition_keys || []).map((k) => String(k).toLowerCase()));
-      const structGrid = new DataGrid({
-        ariaLabel: "表字段元数据明细",
+      tabPanelBody = new DataGrid({
+        ariaLabel: "表结构",
         columns: [
-          { key: "ordinal_position", label: "物理列序" },
-          { key: "column_name", label: "字段名" },
-          { key: "data_type", label: "数据类型" },
-          {
-            key: "is_not_null",
-            label: "非空",
-            render: (r) => (r.is_not_null || r.not_null ? badge("NOT NULL", "warn") : "可空"),
-          },
+          { key: "ordinal_position", label: "#" },
+          { key: "column_name", label: "字段", render: (r) => el("span", { className: "mono", style: { fontWeight: "600" }, text: r.column_name }) },
+          { key: "data_type", label: "类型", render: (r) => el("span", { className: "mono", text: r.data_type }) },
+          { key: "not_null", label: "非空", render: (r) => (r.is_not_null || r.not_null ? "是" : "-") },
           {
             key: "keys",
-            label: "主键 / 分布键 / 分区键",
+            label: "键属性",
             render: (r) => {
               const tags = [];
               const low = String(r.column_name || "").toLowerCase();
@@ -317,39 +335,38 @@ export class SqlConsoleView {
               return tags.length ? el("div", { style: { display: "flex", gap: "4px" } }, tags) : "-";
             },
           },
-          { key: "lineage_source", label: "视图血缘穿透源", render: (r) => r.lineage_source || "-" },
-          { key: "column_comment", label: "字段中文注释", render: (r) => r.column_comment || "-" },
+          { key: "column_comment", label: "注释", render: (r) => r.column_comment || "-" },
         ],
         rows: colsMeta,
         rowKey: "column_name",
-        emptyText: "请先通过上方库表选择器点击「预览表数据与结构」或双击左侧树节点加载表结构",
-        maxHeight: "52vh",
-      });
-      tabBody = structGrid.root;
+        emptyText: "请先选择一张表点击「预览」",
+      }).root;
     } else {
       const ddlText =
         this.lastTableMeta?.raw_ddl ||
         this.lastTableMeta?.view_definition ||
-        "-- 请先选择并预览一张具体的数据表或视图，如需跨方言生成建表语句可点击右上角「翻译此对象 DDL →」";
-      const ddlViewer = new SqlCodeBox({
-        title: this.lastTableMeta
-          ? `${this.lastTableMeta.schema_name}.${this.lastTableMeta.table_name} (${this.lastTableMeta.object_type || "TABLE"}) 定义`
-          : "对象 DDL 定义",
+        "-- 选择表后点击「预览」查看原始定义";
+      tabPanelBody = new SqlCodeBox({
+        title: this.lastTableMeta ? `${this.lastTableMeta.schema_name}.${this.lastTableMeta.table_name}` : "DDL",
         value: ddlText,
         readOnly: true,
-        minHeight: "320px",
-        filename: `${this.tableName || "object"}_ddl.sql`,
-      });
-      tabBody = ddlViewer.root;
+        frameless: true,
+        minHeight: "340px",
+        filename: `${this.tableName || "table"}_ddl.sql`,
+      }).root;
     }
 
-    const content = el(
-      "div",
-      { className: "module-content" },
+    clearEl(
+      this.rightPane,
       this.sqlBox.root,
-      el("div", { className: "card", style: { display: "flex", flexDirection: "column", gap: "10px" } }, tabsBar, tabBody)
+      tabsBar,
+      el(
+        "div",
+        { role: "tabpanel", style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column" } },
+        tabPanelBody
+      )
     );
 
-    clearEl(this.root, toolbar, content);
+    clearEl(this.root, this.sidebarVisible ? this.treeHost : null, this.rightPane);
   }
 }

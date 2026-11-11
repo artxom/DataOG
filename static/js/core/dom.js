@@ -1,5 +1,5 @@
 /**
- * DataOG 前端安全 DOM 构造工具 (零 innerHTML / 严格防 XSS)
+ * Data.O.G 前端安全 DOM 构造工具 (零 innerHTML / 严格防 XSS)
  */
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -73,6 +73,7 @@ export function el(tag, props = {}, ...children) {
  * @param {...any} children
  */
 export function clearEl(container, ...children) {
+  if (!container) return;
   container.replaceChildren();
   for (const ch of children) {
     if (ch === undefined || ch === null || ch === false) continue;
@@ -92,6 +93,17 @@ export function clearEl(container, ...children) {
 }
 
 const ICON_PATHS = {
+  settings:
+    "M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zm7.4 2.5l1.6 1-1.6 1 .2 1.9-1.8.8-.8 1.8-1.9-.2-1 1.6-1-1.6-1.9.2-.8-1.8-1.8-.8.2-1.9-1.6-1 1.6-1-.2-1.9 1.8-.8.8-1.8 1.9.2 1-1.6 1 1.6 1.9-.2.8 1.8 1.8.8-.2 1.9z",
+  explorer:
+    "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zm3.8 5.2l-2.3 5.3-5.3 2.3 2.3-5.3 5.3-2.3z",
+  standard:
+    "M12 3l8 4.5-8 4.5-8-4.5L12 3zm-8 9l8 4.5 8-4.5m-16 4.5L12 21l8-4.5",
+  polyglot:
+    "M4 5h8M8 3v2m-2.5 0c.5 3.5 2.5 6 5.5 7.5M5.5 12.5C8 11 9.5 8.5 10 5m3 15l3.5-9 3.5 9m-5.8-3h4.6",
+  sparkles:
+    "M12 3l1.8 4.6L18.5 9l-4.7 1.4L12 15l-1.8-4.6L5.5 9l4.7-1.4L12 3zm6.5 11l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1z",
+  search: "M11 4a7 7 0 1 0 4.9 12l4.1 4.1M16 16l4 4",
   plug: "M12 2v4m-4 0h8a2 2 0 0 1 2 2v3a6 6 0 0 1-5 5.91V22h-2v-5.09A6 6 0 0 1 6 11V8a2 2 0 0 1 2-2z",
   terminal: "M4 6l6 5-6 5m8 0h8",
   shield: "M12 3l7 3v5c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-3zm-2 9l2 2 4-4",
@@ -103,11 +115,13 @@ const ICON_PATHS = {
   table: "M3 5h18v14H3V5zm0 5h18M9 10v9",
   view: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
   folder: "M3 6h6l2 2h10v10H3V6z",
+  upload: "M12 16V4m0 0l-4 4m4-4l4 4M4 18v2h16v-2",
+  copy: "M9 9h10v11H9V9zm-4 6H4V4h10v1",
 };
 
 /**
  * 使用 createElementNS 安全绘制矢量图标
- * @param {keyof typeof ICON_PATHS} name
+ * @param {string} name
  * @param {number} [size]
  */
 export function svgIcon(name, size = 18) {
@@ -131,6 +145,86 @@ export function badge(text, tone = "neutral") {
   return el("span", { className: `badge badge-${tone}`, text: String(text ?? "") });
 }
 
+export function statusDot(text, tone = "muted") {
+  const dotTone =
+    tone === "success"
+      ? "dot-success"
+      : tone === "warn"
+      ? "dot-warn"
+      : tone === "danger"
+      ? "dot-danger"
+      : tone === "info"
+      ? "dot-info"
+      : "dot-muted";
+  return el(
+    "span",
+    { className: "status-dot-wrap" },
+    el("span", { className: `dot ${dotTone}` }),
+    el("span", { text: String(text ?? "") })
+  );
+}
+
+/**
+ * 渲染软件品牌主图标（支持本地自定义上传图片覆盖）
+ */
+export function renderBrandMark(appearance, size = "lg") {
+  const customUrl = appearance?.brand_icon_url || "";
+  const isSmall = size === "sm";
+  const isMed = size === "md";
+  const box = el("span", {
+    className: `squircle-icon squircle-brand ${isSmall ? "squircle-sm" : isMed ? "squircle-md" : ""}`,
+    style: isSmall
+      ? { width: "16px", height: "16px", borderRadius: "4px", boxShadow: "none" }
+      : isMed
+      ? { width: "40px", height: "40px", borderRadius: "10px" }
+      : { width: "54px", height: "54px", borderRadius: "14px" },
+  });
+
+  if (customUrl) {
+    box.appendChild(
+      el("img", {
+        className: "squircle-custom-img",
+        src: customUrl,
+        alt: "Data.O.G",
+      })
+    );
+  } else {
+    box.appendChild(
+      el("span", {
+        className: "brand-monogram",
+        style: { fontSize: isSmall ? "8.5px" : isMed ? "15px" : "20px" },
+        text: "OG",
+      })
+    );
+  }
+  return box;
+}
+
+/**
+ * 渲染四大桌面模块超椭圆图标（支持本地自定义上传图片覆盖）
+ */
+export function renderAppSquircle(appId, appearance, size = "lg") {
+  const customUrl = appearance?.app_icons?.[appId] || "";
+  const sizeCls = size === "sm" ? "squircle-sm" : size === "md" ? "squircle-md" : "";
+  const iconSize = size === "sm" ? 15 : size === "md" ? 20 : 28;
+  const box = el("span", {
+    className: `squircle-icon squircle-${appId} ${sizeCls}`.trim(),
+  });
+
+  if (customUrl) {
+    box.appendChild(
+      el("img", {
+        className: "squircle-custom-img",
+        src: customUrl,
+        alt: appId,
+      })
+    );
+  } else {
+    box.appendChild(svgIcon(appId, iconSize));
+  }
+  return box;
+}
+
 export function formatBytes(bytes) {
   const num = Number(bytes || 0);
   if (num < 1024) return `${num} B`;
@@ -145,6 +239,21 @@ export function downloadBlob(blob, filename) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+export async function copyText(text) {
+  const val = String(text || "");
+  if (!val.trim()) return false;
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(val);
+    return true;
+  }
+  const ta = el("textarea", { value: val, style: { position: "fixed", opacity: "0" } });
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  ta.remove();
+  return true;
 }
 
 /**

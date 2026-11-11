@@ -1,5 +1,5 @@
 /**
- * DataOG 统一后端通信客户端 (FastAPI 微内核与各独立业务插件 API)
+ * Data.O.G 统一后端通信客户端 (FastAPI 微内核与各独立业务模块 API)
  */
 
 import { downloadBlob } from "./dom.js";
@@ -73,6 +73,39 @@ export async function downloadApiFile(url, { method = "GET", body = undefined, f
 
 export const platformApi = {
   bootstrap: () => requestJson("/api/platform/bootstrap"),
+
+  // 外观壁纸与软件/模块图标本地持久化 (AssetStore)
+  getAppearance: () => requestJson("/api/platform/appearance"),
+  updateAppearance: (payload) =>
+    requestJson("/api/platform/appearance", { method: "PUT", body: payload }),
+  uploadAppearanceAsset: (file, slot) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("slot", slot);
+    return uploadFormData("/api/platform/appearance/upload", fd);
+  },
+  resetAppearance: (slot) =>
+    requestJson("/api/platform/appearance/reset", { method: "POST", body: { slot } }),
+
+  // AI 大模型统一接入中枢 (LLMHub)
+  listLlmProviders: () => requestJson("/api/platform/llm/providers"),
+  saveLlmProvider: (payload) =>
+    requestJson("/api/platform/llm/providers", { method: "POST", body: payload }),
+  updateLlmProvider: (providerId, payload) =>
+    requestJson(`/api/platform/llm/providers/${encodeURIComponent(providerId)}`, {
+      method: "PUT",
+      body: payload,
+    }),
+  deleteLlmProvider: (providerId) =>
+    requestJson(`/api/platform/llm/providers/${encodeURIComponent(providerId)}`, {
+      method: "DELETE",
+    }),
+  testLlmProvider: (payload) =>
+    requestJson("/api/platform/llm/test", { method: "POST", body: payload }),
+  fetchLlmModels: (payload) =>
+    requestJson("/api/platform/llm/models", { method: "POST", body: payload }),
+
+  // 驱动管理 (DriverManager)
   listDrivers: () => requestJson("/api/platform/drivers"),
   uploadDriver: (file, { name = "", dbTypeHint = "CUSTOM_JDBC", driverClassHint = "" } = {}) => {
     const fd = new FormData();
@@ -85,6 +118,7 @@ export const platformApi = {
   deleteDriver: (driverId) =>
     requestJson(`/api/platform/drivers/${encodeURIComponent(driverId)}`, { method: "DELETE" }),
 
+  // 数据源连接档案 (ConnectionHub)
   listConnections: () => requestJson("/api/platform/connections"),
   saveConnection: (payload) =>
     requestJson("/api/platform/connections", { method: "POST", body: payload }),
@@ -97,6 +131,7 @@ export const platformApi = {
   testSavedConnection: (connId) =>
     requestJson(`/api/platform/connections/${encodeURIComponent(connId)}/test`, { method: "POST" }),
 
+  // 元数据中枢 (MetadataHub)
   getMetadataTree: (connId, autoRefresh = false) =>
     requestJson(
       `/api/platform/metadata/${encodeURIComponent(connId)}/tree?auto_refresh=${autoRefresh ? "true" : "false"}`
@@ -120,6 +155,7 @@ export const platformApi = {
     return requestJson(`/api/platform/metadata/search?${qs.toString()}`);
   },
 
+  // 查询预览中心 (QueryEngine)
   executeSql: (payload) =>
     requestJson("/api/platform/query/execute", { method: "POST", body: payload }),
   previewTable: (connectionId, schemaName, tableName, limit = 200) => {
@@ -163,11 +199,11 @@ export const migratorApi = {
   clearItems: () => requestJson("/api/modules/standard_migrator/checklist/clear", { method: "POST" }),
   downloadTemplate: () =>
     downloadApiFile("/api/modules/standard_migrator/checklist/template.xlsx", {
-      fallbackName: "DataOG_字段贯标标准导入模板.xlsx",
+      fallbackName: "Data.O.G_字段贯标模板.xlsx",
     }),
   exportReport: () =>
     downloadApiFile("/api/modules/standard_migrator/checklist/report.xlsx", {
-      fallbackName: "DataOG_单库贯标核验与执行报告.xlsx",
+      fallbackName: "Data.O.G_贯标报告.xlsx",
     }),
   executeSingle: (itemId) =>
     requestJson(`/api/modules/standard_migrator/execute/item/${encodeURIComponent(itemId)}`, {
@@ -203,12 +239,12 @@ export const crossApi = {
     requestJson("/api/modules/cross_comparator/standard/clear", { method: "POST" }),
   exportJson: () =>
     downloadApiFile("/api/modules/cross_comparator/bindings/export.json", {
-      fallbackName: "DataOG_跨环境三方数标绑定配置包.json",
+      fallbackName: "Data.O.G_跨环境绑定包.json",
     }),
   exportExcel: (tableKey = "") => {
     const qs = tableKey ? `?table_key=${encodeURIComponent(tableKey)}` : "";
     return downloadApiFile(`/api/modules/cross_comparator/bindings/export.xlsx${qs}`, {
-      fallbackName: "DataOG_跨环境三栏数标比对与绑定报告.xlsx",
+      fallbackName: "Data.O.G_三栏比对报告.xlsx",
     });
   },
   pushToMigrator: (stdTableKey = "") =>
@@ -220,6 +256,10 @@ export const crossApi = {
 
 export const ddlApi = {
   getOptions: () => requestJson("/api/modules/ddl_translator/options"),
+  smartNaming: (payload) =>
+    requestJson("/api/modules/ddl_translator/naming", { method: "POST", body: payload }),
   translate: (payload) =>
     requestJson("/api/modules/ddl_translator/translate", { method: "POST", body: payload }),
 };
+
+export const polyglotApi = ddlApi;

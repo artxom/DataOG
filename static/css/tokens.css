@@ -1,99 +1,196 @@
-/* DataOG v2.0.0 — 全局明暗双色 Design Tokens */
+/**
+ * Data.O.G — macOS HIG 双色语义化 Design Tokens
+ * 遵循 Modern Web Guidance:
+ * - :root 默认 color-scheme: light dark 自适应系统，并通过 :has(meta[name="color-scheme"]) 映射手动覆写
+ * - 同时提供 @media (prefers-color-scheme: dark) 与 light-dark() 渐进增强
+ */
+
 :root {
   color-scheme: light dark;
 
-  /* 基础画布与表面层级 */
-  --bg-app: light-dark(#f3f5f9, #0d1117);
-  --bg-surface: light-dark(#ffffff, #161b22);
-  --bg-surface-alt: light-dark(#f8fafc, #1c222d);
-  --bg-elevated: light-dark(#ffffff, #212836);
-  --bg-activity-bar: light-dark(#0f172a, #090d13);
-  --bg-topbar: light-dark(#ffffff, #121721);
-  --bg-code: light-dark(#f6f8fa, #0b0f16);
-  --bg-hover: light-dark(#eef2f7, #262f3f);
-  --bg-selected: light-dark(#e0ebff, #1c3259);
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
 
-  /* 文本色彩阶梯 */
-  --text-primary: light-dark(#0f172a, #e6edf3);
-  --text-secondary: light-dark(#475569, #9da7b3);
-  --text-muted: light-dark(#64748b, #7d8590);
-  --text-inverse: #ffffff;
+  /* Light 基础色板 */
+  --bg-menubar-light: rgba(255, 255, 255, 0.72);
+  --bg-win-light: #ffffff;
+  --bg-sidebar-light: #f5f5f7;
+  --bg-toolbar-light: #f7f7f9;
+  --bg-subtle-light: #fafafa;
+  --bg-drawer-light: rgba(255, 255, 255, 0.84);
+  --bg-input-light: #ffffff;
+  --border-hairline-light: rgba(0, 0, 0, 0.085);
+  --border-strong-light: rgba(0, 0, 0, 0.15);
+  --text-primary-light: #1d1d1f;
+  --text-secondary-light: #6e6e73;
+  --text-muted-light: #86868b;
+  --accent-light: #0071e3;
+  --seg-track-light: rgba(0, 0, 0, 0.065);
+  --seg-thumb-light: #ffffff;
+  --hover-light: rgba(0, 0, 0, 0.045);
+  --select-light: rgba(0, 113, 227, 0.12);
+  --win-shadow-light: 0 24px 64px rgba(15, 23, 42, 0.18), 0 0 0 0.5px rgba(0, 0, 0, 0.12);
 
-  /* 边框与分割线 */
-  --border-subtle: light-dark(#e2e8f0, #2a3342);
-  --border-strong: light-dark(#cbd5e1, #3b4659);
+  /* Dark 基础色板 */
+  --bg-menubar-dark: rgba(24, 24, 28, 0.74);
+  --bg-win-dark: #18181b;
+  --bg-sidebar-dark: #1f1f23;
+  --bg-toolbar-dark: #222226;
+  --bg-subtle-dark: #141417;
+  --bg-drawer-dark: rgba(34, 34, 39, 0.86);
+  --bg-input-dark: #26262b;
+  --border-hairline-dark: rgba(255, 255, 255, 0.095);
+  --border-strong-dark: rgba(255, 255, 255, 0.18);
+  --text-primary-dark: #f5f5f7;
+  --text-secondary-dark: #a1a1a6;
+  --text-muted-dark: #8e8e93;
+  --accent-dark: #0a84ff;
+  --seg-track-dark: rgba(255, 255, 255, 0.09);
+  --seg-thumb-dark: #38383f;
+  --hover-dark: rgba(255, 255, 255, 0.06);
+  --select-dark: rgba(10, 132, 255, 0.22);
+  --win-shadow-dark: 0 28px 72px rgba(0, 0, 0, 0.65), 0 0 0 0.5px rgba(255, 255, 255, 0.14);
 
-  /* 主品牌色与语义状态色 */
-  --accent-primary: light-dark(#2563eb, #3b82f6);
-  --accent-primary-hover: light-dark(#1d4ed8, #60a5fa);
-  --accent-soft: light-dark(#dbeafe, rgba(59, 130, 246, 0.18));
+  /* 默认回退 (Light) */
+  --os-menubar: var(--bg-menubar-light);
+  --os-win-bg: var(--bg-win-light);
+  --os-sidebar-bg: var(--bg-sidebar-light);
+  --os-toolbar-bg: var(--bg-toolbar-light);
+  --os-subtle-bg: var(--bg-subtle-light);
+  --os-drawer-bg: var(--bg-drawer-light);
+  --os-input-bg: var(--bg-input-light);
+  --os-border: var(--border-hairline-light);
+  --os-border-strong: var(--border-strong-light);
+  --os-text: var(--text-primary-light);
+  --os-text-secondary: var(--text-secondary-light);
+  --os-muted: var(--text-muted-light);
+  --os-accent: var(--accent-light);
+  --os-seg-track: var(--seg-track-light);
+  --os-seg-thumb: var(--seg-thumb-light);
+  --os-hover: var(--hover-light);
+  --os-select: var(--select-light);
+  --os-win-shadow: var(--win-shadow-light);
+  --os-icon-label: #1d1d1f;
+  --os-icon-label-shadow: 0 1px 3px rgba(255, 255, 255, 0.85);
 
-  --status-success: light-dark(#15803d, #3fb950);
-  --status-success-bg: light-dark(#dcfce7, rgba(63, 185, 80, 0.16));
+  /* 语义状态色 */
+  --status-success: #28cd41;
+  --status-warn: #ff9f0a;
+  --status-danger: #ff3b30;
+  --status-info: #0071e3;
 
-  --status-warn: light-dark(#b45309, #d29922);
-  --status-warn-bg: light-dark(#fef3c7, rgba(210, 153, 34, 0.18));
+  /* 兼容旧组件别名 */
+  --text-primary: var(--os-text);
+  --text-secondary: var(--os-text-secondary);
+  --text-muted: var(--os-muted);
+  --border-subtle: var(--os-border);
+  --bg-surface: var(--os-win-bg);
+  --bg-elevated: var(--os-subtle-bg);
 
-  --status-danger: light-dark(#b91c1c, #f85149);
-  --status-danger-bg: light-dark(#fee2e2, rgba(248, 81, 73, 0.16));
+  /* 内置壁纸预设 (Light) */
+  --wp-default: radial-gradient(120% 100% at 15% 10%, #dceaff 0%, #edf1f7 46%, #e2e8f3 100%);
+  --wp-sonoma: linear-gradient(135deg, #c2e9fb 0%, #a1c4fd 48%, #d4fc79 100%);
+  --wp-sequoia: linear-gradient(135deg, #f6d365 0%, #fda085 50%, #a18cd1 100%);
+  --wp-aurora: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
 
-  --status-info: light-dark(#0369a1, #58a6ff);
-  --status-info-bg: light-dark(#e0f2fe, rgba(88, 166, 255, 0.16));
+  --scrollbar-thumb: rgba(120, 120, 128, 0.36);
+  --scrollbar-track: transparent;
 
-  /* 尺寸与圆角规范 */
-  --topbar-height: 46px;
-  --activity-bar-width: 56px;
-  --nav-pane-width: 288px;
-  --drawer-height: 185px;
-
-  --radius-xs: 4px;
-  --radius-sm: 6px;
-  --radius-md: 8px;
-  --radius-lg: 12px;
-
-  --shadow-sm: light-dark(
-    0 1px 2px rgba(15, 23, 42, 0.06),
-    0 1px 3px rgba(0, 0, 0, 0.4)
-  );
-  --shadow-lg: light-dark(
-    0 14px 34px rgba(15, 23, 42, 0.16),
-    0 16px 40px rgba(0, 0, 0, 0.65)
-  );
-
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-  --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace;
-
-  scrollbar-width: thin;
-  scrollbar-color: var(--border-strong) transparent;
+  accent-color: var(--os-accent);
 }
 
-/* 针对显式切换 meta[name="color-scheme"] 或 data-theme 的强制配色同步 */
-:root:has(> head > meta[name="color-scheme"][content="light"]),
-:root[data-theme="light"] {
-  color-scheme: light;
+@media (prefers-color-scheme: dark) {
+  :root {
+    --os-menubar: var(--bg-menubar-dark);
+    --os-win-bg: var(--bg-win-dark);
+    --os-sidebar-bg: var(--bg-sidebar-dark);
+    --os-toolbar-bg: var(--bg-toolbar-dark);
+    --os-subtle-bg: var(--bg-subtle-dark);
+    --os-drawer-bg: var(--bg-drawer-dark);
+    --os-input-bg: var(--bg-input-dark);
+    --os-border: var(--border-hairline-dark);
+    --os-border-strong: var(--border-strong-dark);
+    --os-text: var(--text-primary-dark);
+    --os-text-secondary: var(--text-secondary-dark);
+    --os-muted: var(--text-muted-dark);
+    --os-accent: var(--accent-dark);
+    --os-seg-track: var(--seg-track-dark);
+    --os-seg-thumb: var(--seg-thumb-dark);
+    --os-hover: var(--hover-dark);
+    --os-select: var(--select-dark);
+    --os-win-shadow: var(--win-shadow-dark);
+    --os-icon-label: #f5f5f7;
+    --os-icon-label-shadow: 0 1px 4px rgba(0, 0, 0, 0.78);
+    --status-info: #0a84ff;
+    --wp-default: radial-gradient(120% 100% at 20% 0%, #1c2536 0%, #11131a 52%, #0b0c10 100%);
+    --wp-sonoma: linear-gradient(135deg, #0f2027 0%, #1b3b4b 48%, #243b55 100%);
+    --wp-sequoia: linear-gradient(135deg, #2b1b2f 0%, #3b2439 50%, #191a2e 100%);
+    --scrollbar-thumb: rgba(160, 160, 172, 0.34);
+  }
 }
 
-:root:has(> head > meta[name="color-scheme"][content="dark"]),
-:root[data-theme="dark"] {
+/* 映射 <meta name="color-scheme"> 手动主题锁定 */
+:root:has(> head > meta[name="color-scheme"][content="dark"]) {
   color-scheme: dark;
+  --os-menubar: var(--bg-menubar-dark);
+  --os-win-bg: var(--bg-win-dark);
+  --os-sidebar-bg: var(--bg-sidebar-dark);
+  --os-toolbar-bg: var(--bg-toolbar-dark);
+  --os-subtle-bg: var(--bg-subtle-dark);
+  --os-drawer-bg: var(--bg-drawer-dark);
+  --os-input-bg: var(--bg-input-dark);
+  --os-border: var(--border-hairline-dark);
+  --os-border-strong: var(--border-strong-dark);
+  --os-text: var(--text-primary-dark);
+  --os-text-secondary: var(--text-secondary-dark);
+  --os-muted: var(--text-muted-dark);
+  --os-accent: var(--accent-dark);
+  --os-seg-track: var(--seg-track-dark);
+  --os-seg-thumb: var(--seg-thumb-dark);
+  --os-hover: var(--hover-dark);
+  --os-select: var(--select-dark);
+  --os-win-shadow: var(--win-shadow-dark);
+  --os-icon-label: #f5f5f7;
+  --os-icon-label-shadow: 0 1px 4px rgba(0, 0, 0, 0.78);
+  --status-info: #0a84ff;
+  --wp-default: radial-gradient(120% 100% at 20% 0%, #1c2536 0%, #11131a 52%, #0b0c10 100%);
+  --wp-sonoma: linear-gradient(135deg, #0f2027 0%, #1b3b4b 48%, #243b55 100%);
+  --wp-sequoia: linear-gradient(135deg, #2b1b2f 0%, #3b2439 50%, #191a2e 100%);
 }
 
-*,
-*::before,
-*::after {
-  box-sizing: border-box;
+:root:has(> head > meta[name="color-scheme"][content="light"]) {
+  color-scheme: light;
+  --os-menubar: var(--bg-menubar-light);
+  --os-win-bg: var(--bg-win-light);
+  --os-sidebar-bg: var(--bg-sidebar-light);
+  --os-toolbar-bg: var(--bg-toolbar-light);
+  --os-subtle-bg: var(--bg-subtle-light);
+  --os-drawer-bg: var(--bg-drawer-light);
+  --os-input-bg: var(--bg-input-light);
+  --os-border: var(--border-hairline-light);
+  --os-border-strong: var(--border-strong-light);
+  --os-text: var(--text-primary-light);
+  --os-text-secondary: var(--text-secondary-light);
+  --os-muted: var(--text-muted-light);
+  --os-accent: var(--accent-light);
+  --os-seg-track: var(--seg-track-light);
+  --os-seg-thumb: var(--seg-thumb-light);
+  --os-hover: var(--hover-light);
+  --os-select: var(--select-light);
+  --os-win-shadow: var(--win-shadow-light);
+  --os-icon-label: #1d1d1f;
+  --os-icon-label-shadow: 0 1px 3px rgba(255, 255, 255, 0.85);
+  --status-info: #0071e3;
+  --wp-default: radial-gradient(120% 100% at 15% 10%, #dceaff 0%, #edf1f7 46%, #e2e8f3 100%);
+  --wp-sonoma: linear-gradient(135deg, #c2e9fb 0%, #a1c4fd 48%, #d4fc79 100%);
+  --wp-sequoia: linear-gradient(135deg, #f6d365 0%, #fda085 50%, #a18cd1 100%);
 }
 
-html,
-body {
-  margin: 0;
-  padding: 0;
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
-  font-family: var(--font-sans);
-  font-size: 13px;
-  line-height: 1.45;
-  color: var(--text-primary);
-  background: var(--bg-app);
+@supports (color: light-dark(white, black)) {
+  :root {
+    --os-text: light-dark(var(--text-primary-light), var(--text-primary-dark));
+    --os-text-secondary: light-dark(var(--text-secondary-light), var(--text-secondary-dark));
+    --os-muted: light-dark(var(--text-muted-light), var(--text-muted-dark));
+    --os-accent: light-dark(var(--accent-light), var(--accent-dark));
+  }
 }

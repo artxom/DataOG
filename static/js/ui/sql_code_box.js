@@ -1,33 +1,22 @@
 /**
- * DataOG 公共 SQL 代码编辑与预览框组件 (SqlCodeBox)
- * 支持：快捷键 Ctrl/Cmd+Enter 运行、一键复制、一键下载 .sql 脚本
+ * Data.O.G 极简 SQL 代码编辑与预览框组件 (SqlCodeBox)
  */
 
-import { downloadBlob, el } from "../core/dom.js";
+import { copyText, downloadBlob, el } from "../core/dom.js";
 import { Toast } from "./toast.js";
 
 export class SqlCodeBox {
-  /**
-   * @param {{
-   *   title?: string,
-   *   value?: string,
-   *   readOnly?: boolean,
-   *   placeholder?: string,
-   *   minHeight?: string,
-   *   filename?: string,
-   *   onRun?: (sql: string) => void,
-   * }} opts
-   */
   constructor(opts = {}) {
-    this.title = opts.title || "SQL 脚本";
+    this.title = opts.title || "SQL";
     this.filename = opts.filename || "script.sql";
     this.onRun = opts.onRun || null;
+    this.frameless = Boolean(opts.frameless);
 
     this.textarea = el("textarea", {
       className: "sql-code-textarea",
       spellcheck: "false",
       readonly: Boolean(opts.readOnly),
-      placeholder: opts.placeholder || "在此输入 SQL 语句 (按 Cmd/Ctrl + Enter 快速执行)...",
+      placeholder: opts.placeholder || "输入 SQL (⌘+Enter 执行)...",
       style: opts.minHeight ? { minHeight: opts.minHeight } : {},
     });
     this.textarea.value = opts.value || "";
@@ -45,7 +34,7 @@ export class SqlCodeBox {
         el("button", {
           type: "button",
           className: "btn btn-xs btn-primary",
-          text: "执行 SQL (⌘/Ctrl+Enter)",
+          text: "执行 ⌘↵",
           onClick: () => this.onRun(this.getValue()),
         })
       );
@@ -54,32 +43,25 @@ export class SqlCodeBox {
     actions.push(
       el("button", {
         type: "button",
-        className: "btn btn-xs btn-secondary",
-        text: "复制 SQL",
+        className: "btn btn-xs btn-ghost",
+        text: "复制",
         onClick: async () => {
-          const text = this.getValue();
-          if (!text.trim()) {
-            Toast.warn("当前没有可复制的 SQL 内容");
+          const ok = await copyText(this.getValue());
+          if (!ok) {
+            Toast.warn("内容为空");
             return;
           }
-          try {
-            await navigator.clipboard.writeText(text);
-            Toast.success("已复制 SQL 到剪贴板");
-          } catch (_e) {
-            this.textarea.select();
-            document.execCommand("copy");
-            Toast.success("已复制 SQL 到剪贴板");
-          }
+          Toast.success("已复制");
         },
       }),
       el("button", {
         type: "button",
         className: "btn btn-xs btn-ghost",
-        text: "下载 .sql",
+        text: ".sql",
         onClick: () => {
           const text = this.getValue();
           if (!text.trim()) {
-            Toast.warn("当前没有可导出的 SQL 内容");
+            Toast.warn("内容为空");
             return;
           }
           const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
@@ -91,8 +73,8 @@ export class SqlCodeBox {
     this.titleNode = el("span", { className: "sql-code-title", text: this.title });
     this.root = el(
       "div",
-      { className: "sql-code-box" },
-      el("div", { className: "sql-code-toolbar" }, this.titleNode, el("div", { style: { display: "flex", gap: "6px" } }, actions)),
+      { className: `sql-code-box ${this.frameless ? "frameless" : ""}`.trim() },
+      el("div", { className: "sql-code-toolbar" }, this.titleNode, el("div", { style: { display: "flex", gap: "4px" } }, actions)),
       this.textarea
     );
   }
