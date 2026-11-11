@@ -200,9 +200,12 @@ logger = setup_console_logging()
 
 FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-    '<rect width="64" height="64" rx="14" fill="#1d4ed8"/>'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0%" stop-color="#0071e3"/><stop offset="100%" stop-color="#00c6ff"/>'
+    "</linearGradient></defs>"
+    '<rect width="64" height="64" rx="15" fill="url(#g)"/>'
     '<text x="50%" y="55%" dominant-baseline="middle" text-anchor="middle" '
-    'fill="#ffffff" font-family="sans-serif" font-weight="800" font-size="22">OG</text>'
+    'fill="#ffffff" font-family="-apple-system,sans-serif" font-weight="800" font-size="22">OG</text>'
     "</svg>"
 )
 
@@ -210,7 +213,7 @@ _SECURITY_CSP = (
     "default-src 'self'; "
     "script-src 'self'; "
     "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data:; "
+    "img-src 'self' data: blob:; "
     "font-src 'self' data:; "
     "connect-src 'self'; "
     "object-src 'none'; "
@@ -269,9 +272,9 @@ def create_app(
         store.clear_items()
 
     app = FastAPI(
-        title="DataOG Workbench",
-        description="类 DataGrip / DBeaver 一体化数据工程与数据治理微内核工作台",
-        version="2.0.0",
+        title="Data.O.G",
+        description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
+        version="2.1.0",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -296,6 +299,7 @@ def create_app(
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
         response.headers.setdefault("Permissions-Policy", "camera=(), geolocation=(), microphone=()")
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
         response.headers.setdefault("Content-Security-Policy", _SECURITY_CSP)
         return response
 
@@ -786,6 +790,14 @@ def create_app(
 
     @app.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
     async def route_favicon() -> Response:
+        custom_fav = await anyio.to_thread.run_sync(ctx.asset_store.read_brand_favicon)
+        if custom_fav is not None:
+            raw_bytes, mime = custom_fav
+            return Response(
+                content=raw_bytes,
+                media_type=mime,
+                headers={"X-Content-Type-Options": "nosniff"},
+            )
         return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
     @app.api_route("/.well-known/{rest_of_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
@@ -833,7 +845,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  DataOG v2.0.0 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.1.0 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")

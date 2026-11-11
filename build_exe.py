@@ -188,8 +188,9 @@ def build_executable() -> None:
         "--hidden-import=et_xmlfile",
         "--hidden-import=unittest.mock",
     ]
-    if importlib.util.find_spec("httpx") is not None:
-        pyinstaller_args.append("--collect-submodules=httpx")
+    for opt_pkg in ("httpx", "httpx2", "httpcore2", "openai", "jiter", "truststore", "sniffio"):
+        if importlib.util.find_spec(opt_pkg) is not None:
+            pyinstaller_args.append(f"--collect-submodules={opt_pkg}")
     if importlib.util.find_spec("jpype") is not None:
         pyinstaller_args.append("--collect-all=jpype")
 
@@ -216,6 +217,7 @@ def build_executable() -> None:
             shutil.rmtree(target_static, ignore_errors=True)
         shutil.copytree(static_src, target_static)
         os.makedirs(os.path.join(dist_bundle_dir, "data", "drivers"), exist_ok=True)
+        os.makedirs(os.path.join(dist_bundle_dir, "data", "assets"), exist_ok=True)
 
     exe_ext = ".exe" if os.name == "nt" else ""
     output_exe = os.path.join(dist_bundle_dir, f"{exe_name}{exe_ext}")
