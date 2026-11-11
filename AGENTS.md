@@ -32,17 +32,48 @@
   - **公共 UI 组件库 (`static/js/ui/`)**：所有模块统一复用标准组件（`DataGrid` 数据网格、`ObjectPicker` 库表级联选择器、`SqlCodeBox` SQL 编辑预览框、`Modal`、`Toast`、`SplitPane`），确保全应用视觉与交互高度一致，并严格使用 `textContent` / `createElement` 等安全 DOM 操作杜绝 XSS。
 
 ## 3. 安全、数据兼容与跨平台打包红线
-- **安全与本地隔离**：默认仅监听 `127.0.0.1`；`data/*.db`、`data/*.log` 及用户上传的驱动目录 `data/drivers/` 必须被 `.gitignore` 排除，严禁将任何数据库密码或本地状态提交至 Git；日志输出严禁打印明文密码。
-- **状态库前后向无损兼容**：运行时状态库统一为 `data/dataog_state.db`（启动时若检测到历史 `dws_migrator_state.db` 与旧版连接键值，必须自动无损迁移）；所有 SQLite 表结构演进必须通过幂等列自检机制（新增列带安全 `DEFAULT`），保障跨分支切换与版本回退零报错。
-- **Windows `.exe` 交付保障**：保留 Windows CMD 快速编辑模式禁用（防点击挂起）、静态目录多路径探测、PyInstaller 隔离临时目录构建等工程保护逻辑。新增任何第三方依赖前必须先通过依赖安全扫描校验。
+- **安全与本地隔离**：默认仅监听 `127.0.0.1:18080`（启用 CSP 与 `Sec-Fetch-Site` 跨站请求防护）；`data/*.db`、`data/*.log` 及用户上传的驱动目录 `data/drivers/` 必须被 `.gitignore` 排除，严禁将任何数据库密码或本地状态提交至 Git；所有接口返回与日志输出必须脱敏密码；`.jar` 驱动上传严格限制大小、校验 `PK\x03\x04` 魔数头、拦截 POSIX/Windows 路径穿越并校验 SHA-256 指纹。
+- **前端零 XSS 与非阻塞交互红线**：前端代码严禁出现 `innerHTML`、`outerHTML`、`insertAdjacentHTML` 及阻塞式 `window.alert`/`confirm`/`prompt`，统一通过 `static/js/core/dom.js` 安全节点工厂与原生 `<dialog>` (`Modal`) 渲染（由单测静态扫描强制守卫）。
+- **状态库前后向无损兼容**：运行时状态库统一为 `data/dataog_state.db`（启动时自动从历史 `dws_migrator_state.db` 及 `dws_conn_saved` / `dws_connection_config` / `cross_source_conn` / `cross_target_conn` 无损迁移为命名数据源档案）；所有 SQLite 表结构演进必须通过 `register_table_schema` 幂等列自检机制（新增列带安全 `DEFAULT`），保障跨分支切换与版本回退零报错。
+- **Windows `.exe` 与冻结态自检保障**：保留 Windows CMD 快速编辑模式禁用（防点击挂起）、标准流 UTF-8 重配置（防 `cp1252`/`gbk` 编码崩溃）、静态目录多路径探测、多线程 JPype `attachThreadToJVM()` 及 PyInstaller 隔离构建保护；模块零互引校验需同时兼容源码 AST 与 PyInstaller 冻结态 `pkgutil` + `dis` 字节码自省，确保 `DataOG.exe --test` 独立自检通过。新增任何第三方依赖前必须先通过依赖安全扫描校验。
 
-## 4. 现代化 Git 分支、合并与版本管理规范
-- **分支模型（GitHub Flow）**：
-  - `main`：稳定主干分支，随时保持测试全绿、可运行、可打包。
-  - `refactor/<主题>`：底座升级与模块化重构分支（如 `refactor/platform-foundation`、`refactor/modularize-domain-tools`）。
-  - `feat/<模块名>`：新功能或工作台特性分支（如 `feat/ide-workbench-and-query`）。
-  - `fix/<问题名>`：缺陷修复分支。
-- **准入与发版要求**：
-  - 提交信息遵循 Conventional Commits（`feat:` / `refactor:` / `fix:` / `docs:` / `test:` / `chore:`）。
-  - 合并回 `main` 前必须通过全量自动化单元测试（`python3 -m unittest discover -s tests -p "test_*.py" -v`）与 `python3 app.py --test` 启动自检。
-  - 按语义化版本（SemVer：`v1.1.0`、`v1.2.0`、`v2.0.0`）打附注 Tag 推送 GitHub，触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 打包发布。
+## 4. 工程交付闭环：文档同步、GitHub Flow 与最佳实践（强制执行）
+每次完成任何开发、重构、缺陷修复或工程变更任务时，**必须完整执行以下「文档同步 + 规范提交 + GitHub 远端闭环」流程**，不得遗漏：
+1. **每次收尾强制同步项目文档（供下次会话无缝衔接）**：
+   - **`AGENTS.md`**：若模块职责、目录拓扑、数据表、路由契约、版本号或工程红线发生变化，立即更新本文档第 5 节基线快照与对应规范章节，确保下一次新会话启动时零成本获取最新上下文。
+   - **`README.md`**：同步更新对外架构说明、功能模块列表、目录速览与运行/打包指引。
+   - **`CHANGELOG.md`**：遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 规范，在 `[Unreleased]` 或对应正式版本下按 `Added` / `Changed` / `Fixed` / `Security` 记录核心变更。
+2. **分支模型（标准 GitHub Flow）**：
+   - `main`：受保护语义的稳定主干分支，随时保持测试全绿、文档同步、可直接运行与打包。
+   - 工作分支一律从最新干净的 `main` 切出：`feat/<模块名>`（新特性）、`fix/<问题名>`（缺陷修复）、`refactor/<主题>`（架构重构）、`docs/<主题>`（文档与规范更新）、`chore/<主题>`（构建与工程维护）。
+3. **原子提交、双门禁校验与 GitHub 同步规范**：
+   - **提交规范**：遵循 Conventional Commits（格式：`<type>(<scope>): <中文简明摘要>`），保持提交原子化；提交前执行 `git status` 与 `git diff` 逐项核查，严禁混入未跟踪的临时文件或本地状态库。
+   - **合并门禁**：合并回 `main` 前必须 100% 通过全量自动化单测（`python3 -m unittest discover -s tests -p "test_*.py" -v`）与启动自检（`python3 app.py --test`）。
+   - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
+
+## 5. 当前代码基线快照（供下次会话快速定位）
+- **当前主干里程碑版本**：`v2.0.0`（`main` 分支已同步至 `origin/main`，GitHub Release `v2.0.0` 已发布含 `DataOG-Windows-x64-v2.0.0.zip`）。
+- **微内核入口与构建脚本**：
+  - `app.py`：FastAPI 微内核入口（`create_app`、UTF-8 流保护、Windows 防挂起、安全头/CSRF 中间件、挂载平台路由与三大插件模块路由，并保留 `/api/*` 脱敏兼容路由）。
+  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后打包 `dist/DataOG/DataOG.exe`（含 `--hidden-import=unittest.mock` 与 `--collect-submodules=httpx` 保障冻结态 `--test` 自检）。
+- **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
+  - `context.py` (`PlatformContext`) / `router.py` / `schemas.py` / `models.py`
+  - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，核心表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_env_standards`、`cross_table_mappings`、`cross_column_bindings`、`execution_logs`)
+  - `driver_manager.py` & `inceptor_client.py` (`DriverManager`，双轨驱动：`NATIVE` 原生通道覆盖 `DWS`/`PGSQL`/`INCEPTOR`/`MYSQL`/`SQLITE`；`JDBC` 通道按需懒加载 `JPype1` + `URLClassLoader` 覆盖 `DM8`/`KINGBASE`/`ORACLE`/`DB2`/`GBASE` 及自定义 `.jar`)
+  - `connection_hub.py` (`ConnectionHub`，统一 `connection_id` 档案管理、密码脱敏与连接会话上下文)
+  - `metadata_hub.py` (`MetadataHub`，定制探查器 + `DatabaseMetaData` 通用回退、四层视图穿透、SQLite 元数据索引与全局搜索)
+  - `query_engine.py` & `excel_io.py` (`QueryEngine`，默认 `LIMIT 500`/上限 `5000` SQL 下推截断 + JDBC `setMaxRows`、耗时统计、CSV/XLSX 导出)
+  - `dialects/`：`identifiers.py`、`types.py`、`dws_ddl.py`、`ddl_builder.py`、`view_lineage.py`（底层核心算法亦兼容复用于 `core/dws_engine.py` 与 `core/cross_env_engine.py`）
+- **独立业务插件模块 (`modules/`，严格零跨模块互引)**：
+  - `modules/standard_migrator/`（`/api/modules/standard_migrator`）：单库批量落标贯标执行台（`DIRECT_ALTER` / `TABLE_REBUILD` 物理列保序迁移、Kahn 拓扑改名、分区继承、并发作业池）。
+  - `modules/cross_comparator/`（`/api/modules/cross_comparator`）：16:9 跨环境三栏数标比对中心（三方双向桥接绑定、Excel/JSON 导入导出、实时差异计算并一键推送至贯标台）。
+  - `modules/ddl_translator/`（`/api/modules/ddl_translator`）：跨方言建表 DDL 翻译与四层递归视图血缘穿透器。
+- **前端原生 ES Modules IDE 工作台 (`static/`)**：
+  - `index.html`、`css/tokens.css`（明暗双主题变量）、`css/workbench.css`、`js/main.js`
+  - 核心层 `js/core/`：`api.js`、`dom.js`、`state.js`
+  - 公共组件 `js/ui/`：`database_tree.js`、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`modal.js`、`toast.js`、`split_pane.js`
+  - 模块视图 `js/views/`：`connections_view.js`、`sql_console_view.js`、`standard_migrator_view.js`、`cross_comparator_view.js`、`ddl_translator_view.js`
+- **全量自动化测试套件 (`tests/`，当前共 24 项测试全绿)**：
+  - `tests/test_core.py`：保留并验证单库保序重建、拓扑改名、分区继承、三栏比对、DDL 互译与四层视图穿透核心引擎测试。
+  - `tests/test_platform.py`：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`QueryEngine` 安全截断与导出。
+  - `tests/test_modules_and_api.py`：验证 FastAPI 全路由契约、跨环境推送贯标闭环、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。

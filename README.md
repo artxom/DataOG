@@ -6,6 +6,7 @@
 
 - **GitHub 仓库**：https://github.com/artxom/DataOG
 - **项目架构记忆与工程规范**：详见 [AGENTS.md](./AGENTS.md)
+- **版本变更记录**：详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
 
@@ -37,24 +38,56 @@ DataOG 采用 **「`core/platform/` 四大全局平台中枢 + `static/js/` 统�
 
 ---
 
-## 二、里程碑版本演进记录
+## 二、项目目录结构速览
 
-| 里程碑版本 | 分支名称 | 核心交付物 |
+```text
+DataOG/
+├── app.py                        # FastAPI 微内核入口（安全响应头、UTF-8/Windows 防挂起、路由装配）
+├── core/
+│   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
+│   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载）
+│   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文
+│   │   ├── metadata_hub.py       # 双层元数据探查器与本地 SQLite 缓存检索中枢
+│   │   ├── query_engine.py       # 跨驱动安全截断查询、表数据预览与 CSV/Excel 导出引擎
+│   │   ├── storage.py            # data/dataog_state.db WAL 状态库、旧版无损迁移与幂等列演进
+│   │   └── dialects/             # 标识符清洗、类型映射矩阵、DDL 生成与四层视图血缘穿透
+│   ├── dws_engine.py             # 单库保序重建、Kahn 拓扑改名与分区继承核心引擎
+│   └── cross_env_engine.py       # 跨环境数标匹配、差异分类与桥接计算核心引擎
+├── modules/                      # 相互独立的插件化业务模块（零跨模块私有导入）
+│   ├── standard_migrator/        # /api/modules/standard_migrator 单库批量落标贯标台
+│   ├── cross_comparator/         # /api/modules/cross_comparator  16:9 跨环境三栏数标比对中心
+│   └── ddl_translator/           # /api/modules/ddl_translator    跨方言建表翻译与视图穿透器
+├── static/                       # 零 Node 构建链原生 ES Modules 前端 IDE 工作台
+│   ├── css/                      # tokens.css（明暗双主题变量）与 workbench.css（IDE 骨架样式）
+│   └── js/                       # core/（API/DOM/状态）、ui/（公共组件库）、views/（五大业务视图）
+├── tests/                        # 全量自动化测试门禁（核心算法 / 平台底座 / 模块隔离与安全扫描）
+├── build_exe.py                  # Windows DataOG.exe PyInstaller 自动化门禁打包脚本
+├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
+└── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
+```
+
+---
+
+## 三、里程碑版本演进记录
+
+| 里程碑版本 | 分支演进 | 核心交付物 |
 | :--- | :--- | :--- |
 | **`v1.0.0`**（已完成） | `main` | 完成单库保序贯标、16:9 三栏跨环境数标比对、多方言 DDL 翻译与视图穿透核心算法基线 |
 | **`v2.0.0`**（当前正式版） | `refactor/dataog-workbench` → `main` | 完成 `FastAPI` 微内核升级、四大全局底座 (`DriverManager` / `ConnectionHub` / `MetadataHub` / `QueryEngine`)、`modules/*` 三大插件解耦、类 DataGrip 原生 ES Module 工作台与 `DataOG.exe` 正式版打包流水线 |
 
 ---
 
-## 三、本地运行、测试与 Windows `DataOG.exe` 打包说明
+## 四、本地运行、测试打包与工程协作规范
 
-### 1. 开发环境启动与全量自动化测试
+### 1. 开发环境启动与全量自动化测试门禁
 ```bash
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试与应用启动自检
+# 运行全量自动化单元测试（24 项核心引擎、平台底座、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
+
+# 运行应用启动与健康路由自检
 python3 app.py --test
 
 # 启动本地 IDE 工作台（严格监听 http://127.0.0.1:18080）
@@ -63,6 +96,10 @@ python3 app.py
 
 ### 2. 在 Windows 下打包为独立免安装程序 (`DataOG.exe`)
 ```bash
-# 双击 build_windows.bat 或直接执行打包脚本（打包前自动运行全量单测门禁）
+# 双击 build_windows.bat 或直接执行打包脚本（打包前自动运行全量单测门禁，产出于 dist/DataOG/DataOG.exe）
 python build_exe.py
 ```
+
+### 3. 持续演进与 GitHub 提交最佳实践
+- **文档同步闭环**：每次完成功能开发、架构调整或缺陷修复，均同步更新 [AGENTS.md](./AGENTS.md)（最新架构基线与会话交接记忆）、[README.md](./README.md) 与 [CHANGELOG.md](./CHANGELOG.md)。
+- **GitHub Flow 与门禁**：从 `main` 切分语义化工作分支（`feat/*`、`fix/*`、`refactor/*`、`docs/*`），采用原子化 Conventional Commits 提交，通过本地全量单测与 `python3 app.py --test` 双门禁后合并回 `main`、清理临时分支并同步推送到 GitHub `origin` 触发 CI 验证。
