@@ -531,9 +531,7 @@ class CrossComparatorService:
             target_table=t_tbl or eff_key,
         )
         if column_bindings:
-            valid = [b for b in column_bindings if int(b.get("id", 0) or 0) > 0]
-            if valid:
-                self.ctx.store.batch_update_cross_column_bindings(valid)
+            self.ctx.store.upsert_cross_table_column_bindings(eff_key, column_bindings)
 
         self.ctx.store.add_log(
             "INFO",
@@ -565,15 +563,30 @@ class CrossComparatorService:
         row_idx = 1
         for t in tables:
             t_key = t["std_table_key"]
-            tgt_schema = t.get("target_schema") or t.get("std_schema_name") or "public"
-            tgt_table = t.get("target_table") or t["std_table_name"]
-            cols = self.ctx.store.list_cross_columns(t_key)
+            comp = self.compare_single_table(t_key)
+            tgt_panel = comp.get("target_panel") or {}
+            tgt_schema = (
+                tgt_panel.get("schema_name")
+                or t.get("target_schema")
+                or t.get("std_schema_name")
+                or "public"
+            )
+            tgt_table = (
+                tgt_panel.get("table_name")
+                or t.get("target_table")
+                or t["std_table_name"]
+            )
+            cols = (comp.get("standard_panel") or {}).get("columns") or self.ctx.store.list_cross_columns(t_key)
             for c in cols:
-                old_c = clean_identifier_input(
-                    c.get("bound_target_col")
-                    if c.get("bound_target_col") and c.get("bound_target_col") != c.get("std_col_name")
-                    else (c.get("orig_col_name") or c.get("bound_source_col") or c["std_col_name"])
-                )
+                t_col_meta = c.get("target_col_meta")
+                if isinstance(t_col_meta, dict) and t_col_meta.get("column_name"):
+                    old_c = clean_identifier_input(t_col_meta["column_name"])
+                else:
+                    old_c = clean_identifier_input(
+                        c.get("bound_target_col")
+                        if c.get("bound_target_col") and c.get("bound_target_col") != c.get("std_col_name")
+                        else (c.get("orig_col_name") or c.get("bound_source_col") or c["std_col_name"])
+                    )
                 new_c = clean_identifier_input(
                     c.get("std_col_name") or c.get("bound_target_col") or old_c
                 )
@@ -583,14 +596,26 @@ class CrossComparatorService:
                         "schema_name": tgt_schema,
                         "table_name": tgt_table,
                         "old_col_name": old_c,
-                        "old_col_type": c.get("orig_col_type") or c.get("std_col_type") or "",
-                        "old_col_comment": c.get("orig_col_comment") or "",
+                        "old_col_type": (
+                            (t_col_meta.get("data_type") if isinstance(t_col_meta, dict) else "")
+                            or c.get("orig_col_type")
+                            or c.get("std_col_type")
+                            or ""
+                        ),
+                        "old_col_comment": (
+                            (t_col_meta.get("column_comment") if isinstance(t_col_meta, dict) else "")
+                            or c.get("orig_col_comment")
+                            or ""
+                        ),
                         "new_col_name": new_c,
                         "new_col_type": c.get("std_col_type") or c.get("orig_col_type") or "",
                         "new_col_comment": c.get("std_col_comment") or "",
                     }
                 )
                 row_idx += 1
+
+        if not items_to_push:
+            raise ValueError("当前标准表暂无可推送的字段改造规则，请先导入数标或连接来源/目标库加载字段")
 
         fn = self.ctx.store.get_meta("cross_standard_filename", "跨环境数标推送清单.xlsx")
         self.ctx.store.replace_all_items(items_to_push, fn, preserve_history=True)

@@ -1612,9 +1612,14 @@ class DWSMigratorEngine:
         table_name: str,
         items_for_table: List[Dict[str, Any]],
         keep_backup: bool = True,
+        table_meta_override: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """生成严格按照原表 pg_attribute.attnum 顺序重建表并完成类型转换与数据迁移的完整事务 SQL."""
-        table_meta = self.inspect_table_metadata(schema_name, table_name)
+        table_meta = (
+            table_meta_override
+            if table_meta_override is not None
+            else self.inspect_table_metadata(schema_name, table_name)
+        )
         if not table_meta.exists:
             raise ValueError(f"数据库中不存在表 {schema_name}.{table_name}，无法生成重建 SQL")
 

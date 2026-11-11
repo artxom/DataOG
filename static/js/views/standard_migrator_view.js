@@ -33,6 +33,33 @@ export class StandardMigratorView {
     this.maxWorkers = 5;
     this.keepBackup = true;
     this.root = el("div", { className: "module-page" });
+    this.kpiMount = el("div", {});
+    this.gridMount = el("div", {});
+    this.batchExecBtn = null;
+    this.searchInput = el("input", {
+      className: "input input-sm",
+      type: "search",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      "aria-label": "过滤贯标任务清单",
+      style: { width: "360px" },
+      placeholder: "按模式名 / 表名 / 原字段名 / 目标标准字段名 / 注释过滤...",
+      onInput: (e) => {
+        this.searchKeyword = e.target.value;
+        this._renderKpiAndGrid();
+      },
+    });
+  }
+
+  _isRebuildItem(it) {
+    return (
+      it?.strategy === "TABLE_REBUILD" ||
+      it?.migration_mode === "TABLE_REBUILD" ||
+      Boolean(it?.is_distribute_key) ||
+      String(it?.table_orientation || "").toUpperCase() === "COLUMN"
+    );
   }
 
   async mount(container) {
@@ -127,7 +154,7 @@ export class StandardMigratorView {
       });
       const sqlBox = new SqlCodeBox({
         title: `整表保序影子表重建事务脚本 (${schemaName}.${tableName})`,
-        value: preview.rebuild_sql || preview.sql || "-- 暂无重建 SQL",
+        value: preview.sql_preview || preview.rebuild_sql || preview.sql || "-- 暂无重建 SQL",
         readOnly: true,
         minHeight: "290px",
         filename: `rebuild_${schemaName}_${tableName}.sql`,
@@ -201,7 +228,9 @@ export class StandardMigratorView {
     const kw = this.searchKeyword.trim().toLowerCase();
     return all.filter((it) => {
       if (this.statusFilter === "REBUILD") {
-        if (it.migration_mode !== "TABLE_REBUILD" && !it.is_distribute_key) return false;
+        if (!this._isRebuildItem(it)) return false;
+      } else if (this.statusFilter === "FAILED") {
+        if (!["FAILED", "MISSING_TABLE", "MISSING_COLUMN"].includes(it.status)) return false;
       } else if (this.statusFilter !== "ALL" && it.status !== this.statusFilter) {
         return false;
       }
@@ -210,6 +239,7 @@ export class StandardMigratorView {
         it.schema_name,
         it.table_name,
         it.old_col_name,
+        it.db_current_col_name,
         it.new_col_name,
         it.old_col_comment,
         it.new_col_comment,
@@ -301,7 +331,7 @@ export class StandardMigratorView {
             }
           },
         }),
-        el("button", {
+        (this.batchExecBtn = el("button", {
           type: "button",
           className: "btn btn-sm btn-primary",
           text: `并发执行选中 (${this.selectedIds.size})`,
@@ -329,7 +359,7 @@ export class StandardMigratorView {
               Toast.error(err.message);
             }
           },
-        }),
+        })),
         el("button", {
           type: "button",
           className: "btn btn-sm btn-secondary",
@@ -356,47 +386,11 @@ export class StandardMigratorView {
       )
     );
 
-    const kpiDefs = [
-      { key: "ALL", label: "全部字段规则", val: summary.total ?? (ws.items || []).length },
-      { key: "PENDING", label: "待执行改造", val: summary.pending ?? 0 },
-      { key: "PARTIAL", label: "部分合规待补齐", val: summary.partial ?? 0 },
-      { key: "COMPLETED", label: "已贯标达标", val: summary.completed ?? 0 },
-      { key: "REBUILD", label: "涉及分布/分区键重建", val: summary.rebuild_required ?? 0 },
-      { key: "FAILED", label: "异常或缺失", val: summary.failed ?? 0 },
-    ];
-
-    const kpiRow = el(
-      "div",
-      { className: "kpi-grid" },
-      kpiDefs.map((k) =>
-        el(
-          "div",
-          {
-            className: `kpi-card ${this.statusFilter === k.key ? "is-active" : ""}`,
-            onClick: () => {
-              this.statusFilter = k.key;
-              this.render();
-            },
-          },
-          el("div", { className: "kpi-label", text: k.label }),
-          el("div", { className: "kpi-value", text: String(k.val) })
-        )
-      )
-    );
-
+    this.searchInput.value = this.searchKeyword;
     const searchBar = el(
       "div",
       { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px" } },
-      el("input", {
-        className: "input input-sm",
-        style: { width: "360px" },
-        placeholder: "按模式名 / 表名 / 原字段名 / 目标标准字段名 / 注释过滤...",
-        value: this.searchKeyword,
-        onInput: (e) => {
-          this.searchKeyword = e.target.value;
-          this.render();
-        },
-      }),
+      el("search", {}, this.searchInput),
       el(
         "div",
         { style: { display: "flex", alignItems: "center", gap: "8px" } },
@@ -405,6 +399,7 @@ export class StandardMigratorView {
           "select",
           {
             className: "input input-xs",
+            "aria-label": "并发线程数",
             onChange: (e) => {
               this.maxWorkers = Number(e.target.value) || 5;
             },
@@ -418,12 +413,61 @@ export class StandardMigratorView {
       )
     );
 
+    this._renderKpiAndGrid();
+    const content = el("div", { className: "module-content" }, this.kpiMount, searchBar, this.gridMount);
+    clearEl(this.root, toolbar, content);
+  }
+
+  _renderKpiAndGrid() {
+    const ws = this.ws || { connections: [], items: [], summary: {} };
+    const summary = ws.summary || {};
+    if (this.batchExecBtn) {
+      this.batchExecBtn.textContent = `并发执行选中 (${this.selectedIds.size})`;
+    }
+
+    const rebuildCount =
+      summary.rebuild_required ??
+      (ws.items || []).filter((it) => it.status !== "COMPLETED" && this._isRebuildItem(it)).length;
+    const failedOrMissingCount = (summary.failed ?? 0) + (summary.missing ?? 0);
+
+    const kpiDefs = [
+      { key: "ALL", label: "全部字段规则", val: summary.total ?? (ws.items || []).length },
+      { key: "PENDING", label: "待执行改造", val: summary.pending ?? 0 },
+      { key: "PARTIAL", label: "部分合规待补齐", val: summary.partial ?? 0 },
+      { key: "COMPLETED", label: "已贯标达标", val: summary.completed ?? 0 },
+      { key: "REBUILD", label: "涉及分布/分区键重建", val: rebuildCount },
+      { key: "FAILED", label: "异常或缺失", val: failedOrMissingCount },
+    ];
+
+    const kpiRow = el(
+      "div",
+      { className: "kpi-grid" },
+      kpiDefs.map((k) =>
+        el(
+          "div",
+          {
+            className: `kpi-card ${this.statusFilter === k.key ? "is-active" : ""}`,
+            onClick: () => {
+              this.statusFilter = k.key;
+              this._renderKpiAndGrid();
+            },
+          },
+          el("div", { className: "kpi-label", text: k.label }),
+          el("div", { className: "kpi-value", text: String(k.val) })
+        )
+      )
+    );
+
     const rows = this._filteredItems();
     const grid = new DataGrid({
       ariaLabel: "字段贯标任务明细表",
       selectable: true,
       selectedKeys: this.selectedIds,
-      onSelectionChange: () => this.render(),
+      onSelectionChange: () => {
+        if (this.batchExecBtn) {
+          this.batchExecBtn.textContent = `并发执行选中 (${this.selectedIds.size})`;
+        }
+      },
       rowKey: "id",
       rows,
       emptyText: "当前暂无贯标字段清单，请点击「上传 Excel 清单」、「从库加载表」或从「跨环境三栏比对中心」推送待改造项",
@@ -448,11 +492,11 @@ export class StandardMigratorView {
               {},
               el("div", {
                 style: { fontWeight: "700", fontFamily: "var(--font-mono)" },
-                text: `${r.current_db_col_name || r.old_col_name} → ${r.new_col_name}`,
+                text: `${r.db_current_col_name || r.current_db_col_name || r.old_col_name} → ${r.new_col_name}`,
               }),
               el("div", {
                 style: { fontSize: "11px", color: "var(--text-secondary)" },
-                text: `${r.current_db_col_type || r.old_col_type || "?"} → ${r.new_col_type}`,
+                text: `${r.db_current_type || r.current_db_col_type || r.old_col_type || "?"} → ${r.new_col_type}`,
               })
             ),
         },
@@ -462,10 +506,10 @@ export class StandardMigratorView {
           render: (r) => r.new_col_comment || r.old_col_comment || "-",
         },
         {
-          key: "migration_mode",
+          key: "strategy",
           label: "保序策略",
           render: (r) =>
-            r.migration_mode === "TABLE_REBUILD" || r.is_distribute_key
+            this._isRebuildItem(r)
               ? badge("TABLE_REBUILD 整表保序", "warn")
               : badge("DIRECT_ALTER 原地修改", "info"),
         },
@@ -476,7 +520,7 @@ export class StandardMigratorView {
             const m = STATUS_META[r.status] || { label: r.status || "未知", tone: "neutral" };
             return el(
               "div",
-              { title: r.last_error || r.sync_detail || "" },
+              { title: r.error_message || r.status_detail || r.last_error || r.sync_detail || "" },
               badge(m.label, m.tone)
             );
           },
@@ -496,7 +540,7 @@ export class StandardMigratorView {
                 disabled: r.status === "COMPLETED",
                 onClick: async (e) => {
                   e.stopPropagation();
-                  if (r.migration_mode === "TABLE_REBUILD" || r.is_distribute_key) {
+                  if (this._isRebuildItem(r)) {
                     await this._openRebuildPreviewModal(r.schema_name, r.table_name);
                     return;
                   }
@@ -522,7 +566,7 @@ export class StandardMigratorView {
       ],
     });
 
-    const content = el("div", { className: "module-content" }, kpiRow, searchBar, grid.root);
-    clearEl(this.root, toolbar, content);
+    clearEl(this.kpiMount, kpiRow);
+    clearEl(this.gridMount, grid.root);
   }
 }

@@ -1423,6 +1423,7 @@ class PlatformStateStore:
             "failed": 0,
             "missing": 0,
             "unchecked": 0,
+            "rebuild_required": 0,
         }
         for item in items:
             st = item["status"]
@@ -1438,6 +1439,12 @@ class PlatformStateStore:
                 summary["missing"] += 1
             else:
                 summary["unchecked"] += 1
+            if st != "COMPLETED" and (
+                item.get("strategy") == "TABLE_REBUILD"
+                or bool(item.get("is_distribute_key"))
+                or str(item.get("table_orientation") or "").upper() == "COLUMN"
+            ):
+                summary["rebuild_required"] += 1
         return summary
 
     # =========================================================================
@@ -1696,6 +1703,73 @@ class PlatformStateStore:
                     """,
                     (bound_src, bound_tgt, now, cid),
                 )
+            conn.commit()
+
+    def upsert_cross_table_column_bindings(
+        self, std_table_key: str, column_bindings: List[Dict[str, Any]]
+    ) -> None:
+        """按 id 或 (std_table_key, std_col_name) 幂等更新或插入三方字段桥接关系（兼容导入数标与在线直连表模式）."""
+        t_key = (std_table_key or "").strip().lower()
+        if not t_key or not column_bindings:
+            return
+        now = self._now_str()
+        quote_chars = '"\'“”‘’`「」『』 \t\r\n\u200b\u3000\ufeff'
+        with self._lock, self._get_conn() as conn:
+            existing_rows = conn.execute(
+                "SELECT id, std_col_name FROM cross_column_bindings WHERE std_table_key = ?",
+                (t_key,),
+            ).fetchall()
+            by_std_col = {
+                str(r["std_col_name"] or "").strip(quote_chars).lower(): int(r["id"])
+                for r in existing_rows
+            }
+            next_row_idx = len(existing_rows) + 1
+            for item in column_bindings:
+                raw_id = int(item.get("id", 0) or 0)
+                std_col = str(item.get("std_col_name") or "").strip(quote_chars)
+                bound_src = str(item.get("bound_source_col") or "").strip(quote_chars)
+                bound_tgt = str(item.get("bound_target_col") or "").strip(quote_chars)
+                target_id = raw_id if raw_id > 0 else by_std_col.get(std_col.lower(), 0)
+                if target_id > 0:
+                    conn.execute(
+                        """
+                        UPDATE cross_column_bindings
+                        SET bound_source_col = ?,
+                            bound_target_col = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (bound_src, bound_tgt, now, target_id),
+                    )
+                elif std_col:
+                    orig_col = str(item.get("orig_col_name") or std_col).strip(quote_chars)
+                    std_type = str(item.get("std_col_type") or item.get("orig_col_type") or "").strip()
+                    std_comm = str(item.get("std_col_comment") or item.get("orig_col_comment") or "").strip()
+                    cur = conn.execute(
+                        """
+                        INSERT INTO cross_column_bindings (
+                            std_table_key, row_index,
+                            orig_col_name, orig_col_type, orig_col_comment,
+                            std_col_name, std_col_type, std_col_comment,
+                            bound_source_col, bound_target_col, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            t_key,
+                            next_row_idx,
+                            orig_col,
+                            std_type,
+                            std_comm,
+                            std_col,
+                            std_type,
+                            std_comm,
+                            bound_src,
+                            bound_tgt,
+                            now,
+                        ),
+                    )
+                    by_std_col[std_col.lower()] = int(cur.lastrowid or 0)
+                    next_row_idx += 1
             conn.commit()
 
     def clear_cross_standards(self) -> None:

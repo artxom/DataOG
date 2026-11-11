@@ -39,7 +39,15 @@ class WorkbenchStore {
     this.state.catalogTrees = data.catalog_trees || {};
     this.state.drivers = data.drivers || [];
     this.state.driverTemplates = data.driver_templates || [];
-    this.state.javaRuntime = data.java_runtime || { available: false, message: "" };
+    const rawJre = data.java_runtime || {};
+    const jreReady = Boolean(rawJre.jdbc_extension_ready ?? rawJre.available);
+    this.state.javaRuntime = {
+      ...rawJre,
+      jdbc_extension_ready: jreReady,
+      available: jreReady,
+      note: rawJre.note || rawJre.message || "",
+      message: rawJre.note || rawJre.message || "",
+    };
     this.state.modules = data.modules || [];
     this.state.logs = data.logs || [];
     if (this.state.connections.length > 0 && this.state.activeModule === "connections" && !this._initialRouted) {

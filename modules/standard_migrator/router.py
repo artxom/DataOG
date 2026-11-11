@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Response, UploadFile
 from fastapi.responses import JSONResponse
 
 from core.platform.context import PlatformContext, get_platform_context
@@ -52,12 +52,17 @@ def api_migrator_sync(ctx: PlatformContext = Depends(get_platform_context)):
 @router.post("/checklist/upload")
 async def api_migrator_upload_checklist(
     file: UploadFile = File(...),
+    default_schema: str = Form(""),
+    default_table: str = Form(""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
         raw = await file.read()
         return StandardMigratorService(ctx).upload_excel_checklist(
-            file.filename or "checklist.xlsx", raw
+            file.filename or "checklist.xlsx",
+            raw,
+            default_schema=default_schema,
+            default_table=default_table,
         )
     except Exception as exc:
         return _err(str(exc), 400)

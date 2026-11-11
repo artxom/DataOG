@@ -18,14 +18,21 @@ export class DatabaseTree {
     this.filterText = "";
     this.expandedConns = new Set();
     this.expandedSchemas = new Set();
+    this.collapsedSchemas = new Set();
     this.expandedTables = new Set();
     this.tableColumnsCache = new Map();
     this.selectedTableKey = "";
+    this._singleClickTimer = null;
 
     this.filterInput = el("input", {
       className: "input input-xs",
       type: "search",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
       placeholder: "过滤树中模式 / 表 / 视图名...",
+      "aria-label": "过滤目录树对象",
       style: { width: "100%" },
       onInput: () => {
         this.filterText = this.filterInput.value.trim().toLowerCase();
@@ -52,7 +59,7 @@ export class DatabaseTree {
           }
         )
       ),
-      this.filterInput
+      el("search", {}, this.filterInput)
     );
 
     clearEl(this.mountEl, header, this.treeBody);
@@ -218,15 +225,25 @@ export class DatabaseTree {
         for (const [schemaName, schemaTables] of bySchema.entries()) {
           if (this.filterText && schemaTables.length === 0) continue;
           const skey = `${cid}::${schemaName}`;
-          const schemaExpanded = this.expandedSchemas.has(skey) || Boolean(this.filterText) || bySchema.size === 1;
+          const schemaExpanded =
+            Boolean(this.filterText) ||
+            this.expandedSchemas.has(skey) ||
+            (bySchema.size === 1 && !this.collapsedSchemas.has(skey));
 
           const schemaRow = el(
             "div",
             {
               className: "tree-node-row",
+              role: "treeitem",
+              "aria-expanded": String(schemaExpanded),
               onClick: () => {
-                if (this.expandedSchemas.has(skey)) this.expandedSchemas.delete(skey);
-                else this.expandedSchemas.add(skey);
+                if (schemaExpanded) {
+                  this.expandedSchemas.delete(skey);
+                  this.collapsedSchemas.add(skey);
+                } else {
+                  this.collapsedSchemas.delete(skey);
+                  this.expandedSchemas.add(skey);
+                }
                 this.renderTreeBody();
               },
             },
@@ -247,14 +264,58 @@ export class DatabaseTree {
                 "div",
                 {
                   className: `tree-node-row ${this.selectedTableKey === tKey ? "is-selected" : ""}`,
+                  role: "treeitem",
+                  tabindex: "0",
+                  "aria-expanded": String(colsExpanded),
+                  dataset: { tableKey: tKey },
                   title: `双击预览数据与结构: ${schemaName}.${tbl.table_name}${tbl.table_comment ? " — " + tbl.table_comment : ""}`,
-                  onClick: (e) => this._toggleTableColumns(cid, schemaName, tbl.table_name, e),
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    this.selectedTableKey = tKey;
+                    for (const prev of this.treeBody.querySelectorAll(".tree-node-row.is-selected")) {
+                      prev.classList.remove("is-selected");
+                    }
+                    tblRow.classList.add("is-selected");
+                    if (this._singleClickTimer) {
+                      clearTimeout(this._singleClickTimer);
+                      this._singleClickTimer = null;
+                    }
+                    if (e.detail >= 2) {
+                      this._openTablePreview(cid, schemaName, tbl.table_name, tbl.object_type);
+                      return;
+                    }
+                    this._singleClickTimer = setTimeout(() => {
+                      this._singleClickTimer = null;
+                      this._toggleTableColumns(cid, schemaName, tbl.table_name, e);
+                    }, 210);
+                  },
                   onDblclick: (e) => {
                     e.stopPropagation();
+                    if (this._singleClickTimer) {
+                      clearTimeout(this._singleClickTimer);
+                      this._singleClickTimer = null;
+                    }
                     this._openTablePreview(cid, schemaName, tbl.table_name, tbl.object_type);
                   },
+                  onKeydown: (e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      this._openTablePreview(cid, schemaName, tbl.table_name, tbl.object_type);
+                    }
+                  },
                 },
-                el("span", { text: colsExpanded ? "▾" : "▸", style: { width: "10px" } }),
+                el("span", {
+                  text: colsExpanded ? "▾" : "▸",
+                  style: { width: "12px", display: "inline-block" },
+                  title: colsExpanded ? "收起字段列表" : "展开字段列表",
+                  onClick: (e) => {
+                    if (this._singleClickTimer) {
+                      clearTimeout(this._singleClickTimer);
+                      this._singleClickTimer = null;
+                    }
+                    this._toggleTableColumns(cid, schemaName, tbl.table_name, e);
+                  },
+                }),
                 svgIcon(isView ? "view" : "table", 13),
                 el("span", { className: "tree-node-title", text: tbl.table_name }),
                 isView ? badge("VIEW", "warn") : null,

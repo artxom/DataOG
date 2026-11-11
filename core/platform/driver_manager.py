@@ -19,6 +19,7 @@ import hashlib
 import io
 import logging
 import os
+import posixpath
 import shutil
 import sqlite3
 import threading
@@ -159,13 +160,24 @@ class JdbcCursorAdapter:
         self.description: Optional[List[Tuple[Any, ...]]] = None
         self.rowcount: int = -1
 
-    def execute(self, sql: str, params: Optional[Sequence[Any]] = None, timeout_sec: int = 0) -> "JdbcCursorAdapter":
+    def execute(
+        self,
+        sql: str,
+        params: Optional[Sequence[Any]] = None,
+        timeout_sec: int = 0,
+        max_rows: int = 0,
+    ) -> "JdbcCursorAdapter":
         self._close_current_rs()
         if params:
             self._stmt = self._jdbc_conn.prepareStatement(sql)
             if timeout_sec > 0:
                 try:
                     self._stmt.setQueryTimeout(int(timeout_sec))
+                except Exception:
+                    pass
+            if max_rows > 0:
+                try:
+                    self._stmt.setMaxRows(int(max_rows))
                 except Exception:
                     pass
             for idx, val in enumerate(params, start=1):
@@ -176,6 +188,11 @@ class JdbcCursorAdapter:
             if timeout_sec > 0:
                 try:
                     self._stmt.setQueryTimeout(int(timeout_sec))
+                except Exception:
+                    pass
+            if max_rows > 0:
+                try:
+                    self._stmt.setMaxRows(int(max_rows))
                 except Exception:
                     pass
             has_rs = bool(self._stmt.execute(sql))
@@ -336,16 +353,19 @@ class DriverManager:
         java_bin = shutil.which("java") or ""
         java_home = os.environ.get("JAVA_HOME", "")
         available = bool(jpype_installed and (jvm_path or java_home or java_bin))
+        note = (
+            "自定义 JDBC 扩展通道就绪"
+            if available
+            else "未检测到本地 Java 运行环境 (JRE/JDK 8+)；内置原生通道 (DWS/PGSQL/Inceptor/MySQL/SQLite) 不受影响可正常使用。"
+        )
         return {
             "jdbc_extension_ready": available,
+            "available": available,
             "jpype_installed": jpype_installed,
             "jvm_detected": bool(jvm_path or java_home or java_bin),
             "java_home": java_home,
-            "note": (
-                "自定义 JDBC 扩展通道就绪"
-                if available
-                else "未检测到本地 Java 运行环境 (JRE/JDK 8+)；内置原生通道 (DWS/PGSQL/Inceptor/MySQL/SQLite) 不受影响可正常使用。"
-            ),
+            "note": note,
+            "message": note,
         }
 
     # =========================================================================
@@ -370,8 +390,16 @@ class DriverManager:
             with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
                 has_class_or_manifest = False
                 for info in zf.infolist():
-                    norm = os.path.normpath(info.filename).replace("\\", "/")
-                    if norm.startswith("/") or norm.startswith("..") or "/../" in norm:
+                    raw_entry = (info.filename or "").replace("\\", "/")
+                    parts = [p for p in raw_entry.split("/") if p not in ("", ".")]
+                    if (
+                        raw_entry.startswith("/")
+                        or ":" in raw_entry.split("/", 1)[0]
+                        or any(p == ".." for p in parts)
+                    ):
+                        raise ValueError("驱动包内检测到非法的路径穿越条目，已安全拦截")
+                    norm = posixpath.normpath(raw_entry)
+                    if norm.startswith("/") or norm == ".." or norm.startswith("../"):
                         raise ValueError("驱动包内检测到非法的路径穿越条目，已安全拦截")
                     if norm.endswith(".class") or norm.upper() == "META-INF/MANIFEST.MF":
                         has_class_or_manifest = True
@@ -518,7 +546,14 @@ class DriverManager:
                     jpype.startJVM(jvm_path, "-Djava.awt.headless=true", convertStrings=True)
                 except Exception as exc:
                     raise RuntimeError(f"启动本地 Java 虚拟机失败: {exc}") from exc
-            return jpype
+
+        if hasattr(jpype, "isThreadAttachedToJVM") and hasattr(jpype, "attachThreadToJVM"):
+            try:
+                if not jpype.isThreadAttachedToJVM():
+                    jpype.attachThreadToJVM()
+            except Exception as exc:
+                raise RuntimeError(f"将当前工作线程挂载至 JVM 失败: {exc}") from exc
+        return jpype
 
     def _open_jdbc_connection(self, profile: ConnectionProfile, timeout_sec: int = 10) -> JdbcConnectionAdapter:
         if not profile.jdbc_driver_id:
