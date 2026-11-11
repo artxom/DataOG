@@ -340,9 +340,28 @@ STATUS_LABELS: Dict[str, str] = {
 
 
 def validate_xlsx_bytes(filename: str, content: bytes) -> None:
-    """基本检查上传文件内容非空."""
+    """严格校验上传的 .xlsx 文件非空、大小上限、ZIP 魔数头、防路径穿越及防 XXE 注入."""
     if not content:
         raise ValueError("上传的 Excel 文件内容为空")
+    if len(content) > MAX_UPLOAD_SIZE_BYTES:
+        raise ValueError("上传的 Excel 文件超过 10MB 安全大小限制")
+    ext = os.path.splitext((filename or "").strip())[1].lower()
+    if ext and ext not in (".xlsx", ".xlsm"):
+        raise ValueError("仅支持标准 .xlsx 格式的 Excel 工作簿")
+    if not content.startswith(XLSX_MAGIC_BYTES):
+        raise ValueError("非法的 .xlsx 文件格式（文件魔数校验未通过，若为旧版 .xls 请另存为 .xlsx）")
+    try:
+        with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
+            for info in zf.infolist():
+                norm = os.path.normpath(info.filename).replace("\\", "/")
+                if norm.startswith("/") or norm.startswith("..") or "/../" in norm:
+                    raise ValueError("检测到非法的压缩包路径结构")
+                if info.filename.lower().endswith((".xml", ".rels")):
+                    raw_xml = zf.read(info.filename)
+                    if FORBIDDEN_XML_PATTERNS.search(raw_xml):
+                        raise ValueError("检测到禁止的外部 XML 实体声明 (XXE 防护拦截)")
+    except zipfile.BadZipFile as exc:
+        raise ValueError("损坏的 .xlsx 工作簿文件") from exc
 
 
 def _normalize_header(raw: Any) -> str:
