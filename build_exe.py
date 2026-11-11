@@ -17,6 +17,20 @@ import time
 import unittest
 
 
+def _ensure_utf8_stdio() -> None:
+    """确保在 Windows GitHub Actions (cp1252) 或 GBK 控制台中输出中文提示与测试日志不触发 UnicodeEncodeError."""
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_stdio()
 _ORIG_RMTREE = shutil.rmtree
 
 
@@ -172,7 +186,10 @@ def build_executable() -> None:
         "--collect-submodules=modules",
         "--hidden-import=h11",
         "--hidden-import=et_xmlfile",
+        "--hidden-import=unittest.mock",
     ]
+    if importlib.util.find_spec("httpx") is not None:
+        pyinstaller_args.append("--collect-submodules=httpx")
     if importlib.util.find_spec("jpype") is not None:
         pyinstaller_args.append("--collect-all=jpype")
 
