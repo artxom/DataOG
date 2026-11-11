@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ============================================================================
-echo   Huawei DWS Column Migrator - Windows Standalone EXE Builder
+echo   DataOG v2.0.0 Workbench - Windows Standalone EXE Builder
 echo ============================================================================
 echo.
 
@@ -32,7 +32,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-echo [STEP 3] Building standalone Windows executable via build_exe.py ...
+echo [STEP 3] Building standalone DataOG.exe via build_exe.py ...
 ".venv\Scripts\python.exe" build_exe.py
 if %errorlevel% neq 0 (
     echo [ERROR] Packaging failed. Please check the error output above.
@@ -49,7 +49,7 @@ if %errorlevel% neq 0 (
     pause
     exit /b 1
 )
-echo [STEP 3] Building standalone Windows executable via build_exe.py ...
+echo [STEP 3] Building standalone DataOG.exe via build_exe.py ...
 python build_exe.py
 if %errorlevel% neq 0 (
     echo [ERROR] Packaging failed.
@@ -59,5 +59,5 @@ if %errorlevel% neq 0 (
 
 :DONE
 echo.
-echo [SUCCESS] Build finished! Check the dist folder for the .exe file.
+echo [SUCCESS] Build finished! Check dist\DataOG\DataOG.exe.
 pause

@@ -494,17 +494,35 @@ class DWSMigratorEngine:
             "tables": [],
         }
 
-        # 从本地 SQLite 直接加载已保存的完整连接信息（含账号与密码）
+        # 从本地 SQLite 直接加载已保存的完整连接信息（含全局 ConnectionHub 命名连接档案回填）
         saved_cfg = self.store.get_meta("dws_conn_saved")
         if isinstance(saved_cfg, dict) and saved_cfg.get("host"):
             for k in ("configured", "host", "port", "dbname", "user", "password", "sslmode"):
                 if k in saved_cfg:
                     self._conn_config[k] = saved_cfg[k]
             self._conn_config["configured"] = True
+        else:
+            active_cid = str(self.store.get_meta("migrator_connection_id", "") or "")
+            if active_cid and hasattr(self.store, "get_connection_profile"):
+                prof = self.store.get_connection_profile(active_cid)
+                if prof and prof.host:
+                    self._apply_profile_to_conn_config(prof)
 
         saved_cat = self.store.get_meta("dws_catalog_cache")
         if isinstance(saved_cat, dict):
             self._catalog_cache = saved_cat
+
+    def _apply_profile_to_conn_config(self, prof: Any) -> None:
+        with self._conn_lock:
+            self._conn_config = {
+                "configured": bool(prof.host and prof.dbname and prof.user),
+                "host": prof.host,
+                "port": int(prof.port or (5432 if prof.db_type == "PGSQL" else 8000)),
+                "dbname": prof.dbname,
+                "user": prof.user,
+                "password": prof.password or "",
+                "sslmode": prof.sslmode or "prefer",
+            }
 
     def is_configured(self) -> bool:
         return bool(

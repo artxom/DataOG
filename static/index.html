@@ -1,783 +1,119 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="color-scheme" content="light dark">
-  <title>华为 DWS 字段贯标与保序转换工作台</title>
-  <link rel="stylesheet" href="/styles.css">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="light dark" />
+  <title>DataOG v2.0.0 — 多功能数据工程与数据治理一体化工作台</title>
+  <link rel="icon" href="/favicon.ico" type="image/svg+xml" />
+  <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
-  <div class="app-shell">
-    <!-- 顶部导航栏 -->
-    <header class="topbar">
-      <div class="brand-group">
-        <div class="brand-logo" aria-hidden="true">DWS</div>
-        <div>
-          <h1 class="brand-title">数仓字段贯标与跨环境数标比对工作台</h1>
-          <p class="brand-subtitle">支持 PGSQL / 华为 DWS / 星环 Inceptor · 16:9 三纵列跨环境数标比对 · 全表物理列顺序 100% 保序迁移</p>
+  <div id="ide-app" class="ide-shell">
+    <!-- 顶部全局 IDE 状态与快速检索栏 -->
+    <header class="ide-topbar" role="banner">
+      <div class="ide-brand">
+        <span class="ide-logo-mark" aria-hidden="true">OG</span>
+        <div class="ide-brand-text">
+          <span class="ide-brand-title">DataOG</span>
+          <span class="ide-brand-badge">v2.0.0 Workbench</span>
         </div>
       </div>
 
-      <!-- 顶部双模式 Tab 切换器 -->
-      <div class="mode-tabs" role="tablist" aria-label="系统功能模式切换">
-        <button type="button" id="tabBtnWorkbench" class="mode-tab-btn active" role="tab" aria-selected="true" aria-controls="viewWorkbench">
-          单库批量贯标执行台
-        </button>
-        <button type="button" id="tabBtnCrossEnv" class="mode-tab-btn" role="tab" aria-selected="false" aria-controls="viewCrossEnv">
-          跨环境三栏数标比对中心 (16:9 三纵列)
-        </button>
+      <div class="ide-global-search-wrap">
+        <input
+          id="global-meta-search-input"
+          class="ide-global-search-input"
+          type="search"
+          autocomplete="off"
+          placeholder="全局秒级检索已缓存的表名 / 视图名 / 字段名 / 中文注释 (Enter 搜索)..."
+          aria-label="全局元数据检索"
+        />
+        <button id="btn-global-meta-search" type="button" class="btn btn-sm btn-ghost">检索元数据</button>
       </div>
 
-      <div class="topbar-actions">
-        <div id="connStatusBadge" class="conn-badge" role="status" aria-live="polite">
-          <span class="status-dot" id="connStatusDot"></span>
-          <span id="connStatusText">未连接数据库</span>
-        </div>
-
-        <button type="button" id="btnOpenConnDialog" class="btn btn-secondary">
-          数据库连接设置
+      <div class="ide-topbar-actions">
+        <span id="jre-runtime-pill" class="status-pill status-pill-muted" title="JDBC 扩展通道 JRE 运行时状态">JRE 检测中</span>
+        <button id="btn-toggle-theme" type="button" class="btn btn-sm btn-ghost" title="切换界面主题 (跟随系统 / 浅色 / 深色)">
+          主题: 自动
         </button>
-        <button type="button" id="btnOpenCatalogDialog" class="btn btn-secondary">
-          浏览目标库表结构
-        </button>
-        <a href="/api/excel/template" class="btn btn-secondary" download>
-          下载标准 Excel 模板
-        </a>
-        <button type="button" id="btnOpenUploadDialog" class="btn btn-primary">
-          导入 Excel 贯标清单
-        </button>
-        <a href="/api/excel/export" class="btn btn-secondary" download>
-          导出结果报告 (.xlsx)
-        </a>
-        <button type="button" id="btnThemeToggle" class="btn btn-ghost" aria-label="切换深浅色外观">
-          切换外观
+        <button id="btn-refresh-platform" type="button" class="btn btn-sm btn-secondary" title="重新同步全局连接与日志状态">
+          刷新工作台
         </button>
       </div>
     </header>
 
-    <!-- ==================== 视图 1：单库批量贯标执行台 ==================== -->
-    <div id="viewWorkbench" class="mode-view">
-    <!-- 实时统计与状态筛选卡片 -->
-    <section class="summary-strip" aria-label="贯标进度统计">
-      <button type="button" class="stat-card active" data-filter="ALL">
-        <span class="stat-label">清单字段总数</span>
-        <strong class="stat-value" id="statTotal">0</strong>
-        <span class="stat-meta" id="excelFileMeta">当前清单: 未导入</span>
-      </button>
+    <!-- 主体区域：Activity Bar + 左侧可折叠 Database Navigator + 右侧独立模块工作区 -->
+    <div class="ide-body" id="ide-body">
+      <nav class="ide-activity-bar" aria-label="功能模块切换栏">
+        <div class="activity-group-top" id="activity-nav-top"></div>
+        <div class="activity-group-bottom" id="activity-nav-bottom"></div>
+      </nav>
 
-      <button type="button" class="stat-card stat-completed" data-filter="COMPLETED">
-        <span class="stat-label">已贯标完成 (库内已匹配)</span>
-        <strong class="stat-value" id="statCompleted">0</strong>
-        <span class="stat-meta">字段名/类型/注释及顺序均已就绪</span>
-      </button>
-
-      <button type="button" class="stat-card stat-pending" data-filter="PENDING">
-        <span class="stat-label">待贯标转换</span>
-        <strong class="stat-value" id="statPending">0</strong>
-        <span class="stat-meta">匹配到原字段，等待执行转换</span>
-      </button>
-
-      <button type="button" class="stat-card stat-partial" data-filter="PARTIAL">
-        <span class="stat-label">部分完成</span>
-        <strong class="stat-value" id="statPartial">0</strong>
-        <span class="stat-meta">字段已改名，类型或注释待补齐</span>
-      </button>
-
-      <button type="button" class="stat-card stat-failed" data-filter="FAILED">
-        <span class="stat-label">执行报错 (需关注)</span>
-        <strong class="stat-value" id="statFailed">0</strong>
-        <span class="stat-meta">分布列/列存受限可一键按原序重建表</span>
-      </button>
-
-      <button type="button" class="stat-card stat-missing" data-filter="MISSING">
-        <span class="stat-label">表或字段缺失</span>
-        <strong class="stat-value" id="statMissing">0</strong>
-        <span class="stat-meta">库内未找到对应表或字段</span>
-      </button>
-    </section>
-
-    <!-- 主工作区：左侧清单与数据库联动表格 + 右侧/底部实时控制台日志 -->
-    <main class="workspace-grid">
-      <section class="panel table-panel" aria-label="字段贯标联动清单">
-        <div class="panel-toolbar">
-          <div class="toolbar-left">
-            <div class="search-field">
-              <label for="searchInput" class="sr-only">搜索表名或字段</label>
-              <input
-                type="search"
-                id="searchInput"
-                name="search_query"
-                placeholder="搜索表名、原字段名、新字段名、注释或报错信息..."
-              >
-            </div>
-            <div class="select-field">
-              <label for="tableFilterSelect" class="sr-only">按数据表筛选</label>
-              <select id="tableFilterSelect" name="table_filter">
-                <option value="ALL">全部数据表</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="toolbar-right">
-            <button type="button" id="btnClearItems" class="btn btn-ghost">
-              清空当前清单
-            </button>
-            <button type="button" id="btnSyncMetadata" class="btn btn-secondary">
-              与数据库实时重新核验
-            </button>
-            <div class="select-field">
-              <label for="workerCountSelect" class="sr-only">并发执行线程数</label>
-              <select id="workerCountSelect" name="worker_count" title="按表并发执行的线程数量">
-                <option value="1">1 线程 (单表串行)</option>
-                <option value="3">3 线程按表并发</option>
-                <option value="5" selected>5 线程按表并发</option>
-                <option value="8">8 线程按表并发</option>
-                <option value="10">10 线程按表并发</option>
-              </select>
-            </div>
-            <button type="button" id="btnBatchAlter" class="btn btn-primary">
-              批量执行选中项 (智能识别分布键)
-            </button>
-            <button type="button" id="btnOpenRebuildWizard" class="btn btn-accent">
-              按原表顺序重建表迁移
-            </button>
-          </div>
-        </div>
-
-        <div class="table-container">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th class="col-check">
-                  <input type="checkbox" id="checkAllRows" aria-label="全选所有待处理字段">
-                </th>
-                <th>序号 / 表内物理位置</th>
-                <th>所属模式与表名</th>
-                <th>修改前 (原字段名 / 类型 / 注释)</th>
-                <th>修改后 (目标字段名 / 类型 / 注释)</th>
-                <th>数据库联动状态 &amp; 报错诊断</th>
-                <th class="col-actions">保序转换操作</th>
-              </tr>
-            </thead>
-            <tbody id="checklistTableBody"></tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- 实时服务控制台日志抽屉 -->
-      <aside class="panel console-panel" aria-label="服务控制台与 SQL 日志">
-        <div class="console-header">
-          <div>
-            <h2 class="console-title">服务控制台 &amp; SQL 执行日志</h2>
-            <p class="console-subtitle">与可执行程序控制台窗口同步显示 SQL 执行进度与 DWS 引擎报错</p>
-          </div>
-          <button type="button" id="btnClearLogs" class="btn btn-ghost btn-sm">
-            清空日志
-          </button>
-        </div>
-        <pre id="consoleLogStream" class="console-stream" aria-live="polite"></pre>
+      <aside id="left-navigator-pane" class="ide-navigator-pane" aria-label="全局数据库目录导航树">
+        <div id="database-tree-mount" class="navigator-inner"></div>
       </aside>
-    </main>
+
+      <div
+        id="splitter-left-nav"
+        class="ide-splitter ide-splitter-vertical"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="调整左侧数据库目录树宽度"
+        tabindex="0"
+      ></div>
+
+      <main id="module-workspace" class="ide-workspace" role="main" aria-live="polite"></main>
     </div>
 
-    <!-- ==================== 视图 2：跨环境三栏数标比对中心 (16:9 三条纵贯线) ==================== -->
-    <div id="viewCrossEnv" class="mode-view is-hidden">
-      <!-- 跨环境顶部表级导航与批量绑定导入导出栏 -->
-      <section class="panel cross-hub-bar" aria-label="跨环境比对总控栏">
-        <div class="cross-hub-left">
-          <div class="cross-table-picker">
-            <label for="crossTableSelect" class="cross-picker-label">当前检视标准表:</label>
-            <select id="crossTableSelect" class="cross-select-main">
-              <option value="">-- 请先上传数标清单或从执行台同步 --</option>
-            </select>
-          </div>
-          <div class="search-field cross-table-search">
-            <label for="crossTableSearchInput" class="sr-only">检索标准表名</label>
-            <input type="search" id="crossTableSearchInput" placeholder="快速检索表名...">
-          </div>
-          <div class="cross-kpi-pills" id="crossKpiPills">
-            <span class="kpi-pill" id="crossKpiTotal">标准字段: 0</span>
-            <span class="kpi-pill kpi-pill-ok" id="crossKpiCompliant">目标已落标: 0</span>
-            <span class="kpi-pill kpi-pill-warn" id="crossKpiPending">目标待改造: 0</span>
-            <span class="kpi-pill kpi-pill-diff" id="crossKpiEnvDiff">两库差异: 0</span>
-          </div>
+    <!-- 底部可拖拽高度调节条 -->
+    <div
+      id="splitter-bottom-drawer"
+      class="ide-splitter ide-splitter-horizontal"
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label="调整底部全局任务与 SQL 日志面板高度"
+      tabindex="0"
+    ></div>
+
+    <!-- 底部可折叠全局任务与 SQL 日志抽屉 -->
+    <section id="bottom-log-drawer" class="ide-bottom-drawer" aria-label="全局任务与 SQL 执行日志抽屉">
+      <div class="drawer-header">
+        <div class="drawer-title-group">
+          <button id="btn-toggle-drawer" type="button" class="btn btn-xs btn-ghost">折叠/展开日志</button>
+          <span class="drawer-title">全局任务与 SQL 审计日志</span>
+          <span id="log-count-badge" class="badge badge-neutral">0</span>
         </div>
-
-        <div class="cross-hub-right">
-          <button type="button" id="btnOpenDdlTranslator" class="btn btn-accent btn-sm" title="选取来源库、目标库或数据标准中的表，一键翻译为 PGSQL / 华为 DWS / 星环 Inceptor 建表 DDL">
-            跨库建表 DDL 翻译器
-          </button>
-          <button type="button" id="btnOpenCrossUploadDialog" class="btn btn-primary btn-sm">
-            上传数标 / 导入绑定包
-          </button>
-          <button type="button" id="btnSyncFromWorkbench" class="btn btn-secondary btn-sm">
-            从执行台同步清单
-          </button>
-          <button type="button" id="btnSaveCrossBindings" class="btn btn-secondary btn-sm">
-            持久保存当前绑定
-          </button>
-          <a href="/api/cross/bindings/export.json" class="btn btn-secondary btn-sm" download>
-            导出绑定包 (.json)
-          </a>
-          <button type="button" id="btnExportCrossExcel" class="btn btn-secondary btn-sm">
-            导出三方比对表 (.xlsx)
-          </button>
-          <button type="button" id="btnPushToWorkbench" class="btn btn-accent btn-sm">
-            推送至贯标执行台
-          </button>
+        <div class="drawer-actions">
+          <select id="log-level-filter" class="input input-xs" aria-label="按日志级别过滤">
+            <option value="ALL">全部级别</option>
+            <option value="INFO">INFO 正常</option>
+            <option value="WARN">WARN 警告</option>
+            <option value="ERROR">ERROR 异常</option>
+          </select>
+          <button id="btn-refresh-logs" type="button" class="btn btn-xs btn-ghost">刷新</button>
+          <button id="btn-clear-logs" type="button" class="btn btn-xs btn-ghost">清空日志</button>
         </div>
-      </section>
-
-      <!-- 16:9 三纵列主体画布：左列（来源库） × 中列（数据标准与绑定） × 右列（目标库） -->
-      <section class="tri-column-stage" aria-label="16:9 三纵列跨环境数标比对工作台">
-        <!-- 左纵贯线：来源库 (Source DB) -->
-        <article class="tri-lane lane-source" aria-label="左列：来源库结构纵贯线">
-          <header class="lane-header">
-            <div class="lane-title-row">
-              <div class="lane-badge-group">
-                <span class="lane-tag lane-tag-source">左列 · 来源库</span>
-                <span id="srcDbTypeBadge" class="db-type-pill">DWS</span>
-              </div>
-              <div class="lane-header-actions">
-                <button type="button" id="btnTranslateFromSource" class="btn btn-secondary btn-sm" title="提取当前来源库表结构并翻译为目标环境建表 DDL">
-                  导出/翻译建表 DDL
-                </button>
-                <button type="button" id="btnOpenSrcConnDialog" class="btn btn-secondary btn-sm">
-                  配置来源库连接
-                </button>
-              </div>
-            </div>
-            <p id="srcConnSummaryText" class="lane-conn-sub">未连接来源数据库（支持 PGSQL / 华为 DWS / 星环 Inceptor）</p>
-
-            <div class="lane-bind-bar">
-              <div class="lane-input-pair">
-                <input type="text" id="srcSchemaInput" class="lane-input-sm" placeholder="来源模式/库名" title="来源库 Schema 或 Database">
-                <input type="text" id="srcTableInput" class="lane-input-lg" list="srcTablesDatalist" placeholder="来源库表名 (回车或点读取)" title="绑定的来源库表名">
-                <datalist id="srcTablesDatalist"></datalist>
-                <button type="button" id="btnReloadSrcTable" class="btn btn-secondary btn-sm">读取表</button>
-              </div>
-              <input type="search" id="srcColFilterInput" class="lane-col-search" placeholder="检索来源库字段名、类型或注释...">
-            </div>
-          </header>
-
-          <div id="srcLaneBody" class="lane-spine-scroll" tabindex="0" role="region" aria-label="来源库表字段纵列"></div>
-        </article>
-
-        <!-- 中纵贯线：数据标准与三方绑定中枢 (Data Standard & Binding Hub) -->
-        <article class="tri-lane lane-standard" aria-label="中列：数据标准与三方绑定中枢">
-          <header class="lane-header">
-            <div class="lane-title-row">
-              <div class="lane-badge-group">
-                <span class="lane-tag lane-tag-standard">中列 · 数据标准中枢</span>
-                <strong id="stdActiveTableBadge" class="std-table-badge">未选择表</strong>
-              </div>
-              <button type="button" id="btnAutoBindCols" class="btn btn-secondary btn-sm" title="按原字段名与标准字段名自动对齐左右两库字段">
-                智能同名重新绑定
-              </button>
-            </div>
-            <p id="stdMetaSummaryText" class="lane-conn-sub">通过落标清单将「来源库字段 ⟷ 数据标准 ⟷ 目标库字段」三者持久绑定</p>
-
-            <div class="lane-bind-bar">
-              <div class="lane-input-pair">
-                <input type="search" id="stdColFilterInput" class="lane-input-lg" placeholder="筛选标准字段名、原字段名或中文注释...">
-                <select id="stdStatusFilterSelect" class="lane-input-sm" aria-label="按落标状态筛选">
-                  <option value="ALL">全部标准项</option>
-                  <option value="PENDING_MIGRATION">仅看待落标/有差异</option>
-                  <option value="COMPLIANT">仅看目标已落标</option>
-                  <option value="ENV_DIFF">仅看两库不一致</option>
-                </select>
-              </div>
-            </div>
-          </header>
-
-          <div id="stdLaneBody" class="lane-spine-scroll" tabindex="0" role="region" aria-label="数据标准与左右库绑定纵列"></div>
-        </article>
-
-        <!-- 右纵贯线：目标库 (Target DB) -->
-        <article class="tri-lane lane-target" aria-label="右列：目标库结构纵贯线">
-          <header class="lane-header">
-            <div class="lane-title-row">
-              <div class="lane-badge-group">
-                <span class="lane-tag lane-tag-target">右列 · 目标库</span>
-                <span id="tgtDbTypeBadge" class="db-type-pill">DWS</span>
-              </div>
-              <div class="lane-header-actions">
-                <button type="button" id="btnTranslateFromTarget" class="btn btn-secondary btn-sm" title="提取当前目标库表结构并翻译为其他环境建表 DDL">
-                  导出/翻译建表 DDL
-                </button>
-                <button type="button" id="btnOpenTgtConnDialog" class="btn btn-secondary btn-sm">
-                  配置目标库连接
-                </button>
-              </div>
-            </div>
-            <p id="tgtConnSummaryText" class="lane-conn-sub">未连接目标数据库（默认自动复用执行台 DWS 连接）</p>
-
-            <div class="lane-bind-bar">
-              <div class="lane-input-pair">
-                <input type="text" id="tgtSchemaInput" class="lane-input-sm" placeholder="目标模式/库名" title="目标库 Schema 或 Database">
-                <input type="text" id="tgtTableInput" class="lane-input-lg" list="tgtTablesDatalist" placeholder="目标库表名 (回车或点读取)" title="绑定的目标库表名">
-                <datalist id="tgtTablesDatalist"></datalist>
-                <button type="button" id="btnReloadTgtTable" class="btn btn-secondary btn-sm">读取表</button>
-              </div>
-              <input type="search" id="tgtColFilterInput" class="lane-col-search" placeholder="检索目标库字段名、类型或落标状态...">
-            </div>
-          </header>
-
-          <div id="tgtLaneBody" class="lane-spine-scroll" tabindex="0" role="region" aria-label="目标库表字段纵列"></div>
-        </article>
-      </section>
-    </div>
+      </div>
+      <div id="drawer-log-list" class="drawer-body" tabindex="0" role="log"></div>
+    </section>
   </div>
 
-  <!-- 弹窗 1：数据库连接配置（本地持久化保存账号密码） -->
-  <dialog id="connDialog" closedby="any" aria-labelledby="connDialogTitle" class="modal-dialog">
-    <form id="connForm">
-      <div class="modal-header">
-        <h2 id="connDialogTitle">华为云 GaussDB(DWS) 数据库连接配置</h2>
-        <button type="button" class="btn-close" data-close-dialog="connDialog" aria-label="关闭弹窗">×</button>
-      </div>
-
-      <div class="modal-body">
-        <div id="connDialogAlert" class="dialog-alert is-hidden" role="alert"></div>
-
-        <fieldset class="form-fieldset">
-          <legend>DWS 集群连接参数（保存后自动持久化到本地，下次免输入）</legend>
-          <div class="form-row-2">
-            <div class="form-group">
-              <label for="inputHost">CN 节点主机地址 (Host)</label>
-              <input type="text" id="inputHost" name="host" placeholder="例如 192.168.1.100" required autocomplete="off">
-            </div>
-            <div class="form-group">
-              <label for="inputPort">端口 (Port)</label>
-              <input type="number" id="inputPort" name="port" value="8000" min="1" max="65535" required>
-            </div>
-          </div>
-
-          <div class="form-row-2">
-            <div class="form-group">
-              <label for="inputDbName">数据库名称 (Database)</label>
-              <input type="text" id="inputDbName" name="dbname" placeholder="例如 gaussdb" required autocomplete="off">
-            </div>
-            <div class="form-group">
-              <label for="inputSslMode">SSL 传输模式</label>
-              <select id="inputSslMode" name="sslmode">
-                <option value="prefer">prefer (优先加密，兼容常规内网)</option>
-                <option value="disable">disable (不启用 SSL)</option>
-                <option value="require">require (强制 SSL)</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="form-row-2">
-            <div class="form-group">
-              <label for="inputUser">数据库用户名 (User)</label>
-              <input type="text" id="inputUser" name="user" placeholder="例如 dbadmin" required autocomplete="username">
-            </div>
-            <div class="form-group">
-              <label for="inputPassword">数据库密码 (Password，自动保存在本地)</label>
-              <input type="password" id="inputPassword" name="password" placeholder="输入连接密码" autocomplete="current-password">
-            </div>
-          </div>
-        </fieldset>
-      </div>
-
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-close-dialog="connDialog">取消</button>
-        <button type="submit" id="btnSaveConn" class="btn btn-primary">保存连接并读取目标库表结构</button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- 弹窗 2：导入 Excel 贯标清单 -->
-  <dialog id="uploadDialog" closedby="any" aria-labelledby="uploadDialogTitle" class="modal-dialog">
-    <form id="uploadForm">
-      <div class="modal-header">
-        <h2 id="uploadDialogTitle">导入 Excel 字段贯标清单</h2>
-        <button type="button" class="btn-close" data-close-dialog="uploadDialog" aria-label="关闭弹窗">×</button>
-      </div>
-
-      <div class="modal-body">
-        <div id="uploadDialogAlert" class="dialog-alert is-hidden" role="alert"></div>
-
-        <p class="dialog-hint">
-          支持单 Sheet 或多 Sheet 清单（自动识别「模式名、表名、修改前字段名、修改前类型、修改前注释、修改后字段名、修改后类型、修改后注释」以及合并单元格）。
-          若 Excel 中未包含「模式名」列，系统将自动在目标库所有业务 Schema 中按表名（忽略大小写）智能匹配定位！
-        </p>
-
-        <div class="form-group">
-          <label for="inputExcelFile">选择 Excel 清单文件 (.xlsx)</label>
-          <input type="file" id="inputExcelFile" name="file" accept=".xlsx" required>
-        </div>
-
-        <div class="form-row-2">
-          <div class="form-group">
-            <label for="inputDefaultSchema">默认模式名 (可选，留空则自动匹配目标库 Schema)</label>
-            <input type="text" id="inputDefaultSchema" name="default_schema" value="" placeholder="留空自动探测 (如 public)">
-          </div>
-          <div class="form-group">
-            <label for="inputDefaultTable">默认表名 (可选，当 Excel 内无表名列时使用)</label>
-            <input type="text" id="inputDefaultTable" name="default_table" placeholder="若 Excel 内已有表名列可留空">
-          </div>
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <a href="/api/excel/template" class="btn btn-ghost" download>下载标准模板</a>
-        <button type="button" class="btn btn-secondary" data-close-dialog="uploadDialog">取消</button>
-        <button type="submit" id="btnSubmitUpload" class="btn btn-primary">上传并联动核验</button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- 弹窗 3：目标库表结构浏览器 -->
-  <dialog id="catalogDialog" closedby="any" aria-labelledby="catalogDialogTitle" class="modal-dialog modal-dialog-wide">
-    <div class="modal-header">
-      <div>
-        <h2 id="catalogDialogTitle">华为 DWS 目标库模式 (Schema) 与表结构浏览器</h2>
-        <p id="catalogSubTitle" class="dialog-submeta">实时探测目标库中的业务模式、表名称、存储属性与列数</p>
-      </div>
-      <button type="button" class="btn-close" data-close-dialog="catalogDialog" aria-label="关闭弹窗">×</button>
-    </div>
-
-    <div class="modal-body">
-      <div id="catalogDialogAlert" class="dialog-alert is-hidden" role="alert"></div>
-
-      <div class="catalog-toolbar">
-        <div class="toolbar-left">
-          <label for="catalogSchemaSelect" class="sr-only">选择模式 (Schema)</label>
-          <select id="catalogSchemaSelect" class="catalog-select">
-            <option value="">全部模式 (Schema)</option>
-          </select>
-          <input type="search" id="catalogSearchInput" class="catalog-search" placeholder="筛选表名或表注释...">
-        </div>
-        <div class="toolbar-right">
-          <button type="button" id="btnRefreshCatalog" class="btn btn-secondary btn-sm">刷新目标库表清单</button>
-          <button type="button" id="btnLoadSchemaTables" class="btn btn-primary btn-sm">载入当前筛选模式下的表结构到工作台</button>
-        </div>
-      </div>
-
-      <div class="mini-table-wrap">
-        <table class="mini-table">
-          <thead>
-            <tr>
-              <th>所属模式 (Schema)</th>
-              <th>表名 (Table)</th>
-              <th>存储方式</th>
-              <th>字段数量</th>
-              <th>表注释</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody id="catalogTableBody"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="modal-footer">
-      <button type="button" class="btn btn-secondary" data-close-dialog="catalogDialog">关闭</button>
+  <!-- 标准语义化模态对话框 (<dialog>) -->
+  <dialog id="global-modal" class="ide-dialog" closedby="any" aria-labelledby="global-modal-title">
+    <div class="dialog-panel">
+      <header class="dialog-header">
+        <h2 id="global-modal-title" class="dialog-title">系统提示</h2>
+        <button id="global-modal-close" type="button" class="btn btn-xs btn-ghost" aria-label="关闭弹窗">关闭</button>
+      </header>
+      <div id="global-modal-body" class="dialog-body"></div>
+      <footer id="global-modal-footer" class="dialog-footer"></footer>
     </div>
   </dialog>
 
-  <!-- 弹窗 4：全表字段物理顺序对比 & 按原序重建表 SQL 预览与执行向导 -->
-  <dialog id="rebuildDialog" closedby="any" aria-labelledby="rebuildDialogTitle" class="modal-dialog modal-dialog-wide">
-    <form id="rebuildForm">
-      <div class="modal-header">
-        <div>
-          <h2 id="rebuildDialogTitle">字段物理顺序 (attnum) 核验与保序转换 SQL 预览</h2>
-          <p id="rebuildTableMetaText" class="dialog-submeta"></p>
-        </div>
-        <button type="button" class="btn-close" data-close-dialog="rebuildDialog" aria-label="关闭弹窗">×</button>
-      </div>
+  <!-- 全局轻提示栈 (Toast) -->
+  <div id="toast-root" class="toast-stack" aria-live="polite" aria-atomic="false"></div>
 
-      <div class="modal-body">
-        <div id="rebuildDialogAlert" class="dialog-alert is-hidden" role="alert"></div>
-
-        <div class="modal-split-body">
-          <div class="order-comparison-box">
-            <h3 class="section-heading">全表字段物理顺序 (pg_attribute.attnum) 前后逐列对比</h3>
-            <div class="mini-table-wrap">
-              <table class="mini-table">
-                <thead>
-                  <tr>
-                    <th>物理位置</th>
-                    <th>当前库内字段 (名称 / 类型 / 注释)</th>
-                    <th>转换后目标字段 (名称 / 类型 / 注释)</th>
-                    <th>变化状态</th>
-                  </tr>
-                </thead>
-                <tbody id="orderCompareBody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="sql-preview-box">
-            <div class="sql-box-header">
-              <h3 class="section-heading">生成的事务级保序 SQL 脚本</h3>
-              <div class="sql-box-controls">
-                <label class="checkbox-inline" for="chkKeepBackup">
-                  <input type="checkbox" id="chkKeepBackup" name="keep_backup" checked>
-                  <span>重建时将原表重命名保留为 __bak 备份表</span>
-                </label>
-                <button type="button" id="btnCopySql" class="btn btn-secondary btn-sm">复制 SQL 脚本</button>
-              </div>
-            </div>
-            <pre id="sqlPreviewCode" class="sql-code-block"></pre>
-          </div>
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-close-dialog="rebuildDialog">关闭</button>
-        <button type="submit" id="btnConfirmRebuild" class="btn btn-accent">
-          一键执行「按原表顺序重建表并迁移数据」
-        </button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- 弹窗 5：跨环境数据库连接配置（支持 PGSQL / 华为 DWS / 星环 Inceptor） -->
-  <dialog id="crossConnDialog" closedby="any" aria-labelledby="crossConnDialogTitle" class="modal-dialog">
-    <form id="crossConnForm">
-      <input type="hidden" id="crossConnRoleInput" name="role" value="source">
-      <div class="modal-header">
-        <h2 id="crossConnDialogTitle">配置跨环境数据库连接 (PGSQL / 华为 DWS / 星环 Inceptor)</h2>
-        <button type="button" class="btn-close" data-close-dialog="crossConnDialog" aria-label="关闭弹窗">×</button>
-      </div>
-
-      <div class="modal-body">
-        <div id="crossConnDialogAlert" class="dialog-alert is-hidden" role="alert"></div>
-
-        <fieldset class="form-fieldset">
-          <legend>选择数据库类型与连接参数（配置后自动持久保存于本地 SQLite）</legend>
-          <div class="form-row-2">
-            <div class="form-group">
-              <label for="crossDbTypeSelect">数据库引擎类型</label>
-              <select id="crossDbTypeSelect" name="db_type">
-                <option value="DWS">华为云 GaussDB(DWS) (默认端口 8000)</option>
-                <option value="PGSQL">PostgreSQL (默认端口 5432)</option>
-                <option value="INCEPTOR">星环 Transwarp Inceptor (HiveServer2 默认 10000)</option>
-              </select>
-            </div>
-            <div class="form-group">
-              <label for="crossAuthModeSelect">认证/SSL 模式</label>
-              <select id="crossAuthModeSelect" name="auth_mode">
-                <option value="LDAP">prefer / LDAP (用户名密码认证)</option>
-                <option value="NONE">disable / NONE (免密或内网直连)</option>
-                <option value="NOSASL">require / NOSASL (Inceptor 原始传输)</option>
-              </select>
-            </div>
-          </div>
-
-          <div class="form-row-2">
-            <div class="form-group">
-              <label for="crossHostInput">主机地址 (Host)</label>
-              <input type="text" id="crossHostInput" name="host" placeholder="例如 192.168.1.100" required autocomplete="off">
-            </div>
-            <div class="form-group">
-              <label for="crossPortInput">端口 (Port)</label>
-              <input type="number" id="crossPortInput" name="port" value="8000" min="1" max="65535" required>
-            </div>
-          </div>
-
-          <div class="form-row-2">
-            <div class="form-group">
-              <label for="crossDbNameInput">数据库名 (Database)</label>
-              <input type="text" id="crossDbNameInput" name="dbname" placeholder="如 gaussdb / postgres / default" required autocomplete="off">
-            </div>
-            <div class="form-group">
-              <label for="crossSchemaInput">默认模式名 (Schema)</label>
-              <input type="text" id="crossSchemaInput" name="schema_name" placeholder="如 public 或 Inceptor 库名" autocomplete="off">
-            </div>
-          </div>
-
-          <div class="form-row-2">
-            <div class="form-group">
-              <label for="crossUserInput">用户名 (User)</label>
-              <input type="text" id="crossUserInput" name="user" placeholder="如 dbadmin / postgres / hive" autocomplete="username">
-            </div>
-            <div class="form-group">
-              <label for="crossPasswordInput">密码 (Password，留空沿用已存密码)</label>
-              <input type="password" id="crossPasswordInput" name="password" placeholder="输入数据库密码" autocomplete="current-password">
-            </div>
-          </div>
-        </fieldset>
-      </div>
-
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-close-dialog="crossConnDialog">取消</button>
-        <button type="submit" id="btnSaveCrossConn" class="btn btn-primary">测试连接并读取表目录</button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- 弹窗 6：上传数据标准或导入三方绑定配置包 -->
-  <dialog id="crossUploadDialog" closedby="any" aria-labelledby="crossUploadDialogTitle" class="modal-dialog">
-    <form id="crossUploadForm">
-      <div class="modal-header">
-        <h2 id="crossUploadDialogTitle">上传数据标准清单 / 批量导入三方绑定包</h2>
-        <button type="button" class="btn-close" data-close-dialog="crossUploadDialog" aria-label="关闭弹窗">×</button>
-      </div>
-
-      <div class="modal-body">
-        <div id="crossUploadDialogAlert" class="dialog-alert is-hidden" role="alert"></div>
-        <p class="dialog-hint">
-          支持上传两种格式：
-          1. <strong>落标清单或数标 Excel (.xlsx)</strong>：自动提取表名、原字段（绑定来源库）、新字段/数据标准（绑定中间数标与目标库），并支持继承本程序导出的三方绑定表；
-          2. <strong>跨环境绑定配置包 (.json)</strong>：一键恢复全部表级与字段级三方绑定关系。
-        </p>
-        <div class="form-group">
-          <label for="inputCrossFile">选择数标 Excel (.xlsx) 或绑定包 (.json)</label>
-          <input type="file" id="inputCrossFile" name="file" accept=".xlsx,.json" required>
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-close-dialog="crossUploadDialog">取消</button>
-        <button type="submit" id="btnSubmitCrossUpload" class="btn btn-primary">导入并建立三方绑定</button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- 弹窗 7：跨环境建表语句导出与多方言翻译器 (PGSQL ⟷ 华为 DWS ⟷ 星环 Inceptor) -->
-  <dialog id="ddlTranslateDialog" closedby="any" aria-labelledby="ddlTranslateDialogTitle" class="modal-dialog modal-dialog-wide">
-    <form id="ddlTranslateForm">
-      <div class="modal-header">
-        <div>
-          <h2 id="ddlTranslateDialogTitle">跨环境建表语句 (DDL) 提取、视图穿透与多方言智能翻译器</h2>
-          <p id="ddlTranslateSubTitle" class="dialog-submeta">
-            支持从来源库（物理表或视图自动穿透基表）、目标库、数据标准或直接粘贴的 CREATE VIEW / SELECT 语句提取完整表结构，一键生成 PGSQL、华为 DWS、星环 Inceptor 可执行建表 SQL
-          </p>
-        </div>
-        <button type="button" class="btn-close" data-close-dialog="ddlTranslateDialog" aria-label="关闭弹窗">×</button>
-      </div>
-
-      <div class="modal-body">
-        <div id="ddlTranslateAlert" class="dialog-alert is-hidden" role="alert"></div>
-
-        <!-- 顶部参数配置矩阵 -->
-        <fieldset class="form-fieldset ddl-config-fieldset">
-          <legend>选择来源环境（支持物理表 &amp; 视图穿透）与目标环境数据库方言</legend>
-          <div class="ddl-config-grid">
-            <div class="form-group">
-              <label for="ddlSourceRoleSelect">来源环境 / 视图解析模式</label>
-              <select id="ddlSourceRoleSelect" name="source_role" autofocus>
-                <option value="source">左列 · 来源库 (支持物理表 &amp; 视图自动穿透)</option>
-                <option value="target">右列 · 目标库 (支持物理表 &amp; 视图自动穿透)</option>
-                <option value="standard">中列 · 数据标准清单 (Data Standard)</option>
-                <option value="view_sql">粘贴视图 DDL / SELECT 语句逆向建表 (支持任意库视图)</option>
-              </select>
-            </div>
-
-            <div class="form-group">
-              <label for="ddlSourceSchemaInput">来源模式/库名 (Schema)</label>
-              <input type="text" id="ddlSourceSchemaInput" name="source_schema" placeholder="如 public / ods">
-            </div>
-
-            <div class="form-group">
-              <label for="ddlSourceTableInput">来源表名或视图名 (Table / View)</label>
-              <input type="text" id="ddlSourceTableInput" name="source_table" list="ddlAllTablesDatalist" placeholder="选择或输入表名/视图名">
-              <datalist id="ddlAllTablesDatalist"></datalist>
-            </div>
-
-            <div class="form-group">
-              <label for="ddlTargetDialectSelect">目标数据库方言</label>
-              <select id="ddlTargetDialectSelect" name="target_dialect">
-                <option value="DWS">华为云 GaussDB(DWS)</option>
-                <option value="PGSQL">PostgreSQL (PGSQL)</option>
-                <option value="INCEPTOR">星环科技 Transwarp Inceptor</option>
-              </select>
-            </div>
-
-            <div class="form-group">
-              <label for="ddlStorageModeSelect">目标表存储与事务特性</label>
-              <select id="ddlStorageModeSelect" name="storage_mode">
-                <option value="AUTO">自动推荐各引擎最佳实践 (AUTO)</option>
-                <option value="DWS_ROW">DWS 行存表 (orientation=row, DISTRIBUTE BY HASH)</option>
-                <option value="DWS_COLUMN">DWS 列存高压缩表 (orientation=column, compression=middle)</option>
-                <option value="INCEPTOR_ORC_TXN">星环 Inceptor ORC 事务分桶表 (CLUSTERED + transactional)</option>
-                <option value="INCEPTOR_ORC">星环 Inceptor 标准 ORC 表 (STORED AS ORC)</option>
-                <option value="INCEPTOR_HOLODESK">星环 Inceptor Holodesk 内存分析表 (STORED AS HOLODESK)</option>
-                <option value="INCEPTOR_TEXTFILE">星环 Inceptor 文本表 (STORED AS TEXTFILE)</option>
-                <option value="PGSQL_HEAP">PostgreSQL 标准 Heap 表 + COMMENT 注释</option>
-              </select>
-            </div>
-
-            <div class="form-group">
-              <label for="ddlTargetSchemaInput">生成目标模式名</label>
-              <input type="text" id="ddlTargetSchemaInput" name="target_schema" placeholder="留空则沿用来源模式名">
-            </div>
-
-            <div class="form-group">
-              <label for="ddlTargetTableInput">生成目标表名</label>
-              <input type="text" id="ddlTargetTableInput" name="target_table" placeholder="留空则沿用来源表名">
-            </div>
-
-            <div class="form-group ddl-config-actions">
-              <label class="checkbox-inline" for="chkDdlApplyStandard" title="勾选后将自动按中间数据标准替换字段名、数据类型及中文注释">
-                <input type="checkbox" id="chkDdlApplyStandard" name="apply_standard_mapping">
-                <span>同时套用中间数据标准</span>
-              </label>
-              <button type="submit" id="btnGenerateTranslatedDdl" class="btn btn-primary btn-sm">
-                生成目标环境建表 DDL
-              </button>
-            </div>
-          </div>
-
-          <div id="ddlViewSqlGroup" class="form-group ddl-view-sql-group is-hidden">
-            <label for="ddlViewSqlInput">
-              粘贴上游视图定义 SQL（支持星环 Inceptor / Hive / DWS / PGSQL 的 <code>CREATE VIEW ... AS SELECT ...</code> 或纯 <code>SELECT</code> 语句，系统将自动解析字段血缘、穿透基表并逆向推演物理表结构）
-            </label>
-            <textarea id="ddlViewSqlInput" name="view_sql" rows="4" class="ddl-view-sql-textarea" placeholder="示例：CREATE VIEW ods.v_cust_loan AS SELECT a.cust_id, a.cust_name, CAST(b.loan_amt AS DECIMAL(18,2)) AS loan_amt, b.stat_dt FROM ods.t_cust_info a LEFT JOIN ods.t_loan_contract b ON a.cust_id = b.cust_id;"></textarea>
-          </div>
-        </fieldset>
-
-        <!-- 左右双栏预览：左侧来源表结构 & 类型映射明细，右侧目标环境可执行建表 DDL -->
-        <div class="modal-split-body ddl-split-body">
-          <div class="order-comparison-box">
-            <div class="sql-box-header">
-              <h3 class="section-heading" id="ddlSourceBoxTitle">来源表原始 DDL 与跨方言类型映射明细</h3>
-              <span id="ddlSourceOriginBadge" class="db-type-pill">待生成</span>
-            </div>
-            <pre id="ddlSourcePreviewCode" class="sql-code-block ddl-source-code-block">-- 点击上方「生成目标环境建表 DDL」提取来源表结构</pre>
-            <div class="mini-table-wrap ddl-mapping-table-wrap">
-              <table class="mini-table">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>字段名</th>
-                    <th>来源类型</th>
-                    <th>目标方言类型</th>
-                    <th>方言转换说明 / 注释</th>
-                  </tr>
-                </thead>
-                <tbody id="ddlTypeMappingBody"></tbody>
-              </table>
-            </div>
-          </div>
-
-          <div class="sql-preview-box">
-            <div class="sql-box-header">
-              <h3 class="section-heading" id="ddlTargetBoxTitle">生成的目标环境可执行建表语句 (CREATE TABLE)</h3>
-              <div class="sql-box-controls">
-                <button type="button" id="btnCopyTranslatedDdl" class="btn btn-primary btn-sm">一键复制目标建表 DDL</button>
-                <button type="button" id="btnDownloadTranslatedDdl" class="btn btn-secondary btn-sm">下载 .sql 脚本</button>
-              </div>
-            </div>
-            <pre id="ddlTargetPreviewCode" class="sql-code-block ddl-target-code-block">-- 生成的目标方言建表语句将显示在此处，可直接复制粘贴至目标库客户端执行</pre>
-          </div>
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-close-dialog="ddlTranslateDialog">关闭</button>
-      </div>
-    </form>
-  </dialog>
-
-  <!-- 顶部轻量级通知条 -->
-  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
-
-  <script src="/app.js"></script>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>
