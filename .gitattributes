@@ -1,0 +1,32 @@
+# 默认对文本文件自动归一化换行符，检出时统一为 LF（防止 macOS 与 Windows 跨分支切换出现满屏换行符冲突）
+* text=auto eol=lf
+
+# Python / Web 前端 / 文档 / GitHub Actions 明确使用 LF
+*.py text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.sql text eol=lf
+
+# Windows 批处理与脚本强制保留 CRLF，确保 cmd.exe / PowerShell 正常解析
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# 二进制文件禁止 Git 进行文本转换或行尾替换
+*.xlsx binary
+*.xls binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.exe binary
+*.dll binary
+*.zip binary
+

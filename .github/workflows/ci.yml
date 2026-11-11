@@ -1,0 +1,85 @@
+name: CI & Windows Build
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unit-tests:
+    name: 自动化单元测试校验
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装项目依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 运行核心单元测试与启动自检
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+          python app.py --test
+
+  build-windows-exe:
+    name: 打包 Windows 独立可执行程序 (.exe)
+    needs: unit-tests
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11 (Windows x64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 安装打包依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 执行 PyInstaller 打包脚本
+        run: python build_exe.py
+
+      - name: 压缩可执行程序目录
+        shell: pwsh
+        run: |
+          $shortSha = (git rev-parse --short HEAD).Trim()
+          $version = if ("${{ github.ref_name }}" -like "v*") { "${{ github.ref_name }}" } else { "dev-$shortSha" }
+          $zipName = "DWS字段贯标工具-Windows-x64-$version.zip"
+          Compress-Archive -Path "dist/DWS字段贯标工具/*" -DestinationPath $zipName -Force
+          echo "ZIP_PATH=$zipName" >> $env:GITHUB_ENV
+
+      - name: 上传构建产物至 GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DWS字段贯标工具-Windows-x64
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 30
+
+      - name: 自动发布至 GitHub Releases (仅限 v* 版本标签)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_PATH }}
+          generate_release_notes: true
