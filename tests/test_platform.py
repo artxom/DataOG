@@ -648,6 +648,84 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             parsed_json = extract_json_payload("输出结果如下：\n```json\n[{\"cn\":\"客户号\",\"en\":\"cust_no\"}]\n```")
             self.assertEqual(parsed_json[0]["en"], "cust_no")
 
+            # 5. 验证零第三方 SDK 的原生标准库 HTTP 客户端真实回环通信（含 Bearer 鉴权、模型拉取与 HTTP 错误提取）
+            import http.server
+            import threading
+
+            received_auth: List[str] = []
+
+            class _MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                    return
+
+                def do_GET(self) -> None:  # noqa: N802
+                    received_auth.append(self.headers.get("Authorization", ""))
+                    if self.path.endswith("/models"):
+                        payload = {"data": [{"id": "models/gemini-2.5-flash"}, {"id": "deepseek-chat"}]}
+                        raw = json.dumps(payload).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        return
+                    self.send_response(404)
+                    self.end_headers()
+
+                def do_POST(self) -> None:  # noqa: N802
+                    received_auth.append(self.headers.get("Authorization", ""))
+                    length = int(self.headers.get("Content-Length", "0") or 0)
+                    req_json = json.loads(self.rfile.read(length).decode("utf-8"))
+                    if req_json.get("model") == "bad-model":
+                        err_bytes = json.dumps({"error": {"message": "Model not found"}}).encode("utf-8")
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(err_bytes)))
+                        self.end_headers()
+                        self.wfile.write(err_bytes)
+                        return
+                    resp_bytes = json.dumps(
+                        {"choices": [{"message": {"content": f"STDLIB_OK:{req_json.get('model')}"}}]}
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(resp_bytes)))
+                    self.end_headers()
+                    self.wfile.write(resp_bytes)
+
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockOpenAIHandler)
+            port = httpd.server_address[1]
+            srv_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            srv_thread.start()
+            try:
+                stdlib_hub = LLMHub(store)
+                stdlib_hub.save_provider(
+                    {
+                        "provider_id": "local_gw",
+                        "name": "本地测试网关",
+                        "provider_type": "GEMINI",
+                        "base_url": f"http://127.0.0.1:{port}/v1",
+                        "api_key": "sk-stdlib-token-777",
+                        "default_model": "gemini-2.5-flash",
+                        "enabled": True,
+                    }
+                )
+                ping_std = stdlib_hub.test_provider({"provider_id": "local_gw"})
+                self.assertEqual(ping_std["reply_preview"], "STDLIB_OK:gemini-2.5-flash")
+                models_std = stdlib_hub.fetch_models({"provider_id": "local_gw"})
+                self.assertEqual(models_std["models"], ["gemini-2.5-flash", "deepseek-chat"])
+                self.assertTrue(all(a == "Bearer sk-stdlib-token-777" for a in received_auth))
+                with self.assertRaises(RuntimeError) as err_ctx:
+                    stdlib_hub.chat_completion(
+                        provider_id="local_gw",
+                        model="bad-model",
+                        messages=[{"role": "user", "content": "hi"}],
+                    )
+                self.assertIn("Model not found", str(err_ctx.exception))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

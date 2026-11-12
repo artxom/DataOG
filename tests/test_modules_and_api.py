@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import contextlib
 import dis
 import glob
@@ -18,14 +19,175 @@ import sys
 import tempfile
 import types
 import unittest
+import uuid
 import zipfile
+from typing import Any, Dict, List, Optional, Tuple
 from unittest import mock
+from urllib.parse import urlencode, urlsplit
 
 import openpyxl
-from fastapi.testclient import TestClient
 
 from app import create_app, resolve_static_dir
 from core.platform.context import PlatformContext
+
+
+class _CaseInsensitiveHeaders:
+    def __init__(self, pairs: List[Tuple[bytes, bytes]]) -> None:
+        self._map: Dict[str, str] = {
+            k.decode("latin-1").lower(): v.decode("latin-1") for k, v in pairs
+        }
+
+    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        return self._map.get(key.lower(), default)
+
+    def __contains__(self, key: str) -> bool:
+        return key.lower() in self._map
+
+
+class _AsgiResponse:
+    def __init__(self, status_code: int, raw_headers: List[Tuple[bytes, bytes]], content: bytes) -> None:
+        self.status_code = status_code
+        self.headers = _CaseInsensitiveHeaders(raw_headers)
+        self.content = content
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", errors="replace")
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+class TestClient:
+    """零第三方 HTTP 依赖的标准库内存 ASGI 测试客户端（免打包 httpx / httpcore / certifi）."""
+
+    __test__ = False
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    @staticmethod
+    def _encode_multipart(
+        data: Optional[Dict[str, Any]],
+        files: Dict[str, Tuple[str, bytes, str]],
+    ) -> Tuple[bytes, str]:
+        boundary = f"----DataOGBoundary{uuid.uuid4().hex}"
+        chunks: List[bytes] = []
+        for k, v in (data or {}).items():
+            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+            chunks.append(f'Content-Disposition: form-data; name="{k}"\r\n\r\n'.encode("utf-8"))
+            chunks.append(str(v).encode("utf-8") + b"\r\n")
+        for field_name, file_spec in files.items():
+            filename, file_bytes, content_type = file_spec
+            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+            chunks.append(
+                f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode("utf-8")
+            )
+            chunks.append(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+            chunks.append(bytes(file_bytes) + b"\r\n")
+        chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+        return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: Any = None,
+        data: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Tuple[str, bytes, str]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> _AsgiResponse:
+        hdrs: Dict[str, str] = {"host": "127.0.0.1:18080"}
+        if headers:
+            for hk, hv in headers.items():
+                hdrs[hk.lower()] = hv
+
+        body = b""
+        if files:
+            body, ctype = self._encode_multipart(data, files)
+            hdrs["content-type"] = ctype
+        elif json_body is not None:
+            body = json.dumps(json_body, ensure_ascii=False).encode("utf-8")
+            hdrs.setdefault("content-type", "application/json")
+        elif data is not None:
+            body = urlencode(data).encode("utf-8")
+            hdrs.setdefault("content-type", "application/x-www-form-urlencoded")
+
+        if body:
+            hdrs["content-length"] = str(len(body))
+
+        parsed = urlsplit(url)
+        path = parsed.path or "/"
+        query_bytes = parsed.query.encode("ascii")
+        raw_headers = [
+            (k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in hdrs.items()
+        ]
+
+        async def _invoke() -> _AsgiResponse:
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": method.upper(),
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode("utf-8"),
+                "query_string": query_bytes,
+                "headers": raw_headers,
+                "client": ("127.0.0.1", 54321),
+                "server": ("127.0.0.1", 18080),
+            }
+            sent = False
+            status_code = 500
+            resp_headers: List[Tuple[bytes, bytes]] = []
+            resp_chunks: List[bytes] = []
+
+            async def receive() -> Dict[str, Any]:
+                nonlocal sent
+                if not sent:
+                    sent = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def send(msg: Dict[str, Any]) -> None:
+                nonlocal status_code, resp_headers
+                if msg["type"] == "http.response.start":
+                    status_code = int(msg["status"])
+                    resp_headers = list(msg.get("headers") or [])
+                elif msg["type"] == "http.response.body":
+                    resp_chunks.append(msg.get("body") or b"")
+
+            await self.app(scope, receive, send)
+            return _AsgiResponse(status_code, resp_headers, b"".join(resp_chunks))
+
+        return asyncio.run(_invoke())
+
+    def get(self, url: str, *, headers: Optional[Dict[str, str]] = None) -> _AsgiResponse:
+        return self.request("GET", url, headers=headers)
+
+    def post(
+        self,
+        url: str,
+        *,
+        json: Any = None,
+        data: Optional[Dict[str, Any]] = None,
+        files: Optional[Dict[str, Tuple[str, bytes, str]]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> _AsgiResponse:
+        return self.request("POST", url, json_body=json, data=data, files=files, headers=headers)
+
+    def put(
+        self,
+        url: str,
+        *,
+        json: Any = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> _AsgiResponse:
+        return self.request("PUT", url, json_body=json, headers=headers)
+
+    def delete(self, url: str, *, headers: Optional[Dict[str, str]] = None) -> _AsgiResponse:
+        return self.request("DELETE", url, headers=headers)
 
 
 def _build_mini_jar() -> bytes:

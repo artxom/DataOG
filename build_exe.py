@@ -111,7 +111,7 @@ def build_executable() -> None:
         import PyInstaller.__main__
     except ImportError:
         print(
-            "[错误] 当前 Python 环境未安装 pyinstaller，请先执行: python -m pip install -r requirements.txt"
+            "[错误] 当前 Python 环境未安装 pyinstaller，请先执行: python -m pip install -r requirements.txt pyinstaller"
         )
         sys.exit(1)
 
@@ -148,7 +148,11 @@ def build_executable() -> None:
     os.environ["PYINSTALLER_CONFIG_DIR"] = cache_path
 
     excluded_modules = [
+        # 大体积科学计算与 GUI 库
         "tkinter",
+        "turtle",
+        "turtledemo",
+        "idlelib",
         "matplotlib",
         "numpy",
         "pandas",
@@ -160,6 +164,43 @@ def build_executable() -> None:
         "streamlit",
         "altair",
         "pyarrow",
+        "lxml",
+        "cryptography",
+        "objc",
+        "AppKit",
+        "Foundation",
+        "Cocoa",
+        "uvloop",
+        "watchfiles",
+        "websockets",
+        "wsproto",
+        "gunicorn",
+        # 已由标准库替代的重型 SDK 与开发期工具包
+        "openai",
+        "jiter",
+        "httpx",
+        "httpcore",
+        "certifi",
+        "tqdm",
+        "distro",
+        "pytest",
+        "pip",
+        "setuptools",
+        "wheel",
+        "venv",
+        "ensurepip",
+        "lib2to3",
+        "pydoc",
+        "doctest",
+        "curses",
+        # 运行时零引用的框架子包
+        "psycopg2.tests",
+        "pydantic.mypy",
+        "fastapi.cli",
+        "uvicorn.workers",
+        "uvicorn.protocols.websockets",
+        "anyio._backends._trio",
+        "anyio.pytest_plugin",
     ]
 
     pyinstaller_args = [
@@ -174,23 +215,23 @@ def build_executable() -> None:
         f"--add-data={add_tests_arg}",
         "--collect-submodules=fastapi",
         "--collect-submodules=pydantic",
-        "--collect-all=pydantic_core",
+        "--collect-binaries=pydantic_core",
+        "--hidden-import=pydantic_core",
         "--collect-submodules=starlette",
         "--collect-submodules=uvicorn",
         "--collect-submodules=anyio",
         "--collect-submodules=openpyxl",
         "--collect-submodules=multipart",
         "--collect-submodules=pymysql",
-        "--collect-all=psycopg2",
+        "--collect-binaries=psycopg2",
+        "--collect-submodules=psycopg2",
         "--collect-submodules=core",
         "--collect-submodules=modules",
         "--hidden-import=h11",
         "--hidden-import=et_xmlfile",
+        "--hidden-import=http.server",
         "--hidden-import=unittest.mock",
     ]
-    for opt_pkg in ("httpx", "httpx2", "httpcore2", "openai", "jiter", "truststore", "sniffio"):
-        if importlib.util.find_spec(opt_pkg) is not None:
-            pyinstaller_args.append(f"--collect-submodules={opt_pkg}")
     if importlib.util.find_spec("jpype") is not None:
         pyinstaller_args.append("--collect-all=jpype")
 
@@ -198,7 +239,7 @@ def build_executable() -> None:
         pyinstaller_args.append(f"--exclude-module={mod}")
 
     print(
-        "[2/3] 正在调用 PyInstaller 打包 DataOG 独立可执行程序 (包含完整 Python 环境与模块化静态资源) ..."
+        "[2/3] 正在调用 PyInstaller 轻量化打包 Data.O.G 独立可执行程序 ..."
     )
     try:
         PyInstaller.__main__.run(pyinstaller_args)
@@ -206,24 +247,35 @@ def build_executable() -> None:
         _safe_rmtree(temp_build_root)
 
     dist_bundle_dir = os.path.join(project_dir, "dist", exe_name)
-    sample_excel = os.path.join(project_dir, "示例_DWS字段贯标清单.xlsx")
+    bundle_size_mb = 0.0
     if os.path.isdir(dist_bundle_dir):
-        if os.path.isfile(sample_excel):
-            shutil.copy2(
-                sample_excel, os.path.join(dist_bundle_dir, "示例_DWS字段贯标清单.xlsx")
-            )
-        target_static = os.path.join(dist_bundle_dir, "static")
-        if os.path.exists(target_static):
-            shutil.rmtree(target_static, ignore_errors=True)
-        shutil.copytree(static_src, target_static)
+        internal_dir = os.path.join(dist_bundle_dir, "_internal")
+        if os.path.isdir(internal_dir):
+            for root, dirs, files in os.walk(internal_dir, topdown=False):
+                for fname in files:
+                    if fname.endswith((".pyi", ".pxd", ".c", ".h")):
+                        try:
+                            os.remove(os.path.join(root, fname))
+                        except OSError:
+                            pass
+                for dname in dirs:
+                    if dname == "__pycache__":
+                        _safe_rmtree(os.path.join(root, dname))
+
         os.makedirs(os.path.join(dist_bundle_dir, "data", "drivers"), exist_ok=True)
         os.makedirs(os.path.join(dist_bundle_dir, "data", "assets"), exist_ok=True)
+        total_bytes = sum(
+            os.path.getsize(os.path.join(r, f))
+            for r, _, fs in os.walk(dist_bundle_dir)
+            for f in fs
+        )
+        bundle_size_mb = total_bytes / (1024 * 1024)
 
     exe_ext = ".exe" if os.name == "nt" else ""
     output_exe = os.path.join(dist_bundle_dir, f"{exe_name}{exe_ext}")
 
     print("\n" + "=" * 74)
-    print("[3/3] DataOG 打包完成！")
+    print(f"[3/3] Data.O.G 轻量化打包完成！（解压态总体积: {bundle_size_mb:.2f} MB）")
     print(f"  [*] 独立运行包目录 : {dist_bundle_dir}")
     print(f"  [*] 可执行程序路径 : {output_exe}")
     print(

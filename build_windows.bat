@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 echo ============================================================================
-echo   DataOG v2.0.0 Workbench - Windows Standalone EXE Builder
+echo   Data.O.G - Windows Standalone EXE Builder
 echo ============================================================================
 echo.
 
@@ -25,7 +25,7 @@ if not exist ".venv\Scripts\python.exe" (
 
 echo [STEP 2] Installing dependencies into .venv ...
 ".venv\Scripts\python.exe" -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
-".venv\Scripts\python.exe" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+".venv\Scripts\python.exe" -m pip install -r requirements.txt "pyinstaller>=6.10.0" -i https://pypi.tuna.tsinghua.edu.cn/simple
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to install dependencies from requirements.txt.
     pause
@@ -43,7 +43,7 @@ goto :DONE
 
 :USE_SYS_PYTHON
 echo [STEP 2] Installing dependencies using system python ...
-python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install -r requirements.txt "pyinstaller>=6.10.0" -i https://pypi.tuna.tsinghua.edu.cn/simple
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to install dependencies.
     pause

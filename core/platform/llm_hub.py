@@ -1,6 +1,6 @@
 """Data.O.G 全局 AI 大模型统一接入中枢 (LLMHub).
 
-参考 Cherry Studio / LobeChat 成熟的多服务商管理架构，采用官方 `openai` Python SDK 统一兼容协议：
+参考 Cherry Studio / LobeChat 成熟的多服务商管理架构，采用零额外第三方依赖的 Python 标准库原生支持 OpenAI 兼容 REST 协议：
 1. 内置三大主流预设（DeepSeek 官方端点、Google Gemini 官方 OpenAI 兼容端点、本地/内网 OpenAI 兼容网关）；
 2. API Key 仅持久化于本地 SQLite `data/dataog_state.db`，所有对外接口严格脱敏回显，留空或回传掩码时自动保留原密钥；
 3. 支持连通性毫秒级测试、远端模型列表拉取（自动兼容剥离 Gemini `models/` 前缀）及结构化 JSON 生成。
@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-
-import httpx
 
 from core.platform.models import LLMProviderProfile
 from core.platform.storage import PlatformStateStore
@@ -367,17 +368,71 @@ class LLMHub:
     def _get_sdk_client(self, profile: LLMProviderProfile, timeout_sec: float = 30.0) -> Any:
         if self._client_factory is not None:
             return self._client_factory(profile, timeout_sec)
-        try:
-            from openai import OpenAI
+        return None
 
-            return OpenAI(
-                api_key=profile.api_key or "local-no-key",
-                base_url=profile.base_url,
-                timeout=timeout_sec,
-                max_retries=1,
-            )
-        except ImportError:
-            return None
+    @staticmethod
+    def _request_openai_json(
+        method: str,
+        endpoint: str,
+        api_key: str,
+        body: Optional[Dict[str, Any]],
+        timeout_sec: float,
+    ) -> Dict[str, Any]:
+        safe_url = validate_llm_base_url(endpoint)
+        headers: Dict[str, str] = {
+            "Accept": "application/json",
+            "User-Agent": "Data.O.G/2.1",
+        }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        payload_bytes: Optional[bytes] = None
+        if body is not None:
+            headers["Content-Type"] = "application/json; charset=utf-8"
+            payload_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+        class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, hdrs, newurl):  # type: ignore[override]
+                validate_llm_base_url(newurl)
+                return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+
+        handlers: List[Any] = [_SafeRedirectHandler()]
+        if safe_url.lower().startswith("https://"):
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        opener = urllib.request.build_opener(*handlers)
+        req = urllib.request.Request(
+            safe_url,
+            data=payload_bytes,
+            headers=headers,
+            method=method.upper(),
+        )
+        try:
+            with opener.open(req, timeout=max(1.0, float(timeout_sec))) as resp:
+                raw = resp.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            err_raw = ""
+            try:
+                err_raw = exc.read(4096).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            err_detail = err_raw.strip()[:300]
+            try:
+                parsed_err = json.loads(err_raw)
+                if isinstance(parsed_err, dict) and isinstance(parsed_err.get("error"), dict):
+                    err_detail = str(parsed_err["error"].get("message") or err_detail)[:300]
+            except Exception:
+                pass
+            raise RuntimeError(f"HTTP {exc.code}: {err_detail or exc.reason}") from None
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"连接 AI 服务端失败: {exc.reason}") from None
+
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError("AI 服务端返回了非 JSON 响应") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError("AI 服务端返回的 JSON 顶层结构异常")
+        return parsed
 
     def _http_fallback_chat(
         self,
@@ -389,9 +444,6 @@ class LLMHub:
         timeout_sec: float,
     ) -> str:
         endpoint = profile.base_url.rstrip("/") + "/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if profile.api_key:
-            headers["Authorization"] = f"Bearer {profile.api_key}"
         body: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -399,27 +451,32 @@ class LLMHub:
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
-        with httpx.Client(timeout=timeout_sec) as http:
-            resp = http.post(endpoint, headers=headers, json=body)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
-            return str(data["choices"][0]["message"]["content"] or "")
+        data = self._request_openai_json(
+            "POST", endpoint, profile.api_key, body, timeout_sec
+        )
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return ""
+        msg = choices[0].get("message") or {}
+        content = msg.get("content") if isinstance(msg, dict) else ""
+        if isinstance(content, list):
+            parts = [
+                str(p.get("text") or "")
+                for p in content
+                if isinstance(p, dict) and p.get("text")
+            ]
+            return "".join(parts)
+        return str(content or "")
 
     def _http_fallback_models(
         self, profile: LLMProviderProfile, timeout_sec: float
     ) -> List[str]:
         endpoint = profile.base_url.rstrip("/") + "/models"
-        headers = {"Accept": "application/json"}
-        if profile.api_key:
-            headers["Authorization"] = f"Bearer {profile.api_key}"
-        with httpx.Client(timeout=timeout_sec) as http:
-            resp = http.get(endpoint, headers=headers)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-            data = resp.json()
-            items = data.get("data") or []
-            return [str(it.get("id") or "") for it in items if isinstance(it, dict) and it.get("id")]
+        data = self._request_openai_json(
+            "GET", endpoint, profile.api_key, None, timeout_sec
+        )
+        items = data.get("data") or []
+        return [str(it.get("id") or "") for it in items if isinstance(it, dict) and it.get("id")]
 
     def chat_completion(
         self,
