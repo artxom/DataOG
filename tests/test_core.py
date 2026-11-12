@@ -32,7 +32,7 @@ from core.excel_handler import (
     generate_template_excel,
     parse_excel_checklist,
 )
-from core.state_store import StateStore
+from core.platform.storage import PlatformStateStore as StateStore
 
 
 async def _call_asgi(
@@ -559,15 +559,18 @@ ENABLE ROW MOVEMENT;"""
 
     def test_cross_env_tri_column_compare_and_bindings_import_export(self) -> None:
         """验证跨环境三栏数标比对中心：来源库(Inceptor/PGSQL) × 数据标准 × 目标库(DWS) 三方绑定、持久化与批量导入导出."""
-        from core.cross_env_engine import CrossEnvCompareEngine, is_cross_type_compatible
+        from core.platform.context import PlatformContext
+        from core.platform.dialects import is_cross_type_compatible
+        from core.platform.models import ColumnMeta as PlatformColumnMeta, TableMeta as PlatformTableMeta
+        from modules.cross_comparator.service import CrossComparatorService
 
         self.assertEqual(is_cross_type_compatible("varchar2(50)", "VARCHAR(50)"), (True, True))
         self.assertEqual(is_cross_type_compatible("string", "varchar(100)"), (False, True))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = StateStore(os.path.join(tmpdir, "state.db"))
-            dws_engine = DWSMigratorEngine(store)
-            cross_engine = CrossEnvCompareEngine(store, dws_engine)
+            ctx = PlatformContext(db_path=os.path.join(tmpdir, "state.db"))
+            store = ctx.store
+            cross_svc = CrossComparatorService(ctx)
 
             # 1) 导入数据标准
             std_items = [
@@ -596,64 +599,71 @@ ENABLE ROW MOVEMENT;"""
             ]
             store.replace_cross_standards(std_items, "数标清单.xlsx")
 
-            # 2) 模拟来源库 (INCEPTOR) 与目标库 (DWS) 已连接并返回各自表结构
-            store.save_meta(
-                "cross_source_conn",
+            # 2) 模拟来源库 (INCEPTOR) 与目标库 (DWS) 已注册并绑定为左右栏角色
+            src_prof = ctx.connection_hub.save_profile(
                 {
-                    "configured": True,
+                    "name": "测试星环源库",
                     "db_type": "INCEPTOR",
                     "host": "10.0.0.11",
                     "port": 10000,
                     "dbname": "ods_db",
-                    "schema_name": "ods_db",
+                    "default_schema": "ods_db",
                     "user": "hive",
-                },
+                }
             )
-            store.save_meta(
-                "cross_target_conn",
+            tgt_prof = ctx.connection_hub.save_profile(
                 {
-                    "configured": True,
+                    "name": "测试DWS目标库",
                     "db_type": "DWS",
                     "host": "10.0.0.22",
                     "port": 8000,
                     "dbname": "dws_db",
-                    "schema_name": "public",
+                    "default_schema": "public",
                     "user": "dbadmin",
-                },
+                }
             )
+            store.save_meta("cross_source_connection_id", src_prof.connection_id)
+            store.save_meta("cross_target_connection_id", tgt_prof.connection_id)
 
-            def fake_inspect_role(role: str, schema_name: str, table_name: str) -> TableMeta:
-                if role == "source":
-                    return TableMeta(
+            def fake_get_table_meta(
+                conn_id: str,
+                schema_name: str,
+                table_name: str,
+                force_refresh: bool = False,
+                penetrate_views: bool = True,
+            ) -> PlatformTableMeta:
+                _ = (force_refresh, penetrate_views)
+                if conn_id == src_prof.connection_id:
+                    return PlatformTableMeta(
                         schema_name=schema_name or "ods_db",
                         table_name=table_name or "t_loan_acct",
                         exists=True,
                         columns=[
-                            ColumnMeta(1, "cst_id", "string", False, None, "客户号"),
-                            ColumnMeta(2, "ln_st", "string", False, None, "状态"),
+                            PlatformColumnMeta(1, "cst_id", "string", False, None, "客户号"),
+                            PlatformColumnMeta(2, "ln_st", "string", False, None, "状态"),
                         ],
                     )
-                return TableMeta(
+                return PlatformTableMeta(
                     schema_name=schema_name or "public",
                     table_name=table_name or "t_loan_acct",
                     exists=True,
                     columns=[
-                        ColumnMeta(1, "cust_id", "character varying(32)", True, None, "客户编号"),
-                        ColumnMeta(2, "ln_st", "character varying(10)", False, None, "状态"),
+                        PlatformColumnMeta(1, "cust_id", "character varying(32)", True, None, "客户编号"),
+                        PlatformColumnMeta(2, "ln_st", "character varying(10)", False, None, "状态"),
                     ],
                 )
 
-            cross_engine.inspect_role_table_metadata = fake_inspect_role  # type: ignore[method-assign]
+            ctx.metadata_hub.get_table_metadata = fake_get_table_meta  # type: ignore[method-assign]
 
-            comp = cross_engine.compare_single_table("t_loan_acct")
+            comp = cross_svc.compare_single_table("t_loan_acct")
             self.assertEqual(comp["summary"]["total"], 2)
             self.assertEqual(comp["summary"]["compliant"], 1)  # cust_id 已落标
             self.assertEqual(comp["summary"]["target_pending"], 1)  # ln_st 待改名为 loan_status
 
             # 3) 修改绑定关系并持久保存
             col_list = comp["standard_panel"]["columns"]
-            cross_engine.save_table_and_column_bindings(
-                "t_loan_acct",
+            cross_svc.save_bindings(
+                std_table_key="t_loan_acct",
                 source_schema="ods_db",
                 source_table="ods_loan_acct",
                 target_schema="public",
@@ -677,13 +687,13 @@ ENABLE ROW MOVEMENT;"""
             self.assertEqual(len(bundle["table_bindings"]), 1)
             self.assertEqual(len(bundle["column_bindings"]), 2)
 
-            excel_bytes = cross_engine.export_comparison_excel("t_loan_acct")
+            excel_bytes = cross_svc.export_comparison_excel_bytes("t_loan_acct")
             self.assertTrue(len(excel_bytes) > 500)
 
             store.clear_cross_standards()
             self.assertEqual(len(store.list_cross_tables()), 0)
 
-            cross_engine.import_bindings_from_file(excel_bytes, "exported_3way.xlsx")
+            cross_svc.import_standard_or_bundle("exported_3way.xlsx", excel_bytes)
             restored_tb = store.get_cross_table_binding("t_loan_acct")
             self.assertIsNotNone(restored_tb)
             assert restored_tb is not None
@@ -691,7 +701,7 @@ ENABLE ROW MOVEMENT;"""
             self.assertEqual(restored_tb["target_table"], "dws_loan_acct")
 
             # 5) 推送至单库批量贯标执行台
-            push_res = cross_engine.push_uncompliant_to_workbench("t_loan_acct")
+            push_res = cross_svc.push_to_migrator("t_loan_acct")
             self.assertEqual(push_res["pushed_count"], 2)
             wb_items = store.list_items()
             self.assertEqual(len(wb_items), 2)
@@ -699,11 +709,10 @@ ENABLE ROW MOVEMENT;"""
 
     def test_cross_dialect_ddl_translation_pgsql_dws_inceptor(self) -> None:
         """验证跨环境建表语句导出与多方言翻译器 (PGSQL ⟷ 华为 DWS ⟷ 星环 Inceptor)."""
-        from core.cross_env_engine import (
-            CrossEnvCompareEngine,
-            build_dialect_ddl,
-            translate_column_type,
-        )
+        from core.platform.context import PlatformContext
+        from core.platform.dialects import build_dialect_ddl, translate_column_type
+        from core.platform.models import ColumnMeta as PlatformColumnMeta, TableMeta as PlatformTableMeta
+        from modules.ddl_translator.service import DdlTranslatorService
 
         # 1) 验证三方核心类型映射
         # Inceptor STRING 作 DWS 分布键时必须转为定长 VARCHAR(255)
@@ -713,12 +722,12 @@ ENABLE ROW MOVEMENT;"""
         self.assertEqual(translate_column_type("TINYINT", "PGSQL")[0], "SMALLINT")
         self.assertEqual(translate_column_type("TINYINT", "DWS")[0], "TINYINT")
         self.assertEqual(translate_column_type("TINYINT", "INCEPTOR")[0], "TINYINT")
-        # NUMERIC(18,2) 與 TIME 在 Inceptor 中分别映射为 DECIMAL(18,2) 與 STRING
+        # NUMERIC(18,2) 与 TIME 在 Inceptor 中分别映射为 DECIMAL(18,2) 与 STRING
         self.assertEqual(translate_column_type("numeric(18,2)", "INCEPTOR")[0], "DECIMAL(18,2)")
         self.assertEqual(translate_column_type("time without time zone", "INCEPTOR")[0], "STRING")
 
         # 2) 验证 build_dialect_ddl 在 DWS / PGSQL / INCEPTOR 下的语法特征（含分区键分离与分桶事务表）
-        sample_meta = TableMeta(
+        sample_meta = PlatformTableMeta(
             schema_name="ods_db",
             table_name="t_acct_txn",
             table_comment="账户交易流水表",
@@ -726,11 +735,11 @@ ENABLE ROW MOVEMENT;"""
             distribute_keys=["acct_no"],
             partition_keys=["stat_dt"],
             columns=[
-                ColumnMeta(1, "acct_no", "STRING", True, None, "账号"),
-                ColumnMeta(2, "txn_amt", " DECIMAL(18,4) ", False, "0.00", "交易金额"),
-                ColumnMeta(3, "txn_time", "time without time zone", False, None, "交易时间"),
-                ColumnMeta(4, "status_flag", "tinyint", True, "1", "状态标志"),
-                ColumnMeta(5, "stat_dt", "DATE", True, None, "统计日期"),
+                PlatformColumnMeta(1, "acct_no", "STRING", True, None, "账号"),
+                PlatformColumnMeta(2, "txn_amt", " DECIMAL(18,4) ", False, "0.00", "交易金额"),
+                PlatformColumnMeta(3, "txn_time", "time without time zone", False, None, "交易时间"),
+                PlatformColumnMeta(4, "status_flag", "tinyint", True, "1", "状态标志"),
+                PlatformColumnMeta(5, "stat_dt", "DATE", True, None, "统计日期"),
             ],
         )
 
@@ -781,11 +790,23 @@ ENABLE ROW MOVEMENT;"""
         # 主字段定义区不能重复出现 stat_dt，仅在 PARTITIONED BY 中出现一次
         self.assertEqual(inc_res["ddl"].count("stat_dt"), 1)
 
-        # 3) 验证 CrossEnvCompareEngine.translate_table_ddl 结合中间数据标准套用转换
+        # 3) 验证 DdlTranslatorService.translate 结合中间数据标准套用转换
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = StateStore(os.path.join(tmpdir, "state.db"))
-            dws_engine = DWSMigratorEngine(store)
-            cross_engine = CrossEnvCompareEngine(store, dws_engine)
+            ctx = PlatformContext(db_path=os.path.join(tmpdir, "state.db"))
+            store = ctx.store
+            translator = DdlTranslatorService(ctx)
+            src_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "测试源库",
+                    "db_type": "INCEPTOR",
+                    "host": "10.0.0.11",
+                    "port": 10000,
+                    "dbname": "ods_db",
+                    "default_schema": "ods_db",
+                }
+            )
+            store.save_meta("cross_source_connection_id", src_prof.connection_id)
+            ctx.metadata_hub.get_table_metadata = lambda *a, **kw: sample_meta  # type: ignore[method-assign]
 
             store.replace_cross_standards(
                 [
@@ -815,15 +836,17 @@ ENABLE ROW MOVEMENT;"""
                 "std.xlsx",
             )
 
-            translated = cross_engine.translate_table_ddl(
-                source_role="source",
-                source_schema="ods_db",
-                source_table="t_acct_txn",
-                target_dialect="DWS",
-                target_schema="public",
-                target_table="dws_acct_std",
-                storage_mode="DWS_ROW",
-                apply_standard_mapping=True,
+            translated = translator.translate(
+                {
+                    "source_role": "source",
+                    "source_schema": "ods_db",
+                    "source_table": "t_acct_txn",
+                    "target_dialect": "DWS",
+                    "target_schema": "public",
+                    "target_table": "dws_acct_std",
+                    "storage_mode": "DWS_ROW",
+                    "apply_standard_mapping": True,
+                }
             )
             self.assertIn("CREATE TABLE public.dws_acct_std", translated["target_ddl"])
             self.assertIn("std_acct_id VARCHAR(64)", translated["target_ddl"])
@@ -837,22 +860,22 @@ ENABLE ROW MOVEMENT;"""
         2. 针对上游星环 Inceptor / DWS / PGSQL 视图 (CREATE VIEW ... AS SELECT ...)，自动解析视图 SQL 血缘并穿透底层物理基表，补全字段精确类型、长度、中文注释、分布键与分区键，逆向生成可执行物理表 CREATE TABLE 语句；
         3. 支持直接粘贴 CREATE VIEW / SELECT 语句逆向推导目标库物理建表 DDL。
         """
-        from core.cross_env_engine import (
-            CrossEnvCompareEngine,
-            InceptorThriftClient,
+        from core.platform.context import PlatformContext
+        from core.platform.dialects import (
+            enrich_view_columns_by_lineage,
+            format_readable_sql_ddl,
             parse_view_sql_lineage,
         )
+        from core.platform.inceptor_client import InceptorThriftClient
+        from core.platform.models import ColumnMeta as PlatformColumnMeta, TableMeta as PlatformTableMeta
+        from modules.cross_comparator.service import CrossComparatorService
+        from modules.ddl_translator.service import DdlTranslatorService
 
         # 1) 验证 InceptorThriftClient._open_session 正确提取 field 3 的 sessionHandle (guid + secret)
         client = InceptorThriftClient("127.0.0.1", 10000, "hive", "secret_pwd", "ods", "LDAP")
         expected_guid = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10"
         expected_secret = b"\xaa\xbb\xcc\xdd\xee\xff\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99"
 
-        # 构造模拟的 TOpenSessionResp 字典结构:
-        # field 1: status (TStatus: statusCode=0)
-        # field 2: serverProtocolVersion=4 (V5)
-        # field 3: sessionHandle (TSessionHandle -> field 1: THandleIdentifier(1: guid, 2: secret))
-        # field 4: configuration (map<string,string> 干扰项)
         fake_parsed_thrift_resp = {
             0: {
                 1: {1: 0},
@@ -899,27 +922,27 @@ ENABLE ROW MOVEMENT;"""
         self.assertEqual(cols_by_name["contract_cnt"]["inferred_type"], "BIGINT")
         self.assertEqual(cols_by_name["stat_dt"]["source_table"], "t_loan_contract")
 
-        # 3) 验证视图底层基表穿透补全 (_enrich_view_metadata_from_lineage + translate_table_ddl)
+        # 3) 验证视图底层基表穿透补全 (enrich_view_columns_by_lineage + DdlTranslatorService.translate)
         with tempfile.TemporaryDirectory() as tmpdir:
-            store = StateStore(os.path.join(tmpdir, "state.db"))
-            dws_engine = DWSMigratorEngine(store)
-            cross_engine = CrossEnvCompareEngine(store, dws_engine)
+            ctx = PlatformContext(db_path=os.path.join(tmpdir, "state.db"))
+            store = ctx.store
+            translator = DdlTranslatorService(ctx)
+            cross_svc = CrossComparatorService(ctx)
 
-            store.save_meta(
-                "cross_source_conn",
+            src_prof = ctx.connection_hub.save_profile(
                 {
-                    "configured": True,
+                    "name": "星环视图源库",
                     "db_type": "INCEPTOR",
                     "host": "10.0.0.11",
                     "port": 10000,
                     "dbname": "ods_db",
-                    "schema_name": "ods_db",
+                    "default_schema": "ods_db",
                     "user": "hive",
-                },
+                }
             )
+            store.save_meta("cross_source_connection_id", src_prof.connection_id)
 
-            # 模拟上游返回的是星环视图（视图自身列类型仅有泛化的 STRING 且无注释，但底层基表有精确 VARCHAR(64)、注释、分布键与分区键）
-            raw_view_meta = TableMeta(
+            raw_view_meta = PlatformTableMeta(
                 schema_name="ods_db",
                 table_name="v_cust_loan_summary",
                 table_comment="",
@@ -928,25 +951,25 @@ ENABLE ROW MOVEMENT;"""
                 view_definition=view_sql,
                 raw_ddl=view_sql.strip(),
                 columns=[
-                    ColumnMeta(1, "customer_id", "STRING", False, None, ""),
-                    ColumnMeta(2, "cust_name", "STRING", False, None, ""),
-                    ColumnMeta(3, "loan_balance", "STRING", False, None, ""),
-                    ColumnMeta(4, "contract_cnt", "BIGINT", False, None, ""),
-                    ColumnMeta(5, "stat_dt", "STRING", False, None, ""),
+                    PlatformColumnMeta(1, "customer_id", "STRING", False, None, ""),
+                    PlatformColumnMeta(2, "cust_name", "STRING", False, None, ""),
+                    PlatformColumnMeta(3, "loan_balance", "STRING", False, None, ""),
+                    PlatformColumnMeta(4, "contract_cnt", "BIGINT", False, None, ""),
+                    PlatformColumnMeta(5, "stat_dt", "STRING", False, None, ""),
                 ],
             )
-            base_cust_meta = TableMeta(
+            base_cust_meta = PlatformTableMeta(
                 schema_name="ods_db",
                 table_name="t_cust_base",
                 table_comment="客户基础信息物理表",
                 exists=True,
                 distribute_keys=["cust_id"],
                 columns=[
-                    ColumnMeta(1, "cust_id", "VARCHAR(64)", True, None, "核心客户号"),
-                    ColumnMeta(2, "cust_name", "VARCHAR(120)", False, None, "客户中文姓名"),
+                    PlatformColumnMeta(1, "cust_id", "VARCHAR(64)", True, None, "核心客户号"),
+                    PlatformColumnMeta(2, "cust_name", "VARCHAR(120)", False, None, "客户中文姓名"),
                 ],
             )
-            base_loan_meta = TableMeta(
+            base_loan_meta = PlatformTableMeta(
                 schema_name="ods_db",
                 table_name="t_loan_contract",
                 table_comment="贷款合同物理表",
@@ -954,61 +977,66 @@ ENABLE ROW MOVEMENT;"""
                 distribute_keys=["cust_id"],
                 partition_keys=["stat_dt"],
                 columns=[
-                    ColumnMeta(1, "contract_no", "VARCHAR(64)", True, None, "合同号"),
-                    ColumnMeta(2, "cust_id", "VARCHAR(64)", True, None, "核心客户号"),
-                    ColumnMeta(3, "loan_bal", "DECIMAL(18,2)", False, None, "合同贷款余额"),
-                    ColumnMeta(4, "stat_dt", "DATE", True, None, "数据统计日期"),
+                    PlatformColumnMeta(1, "contract_no", "VARCHAR(64)", True, None, "合同号"),
+                    PlatformColumnMeta(2, "cust_id", "VARCHAR(64)", True, None, "核心客户号"),
+                    PlatformColumnMeta(3, "loan_bal", "DECIMAL(18,2)", False, None, "合同贷款余额"),
+                    PlatformColumnMeta(4, "stat_dt", "DATE", True, None, "数据统计日期"),
                 ],
             )
 
-            def fake_inspect(role: str, s_name: str, t_name: str) -> TableMeta:
-                if t_name == "v_cust_loan_summary":
-                    return cross_engine._enrich_view_metadata_from_lineage(
-                        raw_view_meta,
-                        base_table_fetcher=lambda bs, bt: (
-                            base_cust_meta
-                            if bt == "t_cust_base"
-                            else base_loan_meta
-                            if bt == "t_loan_contract"
-                            else TableMeta(schema_name=bs, table_name=bt, exists=False)
-                        ),
-                    )
-                if t_name == "t_cust_base":
+            def _fetch_base(bs: str, bt: str) -> PlatformTableMeta:
+                if bt == "t_cust_base":
                     return base_cust_meta
-                if t_name == "t_loan_contract":
+                if bt == "t_loan_contract":
                     return base_loan_meta
-                return TableMeta(schema_name=s_name, table_name=t_name, exists=False)
+                return PlatformTableMeta(schema_name=bs, table_name=bt, exists=False)
 
-            cross_engine.inspect_role_table_metadata = fake_inspect  # type: ignore[method-assign]
+            def fake_get_table_meta(
+                conn_id: str,
+                schema_name: str,
+                table_name: str,
+                force_refresh: bool = False,
+                penetrate_views: bool = True,
+            ) -> PlatformTableMeta:
+                _ = (conn_id, force_refresh, penetrate_views)
+                if table_name == "v_cust_loan_summary":
+                    return enrich_view_columns_by_lineage(
+                        raw_view_meta, fetch_object_fn=_fetch_base, max_depth=4
+                    )
+                return _fetch_base(schema_name, table_name)
 
-            res_dws = cross_engine.translate_table_ddl(
-                source_role="source",
-                source_schema="ods_db",
-                source_table="v_cust_loan_summary",
-                target_dialect="DWS",
-                target_schema="dws_fin",
-                target_table="dws_cust_loan_summary",
+            ctx.metadata_hub.get_table_metadata = fake_get_table_meta  # type: ignore[method-assign]
+
+            res_dws = translator.translate(
+                {
+                    "source_role": "source",
+                    "source_schema": "ods_db",
+                    "source_table": "v_cust_loan_summary",
+                    "target_dialect": "DWS",
+                    "target_schema": "dws_fin",
+                    "target_table": "dws_cust_loan_summary",
+                }
             )
             self.assertEqual(res_dws["source_object_type"], "VIEW")
             self.assertIn("ods_db.t_cust_base", res_dws["penetrated_base_tables"])
             self.assertIn("ods_db.t_loan_contract", res_dws["penetrated_base_tables"])
-            # 验证泛化的 STRING 已被底层基表的精确类型 VARCHAR(64) / VARCHAR(120) / NUMERIC(18,2) / DATE 升级替代！
             self.assertIn("customer_id VARCHAR(64)", res_dws["target_ddl"])
             self.assertIn("cust_name VARCHAR(120)", res_dws["target_ddl"])
             self.assertIn("loan_balance NUMERIC(18,2)", res_dws["target_ddl"])
             self.assertIn("stat_dt DATE", res_dws["target_ddl"])
-            # 验证底层基表的分布键 cust_id（对应视图别名列 customer_id）与分区键 stat_dt 已被自动继承！
             self.assertIn("DISTRIBUTE BY HASH(customer_id)", res_dws["target_ddl"])
             self.assertIn("PARTITION BY RANGE (stat_dt)", res_dws["target_ddl"])
             self.assertIn("COMMENT ON COLUMN dws_fin.dws_cust_loan_summary.cust_name IS '客户中文姓名';", res_dws["target_ddl"])
 
             # 4) 验证直接粘贴视图 SQL 逆向建表 (source_role="view_sql")
-            res_pasted = cross_engine.translate_table_ddl(
-                source_role="view_sql",
-                target_dialect="INCEPTOR",
-                target_schema="dw_ods",
-                target_table="inc_cust_loan_phys",
-                view_sql=view_sql,
+            res_pasted = translator.translate(
+                {
+                    "source_role": "view_sql",
+                    "target_dialect": "INCEPTOR",
+                    "target_schema": "dw_ods",
+                    "target_table": "inc_cust_loan_phys",
+                    "view_sql": view_sql,
+                }
             )
             self.assertEqual(res_pasted["source_object_type"], "VIEW")
             self.assertIn("DROP TABLE IF EXISTS dw_ods.inc_cust_loan_phys;", res_pasted["target_ddl"])
@@ -1018,8 +1046,8 @@ ENABLE ROW MOVEMENT;"""
             self.assertIn("DROP TABLE IF EXISTS dws_fin.dws_cust_loan_summary;", res_dws["target_ddl"])
 
             # 5) 验证未上传/未选择标准表时，直接在来源库选择视图并点击「读取表」不会报错，且自动生成三栏比对结果
-            overview_after_read = cross_engine.save_table_and_column_bindings(
-                "",
+            overview_after_read = cross_svc.save_bindings(
+                std_table_key="",
                 source_schema="ods_db",
                 source_table="v_cust_loan_summary",
                 target_schema="dws_fin",
@@ -1032,15 +1060,13 @@ ENABLE ROW MOVEMENT;"""
             self.assertEqual(len(comp_view["source_panel"]["columns"]), 5)
             self.assertEqual(len(comp_view["standard_panel"]["columns"]), 5)
 
-            # 6) 验证单行超长视图 DDL 自动换行美化 (_format_readable_sql_ddl)
-            from core.cross_env_engine import _format_readable_sql_ddl
-
+            # 6) 验证单行超长视图 DDL 自动换行美化 (format_readable_sql_ddl)
             single_line_view = (
                 "CREATE VIEW ods.v_long AS SELECT a.col1, a.col2, a.col3, a.col4, a.col5, "
                 "b.col6, b.col7, b.col8, b.col9 FROM ods.table_alpha a LEFT JOIN ods.table_beta b "
                 "ON a.col1 = b.col6 WHERE a.col2 = 'ACTIVE' GROUP BY a.col1"
             )
-            formatted_view = _format_readable_sql_ddl(single_line_view)
+            formatted_view = format_readable_sql_ddl(single_line_view)
             self.assertGreater(len(formatted_view.splitlines()), 3)
 
     def test_state_store_branch_rollback_schema_compatibility(self) -> None:

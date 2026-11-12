@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 from psycopg2 import sql as pg_sql
 
-from core.state_store import StateStore
+from core.platform.storage import PlatformStateStore as StateStore
 
 logger = logging.getLogger("dws_migrator")
 
