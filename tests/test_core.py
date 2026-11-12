@@ -61,6 +61,7 @@ async def _call_asgi(
     }
 
     sent_request = False
+    response_complete = asyncio.Event()
     status_code = 500
     resp_headers: Dict[str, str] = {}
     resp_chunks: list[bytes] = []
@@ -70,6 +71,7 @@ async def _call_asgi(
         if not sent_request:
             sent_request = True
             return {"type": "http.request", "body": body, "more_body": False}
+        await response_complete.wait()
         return {"type": "http.disconnect"}
 
     async def send(message: Dict[str, Any]) -> None:
@@ -82,8 +84,13 @@ async def _call_asgi(
             }
         elif message["type"] == "http.response.body":
             resp_chunks.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                response_complete.set()
 
-    await app(scope, receive, send)
+    try:
+        await app(scope, receive, send)
+    finally:
+        response_complete.set()
     return status_code, resp_headers, b"".join(resp_chunks)
 
 

@@ -139,6 +139,7 @@ class TestClient:
                 "server": ("127.0.0.1", 18080),
             }
             sent = False
+            response_complete = asyncio.Event()
             status_code = 500
             resp_headers: List[Tuple[bytes, bytes]] = []
             resp_chunks: List[bytes] = []
@@ -148,6 +149,7 @@ class TestClient:
                 if not sent:
                     sent = True
                     return {"type": "http.request", "body": body, "more_body": False}
+                await response_complete.wait()
                 return {"type": "http.disconnect"}
 
             async def send(msg: Dict[str, Any]) -> None:
@@ -157,8 +159,13 @@ class TestClient:
                     resp_headers = list(msg.get("headers") or [])
                 elif msg["type"] == "http.response.body":
                     resp_chunks.append(msg.get("body") or b"")
+                    if not msg.get("more_body", False):
+                        response_complete.set()
 
-            await self.app(scope, receive, send)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                response_complete.set()
             return _AsgiResponse(status_code, resp_headers, b"".join(resp_chunks))
 
         return asyncio.run(_invoke())
