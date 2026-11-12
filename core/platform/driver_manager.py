@@ -19,6 +19,7 @@ import hashlib
 import io
 import logging
 import os
+from pathlib import Path
 import posixpath
 import shutil
 import sqlite3
@@ -284,11 +285,26 @@ class JdbcConnectionAdapter:
 
     def __init__(self, jdbc_conn: Any) -> None:
         self.raw_jdbc_conn = jdbc_conn
+        self._readonly: bool = False
 
     def cursor(self) -> JdbcCursorAdapter:
         return JdbcCursorAdapter(self.raw_jdbc_conn)
 
+    def set_readonly_mode(self, readonly: bool = True) -> None:
+        """强制开启 JDBC 会话级只读锁并关闭自动提交，确保退出时无条件回滚."""
+        self._readonly = bool(readonly)
+        try:
+            self.raw_jdbc_conn.setAutoCommit(False)
+        except Exception:
+            pass
+        try:
+            self.raw_jdbc_conn.setReadOnly(bool(readonly))
+        except Exception as exc:
+            logger.debug("JDBC setReadOnly(%s) 驱动提示: %s", readonly, exc)
+
     def commit(self) -> None:
+        if self._readonly:
+            raise RuntimeError("JDBC 只读探查会话严禁执行 commit()")
         try:
             if not self.raw_jdbc_conn.getAutoCommit():
                 self.raw_jdbc_conn.commit()
@@ -297,7 +313,7 @@ class JdbcConnectionAdapter:
 
     def rollback(self) -> None:
         try:
-            if not self.raw_jdbc_conn.getAutoCommit():
+            if self._readonly or not self.raw_jdbc_conn.getAutoCommit():
                 self.raw_jdbc_conn.rollback()
         except Exception:
             pass
@@ -611,15 +627,28 @@ class DriverManager:
             )
         return JdbcConnectionAdapter(raw_conn)
 
-    def open_connection(self, profile: ConnectionProfile, timeout_sec: int = 10) -> Any:
-        """根据 ConnectionProfile 打开对应驱动连接（返回 DB-API 连接、InceptorThriftClient 或 JdbcConnectionAdapter）."""
+    def open_connection(
+        self,
+        profile: ConnectionProfile,
+        timeout_sec: int = 10,
+        *,
+        readonly: bool = False,
+    ) -> Any:
+        """根据 ConnectionProfile 打开对应驱动连接（readonly=True 时强制开启数据库会话级硬件只读锁）."""
         track = (profile.driver_track or "NATIVE").strip().upper()
         db_type = (profile.db_type or "DWS").strip().upper()
 
         if track == "JDBC" or db_type in ("DM8", "ORACLE", "DB2", "GBASE", "CUSTOM_JDBC") or (
             db_type == "KINGBASE" and profile.jdbc_driver_id
         ):
-            return self._open_jdbc_connection(profile, timeout_sec=timeout_sec)
+            adapter = self._open_jdbc_connection(profile, timeout_sec=timeout_sec)
+            if readonly:
+                try:
+                    adapter.set_readonly_mode(True)
+                except Exception:
+                    adapter.close()
+                    raise
+            return adapter
 
         if db_type in ("DWS", "PGSQL", "KINGBASE"):
             if psycopg2 is None:
@@ -627,7 +656,7 @@ class DriverManager:
             if not profile.host or not profile.dbname or not profile.user:
                 raise ValueError(f"{db_type} 连接配置不完整（需填写主机、端口、数据库名与用户名）")
             default_port = 8000 if db_type == "DWS" else 5432
-            return psycopg2.connect(
+            conn = psycopg2.connect(
                 host=profile.host.strip(),
                 port=int(profile.port or default_port),
                 dbname=profile.dbname.strip(),
@@ -636,6 +665,22 @@ class DriverManager:
                 sslmode=(profile.sslmode or "prefer").strip(),
                 connect_timeout=max(3, int(timeout_sec)),
             )
+            if readonly:
+                try:
+                    try:
+                        conn.set_session(readonly=True, autocommit=False)
+                    except Exception:
+                        conn.autocommit = False
+                        with conn.cursor() as cur:
+                            cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;")
+                            cur.execute("SET TRANSACTION READ ONLY;")
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise
+            return conn
 
         if db_type == "INCEPTOR":
             if not profile.host:
@@ -657,7 +702,7 @@ class DriverManager:
                 raise RuntimeError("当前环境未安装 PyMySQL 驱动")
             if not profile.host or not profile.user:
                 raise ValueError(f"{db_type} 连接配置不完整（需填写主机地址与用户名）")
-            return pymysql.connect(
+            conn = pymysql.connect(
                 host=profile.host.strip(),
                 port=int(profile.port or 3306),
                 user=profile.user.strip(),
@@ -667,13 +712,57 @@ class DriverManager:
                 connect_timeout=max(3, int(timeout_sec)),
                 read_timeout=max(10, int(timeout_sec) * 3),
                 write_timeout=max(10, int(timeout_sec) * 3),
-                autocommit=True,
+                autocommit=not readonly,
             )
+            if readonly:
+                try:
+                    with conn.cursor() as cur:
+                        try:
+                            cur.execute("SET SESSION TRANSACTION READ ONLY")
+                            cur.execute("START TRANSACTION READ ONLY")
+                        except Exception as ro_exc:
+                            # Doris/StarRocks 等无事务 OLAP 引擎可能不支持 TRANSACTION READ ONLY 语法，
+                            # 对标准 MySQL/MariaDB/TiDB/OceanBase 则严禁忽略异常
+                            if db_type not in ("DORIS", "STARROCKS"):
+                                raise
+                            logger.debug("%s 只读事务提示: %s", db_type, ro_exc)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise
+            return conn
 
         if db_type == "SQLITE":
             raw_path = (profile.sqlite_path or profile.dbname or "").strip()
             if not raw_path:
                 raise ValueError("SQLite 数据源需指定数据库文件路径 (sqlite_path 或 dbname)")
+            if readonly:
+                if raw_path != ":memory:":
+                    abs_sq = os.path.abspath(raw_path)
+                    if not os.path.isfile(abs_sq):
+                        raise FileNotFoundError(f"只读探查目标 SQLite 文件不存在: {abs_sq}")
+                    ro_uri = f"{Path(abs_sq).as_uri()}?mode=ro"
+                    conn = sqlite3.connect(
+                        ro_uri,
+                        uri=True,
+                        timeout=float(max(5, int(timeout_sec))),
+                        check_same_thread=False,
+                    )
+                else:
+                    conn = sqlite3.connect(
+                        ":memory:",
+                        timeout=float(max(5, int(timeout_sec))),
+                        check_same_thread=False,
+                    )
+                try:
+                    conn.execute("PRAGMA query_only = ON;")
+                except Exception:
+                    conn.close()
+                    raise
+                return conn
+
             if raw_path != ":memory:":
                 abs_sq = os.path.abspath(raw_path)
                 os.makedirs(os.path.dirname(abs_sq), exist_ok=True)

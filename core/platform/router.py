@@ -17,6 +17,7 @@ from core.platform.schemas import (
     MetadataRefreshPayload,
     QueryExecutePayload,
     QueryExportPayload,
+    ReadOnlyQueryExecutePayload,
 )
 
 router = APIRouter(prefix="/api/platform", tags=["platform"])
@@ -285,6 +286,24 @@ def api_execute_query(
             payload.connection_id,
             payload.sql,
             limit=payload.limit,
+            timeout_sec=payload.timeout_sec,
+        )
+        return {"ok": True, "result": result.to_dict()}
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
+@router.post("/query/execute-readonly")
+def api_execute_readonly_query(
+    payload: ReadOnlyQueryExecutePayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        result = ctx.query_engine.execute_readonly_sql(
+            payload.connection_id,
+            payload.sql,
+            limit=payload.limit,
+            max_limit_cap=200,
             timeout_sec=payload.timeout_sec,
         )
         return {"ok": True, "result": result.to_dict()}
