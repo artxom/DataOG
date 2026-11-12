@@ -8,6 +8,32 @@
 
 ---
 
+## [2.2.0] - 2026-11-12
+
+### Added
+- **AI 只读智能数据探查模块 (`modules/data_explorer/` — `/api/modules/data_explorer`)**：
+  - 新增目标驱动的多轮大模型自动数据探查引擎（`POST /explore`），零新增第三方依赖直接复用 `LLMHub`（DeepSeek / Google Gemini / OpenAI 兼容网关）与 `MetadataHub` 库表字段上下文，支持数据分布画像、空值/重复/异常脏数据诊断、主外键与跨表关联推断、业务指标核对。
+  - 新增探查会话与采样轨迹持久化管理接口（`GET /sessions`、`POST /sessions`、`GET /sessions/{session_id}`、`PATCH /sessions/{session_id}`、`DELETE /sessions/{session_id}`），通过 `PlatformStateStore.register_table_schema` 幂等注册 `explorer_sessions` 与 `explorer_messages` 表。
+- **平台底座只读 SQL 沙箱与跨驱动硬件只读通道 (`core/platform/`)**：
+  - 新增 `core/platform/readonly_guard.py`（`validate_readonly_sql`）与平台只读执行接口 `POST /api/platform/query/execute-readonly`。
+  - 新增 `ConnectionHub.readonly_session` 与 `QueryEngine.execute_readonly_sql`，统一施加单步采样行数上限（默认 `100` 行，硬上限 `200` 行）与短超时熔断（默认 `12s`）。
+- **macOS 风格「数据探查」双模工作台 (`static/js/ui/database_tree.js` & `static/js/views/`)**：
+  - 顶栏新增 `SQL 查询` | `AI 探查` 分段切换，完整保留目录树浏览、双击表预览、自由 SQL 执行与 CSV/Excel 导出。
+  - 左侧继续沿用 DataGrip 风格四级已连接数据库目录树（`连接` → `Schema` → `表/视图` → `字段`），在 `AI 探查` 模式下支持直接在树节点内联勾选焦点表（含 Schema 级全选与 `indeterminate` 半选态）。
+  - 新增 `explorer_ai_pane.js`，采用原生 `<details>` 折叠面板透明展示每一步执行的采样 SQL、耗时、行集预览与结构化结论卡片，支持一键将探查 SQL 填入主编辑器复核导出，并兼容中文输入法（IME）安全回车发送。
+
+### Changed
+- 升级微内核与应用清单版本至 `2.2.0`，扩充全量自动化单元与红队集成测试至 **30 项**。
+
+### Security
+- **四道引擎级绝对只读硬隔离防线（绝不依赖 Prompt 软约束）**：
+  1. **双模态词法/语法白名单（`ReadOnlySqlGuard`）**：同时在标准 SQL 与反斜杠转义双模式下确定性分词以消除转义歧义偷渡，阻断 MySQL 条件可执行注释 `/*! ... */` 与未闭合注释/Dollar-Quoting，强制单语句（禁 `;` 堆叠），顶层仅放行 `SELECT`、`WITH ... SELECT`（递归校验全部 CTE 子句严禁数据修改型 CTE）、元数据 `SHOW`、`DESCRIBE`/`DESC` 与非 `ANALYZE` `EXPLAIN`，全语句拦截一切写/DDL/DCL/TCL/锁/`INTO` 关键字及跨方言危险控制/文件函数（含双引号标识符包裹调用）。
+  2. **数据库驱动会话级硬件只读锁**：PostgreSQL/DWS 强制 `set_session(readonly=True, autocommit=False)` + `SET TRANSACTION READ ONLY`；MySQL 系强制 `SET SESSION TRANSACTION READ ONLY` + `START TRANSACTION READ ONLY`；SQLite 强制 URI `?mode=ro` + `PRAGMA query_only = ON`；JDBC 强制 `setAutoCommit(False)` + `setReadOnly(True)` 并禁用 `commit()`。
+  3. **零提交与退出无条件回滚**：只读执行路径零 `commit()` 调用，`readonly_session` 在 `finally:` 中无条件调用 `rollback()`。
+  4. **输出二次清洗与步数熔断**：单轮自动探查硬上限 `8` 步熔断，并对 AI 返回的 `recommended_sql` 再次执行只读白名单校验，防止恶意写语句被诱导填入主编辑器。
+
+---
+
 ## [2.1.1] - 2026-11-12
 
 ### Changed

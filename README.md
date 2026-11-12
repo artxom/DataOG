@@ -1,4 +1,4 @@
-# Data.O.G v2.1.1 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.2.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -24,7 +24,9 @@
    - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
    - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
 2. **数据探查 (`explorer`)**
-   - 无框 Finder 风格数据库目录树 + 沉浸式 SQL 编辑器（`⌘+Enter` 执行）+ `结果` / `结构` / `DDL` 三合一面板，默认安全行数截断保护，支持一键导出 CSV / Excel `.xlsx` 或将当前表直接送入「多邻国」。
+   - 顶栏分段切换 **`SQL 查询` | `AI 探查`**，左侧统一维持 **DataGrip 风格四级已连接数据库目录树**（`连接` → `Schema` → `表/视图` → `字段`）。
+   - **`SQL 查询`**：双击表快速抽样预览 + 沉浸式自由 SQL 编辑器（`⌘+Enter` 执行）+ `结果` / `结构` / `DDL` 三合一面板，支持一键导出 CSV / Excel `.xlsx` 或送入「多邻国」。
+   - **`AI 探查`**：在左侧数据库清单直接勾选焦点表（支持 Schema 级全选/半选），结合 `MetadataHub` 与 `LLMHub` 自动规划执行多步只读采样查询（覆盖分布画像、空值/重复/脏数据诊断、主外键与跨表关联推断、业务指标核对），透明展开每一步采样 SQL 与行集依据，支持会话历史持久化与一键将探查 SQL 填入主编辑器；底层由**双模态词法白名单 + 数据库会话硬件只读事务 + 退出无条件回滚 + 行数/超时/步数熔断**四道硬防线 100% 阻断任何写操作。
 3. **数据标准 (`standard`)**
    - 顶栏分段切换 **`贯标` | `比对`**：整合单库物理列序保持批量贯标执行台（`DIRECT_ALTER` / `TABLE_REBUILD`、Kahn 拓扑改名排序、分区边界继承、多线程并发）与跨环境三栏数标比对中心（来源库 × 数据标准 × 目标库双向桥接，一键推送待改规则至贯标执行）。
 4. **多邻国 (`polyglot`)**
@@ -37,15 +39,16 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.1.1 微内核入口（安全响应头、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.2.0 微内核入口（安全响应头、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
 │   │   ├── llm_hub.py            # 零额外依赖标准库 DeepSeek / Gemini / OpenAI 兼容协议大模型中枢
-│   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载）
-│   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文
+│   │   ├── readonly_guard.py     # 双模态词法/语法级只读 SQL 白名单沙箱校验器
+│   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载 + 硬件只读模式）
+│   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文（含 readonly_session 无条件回滚）
 │   │   ├── metadata_hub.py       # 双层元数据探查器与本地 SQLite 缓存检索中枢
-│   │   ├── query_engine.py       # 跨驱动安全截断查询、表数据预览与 CSV/Excel 导出引擎
+│   │   ├── query_engine.py       # 跨驱动安全截断查询、硬件级只读执行通道与 CSV/Excel 导出引擎
 │   │   ├── storage.py            # data/dataog_state.db WAL 状态库、旧版无损迁移与幂等列演进
 │   │   └── dialects/             # 标识符清洗、类型映射矩阵、DDL 生成与四层视图血缘穿透
 │   ├── dws_engine.py             # 单库保序重建、Kahn 拓扑改名与分区继承核心引擎
@@ -53,11 +56,12 @@ DataOG/
 ├── modules/                      # 相互独立的插件化业务模块（严格零跨模块私有导入）
 │   ├── standard_migrator/        # /api/modules/standard_migrator 单库批量落标贯标引擎
 │   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境三栏数标比对引擎
-│   └── ddl_translator/           # /api/modules/ddl_translator    多邻国（智能命名 + 跨方言翻译）
+│   ├── ddl_translator/           # /api/modules/ddl_translator    多邻国（智能命名 + 跨方言翻译）
+│   └── data_explorer/            # /api/modules/data_explorer     AI 只读智能数据探查多轮会话引擎
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（桌面与窗口管理器）、core/、ui/、views/（四大模块视图）
-├── tests/                        # 27 项全量自动化测试（核心算法 / 平台底座 / 模块隔离与安全扫描）
+├── tests/                        # 30 项全量自动化测试（核心算法 / 平台底座 / 只读红队矩阵 / 模块隔离）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -72,8 +76,8 @@ DataOG/
 | **`v1.0.0`** | `main` | 单库保序贯标、16:9 三栏跨环境数标比对、多方言 DDL 翻译与四层视图穿透核心算法基线 |
 | **`v2.0.0`** | `refactor/dataog-workbench` → `main` | `FastAPI` 微内核升级、四大全局数据底座、`modules/*` 插件解耦与 `DataOG.exe` 打包流水线 |
 | **`v2.1.0`** | `feat/macos-desktop-v2.1` → `main` | 品牌升级 **`Data.O.G`**，全面重塑 **macOS 桌面与红黄绿窗口体系（含右下角最小化抽屉）**，拆解为 **系统配置 / 数据探查 / 数据标准 / 多邻国** 四大模块，新增本地自定义壁纸图标存储与 DeepSeek / Gemini 大模型接入 |
-| **`v2.1.1`**（当前正式版） | `refactor/project-slim` → `main` | 全工程深度瘦身与轻量化打包：清理历史冗余模块与一次性脚本，以标准库替代 `openai` / `httpx` 重型依赖，Windows 发行包缩减 `29.2%` 至 `19.42 MB` |
-| **`v2.2.0`**（下一阶段规划） | 待切出 `feat/explorer-ai-agent` | **数据探查 · AI 只读智能探查会话**：在自由 SQL 查询与随机浏览基础上，接入 `LLMHub` 实现目标驱动的多步自动数据探查与画像诊断（词法白名单 + 数据库只读事务双重零写入保障） |
+| **`v2.1.1`** | `refactor/project-slim` → `main` | 全工程深度瘦身与轻量化打包：清理历史冗余模块与一次性脚本，以标准库替代 `openai` / `httpx` 重型依赖，Windows 发行包缩减 `29.2%` 至 `19.42 MB` |
+| **`v2.2.0`**（当前正式版） | `feat/data-explorer-ai` → `main` | **数据探查 · AI 只读智能探查会话**：保留 DataGrip 四级数据库清单与自由 SQL 查询，新增目标驱动的多轮大模型自动采样探查、结论溯源与会话历史持久化，落地四道引擎级绝对只读硬隔离防线 |
 
 ---
 
@@ -84,7 +88,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（27 项核心引擎、平台底座、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（30 项核心引擎、平台底座、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检
