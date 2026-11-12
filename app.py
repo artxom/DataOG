@@ -125,6 +125,7 @@ try:
     from core.platform.context import PlatformContext
     from core.platform.router import router as platform_router
     from modules.cross_comparator.router import router as cross_comparator_router
+    from modules.data_explorer.router import router as data_explorer_router
     from modules.ddl_translator.router import router as ddl_translator_router
     from modules.standard_migrator.router import router as standard_migrator_router
 except BaseException:
@@ -254,6 +255,12 @@ def create_app(
         subtitle="多方言建表 DDL 互译与上游视图四层血缘自动穿透",
         api_prefix="/api/modules/ddl_translator",
     )
+    ctx.register_module_manifest(
+        module_id="data_explorer",
+        title="AI 只读智能数据探查",
+        subtitle="硬件级只读沙箱与多轮自动采样画像会话",
+        api_prefix="/api/modules/data_explorer",
+    )
 
     store = ctx.store
     engine = DWSMigratorEngine(store)
@@ -265,7 +272,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.1.1",
+        version="2.2.0",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -293,11 +300,12 @@ def create_app(
         response.headers.setdefault("Content-Security-Policy", _SECURITY_CSP)
         return response
 
-    # 注册平台公共底座路由与三大独立插件模块路由
+    # 注册平台公共底座路由与四大独立插件模块路由
     app.include_router(platform_router)
     app.include_router(standard_migrator_router)
     app.include_router(cross_comparator_router)
     app.include_router(ddl_translator_router)
+    app.include_router(data_explorer_router)
 
     # =========================================================================
     # 向后兼容 v1.0.0 历史 API 路由（共享同一底层 PlatformStateStore）
@@ -387,7 +395,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.1.1 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.2.0 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")

@@ -164,6 +164,28 @@ class ConnectionHub:
             except Exception:
                 pass
 
+    @contextlib.contextmanager
+    def readonly_session(
+        self, connection_id: str, timeout_sec: int = 12
+    ) -> Generator[Any, None, None]:
+        """按 connection_id 获取硬件级只读隔离会话上下文，退出时无条件执行 rollback() 并关闭连接."""
+        profile = self.require_profile(connection_id)
+        conn = self.driver_manager.open_connection(
+            profile, timeout_sec=timeout_sec, readonly=True
+        )
+        try:
+            yield conn
+        finally:
+            if hasattr(conn, "rollback"):
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def test_profile(self, profile: ConnectionProfile) -> Dict[str, Any]:
         """执行真实数据库握手与版本/探针查询（绝不记录或返回明文密码）."""
         t0 = time.perf_counter()

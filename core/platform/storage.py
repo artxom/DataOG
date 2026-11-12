@@ -253,6 +253,17 @@ class PlatformStateStore:
             self._ensure_columns_for_table(conn, table_name, expected_columns)
             conn.commit()
 
+    @contextlib.contextmanager
+    def module_db(self):
+        """供业务插件模块执行参数化 SQLite 读写事务的线程安全上下文."""
+        with self._lock, self._get_conn() as conn:
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     @staticmethod
     def _ensure_columns_for_table(
         conn: sqlite3.Connection,

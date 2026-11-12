@@ -20,6 +20,8 @@ export function el(tag, props = {}, ...children) {
         node.className = String(v);
       } else if (k === "text") {
         node.textContent = String(v);
+      } else if (k === "indeterminate") {
+        node.indeterminate = Boolean(v);
       } else if (k === "dataset" && typeof v === "object") {
         for (const [dk, dv] of Object.entries(v)) {
           if (dv !== undefined && dv !== null) {
@@ -117,6 +119,9 @@ const ICON_PATHS = {
   folder: "M3 6h6l2 2h10v10H3V6z",
   upload: "M12 16V4m0 0l-4 4m4-4l4 4M4 18v2h16v-2",
   copy: "M9 9h10v11H9V9zm-4 6H4V4h10v1",
+  plus: "M12 5v14M5 12h14",
+  trash: "M4 7h16M9 7V4h6v3m-7 3v7m4-7v7m4-7v7M6 7l1 13h10l1-13",
+  send: "M21 3L10 14M21 3l-7 18-4-7-7-4 18-7z",
 };
 
 /**

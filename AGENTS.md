@@ -19,8 +19,9 @@
 2. **全局元数据共享中枢 (`MetadataHub`)**：
    - 统一标准化元数据模型：`Catalog/Schema` → `Table/View/MatView` → `ColumnMeta`（物理列序 `ordinal_position`、原始类型与归一化类型、非空 `is_not_null`、默认值、注释、主键/索引、分布键/分桶键、分区键）。
    - **双层探查与本地持久化缓存**：针对深度适配库（DWS/PG/Inceptor/MySQL）使用定制高性能探查器；针对任意自定义 JDBC 驱动库自动回退使用标准 `java.sql.DatabaseMetaData` 通用探查器；采集结果持久化缓存至本地 SQLite 元数据索引表，支持增量刷新与 `⌘K` Spotlight 全局秒级检索。
-3. **通用数据查询与预览中心 (`QueryEngine`)**：
-   - 提供跨驱动统一的 SQL 查询与表数据快速预览能力，输出标准 `QueryResult`（列头类型描述、行集、耗时、默认 `LIMIT 500`/上限 `5000` 安全截断、查询超时保护、CSV/Excel 导出）。
+3. **通用数据查询、预览与硬件级只读沙箱中心 (`QueryEngine` & `ReadOnlySqlGuard`)**：
+   - 提供跨驱动统一的自由 SQL 查询与表数据快速预览能力，输出标准 `QueryResult`（列头类型描述、行集、耗时、默认 `LIMIT 500`/上限 `5000` 安全截断、查询超时保护、CSV/Excel 导出）。
+   - 内置双模态词法/语法级只读白名单校验器（`readonly_guard.py`）与跨驱动会话级硬件只读执行通道（`execute_readonly_sql` + `ConnectionHub.readonly_session` 退出无条件 `rollback()` + 零 `commit()`），供 AI 探查等零副作用场景复用。
 4. **AI 大模型统一接入中枢 (`LLMHub`)**：
    - 参考 Cherry Studio 多服务商范式，采用零额外第三方依赖的 Python 标准库（`urllib.request` / `ssl` / `json`）原生实现 OpenAI 兼容 REST 协议管理 `llm_providers` 表，内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关预设，支持连通性检测、远端模型拉取（自动剥离 Gemini `models/` 前缀）与结构化 JSON 输出。
 5. **本地壁纸与自定义图标资源中心 (`AssetStore`)**：
@@ -59,42 +60,41 @@
    - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
 
 ## 5. 当前代码基线快照（供下次会话快速定位）
-- **当前主干里程碑版本**：`v2.1.1`（官方品牌名 `Data.O.G`，全工程瘦身与轻量化打包版，`main` 分支与 `v2.1.1` 标签同步至 `origin`）。
+- **当前主干里程碑版本**：`v2.2.0`（官方品牌名 `Data.O.G`，数据探查 · AI 只读智能探查会话版，`main` 分支与 `v2.2.0` 标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI `2.1.1` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、安全头/CSRF 中间件、挂载平台路由与三大插件模块路由，精简移除历史 v1.0 冗余路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
-  - `requirements.txt`：精简为 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），彻底移除 `openai`、`httpx`、`pytest` 等冗余包。
+  - `app.py`：FastAPI `2.2.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
+  - `requirements.txt`：保持 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），零新增第三方依赖。
   - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（去除重复静态资源拷贝、排除非运行时重型包与测试子模块、自动剥离 `.pyi`/`.pxd`/`__pycache__` 冗余元数据，保障冻结态 `--test` 自检）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
   - `context.py` (`PlatformContext`) / `router.py` / `schemas.py` / `models.py`
-  - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，核心表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_env_standards`、`cross_table_mappings`、`cross_column_bindings`、`execution_logs`)
+  - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，暴露线程安全 `module_db()` 上下文，核心与模块表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_env_standards`、`cross_table_mappings`、`cross_column_bindings`、`explorer_sessions`、`explorer_messages`、`execution_logs`)
+  - `readonly_guard.py` (`validate_readonly_sql` / `ReadOnlyViolationError`，双模态 ANSI + 反斜杠转义词法分词器、单语句校验、`SELECT`/`WITH ... SELECT`/`SHOW`/`DESCRIBE`/非 `ANALYZE` `EXPLAIN` 顶层白名单、全语句写/DDL/锁/`INTO` 与跨方言危险系统函数黑名单)
   - `asset_store.py` (`AssetStore`，管理壁纸预设、本地上传壁纸、`Data.O.G` 主图标与四大模块自定义图标持久化至 `data/assets/`，挂载 `/appearance*` 与 `/assets/{asset_name}`)
   - `llm_hub.py` (`LLMHub`，基于 Python 标准库 `urllib.request` 零额外依赖统一接入 DeepSeek、Google Gemini 与自定义 OpenAI 兼容网关，挂载 `/llm/providers*`、`/llm/test`、`/llm/models`)
-  - `driver_manager.py` & `inceptor_client.py` (`DriverManager`，双轨驱动：`NATIVE` + 按需懒加载 `JDBC`)
-  - `connection_hub.py` / `metadata_hub.py` / `query_engine.py` / `excel_io.py` / `dialects/`
+  - `driver_manager.py` & `inceptor_client.py` (`DriverManager`，双轨驱动：`NATIVE` + 按需懒加载 `JDBC`，支持 `open_connection(..., readonly=True)` 会话级硬件只读锁)
+  - `connection_hub.py`（含 `readonly_session` 退出无条件 `rollback()`） / `metadata_hub.py` / `query_engine.py`（含 `execute_readonly_sql` 与 `POST /query/execute-readonly`） / `excel_io.py` / `dialects/`
 - **独立业务插件模块 (`modules/`，严格零跨模块互引)**：
   - `modules/standard_migrator/`（`/api/modules/standard_migrator`）：单库批量落标贯标执行台（依赖 `core/dws_engine.py` 实现 `DIRECT_ALTER` / `TABLE_REBUILD` 物理列保序迁移、Kahn 拓扑改名、分区继承、并发作业池）。
   - `modules/cross_comparator/`（`/api/modules/cross_comparator`）：跨环境三栏数标比对中心（三方双向桥接绑定、Excel/JSON 导入导出、一键推送至贯标台）。
   - `modules/ddl_translator/`（`/api/modules/ddl_translator`）：支撑「多邻国」模块，含 `POST /naming`（AI 大模型 + 内置 170+ 数仓标准词根双驱动智能命名与建表草稿生成）与 `POST /translate`（数据源库表/粘贴 `CREATE TABLE` 或 `VIEW`/自由异构 SQL 跨方言互译、四层递归视图穿透与 `AST+AI` 语法适配）。
+  - `modules/data_explorer/`（`/api/modules/data_explorer`）：支撑「数据探查 · AI 探查」多轮目标驱动只读探查会话，含 `/sessions*` 会话历史管理与 `POST /explore` 多步自动采样推理循环（单步采样上限 `200` 行、`12s` 超时、单轮最多 `8` 步熔断及 `recommended_sql` 二次只读清洗）。
 - **前端原生 ES Modules macOS 桌面工作台 (`static/`)**：
   - `index.html`、`css/tokens.css`（明暗双主题与内置壁纸变量）、`css/workbench.css`、`js/main.js`（macOS 桌面、红黄绿窗口控制器、右下角最小化抽屉、`⌘K` Spotlight、日志控制台）
   - 核心层 `js/core/`：`api.js`、`dom.js`、`state.js`
-  - 公共组件 `js/ui/`：`database_tree.js`、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`modal.js`、`toast.js`
+  - 公共组件 `js/ui/`：`database_tree.js`（DataGrip 风格四级已连接数据库目录树，支持 `single` 浏览与 `multi` 内联 Schema/表级勾选及半选态）、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`modal.js`、`toast.js`
   - 四大桌面应用视图 `js/views/`：
     - **系统配置**：`settings_view.js` + `connections_view.js`（外观与图标 / 数据库连接 / JDBC 驱动 / AI 模型）
-    - **数据探查**：`sql_console_view.js`
+    - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单并支持探查 SQL 一键同步至主编辑器）
     - **数据标准**：`standard_view.js` + `standard_migrator_view.js` + `cross_comparator_view.js`（贯标 | 比对）
     - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
-- **全量自动化测试套件 (`tests/`，当前共 27 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
+- **全量自动化测试套件 (`tests/`，当前共 30 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
   - `tests/test_core.py`（13 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、DDL 互译与四层视图穿透核心引擎。
-  - `tests/test_platform.py`（8 项）：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏。
-  - `tests/test_modules_and_api.py`（6 项）：验证 FastAPI 全路由契约、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、跨环境推送贯标闭环、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
+  - `tests/test_platform.py`（10 项）：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
+  - `tests/test_modules_and_api.py`（7 项）：验证 FastAPI 全路由契约、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、跨环境推送贯标闭环、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
 
-## 6. 下一阶段演进蓝图（供下次新会话直接衔接）：`v2.2.0` 数据探查 · AI 只读智能探查
-- **核心产品目标**：在保留桌面模块 **「数据探查 (`explorer`)」** 现有目录树随机浏览、表数据抽样预览、自由 SQL 查询与 CSV/Excel 导出能力的基础上，新增 **基于大模型 API 的有目的性多轮数据探查会话**（支持数据质量画像、空值/重复值/异常值诊断、主外键与表间关联推断、业务指标核对等目标驱动式探查）。
-- **强制安全红线（100% 纯只读零副作用铁律，绝不依赖 Prompt 软约束）**：
-  1. **词法与语法级只读 SQL 白名单沙箱（`QueryEngine` 扩展只读执行通道）**：剥离注释与字符串字面量后，强制单语句校验（严禁 `;` 多语句堆叠注入），顶层语句仅允许只读探查语法（`SELECT`、`WITH ... SELECT`、`SHOW`、`DESCRIBE`/`DESC`、纯 `EXPLAIN`），全语句扫描严厉拦截任何 `INSERT`、`UPDATE`、`DELETE`、`MERGE`、`UPSERT`、`REPLACE`、`CREATE`、`ALTER`、`DROP`、`TRUNCATE`、`RENAME`、`GRANT`、`REVOKE`、`CALL`、`EXEC`/`EXECUTE`、`COPY`、`LOAD`、`UNLOAD`、`SET`、`VACUUM`、`ANALYZE`、`LOCK`、`SELECT ... INTO`、`INTO OUTFILE`/`DUMPFILE`、`FOR UPDATE`/`FOR SHARE` 及危险系统控制函数（如 `pg_terminate_backend`、`pg_cancel_backend`、`dblink_exec`、`lo_import`/`lo_export` 等）。
-  2. **数据库会话级硬件只读加固**：在探查连接会话层强制开启只读事务/只读模式（PostgreSQL/DWS `SET TRANSACTION READ ONLY`、`PyMySQL` `SET SESSION TRANSACTION READ ONLY`、`SQLite` `PRAGMA query_only = ON`、JDBC `conn.setReadOnly(True)`，并在会话结束时无条件 `rollback()`），双重阻断任何潜在写操作或隐式副作用。
-  3. **探查行数、超时与步数熔断**：AI 发起的单条探查 SQL 强制施加采样行数上限（如 `LIMIT 100~200`）与短超时保护，单次问答的自动探查循环设置最大步数上限（如 `5~8` 步），防止慢查询拖垮目标库或撑爆大模型上下文。
-- **架构落地约束**：
-  - **后端插件化隔离**：新增独立模块 `modules/data_explorer/`（挂载于 `/api/modules/data_explorer`），严格通过 `PlatformContext` 复用 `LLMHub`（复用「系统配置 → AI 模型」已配好的 DeepSeek / Gemini / OpenAI 兼容网关，零新增第三方 Python 依赖，保持 `19.42 MB` 轻量打包基线）、`MetadataHub`（获取库表字段上下文）与 `QueryEngine`（只读安全执行），通过 `PlatformStateStore.register_table_schema` 幂等持久化探查会话历史，与其他 `modules/*` 严格零互引。
-  - **前端 macOS 极简体验**：在 `static/js/views/`（「数据探查」窗口内）融合自由 SQL 工作区与 AI 探查会话面板，透明展示每一步执行的只读探查 SQL、采样依据与结论，支持将 AI 生成的探查 SQL 一键同步至主编辑器或导出结果，严守零 `innerHTML` 与克制无废话的 macOS 界面规范。
+## 6. AI 只读探查硬隔离铁律与后续演进守则
+- **绝对只读四道硬防线（后续任何涉及 AI 自动查询的功能均须严格复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束）**：
+  1. **双模态词法/语法白名单（`core/platform/readonly_guard.py`）**：同时在标准 SQL 与反斜杠转义双模式下分词，强制单语句，顶层仅放行纯只读语句，递归校验 CTE 子句，全语句封禁写/DDL/锁/`INTO` 与危险系统函数。
+  2. **数据库会话级硬件只读锁（`DriverManager.open_connection(..., readonly=True)`）**：SQLite `mode=ro` + `PRAGMA query_only=ON`、PostgreSQL/DWS `set_session(readonly=True, autocommit=False)`、PyMySQL `SET SESSION TRANSACTION READ ONLY` + `START TRANSACTION READ ONLY`、JDBC `setAutoCommit(False)` + `setReadOnly(True)`。
+  3. **零提交与退出无条件回滚（`ConnectionHub.readonly_session`）**：只读执行路径零 `commit()` 调用，会话 `finally:` 块无条件执行 `rollback()`。
+  4. **采样行数、超时与步数熔断**：单步强制采样上限 `200` 行、`12s` 超时，单轮自动探查最多 `8` 步熔断。

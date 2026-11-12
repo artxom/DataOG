@@ -158,6 +158,8 @@ export const platformApi = {
   // 查询预览中心 (QueryEngine)
   executeSql: (payload) =>
     requestJson("/api/platform/query/execute", { method: "POST", body: payload }),
+  executeReadonlySql: (payload) =>
+    requestJson("/api/platform/query/execute-readonly", { method: "POST", body: payload }),
   previewTable: (connectionId, schemaName, tableName, limit = 200) => {
     const qs = new URLSearchParams({
       connection_id: connectionId,
@@ -263,3 +265,28 @@ export const ddlApi = {
 };
 
 export const polyglotApi = ddlApi;
+
+export const explorerApi = {
+  listSessions: (connectionId = "") => {
+    const qs = connectionId ? `?connection_id=${encodeURIComponent(connectionId)}` : "";
+    return requestJson(`/api/modules/data_explorer/sessions${qs}`);
+  },
+  createSession: (payload) =>
+    requestJson("/api/modules/data_explorer/sessions", { method: "POST", body: payload }),
+  getSession: (sessionId) =>
+    requestJson(`/api/modules/data_explorer/sessions/${encodeURIComponent(sessionId)}`),
+  updateSession: (sessionId, payload) =>
+    requestJson(`/api/modules/data_explorer/sessions/${encodeURIComponent(sessionId)}`, {
+      method: "PATCH",
+      body: payload,
+    }),
+  deleteSession: (sessionId, connectionId = "") => {
+    const qs = connectionId ? `?connection_id=${encodeURIComponent(connectionId)}` : "";
+    return requestJson(
+      `/api/modules/data_explorer/sessions/${encodeURIComponent(sessionId)}${qs}`,
+      { method: "DELETE" }
+    );
+  },
+  explore: (payload) =>
+    requestJson("/api/modules/data_explorer/explore", { method: "POST", body: payload }),
+};

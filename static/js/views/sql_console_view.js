@@ -1,6 +1,6 @@
 /**
  * Data.O.G 桌面模块 2：数据探查 (SqlConsoleView)
- * 无框 Finder 风格左侧数据库目录树 + 沉浸式 SQL 编辑器 + 结果/结构/DDL 标签面板
+ * 共享左侧 DataGrip 风格四级数据库清单 (DatabaseTree) + 双模工作区（SQL 查询 | AI 只读智能探查）
  */
 
 import { platformApi } from "../core/api.js";
@@ -11,9 +11,12 @@ import { DatabaseTree } from "../ui/database_tree.js";
 import { ObjectPicker } from "../ui/object_picker.js";
 import { SqlCodeBox } from "../ui/sql_code_box.js";
 import { Toast } from "../ui/toast.js";
+import { ExplorerAiPane } from "./explorer_ai_pane.js";
 
 export class SqlConsoleView {
   constructor() {
+    this.mode = "sql"; // "sql" | "ai"
+    this._aiInitialized = false;
     this.connectionId = store.state.connections[0]?.connection_id || "";
     this.schemaName = "";
     this.tableName = "";
@@ -26,12 +29,55 @@ export class SqlConsoleView {
 
     this.treeHost = el("aside", { className: "mac-sidebar mac-sidebar-wide" });
     this.dbTree = new DatabaseTree(this.treeHost, {
+      selectionMode: "single",
       onPreviewTable: ({ connectionId, schemaName, tableName }) => {
         this.connectionId = connectionId;
         this.schemaName = schemaName;
         this.tableName = tableName;
         this.picker.setValue({ connectionId, schemaName, tableName });
         this.previewSelectedTable();
+      },
+      onFocusSelectionChange: ({ connectionId, schemaName, focusTables }) => {
+        this.connectionId = connectionId;
+        if (schemaName) this.schemaName = schemaName;
+        this.aiPane.syncScope({
+          connectionId,
+          schemaName: this.schemaName,
+          focusTables,
+        });
+      },
+      onActiveConnectionChange: (connId) => {
+        this.connectionId = connId;
+        this.picker.setValue({ connectionId: connId });
+        if (this.mode === "ai") {
+          this.aiPane.syncScope({
+            connectionId: connId,
+            schemaName: "",
+            focusTables: this.dbTree.getFocusTables(connId),
+            reloadSessions: true,
+          });
+        }
+      },
+    });
+
+    this.aiPane = new ExplorerAiPane({
+      onSendSqlToEditor: (sqlText) => {
+        this.sqlBox.setValue(sqlText, "ai_probe.sql");
+        this.switchMode("sql");
+        Toast.success("探查 SQL 已填入主编辑器");
+      },
+      onSyncFocusToTree: ({ connectionId, focusTables }) => {
+        if (connectionId) {
+          this.connectionId = connectionId;
+          this.dbTree.setActiveConnection(connectionId, { expand: true });
+          this.dbTree.setFocusTables(connectionId, focusTables || []);
+        }
+      },
+      onClearTreeFocus: () => {
+        this.dbTree.clearFocusTables(this.connectionId);
+      },
+      onHeaderStateChange: () => {
+        this.refreshHeader?.();
       },
     });
 
@@ -59,12 +105,102 @@ export class SqlConsoleView {
 
   destroy() {
     this.dbTree.destroy();
+    this.aiPane.destroy();
+  }
+
+  async switchMode(nextMode) {
+    const target = nextMode === "ai" ? "ai" : "sql";
+    this.mode = target;
+    this.dbTree.setSelectionMode(target === "ai" ? "multi" : "single");
+
+    if (target === "ai") {
+      if (!this.connectionId && store.state.connections.length > 0) {
+        this.connectionId = store.state.connections[0].connection_id;
+      }
+      await this.dbTree.setActiveConnection(this.connectionId, { expand: true });
+      const needLoad = !this._aiInitialized || this.aiPane.connectionId !== this.connectionId;
+      this._aiInitialized = true;
+      await this.aiPane.syncScope({
+        connectionId: this.connectionId,
+        schemaName: this.schemaName,
+        focusTables: this.dbTree.getFocusTables(this.connectionId),
+        reloadSessions: needLoad,
+      });
+    }
+
+    this.render();
+    this.refreshHeader?.();
   }
 
   getHeaderParts() {
     this.picker.renderOptions();
-    const summaryText = this.tableName ? `${this.tableName}` : "SQL 查询";
+    const summaryText =
+      this.mode === "ai"
+        ? "AI 探查"
+        : this.tableName
+        ? `${this.tableName}`
+        : "SQL 查询";
     store.setAppSummary("explorer", summaryText);
+
+    const modeSeg = el(
+      "div",
+      { className: "seg-group", role: "tablist", "aria-label": "数据探查工作模式" },
+      el("button", {
+        type: "button",
+        role: "tab",
+        "aria-selected": String(this.mode === "sql"),
+        className: `seg-btn ${this.mode === "sql" ? "is-active" : ""}`.trim(),
+        text: "SQL 查询",
+        onClick: () => this.switchMode("sql"),
+      }),
+      el("button", {
+        type: "button",
+        role: "tab",
+        "aria-selected": String(this.mode === "ai"),
+        className: `seg-btn ${this.mode === "ai" ? "is-active" : ""}`.trim(),
+        text: "AI 探查",
+        onClick: () => this.switchMode("ai"),
+      })
+    );
+
+    const centerChildren = [
+      el(
+        "button",
+        {
+          type: "button",
+          className: "mac-btn mac-btn-sm mac-btn-ghost",
+          title: "显示/隐藏数据库清单",
+          onClick: () => {
+            this.sidebarVisible = !this.sidebarVisible;
+            this.render();
+          },
+        },
+        svgIcon("sidebar", 14)
+      ),
+      modeSeg,
+    ];
+
+    if (this.mode === "sql") {
+      centerChildren.push(
+        this.picker.root,
+        el("button", {
+          type: "button",
+          className: "mac-btn mac-btn-sm",
+          text: "预览",
+          onClick: () => this.previewSelectedTable(),
+        })
+      );
+    }
+
+    const center = el(
+      "div",
+      { style: { display: "inline-flex", alignItems: "center", gap: "6px", flexWrap: "wrap" } },
+      centerChildren
+    );
+
+    if (this.mode === "ai") {
+      return { center, right: this.aiPane.buildHeaderRightControls() };
+    }
 
     const limitSelect = el(
       "select",
@@ -79,27 +215,6 @@ export class SqlConsoleView {
         const o = el("option", { value: String(n), text: `${n} 行` });
         if (this.limit === n) o.selected = true;
         return o;
-      })
-    );
-
-    const center = el(
-      "div",
-      { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
-      el("button", {
-        type: "button",
-        className: "mac-btn mac-btn-sm mac-btn-ghost",
-        title: "显示/隐藏目录树",
-        onClick: () => {
-          this.sidebarVisible = !this.sidebarVisible;
-          this.render();
-        },
-      }, svgIcon("sidebar", 14)),
-      this.picker.root,
-      el("button", {
-        type: "button",
-        className: "mac-btn mac-btn-sm",
-        text: "预览",
-        onClick: () => this.previewSelectedTable(),
       })
     );
 
@@ -146,6 +261,19 @@ export class SqlConsoleView {
       schemaName: this.schemaName,
       tableName: this.tableName,
     });
+
+    if (context?.mode === "ai") {
+      if (this.connectionId && this.tableName) {
+        this.dbTree.addFocusTable(this.connectionId, this.schemaName, this.tableName);
+      }
+      await this.switchMode("ai");
+      return;
+    }
+
+    if (context?.action === "preview_table") {
+      this.mode = "sql";
+      this.dbTree.setSelectionMode("single");
+    }
 
     this.render();
     this.refreshHeader?.();
@@ -234,9 +362,21 @@ export class SqlConsoleView {
   }
 
   render() {
+    if (this.mode === "ai") {
+      this.aiPane.render();
+      clearEl(this.rightPane, this.aiPane.root);
+      clearEl(this.root, this.sidebarVisible ? this.treeHost : null, this.rightPane);
+      return;
+    }
+
     const tabDefs = [
       { id: "rows", label: this.lastResult ? `结果 (${this.lastResult.row_count})` : "结果" },
-      { id: "structure", label: this.lastTableMeta ? `结构 (${(this.lastTableMeta.columns || []).length})` : "结构" },
+      {
+        id: "structure",
+        label: this.lastTableMeta
+          ? `结构 (${(this.lastTableMeta.columns || []).length})`
+          : "结构",
+      },
       { id: "ddl", label: "DDL" },
     ];
 
@@ -258,12 +398,29 @@ export class SqlConsoleView {
       ),
       el(
         "div",
-        { style: { marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: "10px" } },
+        { style: { marginLeft: "auto", display: "inline-flex", alignItems: "center", gap: "8px" } },
         this.lastResult
           ? statusDot(
-              `${this.lastResult.elapsed_ms ?? 0} ms${this.lastResult.truncated ? " · 已截断" : ""}`,
+              `${this.lastResult.elapsed_ms ?? 0} ms${
+                this.lastResult.truncated ? " · 已截断" : ""
+              }`,
               this.lastResult.truncated ? "warn" : "success"
             )
+          : null,
+        this.tableName
+          ? el("button", {
+              type: "button",
+              className: "btn btn-xs btn-ghost",
+              text: "AI 探查此表 →",
+              onClick: () => {
+                this.dbTree.addFocusTable(
+                  this.connectionId,
+                  this.schemaName,
+                  this.tableName
+                );
+                this.switchMode("ai");
+              },
+            })
           : null,
         this.tableName
           ? el("button", {
@@ -314,14 +471,27 @@ export class SqlConsoleView {
       }
     } else if (this.activeTab === "structure") {
       const colsMeta = this.lastTableMeta?.columns || [];
-      const distSet = new Set((this.lastTableMeta?.distribute_keys || []).map((k) => String(k).toLowerCase()));
-      const partSet = new Set((this.lastTableMeta?.partition_keys || []).map((k) => String(k).toLowerCase()));
+      const distSet = new Set(
+        (this.lastTableMeta?.distribute_keys || []).map((k) => String(k).toLowerCase())
+      );
+      const partSet = new Set(
+        (this.lastTableMeta?.partition_keys || []).map((k) => String(k).toLowerCase())
+      );
       tabPanelBody = new DataGrid({
         ariaLabel: "表结构",
         columns: [
           { key: "ordinal_position", label: "#" },
-          { key: "column_name", label: "字段", render: (r) => el("span", { className: "mono", style: { fontWeight: "600" }, text: r.column_name }) },
-          { key: "data_type", label: "类型", render: (r) => el("span", { className: "mono", text: r.data_type }) },
+          {
+            key: "column_name",
+            label: "字段",
+            render: (r) =>
+              el("span", { className: "mono", style: { fontWeight: "600" }, text: r.column_name }),
+          },
+          {
+            key: "data_type",
+            label: "类型",
+            render: (r) => el("span", { className: "mono", text: r.data_type }),
+          },
           { key: "not_null", label: "非空", render: (r) => (r.is_not_null || r.not_null ? "是" : "-") },
           {
             key: "keys",
@@ -347,7 +517,9 @@ export class SqlConsoleView {
         this.lastTableMeta?.view_definition ||
         "-- 选择表后点击「预览」查看原始定义";
       tabPanelBody = new SqlCodeBox({
-        title: this.lastTableMeta ? `${this.lastTableMeta.schema_name}.${this.lastTableMeta.table_name}` : "DDL",
+        title: this.lastTableMeta
+          ? `${this.lastTableMeta.schema_name}.${this.lastTableMeta.table_name}`
+          : "DDL",
         value: ddlText,
         readOnly: true,
         frameless: true,

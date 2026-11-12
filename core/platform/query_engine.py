@@ -26,10 +26,13 @@ from core.platform.driver_manager import JdbcConnectionAdapter
 from core.platform.excel_io import export_tabular_csv_bytes, export_tabular_xlsx_bytes
 from core.platform.inceptor_client import InceptorThriftClient
 from core.platform.models import ConnectionProfile, QueryColumn, QueryResult
+from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
 from core.platform.storage import PlatformStateStore
 
 MAX_ALLOWED_QUERY_LIMIT = 5000
 DEFAULT_QUERY_LIMIT = 500
+DEFAULT_READONLY_SAMPLE_LIMIT = 100
+MAX_READONLY_SAMPLE_LIMIT = 200
 
 
 def serialize_cell_value(val: Any) -> Any:
@@ -67,7 +70,22 @@ class QueryEngine:
     def _build_bounded_select_sql(sql: str, db_type: str, cap: int) -> str:
         """在不破坏原语义的前提下，对未显式声明 LIMIT 的单条纯查询 SELECT 自动追加行数保护上限."""
         dialect = (db_type or "").strip().upper()
-        if dialect not in ("DWS", "PGSQL", "KINGBASE", "MYSQL", "SQLITE", "DM8", "GBASE"):
+        limit_dialects = {
+            "DWS",
+            "PGSQL",
+            "KINGBASE",
+            "MYSQL",
+            "MARIADB",
+            "OCEANBASE",
+            "DORIS",
+            "STARROCKS",
+            "TIDB",
+            "INCEPTOR",
+            "SQLITE",
+            "DM8",
+            "GBASE",
+        }
+        if dialect not in limit_dialects and dialect not in ("DB2", "ORACLE"):
             return sql
         stripped = strip_sql_comments_preserve_literals(sql).strip()
         while stripped.endswith(";"):
@@ -85,6 +103,10 @@ class QueryEngine:
         raw_no_semi = sql.rstrip()
         while raw_no_semi.endswith(";"):
             raw_no_semi = raw_no_semi[:-1].rstrip()
+        if dialect == "DB2":
+            return f"{raw_no_semi}\nFETCH FIRST {int(cap)} ROWS ONLY"
+        if dialect == "ORACLE":
+            return f"SELECT * FROM (\n{raw_no_semi}\n) dataog_ro_sub WHERE ROWNUM <= {int(cap)}"
         return f"{raw_no_semi}\nLIMIT {int(cap)}"
 
     def execute_sql(
@@ -332,5 +354,209 @@ class QueryEngine:
             except Exception:
                 pass
             return [], [], False, affected
+        finally:
+            cur.close()
+
+    # =========================================================================
+    # 物理级只读安全查询通道 (ReadOnly Sandbox + Hardware ReadOnly + Unconditional Rollback)
+    # =========================================================================
+
+    def execute_readonly_sql(
+        self,
+        connection_id: str,
+        sql: str,
+        *,
+        limit: int = DEFAULT_READONLY_SAMPLE_LIMIT,
+        max_limit_cap: int = MAX_READONLY_SAMPLE_LIMIT,
+        timeout_sec: int = 12,
+    ) -> QueryResult:
+        """执行 100% 物理只读查询：双模态白名单校验 -> 硬件只读事务连接 -> 采样截断 -> 退出无条件 rollback."""
+        profile = self.connection_hub.require_profile(connection_id)
+        try:
+            validated_sql = validate_readonly_sql(sql, db_type=profile.db_type)
+        except ReadOnlyViolationError as vio_exc:
+            self.store.add_log(
+                "WARN",
+                f"只读沙箱 [{profile.name}]",
+                f"已硬阻断非只读或危险 SQL: {vio_exc}",
+                sql_text=(sql or "")[:1500],
+            )
+            raise
+
+        hard_cap = max(1, min(1000, int(max_limit_cap or MAX_READONLY_SAMPLE_LIMIT)))
+        try:
+            req_limit = int(limit)
+        except (TypeError, ValueError):
+            req_limit = DEFAULT_READONLY_SAMPLE_LIMIT
+        safe_limit = max(1, min(hard_cap, req_limit))
+        safe_timeout = max(2, min(25, int(timeout_sec or 12)))
+
+        t0 = time.perf_counter()
+        try:
+            with self.connection_hub.readonly_session(
+                connection_id, timeout_sec=min(12, safe_timeout)
+            ) as conn:
+                if isinstance(conn, InceptorThriftClient):
+                    bounded_sql = self._build_bounded_select_sql(
+                        validated_sql, profile.db_type, safe_limit + 1
+                    )
+                    cols_meta, raw_rows, truncated = conn.execute_query_with_meta(
+                        bounded_sql, max_rows=safe_limit
+                    )
+                    q_cols = [
+                        QueryColumn(name=c.column_name, data_type=c.data_type)
+                        for c in cols_meta
+                    ]
+                    rows = [
+                        [serialize_cell_value(cell) for cell in r]
+                        for r in raw_rows
+                    ]
+                elif isinstance(conn, JdbcConnectionAdapter):
+                    q_cols, rows, truncated = self._exec_readonly_on_jdbc(
+                        conn, profile, validated_sql, safe_limit, safe_timeout
+                    )
+                elif profile.db_type == "SQLITE":
+                    q_cols, rows, truncated = self._exec_readonly_on_sqlite(
+                        conn, validated_sql, safe_limit, safe_timeout
+                    )
+                else:
+                    q_cols, rows, truncated = self._exec_readonly_on_dbapi(
+                        conn, profile, validated_sql, safe_limit, safe_timeout
+                    )
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.store.add_log(
+                "ERROR",
+                f"只读探查 [{profile.name}]",
+                f"只读 SQL 执行异常 ({elapsed_ms:.1f} ms): {exc}",
+                sql_text=validated_sql[:1500],
+            )
+            raise
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        msg = (
+            f"只读采样完成：返回 {len(rows)} 行"
+            + (f"（已按上限 {safe_limit} 行安全截断）" if truncated else "")
+            + f"，耗时 {elapsed_ms:.1f} ms"
+        )
+        self.store.add_log(
+            "INFO",
+            f"只读探查 [{profile.name}]",
+            msg,
+            sql_text=validated_sql[:1500],
+        )
+        return QueryResult(
+            connection_id=connection_id,
+            sql=validated_sql,
+            columns=q_cols,
+            rows=rows,
+            row_count=len(rows),
+            truncated=truncated,
+            limit_applied=safe_limit,
+            elapsed_ms=elapsed_ms,
+            affected_rows=0,
+            message=msg,
+        )
+
+    def _exec_readonly_on_sqlite(
+        self,
+        conn: Any,
+        sql: str,
+        safe_limit: int,
+        timeout_sec: int,
+    ) -> Tuple[List[QueryColumn], List[List[Any]], bool]:
+        """SQLite 只读执行器：零 commit()，带线程级 interrupt 超时熔断."""
+        timed_out = threading.Event()
+
+        def _interrupt() -> None:
+            timed_out.set()
+            try:
+                conn.interrupt()
+            except Exception:
+                pass
+
+        bounded_sql = self._build_bounded_select_sql(sql, "SQLITE", safe_limit + 1)
+        timer = threading.Timer(float(timeout_sec), _interrupt)
+        timer.daemon = True
+        timer.start()
+        try:
+            cur = conn.execute(bounded_sql)
+            try:
+                if not cur.description:
+                    return [], [], False
+                q_cols = [QueryColumn(name=str(d[0]), data_type="") for d in cur.description]
+                fetched = cur.fetchmany(safe_limit + 1)
+                truncated = len(fetched) > safe_limit
+                if truncated:
+                    fetched = fetched[:safe_limit]
+                rows = [[serialize_cell_value(v) for v in r] for r in fetched]
+                return q_cols, rows, truncated
+            finally:
+                cur.close()
+        except Exception as exc:
+            if timed_out.is_set():
+                raise TimeoutError(f"SQLite 只读探查超过 {timeout_sec} 秒超时上限已自动中断") from exc
+            raise
+        finally:
+            timer.cancel()
+
+    def _exec_readonly_on_jdbc(
+        self,
+        conn: JdbcConnectionAdapter,
+        profile: ConnectionProfile,
+        sql: str,
+        safe_limit: int,
+        timeout_sec: int,
+    ) -> Tuple[List[QueryColumn], List[List[Any]], bool]:
+        """JDBC 只读执行器：零 commit()，强制 queryTimeout 与 maxRows."""
+        bounded_sql = self._build_bounded_select_sql(sql, profile.db_type, safe_limit + 1)
+        with conn.cursor() as cur:
+            cur.execute(bounded_sql, timeout_sec=timeout_sec, max_rows=safe_limit + 1)
+            if not cur.description:
+                return [], [], False
+            q_cols = [
+                QueryColumn(name=str(d[0]), data_type=str(d[1] or ""))
+                for d in cur.description
+            ]
+            fetched = cur.fetchmany(safe_limit + 1)
+            truncated = len(fetched) > safe_limit
+            if truncated:
+                fetched = fetched[:safe_limit]
+            rows = [[serialize_cell_value(v) for v in r] for r in fetched]
+            return q_cols, rows, truncated
+
+    def _exec_readonly_on_dbapi(
+        self,
+        conn: Any,
+        profile: ConnectionProfile,
+        sql: str,
+        safe_limit: int,
+        timeout_sec: int,
+    ) -> Tuple[List[QueryColumn], List[List[Any]], bool]:
+        """DB-API (psycopg2 / PyMySQL) 只读执行器：零 commit()，会话超时保护."""
+        cur = conn.cursor()
+        try:
+            if profile.db_type in ("DWS", "PGSQL", "KINGBASE"):
+                try:
+                    cur.execute(f"SET LOCAL statement_timeout = {int(timeout_sec) * 1000};")
+                except Exception:
+                    pass
+            bounded_sql = self._build_bounded_select_sql(sql, profile.db_type, safe_limit + 1)
+            cur.execute(bounded_sql)
+            if not cur.description:
+                return [], [], False
+            q_cols = [
+                QueryColumn(
+                    name=str(d[0]),
+                    data_type=str(d[1].__name__ if hasattr(d[1], "__name__") else ""),
+                )
+                for d in cur.description
+            ]
+            fetched = cur.fetchmany(safe_limit + 1)
+            truncated = len(fetched) > safe_limit
+            if truncated:
+                fetched = fetched[:safe_limit]
+            rows = [[serialize_cell_value(v) for v in r] for r in fetched]
+            return q_cols, rows, truncated
         finally:
             cur.close()

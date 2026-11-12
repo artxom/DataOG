@@ -1,5 +1,9 @@
 /**
- * Data.O.G 无框 Finder 风格数据库目录树 (DatabaseTree)
+ * Data.O.G DataGrip / Finder 风格四级数据库目录树 (DatabaseTree)
+ * 层级：已连接数据源 (Connection) → 模式 (Schema) → 表/视图 (Table/View) → 字段 (Column)
+ * 支持双选单模式：
+ * - single (SQL 查询模式)：点击表行预览数据，点击 ▸ 展开字段
+ * - multi  (AI 探查模式)：直接在树内 Schema / 表节点勾选焦点表，点击 ▸ 仍可展开查看字段结构
  */
 
 import { platformApi } from "../core/api.js";
@@ -8,9 +12,21 @@ import { store } from "../core/state.js";
 import { Toast } from "./toast.js";
 
 export class DatabaseTree {
-  constructor(mountEl, { onPreviewTable = null } = {}) {
+  constructor(
+    mountEl,
+    {
+      onPreviewTable = null,
+      onFocusSelectionChange = null,
+      onActiveConnectionChange = null,
+      selectionMode = "single",
+    } = {}
+  ) {
     this.mountEl = mountEl;
     this.onPreviewTable = onPreviewTable;
+    this.onFocusSelectionChange = onFocusSelectionChange;
+    this.onActiveConnectionChange = onActiveConnectionChange;
+    this.selectionMode = selectionMode === "multi" ? "multi" : "single";
+
     this.filterText = "";
     this.expandedConns = new Set();
     this.expandedSchemas = new Set();
@@ -18,7 +34,8 @@ export class DatabaseTree {
     this.expandedTables = new Set();
     this.tableColumnsCache = new Map();
     this.selectedTableKey = "";
-    this._singleClickTimer = null;
+    this.activeConnectionId = store.state.connections[0]?.connection_id || "";
+    this.focusTablesByConn = new Map(); // connId -> Set<"schema.table">
 
     this.filterInput = el("input", {
       className: "mac-input mac-input-sm",
@@ -36,7 +53,11 @@ export class DatabaseTree {
       },
     });
 
-    this.treeBody = el("div", { className: "nav-tree-scroll", role: "tree" });
+    this.treeBody = el("div", {
+      className: "nav-tree-scroll",
+      role: "tree",
+      "aria-label": "数据库目录清单",
+    });
 
     const header = el(
       "div",
@@ -58,6 +79,9 @@ export class DatabaseTree {
     clearEl(this.mountEl, header, this.treeBody);
     this._unsub = store.subscribe((_state, reason) => {
       if (["bootstrap", "connections", "catalog"].includes(reason)) {
+        if (!this.activeConnectionId && store.state.connections.length > 0) {
+          this.activeConnectionId = store.state.connections[0].connection_id;
+        }
         this.renderTreeBody();
       }
     });
@@ -68,23 +92,106 @@ export class DatabaseTree {
     this._unsub?.();
   }
 
-  async _toggleConnection(conn) {
-    const cid = conn.connection_id;
-    if (this.expandedConns.has(cid)) {
-      this.expandedConns.delete(cid);
-      this.renderTreeBody();
-      return;
+  setSelectionMode(mode) {
+    const next = mode === "multi" ? "multi" : "single";
+    if (this.selectionMode === next) return;
+    this.selectionMode = next;
+    this.renderTreeBody();
+  }
+
+  async setActiveConnection(connId, { expand = false } = {}) {
+    if (!connId) return;
+    this.activeConnectionId = connId;
+    if (expand) {
+      this.expandedConns.add(connId);
+      await this._ensureConnCatalogLoaded(connId);
     }
-    this.expandedConns.add(cid);
+    this.renderTreeBody();
+  }
+
+  _getConnFocusSet(connId) {
+    if (!connId) return new Set();
+    if (!this.focusTablesByConn.has(connId)) {
+      this.focusTablesByConn.set(connId, new Set());
+    }
+    return this.focusTablesByConn.get(connId);
+  }
+
+  getFocusTables(connId = this.activeConnectionId) {
+    return Array.from(this._getConnFocusSet(connId));
+  }
+
+  setFocusTables(connId, tables = []) {
+    if (!connId) return;
+    const set = new Set();
+    for (const raw of tables || []) {
+      const s = String(raw || "").trim();
+      if (s) set.add(s);
+    }
+    this.focusTablesByConn.set(connId, set);
+    this.renderTreeBody();
+  }
+
+  addFocusTable(connId, schemaName, tableName) {
+    if (!connId || !tableName) return;
+    this.activeConnectionId = connId;
+    this.expandedConns.add(connId);
+    if (schemaName) {
+      const skey = `${connId}::${schemaName}`;
+      this.collapsedSchemas.delete(skey);
+      this.expandedSchemas.add(skey);
+    }
+    const fq = schemaName ? `${schemaName}.${tableName}` : tableName;
+    const set = this._getConnFocusSet(connId);
+    set.add(fq);
+    this.renderTreeBody();
+    this.onFocusSelectionChange?.({
+      connectionId: connId,
+      schemaName: schemaName || "",
+      focusTables: Array.from(set),
+    });
+  }
+
+  clearFocusTables(connId = this.activeConnectionId) {
+    if (!connId) return;
+    const set = this._getConnFocusSet(connId);
+    set.clear();
+    this.renderTreeBody();
+    this.onFocusSelectionChange?.({
+      connectionId: connId,
+      schemaName: "",
+      focusTables: [],
+    });
+  }
+
+  async _ensureConnCatalogLoaded(cid, connName = "") {
     const cached = store.state.catalogTrees[cid];
     if (!cached || !(cached.tables || []).length) {
       try {
         const res = await platformApi.getMetadataTree(cid, true);
         store.updateCatalogTree(cid, res);
       } catch (err) {
-        Toast.warn(`${conn.name}: ${err.message}`);
+        if (connName) {
+          Toast.warn(`${connName}: ${err.message}`);
+        }
       }
     }
+  }
+
+  async _toggleConnection(conn) {
+    const cid = conn.connection_id;
+    const prevActive = this.activeConnectionId;
+    this.activeConnectionId = cid;
+    if (prevActive !== cid) {
+      this.onActiveConnectionChange?.(cid);
+    }
+    if (this.expandedConns.has(cid)) {
+      this.expandedConns.delete(cid);
+      this.renderTreeBody();
+      return;
+    }
+    this.expandedConns.add(cid);
+    await this._ensureConnCatalogLoaded(cid, conn.name);
     this.renderTreeBody();
   }
 
@@ -112,8 +219,12 @@ export class DatabaseTree {
     if (!this.tableColumnsCache.has(key)) {
       try {
         const res = await platformApi.getTableDetail(connId, schemaName, tableName, false);
-        const distSet = new Set((res.table?.distribute_keys || []).map((k) => String(k).toLowerCase()));
-        const partSet = new Set((res.table?.partition_keys || []).map((k) => String(k).toLowerCase()));
+        const distSet = new Set(
+          (res.table?.distribute_keys || []).map((k) => String(k).toLowerCase())
+        );
+        const partSet = new Set(
+          (res.table?.partition_keys || []).map((k) => String(k).toLowerCase())
+        );
         const cols = (res.table?.columns || []).map((c) => ({
           ...c,
           is_distribute_key: distSet.has(String(c.column_name || "").toLowerCase()),
@@ -127,12 +238,62 @@ export class DatabaseTree {
     this.renderTreeBody();
   }
 
+  _toggleSingleTableFocus(connId, schemaName, tableName) {
+    const prevActive = this.activeConnectionId;
+    this.activeConnectionId = connId;
+    if (prevActive !== connId) {
+      this.onActiveConnectionChange?.(connId);
+    }
+    const set = this._getConnFocusSet(connId);
+    const fq = schemaName ? `${schemaName}.${tableName}` : tableName;
+    if (set.has(fq)) {
+      set.delete(fq);
+    } else {
+      set.add(fq);
+    }
+    this.renderTreeBody();
+    this.onFocusSelectionChange?.({
+      connectionId: connId,
+      schemaName: schemaName || "",
+      focusTables: Array.from(set),
+    });
+  }
+
+  _toggleSchemaFocus(connId, schemaName, schemaTables, shouldCheck) {
+    const prevActive = this.activeConnectionId;
+    this.activeConnectionId = connId;
+    if (prevActive !== connId) {
+      this.onActiveConnectionChange?.(connId);
+    }
+    const set = this._getConnFocusSet(connId);
+    for (const tbl of schemaTables || []) {
+      const fq = schemaName ? `${schemaName}.${tbl.table_name}` : tbl.table_name;
+      if (shouldCheck) {
+        set.add(fq);
+      } else {
+        set.delete(fq);
+      }
+    }
+    this.renderTreeBody();
+    this.onFocusSelectionChange?.({
+      connectionId: connId,
+      schemaName: schemaName || "",
+      focusTables: Array.from(set),
+    });
+  }
+
   _openTablePreview(connId, schemaName, tableName, objectType) {
     const key = `${connId}::${schemaName}::${tableName}`;
+    this.activeConnectionId = connId;
     this.selectedTableKey = key;
     this.renderTreeBody();
     if (typeof this.onPreviewTable === "function") {
-      this.onPreviewTable({ connectionId: connId, schemaName, tableName, objectType: objectType || "TABLE" });
+      this.onPreviewTable({
+        connectionId: connId,
+        schemaName,
+        tableName,
+        objectType: objectType || "TABLE",
+      });
       return;
     }
     store.openApp("explorer", {
@@ -165,21 +326,25 @@ export class DatabaseTree {
       return;
     }
 
-    // 若仅有一个连接且尚未展开，默认展开以减少点击
     if (conns.length === 1 && !this._autoOpenedFirst) {
       this._autoOpenedFirst = true;
       this.expandedConns.add(conns[0].connection_id);
+      this._ensureConnCatalogLoaded(conns[0].connection_id);
     }
+
+    const isMulti = this.selectionMode === "multi";
 
     const cards = conns.map((conn) => {
       const cid = conn.connection_id;
       const isExpanded = this.expandedConns.has(cid);
+      const isActiveConn = this.activeConnectionId === cid;
+      const focusSet = this._getConnFocusSet(cid);
       const tree = store.state.catalogTrees[cid] || { schemas: [], tables: [] };
 
       const connRow = el(
         "div",
         {
-          className: "tree-node-row",
+          className: `tree-node-row ${isMulti && isActiveConn ? "is-conn-active" : ""}`.trim(),
           role: "treeitem",
           "aria-expanded": String(isExpanded),
           onClick: () => this._toggleConnection(conn),
@@ -192,7 +357,9 @@ export class DatabaseTree {
           text: conn.name,
           title: `${conn.name} (${conn.db_type})`,
         }),
-        el("span", { style: { fontSize: "10.5px", color: "var(--os-muted)" }, text: conn.db_type }),
+        isMulti && focusSet.size > 0
+          ? badge(String(focusSet.size), "info")
+          : el("span", { style: { fontSize: "10.5px", color: "var(--os-muted)" }, text: conn.db_type }),
         el("button", {
           type: "button",
           className: "btn btn-xs btn-ghost",
@@ -240,6 +407,16 @@ export class DatabaseTree {
             this.expandedSchemas.has(skey) ||
             (bySchema.size === 1 && !this.collapsedSchemas.has(skey));
 
+          let checkedInSchema = 0;
+          if (isMulti && schemaTables.length > 0) {
+            for (const tbl of schemaTables) {
+              const fq = schemaName ? `${schemaName}.${tbl.table_name}` : tbl.table_name;
+              if (focusSet.has(fq)) checkedInSchema += 1;
+            }
+          }
+          const allSchemaChecked = schemaTables.length > 0 && checkedInSchema === schemaTables.length;
+          const someSchemaChecked = checkedInSchema > 0 && checkedInSchema < schemaTables.length;
+
           const schemaRow = el(
             "div",
             {
@@ -257,36 +434,70 @@ export class DatabaseTree {
                 this.renderTreeBody();
               },
             },
-            el("span", { text: schemaExpanded ? "▾" : "▸", style: { width: "10px", color: "var(--os-muted)" } }),
+            el("span", {
+              text: schemaExpanded ? "▾" : "▸",
+              style: { width: "10px", color: "var(--os-muted)" },
+            }),
+            isMulti && schemaTables.length > 0
+              ? el("input", {
+                  type: "checkbox",
+                  className: "tree-focus-check",
+                  checked: allSchemaChecked,
+                  indeterminate: someSchemaChecked,
+                  "aria-label": `勾选 ${schemaName} 下全部表`,
+                  title: "勾选/取消此 Schema 下所有表作为探查焦点",
+                  onClick: (e) => e.stopPropagation(),
+                  onChange: (e) =>
+                    this._toggleSchemaFocus(cid, schemaName, schemaTables, e.target.checked),
+                })
+              : null,
             svgIcon("folder", 13),
             el("span", { className: "tree-node-title", text: schemaName }),
-            el("span", { style: { fontSize: "10.5px", color: "var(--os-muted)" }, text: String(schemaTables.length) })
+            el("span", {
+              style: { fontSize: "10.5px", color: "var(--os-muted)" },
+              text: String(schemaTables.length),
+            })
           );
 
           const tableListNodes = [];
           if (schemaExpanded) {
             for (const tbl of schemaTables) {
               const tKey = `${cid}::${schemaName}::${tbl.table_name}`;
+              const fqName = schemaName ? `${schemaName}.${tbl.table_name}` : tbl.table_name;
               const colsExpanded = this.expandedTables.has(tKey);
               const isView = (tbl.object_type || "TABLE") !== "TABLE";
+              const isChecked = focusSet.has(fqName);
+              const isRowSelected = isMulti
+                ? isActiveConn && isChecked
+                : this.selectedTableKey === tKey;
 
               const tblRow = el(
                 "div",
                 {
-                  className: `tree-node-row ${this.selectedTableKey === tKey ? "is-selected" : ""}`,
+                  className: `tree-node-row ${isRowSelected ? "is-selected" : ""}`.trim(),
                   role: "treeitem",
                   tabindex: "0",
                   "aria-expanded": String(colsExpanded),
                   dataset: { tableKey: tKey },
-                  title: tbl.table_comment ? `${tbl.table_name} — ${tbl.table_comment}` : tbl.table_name,
+                  title: tbl.table_comment
+                    ? `${tbl.table_name} — ${tbl.table_comment}`
+                    : tbl.table_name,
                   onClick: (e) => {
                     e.stopPropagation();
-                    this._openTablePreview(cid, schemaName, tbl.table_name, tbl.object_type);
+                    if (isMulti) {
+                      this._toggleSingleTableFocus(cid, schemaName, tbl.table_name);
+                    } else {
+                      this._openTablePreview(cid, schemaName, tbl.table_name, tbl.object_type);
+                    }
                   },
                   onKeydown: (e) => {
-                    if (e.key === "Enter") {
+                    if (e.key === "Enter" || (isMulti && e.key === " ")) {
                       e.preventDefault();
-                      this._openTablePreview(cid, schemaName, tbl.table_name, tbl.object_type);
+                      if (isMulti) {
+                        this._toggleSingleTableFocus(cid, schemaName, tbl.table_name);
+                      } else {
+                        this._openTablePreview(cid, schemaName, tbl.table_name, tbl.object_type);
+                      }
                     }
                   },
                 },
@@ -294,8 +505,20 @@ export class DatabaseTree {
                   text: colsExpanded ? "▾" : "▸",
                   style: { width: "10px", display: "inline-block", color: "var(--os-muted)" },
                   title: "展开字段",
-                  onClick: (e) => this._toggleTableColumns(cid, schemaName, tbl.table_name, e),
+                  onClick: (e) =>
+                    this._toggleTableColumns(cid, schemaName, tbl.table_name, e),
                 }),
+                isMulti
+                  ? el("input", {
+                      type: "checkbox",
+                      className: "tree-focus-check",
+                      checked: isChecked,
+                      "aria-label": `勾选焦点表 ${fqName}`,
+                      onClick: (e) => e.stopPropagation(),
+                      onChange: () =>
+                        this._toggleSingleTableFocus(cid, schemaName, tbl.table_name),
+                    })
+                  : null,
                 svgIcon(isView ? "view" : "table", 13),
                 el("span", { className: "tree-node-title", text: tbl.table_name }),
                 isView ? badge("V", "warn") : null
@@ -310,7 +533,13 @@ export class DatabaseTree {
                     { className: "tree-col-row", title: c.column_comment || "" },
                     el(
                       "span",
-                      { style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+                      {
+                        style: {
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          whiteSpace: "nowrap",
+                        },
+                      },
                       c.column_name,
                       c.is_primary_key ? " · PK" : "",
                       c.is_distribute_key ? " · DK" : ""

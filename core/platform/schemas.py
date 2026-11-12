@@ -41,6 +41,13 @@ class QueryExecutePayload(BaseModel):
     timeout_sec: int = Field(default=30, ge=2, le=300)
 
 
+class ReadOnlyQueryExecutePayload(BaseModel):
+    connection_id: str
+    sql: str
+    limit: int = Field(default=100, ge=1, le=200)
+    timeout_sec: int = Field(default=12, ge=2, le=25)
+
+
 class QueryExportPayload(BaseModel):
     connection_id: Optional[str] = None
     sql: Optional[str] = None
