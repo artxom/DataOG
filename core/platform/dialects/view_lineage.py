@@ -871,11 +871,11 @@ def enrich_view_columns_by_lineage(
                 None,
             )
             if matched_base_col:
-                if not pc.get("has_explicit_cast") and (
-                    is_generic_or_unbounded_type(col.data_type)
-                    or not col.data_type
-                ):
-                    col.data_type = matched_base_col.data_type
+                if is_generic_or_unbounded_type(col.data_type) or not col.data_type:
+                    if pc.get("has_explicit_cast") and pc.get("inferred_type"):
+                        col.data_type = pc["inferred_type"]
+                    else:
+                        col.data_type = matched_base_col.data_type
                 if not col.column_comment and matched_base_col.column_comment:
                     col.column_comment = matched_base_col.column_comment
                 col.lineage_source = (

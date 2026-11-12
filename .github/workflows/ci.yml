@@ -60,7 +60,7 @@ jobs:
       - name: 安装打包依赖
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          python -m pip install -r requirements.txt "pyinstaller>=6.10.0"
 
       - name: 执行 PyInstaller 打包脚本
         run: python build_exe.py

@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import socket
@@ -20,7 +19,6 @@ import time
 import traceback
 import webbrowser
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 
 
 def disable_windows_console_quick_edit() -> None:
@@ -123,13 +121,7 @@ try:
     from fastapi.responses import JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
 
-    from core.cross_env_engine import CrossEnvCompareEngine
     from core.dws_engine import DWSMigratorEngine
-    from core.excel_handler import (
-        export_report_excel,
-        generate_template_excel,
-        parse_excel_checklist,
-    )
     from core.platform.context import PlatformContext
     from core.platform.router import router as platform_router
     from modules.cross_comparator.router import router as cross_comparator_router
@@ -265,7 +257,6 @@ def create_app(
 
     store = ctx.store
     engine = DWSMigratorEngine(store)
-    cross_engine = CrossEnvCompareEngine(store, engine)
 
     # 清理旧版本遗留的内置沙盒假数据，确保纯净初始化
     if store.get_meta("current_excel_name") == "内置示例_DWS贯标清单.xlsx":
@@ -274,7 +265,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.1.0",
+        version="2.1.1",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -282,7 +273,6 @@ def create_app(
     app.state.platform_ctx = ctx
     app.state.store = store
     app.state.engine = engine
-    app.state.cross_engine = cross_engine
 
     @app.middleware("http")
     async def security_headers_and_csrf_middleware(request: Request, call_next):
@@ -339,454 +329,6 @@ def create_app(
     async def api_bootstrap() -> JSONResponse:
         data = await anyio.to_thread.run_sync(_build_full_state_dict)
         return JSONResponse(data)
-
-    @app.post("/api/connection", include_in_schema=False)
-    async def api_configure_connection(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-
-            def _do_connect() -> Dict[str, Any]:
-                conn_res = engine.configure_connection(
-                    host=str(body.get("host", "")),
-                    port=int(body.get("port", 8000)),
-                    dbname=str(body.get("dbname", "")),
-                    user=str(body.get("user", "")),
-                    password=str(body.get("password", "")),
-                    sslmode=str(body.get("sslmode", "prefer")),
-                )
-                prof = ctx.connection_hub.save_profile(
-                    {
-                        "connection_id": "conn_migrator_default",
-                        "name": f"贯标目标库 ({body.get('host', '')}/{body.get('dbname', '')})",
-                        "driver_track": "NATIVE",
-                        "db_type": "DWS",
-                        "host": str(body.get("host", "")),
-                        "port": int(body.get("port", 8000)),
-                        "dbname": str(body.get("dbname", "")),
-                        "user": str(body.get("user", "")),
-                        "password": str(body.get("password", "")),
-                        "default_schema": str(conn_res.get("current_schema") or "public"),
-                        "sslmode": str(body.get("sslmode", "prefer")),
-                    }
-                )
-                store.save_meta("migrator_connection_id", prof.connection_id)
-                if store.list_items():
-                    engine.sync_all_items_with_db()
-                return _build_full_state_dict({"connection_result": conn_res})
-
-            result = await anyio.to_thread.run_sync(_do_connect)
-            return JSONResponse(result)
-        except Exception as exc:
-            logger.error("配置数据库连接异常: %s", exc)
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.get("/api/catalog", include_in_schema=False)
-    async def api_discover_catalog() -> JSONResponse:
-        try:
-            def _do_discover() -> Dict[str, Any]:
-                cat = engine.discover_database_catalog()
-                return {
-                    "catalog": cat,
-                    "connection": _safe_legacy_conn_info(),
-                }
-
-            res = await anyio.to_thread.run_sync(_do_discover)
-            return JSONResponse(res)
-        except Exception as exc:
-            logger.error("读取目标库表目录失败: %s", exc)
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/catalog/load", include_in_schema=False)
-    async def api_load_catalog_tables(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            schema_name = str(body.get("schema_name") or "").strip()
-            table_name = str(body.get("table_name") or "").strip()
-            max_tables = int(body.get("max_tables") or 30)
-
-            def _do_load() -> Dict[str, Any]:
-                loaded_count = engine.load_tables_from_database(
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    max_tables=max_tables,
-                )
-                if loaded_count == 0:
-                    raise ValueError("未在目标库中查找到匹配的表结构，请确认模式名或表名是否正确")
-                return _build_full_state_dict(
-                    {
-                        "loaded_count": loaded_count,
-                        "message": f"已成功从目标库读取 {loaded_count} 个字段结构并载入工作台！",
-                    }
-                )
-
-            res = await anyio.to_thread.run_sync(_do_load)
-            return JSONResponse(res)
-        except Exception as exc:
-            logger.error("从目标库加载表结构失败: %s", exc)
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/items/clear", include_in_schema=False)
-    async def api_clear_items() -> JSONResponse:
-        def _do_clear_items() -> Dict[str, Any]:
-            store.clear_items()
-            store.add_log("INFO", "清空清单", "已清空当前工作台中的字段清单。")
-            return _build_full_state_dict()
-
-        res = await anyio.to_thread.run_sync(_do_clear_items)
-        return JSONResponse(res)
-
-    @app.post("/api/excel/upload", include_in_schema=False)
-    async def api_upload_excel(request: Request) -> JSONResponse:
-        try:
-            form = await request.form()
-            upload_file = form.get("file")
-            if upload_file is None or not hasattr(upload_file, "read"):
-                return JSONResponse(status_code=400, content={"detail": "未接收到上传的 Excel 文件"})
-            safe_filename = os.path.basename(getattr(upload_file, "filename", "") or "checklist.xlsx")
-            content = await upload_file.read()
-            raw_default_schema = str(form.get("default_schema") or "").strip()
-            default_table = str(form.get("default_table") or "").strip()
-
-            def _do_parse_and_sync() -> Dict[str, Any]:
-                conn_info = engine.get_public_conn_info()
-                effective_schema = raw_default_schema or conn_info.get("current_schema") or "public"
-                parsed_items = parse_excel_checklist(
-                    content=content,
-                    filename=safe_filename,
-                    default_schema=effective_schema,
-                    default_table=default_table,
-                )
-                store.replace_all_items(parsed_items, safe_filename)
-                store.replace_cross_standards(parsed_items, safe_filename, preserve_bindings=True)
-                sync_msg = f"成功导入 [{safe_filename}] 共 {len(parsed_items)} 条字段"
-                if engine.is_configured():
-                    try:
-                        engine.sync_all_items_with_db()
-                        sync_msg += "，并已完成与数据库联动比对！"
-                    except Exception as sync_exc:
-                        store.add_log("ERROR", "数据库比对", f"清单已导入，但连接数据库比对失败: {sync_exc}")
-                        sync_msg += f"（注意：数据库联动比对未完成: {sync_exc}）"
-                return _build_full_state_dict({"imported_count": len(parsed_items), "message": sync_msg})
-
-            res = await anyio.to_thread.run_sync(_do_parse_and_sync)
-            return JSONResponse(res)
-        except Exception as exc:
-            logger.error("解析上传的 Excel 清单失败: %s", exc)
-            store.add_log("ERROR", "Excel导入", f"导入失败: {exc}")
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.get("/api/excel/template", include_in_schema=False)
-    async def api_download_template() -> Response:
-        data = await anyio.to_thread.run_sync(generate_template_excel)
-        encoded_name = quote("DWS字段贯标标准模板.xlsx")
-        headers = {
-            "Content-Disposition": f"attachment; filename=\"dws_template.xlsx\"; filename*=UTF-8''{encoded_name}",
-        }
-        return Response(
-            content=data,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=headers,
-        )
-
-    @app.get("/api/excel/export", include_in_schema=False)
-    async def api_export_report() -> Response:
-        data = await anyio.to_thread.run_sync(lambda: export_report_excel(store.list_items()))
-        encoded_name = quote("DWS字段贯标执行结果报告.xlsx")
-        headers = {
-            "Content-Disposition": f"attachment; filename=\"dws_migration_report.xlsx\"; filename*=UTF-8''{encoded_name}",
-        }
-        return Response(
-            content=data,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=headers,
-        )
-
-    @app.post("/api/sync", include_in_schema=False)
-    async def api_sync_with_db() -> JSONResponse:
-        try:
-            def _do_sync() -> Dict[str, Any]:
-                if not engine.is_configured():
-                    raise RuntimeError("尚未配置目标数据库连接")
-                engine.sync_all_items_with_db()
-                return _build_full_state_dict()
-
-            res = await anyio.to_thread.run_sync(_do_sync)
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.get("/api/table/inspect", include_in_schema=False)
-    async def api_inspect_table(request: Request) -> JSONResponse:
-        try:
-            schema_name = request.query_params.get("schema_name", "public")
-            table_name = request.query_params.get("table_name", "")
-            keep_backup = request.query_params.get("keep_backup", "true").lower() != "false"
-
-            def _do_inspect() -> Dict[str, Any]:
-                all_items = store.list_items()
-                table_items = [
-                    it
-                    for it in all_items
-                    if it["schema_name"].lower() == schema_name.lower()
-                    and it["table_name"].lower() == table_name.lower()
-                ]
-                return engine.build_table_rebuild_sql_preview(
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    items_for_table=table_items,
-                    keep_backup=keep_backup,
-                )
-
-            plan = await anyio.to_thread.run_sync(_do_inspect)
-            return JSONResponse(plan)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/execute/direct", include_in_schema=False)
-    async def api_execute_direct(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            item_ids = body.get("item_ids") or []
-            max_workers = int(body.get("max_workers") or 5)
-            keep_backup = bool(body.get("keep_backup", True))
-            if not item_ids:
-                return JSONResponse(status_code=400, content={"detail": "请至少选择一条待执行的字段记录"})
-
-            def _do_exec_direct() -> Dict[str, Any]:
-                batch_res = engine.execute_batch_items(
-                    item_ids=[int(x) for x in item_ids],
-                    max_workers=max_workers,
-                    keep_backup=keep_backup,
-                )
-                return _build_full_state_dict(batch_res)
-
-            res = await anyio.to_thread.run_sync(_do_exec_direct)
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/execute/rebuild", include_in_schema=False)
-    async def api_execute_rebuild(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            schema_name = str(body.get("schema_name", ""))
-            table_name = str(body.get("table_name", ""))
-            item_ids = body.get("item_ids")
-            keep_backup = bool(body.get("keep_backup", True))
-
-            def _do_rebuild() -> Dict[str, Any]:
-                res = engine.execute_table_rebuild_migration(
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    item_ids=item_ids,
-                    keep_backup=keep_backup,
-                )
-                return _build_full_state_dict({"message": res["message"]})
-
-            res = await anyio.to_thread.run_sync(_do_rebuild)
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.get("/api/logs", include_in_schema=False)
-    async def api_get_logs() -> JSONResponse:
-        res = await anyio.to_thread.run_sync(
-            lambda: {"logs": store.list_logs(limit=150), "summary": store.get_summary()}
-        )
-        return JSONResponse(res)
-
-    @app.post("/api/logs/clear", include_in_schema=False)
-    async def api_clear_logs() -> JSONResponse:
-        def _do_clear() -> Dict[str, Any]:
-            store.clear_logs()
-            store.add_log("INFO", "系统控制台", "已清空历史操作日志。")
-            return {"logs": store.list_logs(limit=150)}
-
-        res = await anyio.to_thread.run_sync(_do_clear)
-        return JSONResponse(res)
-
-    @app.get("/api/cross/overview", include_in_schema=False)
-    async def api_cross_overview_legacy(request: Request) -> JSONResponse:
-        try:
-            table_key = request.query_params.get("table_key", "")
-            res = await anyio.to_thread.run_sync(
-                lambda: cross_engine.get_overview_state(selected_table_key=table_key)
-            )
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/cross/connection", include_in_schema=False)
-    async def api_cross_configure_connection(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            role = str(body.get("role") or "source").strip().lower()
-            table_key = str(body.get("active_table_key") or "").strip()
-
-            def _do_cfg_conn() -> Dict[str, Any]:
-                cross_engine.configure_role_connection(
-                    role=role,
-                    db_type=str(body.get("db_type") or "DWS"),
-                    host=str(body.get("host") or ""),
-                    port=int(body.get("port") or 8000),
-                    dbname=str(body.get("dbname") or ""),
-                    user=str(body.get("user") or ""),
-                    password=str(body.get("password") or ""),
-                    schema_name=str(body.get("schema_name") or ""),
-                    sslmode=str(body.get("sslmode") or "prefer"),
-                    auth_mode=str(body.get("auth_mode") or "LDAP"),
-                )
-                return cross_engine.get_overview_state(selected_table_key=table_key)
-
-            res = await anyio.to_thread.run_sync(_do_cfg_conn)
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.get("/api/cross/compare", include_in_schema=False)
-    async def api_cross_compare_table(request: Request) -> JSONResponse:
-        try:
-            table_key = request.query_params.get("table_key", "")
-            src_schema = request.query_params.get("source_schema")
-            src_table = request.query_params.get("source_table")
-            tgt_schema = request.query_params.get("target_schema")
-            tgt_table = request.query_params.get("target_table")
-            if not table_key:
-                raise ValueError("请指定要查看的标准表名称 (table_key)")
-            res = await anyio.to_thread.run_sync(
-                lambda: cross_engine.compare_single_table(
-                    table_key,
-                    override_source_schema=src_schema,
-                    override_source_table=src_table,
-                    override_target_schema=tgt_schema,
-                    override_target_table=tgt_table,
-                )
-            )
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/cross/bindings/save", include_in_schema=False)
-    async def api_cross_save_bindings(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            std_table_key = (
-                str(body.get("std_table_key") or "").strip()
-                or str(body.get("source_table") or "").strip()
-                or str(body.get("target_table") or "").strip()
-            )
-            if not std_table_key:
-                raise ValueError("请先在来源库或目标库中选择/输入要读取的表名或视图名")
-            res = await anyio.to_thread.run_sync(
-                lambda: cross_engine.save_table_and_column_bindings(
-                    std_table_key=std_table_key,
-                    source_schema=str(body.get("source_schema") or ""),
-                    source_table=str(body.get("source_table") or ""),
-                    target_schema=str(body.get("target_schema") or ""),
-                    target_table=str(body.get("target_table") or ""),
-                    column_bindings=body.get("column_bindings") or [],
-                )
-            )
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/cross/standard/upload", include_in_schema=False)
-    async def api_cross_upload_standard(request: Request) -> JSONResponse:
-        try:
-            form = await request.form()
-            upload_file = form.get("file")
-            if upload_file is None or not hasattr(upload_file, "read"):
-                return JSONResponse(status_code=400, content={"detail": "未接收到上传的数标/绑定文件"})
-            safe_filename = os.path.basename(
-                getattr(upload_file, "filename", "") or "data_standard.xlsx"
-            )
-            content = await upload_file.read()
-            res = await anyio.to_thread.run_sync(
-                lambda: cross_engine.import_bindings_from_file(content, safe_filename)
-            )
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/cross/standard/sync-from-workbench", include_in_schema=False)
-    async def api_cross_sync_from_workbench() -> JSONResponse:
-        try:
-            res = await anyio.to_thread.run_sync(cross_engine.sync_standards_from_workbench)
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.post("/api/cross/push-to-workbench", include_in_schema=False)
-    async def api_cross_push_to_workbench(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            std_table_key = str(body.get("std_table_key") or "").strip() or None
-
-            def _do_push() -> Dict[str, Any]:
-                push_res = cross_engine.push_uncompliant_to_workbench(std_table_key)
-                return _build_full_state_dict(push_res)
-
-            res = await anyio.to_thread.run_sync(_do_push)
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
-
-    @app.get("/api/cross/bindings/export.json", include_in_schema=False)
-    async def api_cross_export_json() -> Response:
-        bundle = await anyio.to_thread.run_sync(store.export_cross_bindings_bundle)
-        raw_bytes = json.dumps(bundle, ensure_ascii=False, indent=2).encode("utf-8")
-        encoded_name = quote("跨环境数标三方绑定配置包.json")
-        headers = {
-            "Content-Disposition": f"attachment; filename=\"cross_bindings_bundle.json\"; filename*=UTF-8''{encoded_name}",
-        }
-        return Response(content=raw_bytes, media_type="application/json; charset=utf-8", headers=headers)
-
-    @app.get("/api/cross/bindings/export.xlsx", include_in_schema=False)
-    async def api_cross_export_excel(request: Request) -> Response:
-        table_key = request.query_params.get("table_key", "").strip() or None
-        data = await anyio.to_thread.run_sync(
-            lambda: cross_engine.export_comparison_excel(table_key)
-        )
-        encoded_name = quote("跨环境数标三方比对与绑定表.xlsx")
-        headers = {
-            "Content-Disposition": f"attachment; filename=\"cross_env_comparison.xlsx\"; filename*=UTF-8''{encoded_name}",
-        }
-        return Response(
-            content=data,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers=headers,
-        )
-
-    @app.post("/api/cross/ddl/translate", include_in_schema=False)
-    async def api_cross_translate_ddl(request: Request) -> JSONResponse:
-        try:
-            raw_body = await request.body()
-            body = json.loads(raw_body.decode("utf-8")) if raw_body else {}
-            res = await anyio.to_thread.run_sync(
-                lambda: cross_engine.translate_table_ddl(
-                    source_role=str(body.get("source_role") or "source"),
-                    source_schema=str(body.get("source_schema") or ""),
-                    source_table=str(body.get("source_table") or ""),
-                    target_dialect=str(body.get("target_dialect") or "DWS"),
-                    target_schema=str(body.get("target_schema") or ""),
-                    target_table=str(body.get("target_table") or ""),
-                    storage_mode=str(body.get("storage_mode") or "AUTO"),
-                    apply_standard_mapping=bool(body.get("apply_standard_mapping", False)),
-                    std_table_key=str(body.get("std_table_key") or ""),
-                    view_sql=str(body.get("view_sql") or ""),
-                )
-            )
-            return JSONResponse(res)
-        except Exception as exc:
-            return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @app.api_route("/favicon.ico", methods=["GET", "HEAD"], include_in_schema=False)
     async def route_favicon() -> Response:
@@ -845,7 +387,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.1.0 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.1.1 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")
