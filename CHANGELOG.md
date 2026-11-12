@@ -8,6 +8,23 @@
 
 ---
 
+## [2.1.1] - 2026-11-12
+
+### Changed
+- **全工程代码与文件深度瘦身**：
+  - 清理移除已被 v2.x 模块化架构完全替代的历史冗余代码与一次性脚本：`core/cross_env_engine.py`（169 KB 历史副本）、`core/state_store.py`、`pytest.bat`、`run_tests.bat`、`static/js/ui/split_pane.js`、`static/styles.css`、`示例_DWS字段贯标清单.xlsx`，并精简 `app.py` 中 450+ 行未使用的 v1.0 遗留路由。
+  - `static/index.html` 直接加载 `/css/tokens.css` 与 `/css/workbench.css`，消除 `@import` 二次串行请求。
+- **核心依赖精简与零 SDK 大模型通信 (`requirements.txt` & `core/platform/llm_hub.py`)**：
+  - `LLMHub` 改用 Python 标准库（`urllib.request` / `ssl` / `json` + 安全重定向协议校验）直连 DeepSeek、Google Gemini 及 OpenAI 兼容端点；`tests/test_modules_and_api.py` 改用轻量标准库内存 ASGI 客户端。
+  - `requirements.txt` 从 15 项精简为 **8 项纯运行时核心依赖**，彻底移除 `openai`（含 `jiter` / `tqdm` / `distro`）、`httpx`（含 `httpcore` / `certifi`）、`pytest`，并将 `pyinstaller` 隔离至打包构建阶段按需安装。
+- **Windows `DataOG.exe` 打包体积优化 (`build_exe.py`)**：
+  - 消除 `static/` 目录在 `_internal/static` 与外层目录的重复拷贝；精细化收敛 `pydantic_core` / `psycopg2` 二进制收集规则，显式排除 `openai`、`httpx`、`lxml`、`cryptography`、`pytest`、`psycopg2.tests`、`uvicorn.protocols.websockets` 等非运行时模块，并在打包后自动剥离 `.pyi` / `.pxd` / `__pycache__` 冗余文件。
+
+### Fixed
+- 修复 `core/platform/dialects/view_lineage.py` 中上游视图投影列同时带有显式 `CAST(...)` 与泛化原类型（如 Hive/Inceptor `STRING`）时未优先升级为 `CAST` 推导精度类型的问题。
+
+---
+
 ## [2.1.0] - 2026-11-12
 
 ### Added

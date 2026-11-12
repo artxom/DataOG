@@ -1,4 +1,4 @@
-# Data.O.G v2.1.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.1.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -37,11 +37,11 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.1.0 微内核入口（安全响应头、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.1.1 微内核入口（安全响应头、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
-│   │   ├── llm_hub.py            # DeepSeek / Gemini / OpenAI 兼容协议多服务商大模型中枢
+│   │   ├── llm_hub.py            # 零额外依赖标准库 DeepSeek / Gemini / OpenAI 兼容协议大模型中枢
 │   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载）
 │   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文
 │   │   ├── metadata_hub.py       # 双层元数据探查器与本地 SQLite 缓存检索中枢
@@ -49,7 +49,7 @@ DataOG/
 │   │   ├── storage.py            # data/dataog_state.db WAL 状态库、旧版无损迁移与幂等列演进
 │   │   └── dialects/             # 标识符清洗、类型映射矩阵、DDL 生成与四层视图血缘穿透
 │   ├── dws_engine.py             # 单库保序重建、Kahn 拓扑改名与分区继承核心引擎
-│   └── cross_env_engine.py       # 跨环境数标匹配、差异分类与桥接计算核心引擎
+│   └── excel_handler.py          # Excel 安全解析（防 XXE / Zip-Slip）、模板生成与结果导出
 ├── modules/                      # 相互独立的插件化业务模块（严格零跨模块私有导入）
 │   ├── standard_migrator/        # /api/modules/standard_migrator 单库批量落标贯标引擎
 │   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境三栏数标比对引擎
@@ -58,7 +58,7 @@ DataOG/
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（桌面与窗口管理器）、core/、ui/、views/（四大模块视图）
 ├── tests/                        # 27 项全量自动化测试（核心算法 / 平台底座 / 模块隔离与安全扫描）
-├── build_exe.py                  # Windows DataOG.exe PyInstaller 自动化门禁打包脚本
+├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
 ```
@@ -71,7 +71,8 @@ DataOG/
 | :--- | :--- | :--- |
 | **`v1.0.0`** | `main` | 单库保序贯标、16:9 三栏跨环境数标比对、多方言 DDL 翻译与四层视图穿透核心算法基线 |
 | **`v2.0.0`** | `refactor/dataog-workbench` → `main` | `FastAPI` 微内核升级、四大全局数据底座、`modules/*` 插件解耦与 `DataOG.exe` 打包流水线 |
-| **`v2.1.0`**（当前正式版） | `feat/macos-desktop-v2.1` → `main` | 品牌升级 **`Data.O.G`**，全面重塑 **macOS 桌面与红黄绿窗口体系（含右下角最小化抽屉）**，拆解为 **系统配置 / 数据探查 / 数据标准 / 多邻国** 四大模块，新增本地自定义壁纸图标存储与 DeepSeek / Gemini 大模型接入 |
+| **`v2.1.0`** | `feat/macos-desktop-v2.1` → `main` | 品牌升级 **`Data.O.G`**，全面重塑 **macOS 桌面与红黄绿窗口体系（含右下角最小化抽屉）**，拆解为 **系统配置 / 数据探查 / 数据标准 / 多邻国** 四大模块，新增本地自定义壁纸图标存储与 DeepSeek / Gemini 大模型接入 |
+| **`v2.1.1`**（当前正式版） | `refactor/project-slim` → `main` | 全工程深度瘦身与轻量化打包：清理历史冗余模块与一次性脚本，以标准库替代 `openai` / `httpx` 重型依赖，优化 PyInstaller 打包体积 |
 
 ---
 
@@ -94,6 +95,7 @@ python3 app.py
 
 ### 2. 在 Windows 下打包为独立免安装程序 (`DataOG.exe`)
 ```bash
-# 双击 build_windows.bat 或直接执行打包脚本（打包前自动运行全量单测门禁，产出于 dist/DataOG/DataOG.exe）
+# 安装打包器后直接执行打包脚本（或双击 build_windows.bat，产出于 dist/DataOG/DataOG.exe）
+python -m pip install "pyinstaller>=6.10.0"
 python build_exe.py
 ```
