@@ -88,3 +88,13 @@
   - `tests/test_core.py`（13 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、DDL 互译与四层视图穿透核心引擎。
   - `tests/test_platform.py`（8 项）：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏。
   - `tests/test_modules_and_api.py`（6 项）：验证 FastAPI 全路由契约、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、跨环境推送贯标闭环、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
+
+## 6. 下一阶段演进蓝图（供下次新会话直接衔接）：`v2.2.0` 数据探查 · AI 只读智能探查
+- **核心产品目标**：在保留桌面模块 **「数据探查 (`explorer`)」** 现有目录树随机浏览、表数据抽样预览、自由 SQL 查询与 CSV/Excel 导出能力的基础上，新增 **基于大模型 API 的有目的性多轮数据探查会话**（支持数据质量画像、空值/重复值/异常值诊断、主外键与表间关联推断、业务指标核对等目标驱动式探查）。
+- **强制安全红线（100% 纯只读零副作用铁律，绝不依赖 Prompt 软约束）**：
+  1. **词法与语法级只读 SQL 白名单沙箱（`QueryEngine` 扩展只读执行通道）**：剥离注释与字符串字面量后，强制单语句校验（严禁 `;` 多语句堆叠注入），顶层语句仅允许只读探查语法（`SELECT`、`WITH ... SELECT`、`SHOW`、`DESCRIBE`/`DESC`、纯 `EXPLAIN`），全语句扫描严厉拦截任何 `INSERT`、`UPDATE`、`DELETE`、`MERGE`、`UPSERT`、`REPLACE`、`CREATE`、`ALTER`、`DROP`、`TRUNCATE`、`RENAME`、`GRANT`、`REVOKE`、`CALL`、`EXEC`/`EXECUTE`、`COPY`、`LOAD`、`UNLOAD`、`SET`、`VACUUM`、`ANALYZE`、`LOCK`、`SELECT ... INTO`、`INTO OUTFILE`/`DUMPFILE`、`FOR UPDATE`/`FOR SHARE` 及危险系统控制函数（如 `pg_terminate_backend`、`pg_cancel_backend`、`dblink_exec`、`lo_import`/`lo_export` 等）。
+  2. **数据库会话级硬件只读加固**：在探查连接会话层强制开启只读事务/只读模式（PostgreSQL/DWS `SET TRANSACTION READ ONLY`、`PyMySQL` `SET SESSION TRANSACTION READ ONLY`、`SQLite` `PRAGMA query_only = ON`、JDBC `conn.setReadOnly(True)`，并在会话结束时无条件 `rollback()`），双重阻断任何潜在写操作或隐式副作用。
+  3. **探查行数、超时与步数熔断**：AI 发起的单条探查 SQL 强制施加采样行数上限（如 `LIMIT 100~200`）与短超时保护，单次问答的自动探查循环设置最大步数上限（如 `5~8` 步），防止慢查询拖垮目标库或撑爆大模型上下文。
+- **架构落地约束**：
+  - **后端插件化隔离**：新增独立模块 `modules/data_explorer/`（挂载于 `/api/modules/data_explorer`），严格通过 `PlatformContext` 复用 `LLMHub`（复用「系统配置 → AI 模型」已配好的 DeepSeek / Gemini / OpenAI 兼容网关，零新增第三方 Python 依赖，保持 `19.42 MB` 轻量打包基线）、`MetadataHub`（获取库表字段上下文）与 `QueryEngine`（只读安全执行），通过 `PlatformStateStore.register_table_schema` 幂等持久化探查会话历史，与其他 `modules/*` 严格零互引。
+  - **前端 macOS 极简体验**：在 `static/js/views/`（「数据探查」窗口内）融合自由 SQL 工作区与 AI 探查会话面板，透明展示每一步执行的只读探查 SQL、采样依据与结论，支持将 AI 生成的探查 SQL 一键同步至主编辑器或导出结果，严守零 `innerHTML` 与克制无废话的 macOS 界面规范。
