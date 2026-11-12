@@ -22,6 +22,7 @@
 
 ### Fixed
 - 修复 `core/platform/dialects/view_lineage.py` 中上游视图投影列同时带有显式 `CAST(...)` 与泛化原类型（如 Hive/Inceptor `STRING`）时未优先升级为 `CAST` 推导精度类型的问题。
+- 修复标准库内存 ASGI 测试客户端在 `BaseHTTPMiddleware` 流式文件响应期间过早返回 `http.disconnect` 导致响应体被提前取消的生命周期竞态。
 
 ---
 
