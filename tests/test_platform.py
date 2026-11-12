@@ -27,6 +27,7 @@ import openpyxl
 from core.platform.context import PlatformContext
 from core.platform.driver_manager import JdbcConnectionAdapter
 from core.platform.llm_hub import LLMHub, extract_json_payload
+from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
 from core.platform.storage import PlatformStateStore
 
 
@@ -725,6 +726,194 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+
+    def test_readonly_sql_guard_redteam_matrix_and_false_positive_immunity(self) -> None:
+        """红队验证：双模态词法/语法只读沙箱拦截一切写/DDL/锁/多语句/转义偷渡/危险函数，且合法查询零误伤."""
+        blocked_cases = [
+            # 1. 多语句堆叠与注释伪装
+            "SELECT 1; DROP TABLE t_users",
+            "SELECT 1; SELECT 2",
+            "SELECT 1; /* comment */ DELETE FROM t_users",
+            # 2. 反斜杠转义歧义偷渡（ANSI vs MySQL/PG 非标转义）
+            r"SELECT 'abc\'; DROP TABLE t_users; --'",
+            # 3. MySQL 条件可执行注释与未闭合注释/Dollar-Quoting
+            "SELECT /*!50000 1 */",
+            "SELECT /*! DROP TABLE t_users */ 1",
+            "SELECT /* outer /* inner */ 1",
+            "SELECT $$unclosed dollar literal",
+            # 4. 数据修改型 CTE (Data-Modifying CTE)
+            "WITH del AS (DELETE FROM t_users RETURNING *) SELECT * FROM del",
+            "WITH s AS (SELECT 1), u AS (UPDATE t_users SET a = 1 RETURNING *) SELECT * FROM u",
+            # 5. SELECT INTO 隐式建表与文件导出
+            "SELECT * INTO new_backup_tbl FROM t_users",
+            "SELECT id, name FROM t_users INTO OUTFILE '/tmp/leak.csv'",
+            "SELECT id FROM t_users INTO DUMPFILE '/tmp/leak.bin'",
+            # 6. 行级锁与表锁
+            "SELECT * FROM t_users FOR UPDATE",
+            "SELECT * FROM t_users FOR SHARE",
+            "SELECT * FROM t_users LOCK IN SHARE MODE",
+            # 7. EXPLAIN ANALYZE 真实执行副作用
+            "EXPLAIN ANALYZE SELECT * FROM t_users",
+            "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t_users",
+            # 8. 顶层写/DDL/DCL/TCL/会话修改语句
+            "DELETE FROM t_users WHERE id = 1",
+            "UPDATE t_users SET status = 'X'",
+            "INSERT INTO t_users(id) VALUES (1)",
+            "MERGE INTO t_users t USING src s ON (t.id = s.id) WHEN MATCHED THEN DELETE",
+            "ALTER TABLE t_users ADD COLUMN hacked INT",
+            "TRUNCATE TABLE t_users",
+            "DROP VIEW v_users",
+            "GRANT SELECT ON t_users TO public",
+            "SET work_mem = '2GB'",
+            "PRAGMA writable_schema = ON",
+            "VACUUM",
+            "CALL sp_refresh_data()",
+            "SHOW GRANTS FOR root",
+            # 9. 跨方言危险控制/系统文件/外部扩展函数（含双引号包裹绕过尝试）
+            "SELECT pg_terminate_backend(1024)",
+            'SELECT "pg_sleep"(5)',
+            "SELECT pg_catalog.pg_read_file('/etc/passwd')",
+            "SELECT dblink_exec('host=10.0.0.1', 'DROP TABLE t')",
+            "SELECT lo_import('/etc/passwd')",
+            "SELECT load_file('/etc/passwd')",
+            "SELECT load_extension('evil_ext')",
+            "SELECT DBMS_LOCK.SLEEP(3) FROM dual",
+            "SELECT UTL_HTTP.REQUEST('http://127.0.0.1') FROM dual",
+        ]
+        for sql in blocked_cases:
+            with self.subTest(blocked_sql=sql):
+                with self.assertRaises(ReadOnlyViolationError, msg=f"未能拦截危险 SQL: {sql}"):
+                    validate_readonly_sql(sql, "PGSQL")
+
+        allowed_cases = [
+            "SELECT REPLACE(phone, '-', '') AS clean_phone, TRUNCATE(pay_amt, 2) AS amt FROM dwd_order;",
+            "SELECT update_tm, create_dt, \"delete\", 'DROP TABLE fake; --' AS note FROM dwd_order; -- end ; note",
+            "SELECT CAST(cust_name AS CHAR CHARACTER SET utf8mb4) FROM dwd_order",
+            (
+                "WITH base AS (SELECT cust_id, pay_amt FROM dwd_order WHERE pay_amt IS NOT NULL), "
+                "ranked AS (SELECT cust_id, pay_amt, ROW_NUMBER() OVER (PARTITION BY cust_id ORDER BY pay_amt DESC) AS rn FROM base) "
+                "SELECT cust_id, pay_amt FROM ranked WHERE rn = 1;"
+            ),
+            "SHOW TABLES;",
+            "SHOW CREATE TABLE dwd_order;",
+            "SHOW FULL COLUMNS FROM dwd_order",
+            "DESCRIBE dwd_order",
+            "DESC dwd_order",
+            "EXPLAIN SELECT * FROM dwd_order WHERE cust_id = 'C01'",
+            "SELECT payload #>> '{profile,tier}' AS tier FROM ods_event_log",
+        ]
+        for sql in allowed_cases:
+            with self.subTest(allowed_sql=sql):
+                cleaned = validate_readonly_sql(sql, "PGSQL")
+                self.assertTrue(len(cleaned) > 0)
+                self.assertFalse(cleaned.rstrip().endswith(";"))
+
+    def test_hardware_readonly_session_unconditional_rollback_and_bounded_sampling(self) -> None:
+        """验证四道防线联动：SQLite URI mode=ro + query_only 硬件拒写、JDBC/PG/MySQL 只读模式与退出无条件回滚."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            biz_sqlite = os.path.join(tmpdir, "ro_guard.sqlite")
+            with contextlib.closing(sqlite3.connect(biz_sqlite)) as conn:
+                conn.execute("CREATE TABLE t_ledger (id INTEGER PRIMARY KEY, amt NUMERIC)")
+                conn.executemany("INSERT INTO t_ledger (id, amt) VALUES (?, ?)", [(i, i * 10) for i in range(1, 251)])
+                conn.commit()
+
+            ctx = PlatformContext(db_path=os.path.join(tmpdir, "dataog_state.db"))
+            prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "只读账本库",
+                    "driver_track": "NATIVE",
+                    "db_type": "SQLITE",
+                    "sqlite_path": biz_sqlite,
+                }
+            )
+
+            # 1. 即使绕过 SQL 校验器直接在 readonly_session 底层连接执行写语句，SQLite 引擎级 mode=ro 也会直接抛错阻断
+            with ctx.connection_hub.readonly_session(prof.connection_id, timeout_sec=8) as ro_conn:
+                q_only = ro_conn.execute("PRAGMA query_only").fetchone()[0]
+                self.assertEqual(int(q_only), 1)
+                with self.assertRaises(sqlite3.OperationalError):
+                    ro_conn.execute("DELETE FROM t_ledger WHERE id = 1")
+                with self.assertRaises(sqlite3.OperationalError):
+                    ro_conn.execute("CREATE TABLE hacked_tbl (x INT)")
+
+            # 核对底层 250 行数据 100% 完好无损
+            with contextlib.closing(sqlite3.connect(biz_sqlite)) as check_conn:
+                cnt = check_conn.execute("SELECT COUNT(*) FROM t_ledger").fetchone()[0]
+                self.assertEqual(cnt, 250)
+
+            # 2. QueryEngine.execute_readonly_sql 行数熔断（limit=999 自动钳制到 MAX_EXPLORER_SAMPLE_LIMIT=200）
+            sampled = ctx.query_engine.execute_readonly_sql(
+                prof.connection_id,
+                "SELECT id, amt FROM t_ledger ORDER BY id;",
+                limit=999,
+                timeout_sec=8,
+            )
+            self.assertEqual(sampled.row_count, 200)
+            self.assertTrue(sampled.truncated)
+
+            # 拦截写 SQL
+            with self.assertRaises(ReadOnlyViolationError):
+                ctx.query_engine.execute_readonly_sql(prof.connection_id, "DELETE FROM t_ledger")
+
+            # 3. 验证 JDBC 只读会话：开启 setAutoCommit(False) + setReadOnly(True)，退出时无条件 rollback 且零 commit
+            raw_jdbc = mock.MagicMock()
+            jdbc_adapter = JdbcConnectionAdapter(raw_jdbc)
+            jdbc_adapter.set_readonly_mode(True)
+            raw_jdbc.setAutoCommit.assert_called_once_with(False)
+            raw_jdbc.setReadOnly.assert_called_once_with(True)
+
+            jdbc_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "模拟JDBC只读库",
+                    "driver_track": "JDBC",
+                    "db_type": "ORACLE",
+                    "jdbc_url": "jdbc:oracle:thin:@127.0.0.1:1521:orcl",
+                }
+            )
+            with mock.patch.object(ctx.driver_manager, "open_connection", return_value=jdbc_adapter) as m_open:
+                with ctx.connection_hub.readonly_session(jdbc_prof.connection_id, timeout_sec=10):
+                    pass
+                m_open.assert_called_once()
+                self.assertTrue(m_open.call_args.kwargs.get("readonly"))
+            raw_jdbc.rollback.assert_called_once()
+            raw_jdbc.commit.assert_not_called()
+
+            # 4. 验证 PostgreSQL / MySQL 驱动打开 readonly=True 连接时下发会话级硬件只读指令
+            pg_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "模拟DWS库",
+                    "driver_track": "NATIVE",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 8000,
+                    "dbname": "dws",
+                    "user": "ro_user",
+                }
+            )
+            fake_pg_conn = mock.MagicMock()
+            with mock.patch("psycopg2.connect", return_value=fake_pg_conn):
+                ctx.driver_manager.open_connection(pg_prof, timeout_sec=9, readonly=True)
+            fake_pg_conn.set_session.assert_called_once_with(readonly=True, autocommit=False)
+
+            mysql_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "模拟MySQL库",
+                    "driver_track": "NATIVE",
+                    "db_type": "MYSQL",
+                    "host": "127.0.0.1",
+                    "port": 3306,
+                    "dbname": "app",
+                    "user": "ro_user",
+                }
+            )
+            fake_my_conn = mock.MagicMock()
+            fake_my_cur = mock.MagicMock()
+            fake_my_conn.cursor.return_value.__enter__.return_value = fake_my_cur
+            with mock.patch("pymysql.connect", return_value=fake_my_conn):
+                ctx.driver_manager.open_connection(mysql_prof, timeout_sec=9, readonly=True)
+            executed_sqls = [c.args[0] for c in fake_my_cur.execute.call_args_list]
+            self.assertIn("SET SESSION TRANSACTION READ ONLY", executed_sqls)
+            self.assertIn("START TRANSACTION READ ONLY", executed_sqls)
 
 
 if __name__ == "__main__":

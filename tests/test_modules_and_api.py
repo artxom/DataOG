@@ -193,6 +193,15 @@ class TestClient:
     ) -> _AsgiResponse:
         return self.request("PUT", url, json_body=json, headers=headers)
 
+    def patch(
+        self,
+        url: str,
+        *,
+        json: Any = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> _AsgiResponse:
+        return self.request("PATCH", url, json_body=json, headers=headers)
+
     def delete(self, url: str, *, headers: Optional[Dict[str, str]] = None) -> _AsgiResponse:
         return self.request("DELETE", url, headers=headers)
 
@@ -320,11 +329,11 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             app = create_app(db_path=os.path.join(tmpdir, "dataog_state.db"))
             client = TestClient(app)
 
-            # 1. Bootstrap 检查三大插件清单注册
+            # 1. Bootstrap 检查四大插件清单注册
             boot = client.get("/api/platform/bootstrap").json()
             self.assertTrue(boot["ok"])
             mod_ids = {m["module_id"] for m in boot["modules"]}
-            self.assertEqual(mod_ids, {"standard_migrator", "cross_comparator", "ddl_translator"})
+            self.assertEqual(mod_ids, {"standard_migrator", "cross_comparator", "ddl_translator", "data_explorer"})
 
             # 2. 上传并删除自定义 JDBC .jar 驱动
             up_drv = client.post(
@@ -861,6 +870,259 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 self.assertTrue(r_ai_tr["ai_used"])
                 self.assertIn("ORIENTATION = COLUMN", r_ai_tr["target_ddl"])
                 self.assertEqual(len(r_ai_tr["column_mappings"]), 2)
+
+    def test_data_explorer_agentic_loop_readonly_block_and_session_lifecycle(self) -> None:
+        """端到端验证 v2.2.0：AI 多轮只读探查会话、幻觉写语句实时拦截保护、恶意推荐 SQL 清洗与会话 CRUD."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            biz_sqlite = os.path.join(tmpdir, "trade_quality.sqlite")
+            with contextlib.closing(sqlite3.connect(biz_sqlite)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE dwd_trade_order (
+                        order_id VARCHAR(64),
+                        cust_id VARCHAR(32),
+                        pay_amt DECIMAL(18,2),
+                        order_status VARCHAR(16)
+                    );
+                    INSERT INTO dwd_trade_order VALUES ('O1001', 'C01', 128.50, 'PAID');
+                    INSERT INTO dwd_trade_order VALUES ('O1001', 'C01', 128.50, 'PAID');
+                    INSERT INTO dwd_trade_order VALUES ('O1002', NULL, -45.00, 'ABNORMAL');
+                    INSERT INTO dwd_trade_order VALUES ('O1003', 'C02', 360.00, 'PAID');
+                    """
+                )
+
+            ctx = PlatformContext(
+                db_path=os.path.join(tmpdir, "dataog_state.db"),
+                drivers_dir=os.path.join(tmpdir, "drivers"),
+                assets_dir=os.path.join(tmpdir, "assets"),
+            )
+            app = create_app(ctx=ctx)
+            client = TestClient(app)
+
+            conn_resp = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "交易质量待检库",
+                    "driver_track": "NATIVE",
+                    "db_type": "SQLITE",
+                    "sqlite_path": biz_sqlite,
+                    "auto_refresh_metadata": True,
+                },
+            ).json()
+            self.assertTrue(conn_resp["ok"])
+            cid = conn_resp["connection"]["connection_id"]
+
+            # 1. 平台级只读执行端点 /api/platform/query/execute-readonly 放行 SELECT、阻断 DELETE
+            ro_ok = client.post(
+                "/api/platform/query/execute-readonly",
+                json={
+                    "connection_id": cid,
+                    "sql": "SELECT COUNT(*) AS cnt FROM dwd_trade_order;",
+                    "limit": 50,
+                },
+            )
+            self.assertEqual(ro_ok.status_code, 200)
+            self.assertEqual(ro_ok.json()["result"]["rows"], [[4]])
+
+            ro_bad = client.post(
+                "/api/platform/query/execute-readonly",
+                json={
+                    "connection_id": cid,
+                    "sql": "DELETE FROM dwd_trade_order WHERE pay_amt < 0",
+                    "limit": 50,
+                },
+            )
+            self.assertEqual(ro_bad.status_code, 400)
+
+            # 2. 配置默认 AI 服务商
+            client.put(
+                "/api/platform/llm/providers/deepseek",
+                json={
+                    "name": "DeepSeek",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "sk-explorer-mock-key-8888",
+                    "default_model": "deepseek-chat",
+                    "models": ["deepseek-chat"],
+                    "enabled": True,
+                    "is_default": True,
+                },
+            )
+
+            # 3. 模拟 3 步 ReAct 探查循环：
+            #    Step 1: 正常统计总行数、空值与负数金额
+            #    Step 2: 大模型幻觉试图执行 DELETE 清理脏数据 -> 被只读沙箱硬拦截 (status='blocked')
+            #    Step 3: 大模型收到拦截错误后输出结论（同时故意夹带非只读 recommended_sql 测试二次清洗）
+            llm_step_replies = [
+                {
+                    "provider_id": "deepseek",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-chat",
+                    "content": json.dumps(
+                        {
+                            "action": "query",
+                            "thought": "核查订单表总行数、客户号空值数与负向金额记录数",
+                            "sql": (
+                                "SELECT COUNT(*) AS total_rows, "
+                                "SUM(CASE WHEN cust_id IS NULL THEN 1 ELSE 0 END) AS null_cust_cnt, "
+                                "SUM(CASE WHEN pay_amt < 0 THEN 1 ELSE 0 END) AS neg_amt_cnt "
+                                "FROM dwd_trade_order"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 30.0,
+                },
+                {
+                    "provider_id": "deepseek",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-chat",
+                    "content": json.dumps(
+                        {
+                            "action": "query",
+                            "thought": "尝试删除负数脏数据（越权幻觉测试）",
+                            "sql": "DELETE FROM dwd_trade_order WHERE pay_amt < 0",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 25.0,
+                },
+                {
+                    "provider_id": "deepseek",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-chat",
+                    "content": json.dumps(
+                        {
+                            "action": "conclude",
+                            "summary": "订单表共 4 行记录，发现 1 条客户号缺失且金额为负数的异常记录。",
+                            "findings": [
+                                {
+                                    "severity": "warn",
+                                    "title": "存在空客户号与负金额脏数据",
+                                    "detail": "O1002 记录 cust_id 为 NULL 且 pay_amt 为 -45.00。",
+                                    "evidence_sql": "SELECT * FROM dwd_trade_order WHERE cust_id IS NULL OR pay_amt < 0",
+                                }
+                            ],
+                            "recommended_sql": "UPDATE dwd_trade_order SET pay_amt = 0 WHERE pay_amt < 0",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 35.0,
+                },
+            ]
+
+            with mock.patch.object(ctx.llm_hub, "chat_completion", side_effect=llm_step_replies):
+                r_exp = client.post(
+                    "/api/modules/data_explorer/explore",
+                    json={
+                        "connection_id": cid,
+                        "schema_name": "main",
+                        "focus_tables": ["main.dwd_trade_order"],
+                        "prompt": "排查订单表空值与异常负金额脏数据",
+                        "goal_type": "dirty",
+                        "max_steps": 5,
+                        "sample_limit": 100,
+                    },
+                )
+            self.assertEqual(r_exp.status_code, 200, r_exp.text)
+            exp_body = r_exp.json()
+            self.assertTrue(exp_body["ok"])
+            session_id = exp_body["session"]["session_id"]
+            assistant_msg = exp_body["assistant_message"]
+            steps = assistant_msg["steps"]
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(steps[0]["status"], "ok")
+            self.assertEqual(steps[0]["rows"], [[4, 1, 1]])
+            self.assertEqual(steps[1]["status"], "blocked")
+            self.assertIn("DELETE", steps[1]["error"].upper())
+
+            # 夹带的恶意 UPDATE recommended_sql 必须被剥离并回退至第 1 步合法的 SELECT SQL
+            self.assertTrue(assistant_msg["recommended_sql"].upper().startswith("SELECT"))
+            self.assertNotIn("UPDATE", assistant_msg["recommended_sql"].upper())
+            self.assertEqual(len(assistant_msg["findings"]), 1)
+
+            # 底层 SQLite 业务表必须保持 4 行分毫无损
+            with contextlib.closing(sqlite3.connect(biz_sqlite)) as check_conn:
+                remain_cnt = check_conn.execute("SELECT COUNT(*) FROM dwd_trade_order").fetchone()[0]
+                self.assertEqual(remain_cnt, 4)
+
+            # 4. 同一 session_id 多轮追问（测试主键重复排查）
+            followup_replies = [
+                {
+                    "provider_id": "deepseek",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-chat",
+                    "content": json.dumps(
+                        {
+                            "action": "query",
+                            "thought": "检查 order_id 是否存在重复值",
+                            "sql": (
+                                "SELECT order_id, COUNT(*) AS dup_cnt "
+                                "FROM dwd_trade_order GROUP BY order_id HAVING COUNT(*) > 1"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 20.0,
+                },
+                {
+                    "provider_id": "deepseek",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-chat",
+                    "content": json.dumps(
+                        {
+                            "action": "conclude",
+                            "summary": "订单号 O1001 存在 2 条重复记录。",
+                            "findings": [
+                                {
+                                    "severity": "error",
+                                    "title": "主键候选列 order_id 重复",
+                                    "detail": "order_id = 'O1001' 重复出现 2 次。",
+                                    "evidence_sql": "SELECT * FROM dwd_trade_order WHERE order_id = 'O1001'",
+                                }
+                            ],
+                            "recommended_sql": "SELECT * FROM dwd_trade_order WHERE order_id = 'O1001'",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 22.0,
+                },
+            ]
+            with mock.patch.object(ctx.llm_hub, "chat_completion", side_effect=followup_replies):
+                r_follow = client.post(
+                    "/api/modules/data_explorer/explore",
+                    json={
+                        "session_id": session_id,
+                        "connection_id": cid,
+                        "schema_name": "main",
+                        "focus_tables": ["main.dwd_trade_order"],
+                        "prompt": "继续检查 order_id 是否有重复单号",
+                        "goal_type": "dirty",
+                    },
+                ).json()
+            self.assertTrue(r_follow["ok"])
+            self.assertEqual(r_follow["assistant_message"]["steps"][0]["rows"], [["O1001", 2]])
+
+            # 5. 会话列表、会话详情（共 4 条消息：2 user + 2 assistant）、重命名与删除闭环
+            s_list = client.get(f"/api/modules/data_explorer/sessions?connection_id={cid}").json()
+            self.assertEqual(len(s_list["sessions"]), 1)
+
+            r_patch = client.patch(
+                f"/api/modules/data_explorer/sessions/{session_id}",
+                json={"title": "订单脏数据与重复单号核查"},
+            ).json()
+            self.assertTrue(r_patch["ok"])
+            self.assertEqual(r_patch["session"]["title"], "订单脏数据与重复单号核查")
+
+            s_detail = client.get(f"/api/modules/data_explorer/sessions/{session_id}").json()
+            self.assertTrue(s_detail["ok"])
+            self.assertEqual(len(s_detail["session"]["messages"]), 4)
+
+            r_del = client.delete(f"/api/modules/data_explorer/sessions/{session_id}").json()
+            self.assertTrue(r_del["ok"])
+            self.assertEqual(
+                client.get(f"/api/modules/data_explorer/sessions/{session_id}").status_code,
+                404,
+            )
 
 
 if __name__ == "__main__":
