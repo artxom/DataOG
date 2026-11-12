@@ -72,7 +72,8 @@ DataOG/
 | **`v1.0.0`** | `main` | 单库保序贯标、16:9 三栏跨环境数标比对、多方言 DDL 翻译与四层视图穿透核心算法基线 |
 | **`v2.0.0`** | `refactor/dataog-workbench` → `main` | `FastAPI` 微内核升级、四大全局数据底座、`modules/*` 插件解耦与 `DataOG.exe` 打包流水线 |
 | **`v2.1.0`** | `feat/macos-desktop-v2.1` → `main` | 品牌升级 **`Data.O.G`**，全面重塑 **macOS 桌面与红黄绿窗口体系（含右下角最小化抽屉）**，拆解为 **系统配置 / 数据探查 / 数据标准 / 多邻国** 四大模块，新增本地自定义壁纸图标存储与 DeepSeek / Gemini 大模型接入 |
-| **`v2.1.1`**（当前正式版） | `refactor/project-slim` → `main` | 全工程深度瘦身与轻量化打包：清理历史冗余模块与一次性脚本，以标准库替代 `openai` / `httpx` 重型依赖，优化 PyInstaller 打包体积 |
+| **`v2.1.1`**（当前正式版） | `refactor/project-slim` → `main` | 全工程深度瘦身与轻量化打包：清理历史冗余模块与一次性脚本，以标准库替代 `openai` / `httpx` 重型依赖，Windows 发行包缩减 `29.2%` 至 `19.42 MB` |
+| **`v2.2.0`**（下一阶段规划） | 待切出 `feat/explorer-ai-agent` | **数据探查 · AI 只读智能探查会话**：在自由 SQL 查询与随机浏览基础上，接入 `LLMHub` 实现目标驱动的多步自动数据探查与画像诊断（词法白名单 + 数据库只读事务双重零写入保障） |
 
 ---
 
