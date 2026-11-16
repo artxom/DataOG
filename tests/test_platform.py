@@ -1427,6 +1427,95 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
         self.assertEqual(cb_records[0], (1, 85))
         self.assertEqual(cb_records[-1], (85, 85))
 
+        # 6. 回归验证：
+        #    a) 共享公式平移保护结构化表引用列名（如 [@ID1]、Table1[[#This Row],[C2]] 不被当作单元格坐标平移）及整行引用平移；
+        #    b) LOOKUP(1,0/(...))、VLOOKUP+CHOOSE({1,2},...)、INDIRECT、OFFSET、$3:$3 整行引用及异常公式外包 IFERROR；
+        #    c) 文本态公式触发懒求值器后 close() 彻底关闭双工作簿句柄；
+        #    d) EasyExcel / write_only 写死 <dimension ref="A1:A1"/> 时准确还原真实行数。
+        import re
+        from core.excel_formula import _shift_shared_formula
+
+        self.assertEqual(
+            _shift_shared_formula("VLOOKUP([@ID1], Dict!$A$2:$B$10, 2, 0)", 3, 0),
+            "VLOOKUP([@ID1], Dict!$A$2:$B$10, 2, 0)",
+        )
+        self.assertEqual(
+            _shift_shared_formula("Table1[[#This Row],[C2]]", 2, 1),
+            "Table1[[#This Row],[C2]]",
+        )
+        self.assertEqual(
+            _shift_shared_formula("INDEX(2:2, 1, B1)", 3, 0),
+            "INDEX(5:5, 1, B4)",
+        )
+
+        wb_idiom = openpyxl.Workbook()
+        ws_id1 = wb_idiom.active
+        ws_id1.title = "Sheet1"
+        ws_id1.append(["tbl", "col", "f_lookup", "f_choose", "f_indirect", "f_offset", "f_rowref", "f_bad", "f_iferr"])
+        ws_id1.append(
+            [
+                "t_cust",
+                "cust_no",
+                "=LOOKUP(1, 0/((Sheet2!A2:A4=A2)*(Sheet2!B2:B4=B2)), Sheet2!C2:C4)",
+                '=VLOOKUP(A2&"|"&B2, CHOOSE({1,2}, Sheet2!A2:A4&"|"&Sheet2!B2:B4, Sheet2!C2:C4), 2, 0)',
+                '=INDIRECT("Sheet2!C3")',
+                "=OFFSET(Sheet2!A1, 2, 2)",
+                "=INDEX(Sheet2!$3:$3, 1, 3)",
+                "=1 @@@ 2",
+                '=IFERROR(H2, "SAFE_FALLBACK")',
+            ]
+        )
+        ws_id2 = wb_idiom.create_sheet("Sheet2")
+        ws_id2.append(["tbl", "col", "std_code"])
+        ws_id2.append(["t_acct", "cust_no", "WRONG_1"])
+        ws_id2.append(["t_cust", "cust_no", "STD_CUST_01"])
+        ws_id2.append(["t_loan", "cust_no", "WRONG_2"])
+        buf_idiom = io.BytesIO()
+        wb_idiom.save(buf_idiom)
+        with ResolvedWorkbook(buf_idiom.getvalue()) as rwb_id:
+            id_rows = list(rwb_id.iter_sheet_rows("Sheet1"))
+            self.assertEqual(id_rows[1][2:7], ["STD_CUST_01"] * 5)
+            self.assertEqual(clean_excel_cell_str(id_rows[1][7]), "")
+            self.assertEqual(id_rows[1][8], "SAFE_FALLBACK")
+
+        wb_txt = openpyxl.Workbook()
+        ws_txt = wb_txt.active
+        ws_txt.title = "TextFml"
+        ws_txt.append(["raw", "fml"])
+        ws_txt.cell(row=2, column=1, value="abc")
+        c_tf = ws_txt.cell(row=2, column=2, value="=UPPER(A2)")
+        c_tf.data_type = "s"
+        buf_txt = io.BytesIO()
+        wb_txt.save(buf_txt)
+        rwb_tf = ResolvedWorkbook(buf_txt.getvalue())
+        tf_rows = list(rwb_tf.iter_sheet_rows("TextFml"))
+        self.assertEqual(tf_rows[1], ["abc", "ABC"])
+        primary_wb = rwb_tf._wb
+        eval_wb = rwb_tf._evaluator._wb_val
+        rwb_tf.close()
+        self.assertIsNone(primary_wb._archive.fp)
+        self.assertIsNone(eval_wb._archive.fp)
+
+        wb_stream = openpyxl.Workbook(write_only=True)
+        ws_st = wb_stream.create_sheet("EasySheet")
+        for r_i in range(1, 211):
+            ws_st.append([f"k_{r_i}", r_i])
+        buf_st = io.BytesIO()
+        wb_stream.save(buf_st)
+        buf_st_fixed_dim = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(buf_st.getvalue()), "r") as zin, zipfile.ZipFile(
+            buf_st_fixed_dim, "w"
+        ) as zout:
+            for zinfo in zin.infolist():
+                zdata = zin.read(zinfo.filename)
+                if zinfo.filename == "xl/worksheets/sheet1.xml":
+                    zdata = re.sub(rb'<dimension\s+ref="[^"]*"\s*/>', b'<dimension ref="A1:A1"/>', zdata)
+                    if b"<dimension" not in zdata:
+                        zdata = zdata.replace(b"<sheetData>", b'<dimension ref="A1:A1"/><sheetData>', 1)
+                zout.writestr(zinfo, zdata)
+        with ResolvedWorkbook(buf_st_fixed_dim.getvalue()) as rwb_st:
+            self.assertEqual(rwb_st.estimate_sheet_rows("EasySheet"), 210)
+
 
 if __name__ == "__main__":
     unittest.main()
