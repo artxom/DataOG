@@ -481,8 +481,8 @@ export class CrossComparatorView {
               })
           : null,
       accept: ".xlsx,.xlsm",
-      onUpload: async (file) => {
-        const res = await crossApi.uploadPairings(file, this.formatProfile);
+      onUpload: async (file, _mode, uploadCtx) => {
+        const res = await crossApi.uploadPairings(file, this.formatProfile, uploadCtx);
         this.overview = res;
         this.activeTableKey = res.active_table_key || "";
         this._hydrateDraftFromComparison(res.active_comparison);

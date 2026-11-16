@@ -22,7 +22,13 @@ from core.platform.dialects import (
     is_cross_type_compatible,
     normalize_cross_type,
 )
-from core.platform.excel_io import parse_excel_checklist, validate_xlsx_bytes
+from core.platform.excel_io import (
+    ResolvedWorkbook,
+    clean_excel_cell_str,
+    parse_excel_checklist,
+    validate_xlsx_bytes,
+)
+from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.models import ColumnMeta, TableMeta
 
 
@@ -648,8 +654,12 @@ class CrossComparatorService:
                     "src_obj": src_obj,
                     "tgt_name": eff_tgt_name,
                     "tgt_obj": tgt_obj,
-                    "saved_src_std": str(sc.get("source_std_code") or "").strip(),
-                    "saved_tgt_std": str(sc.get("target_std_code") or "").strip(),
+                    "saved_src_std": clean_excel_cell_str(
+                        sc.get("source_std_code"), treat_placeholder_empty=True
+                    ),
+                    "saved_tgt_std": clean_excel_cell_str(
+                        sc.get("target_std_code"), treat_placeholder_empty=True
+                    ),
                     "fallback_std_name": "" if sc_name.startswith("__unpaired_") else sc_name,
                     "fallback_std_type": str(sc.get("std_col_type") or "").strip(),
                     "fallback_std_comment": str(sc.get("std_col_comment") or "").strip(),
@@ -945,19 +955,21 @@ class CrossComparatorService:
         # 收集标准字典信息用于填充标准名称与目标物理类型
         codes_to_fetch = []
         for p in pairings:
-            if p.get("source_std_code"):
-                codes_to_fetch.append(str(p["source_std_code"]).strip())
-            if p.get("target_std_code"):
-                codes_to_fetch.append(str(p["target_std_code"]).strip())
+            sc_clean = clean_excel_cell_str(p.get("source_std_code"), treat_placeholder_empty=True)
+            tc_clean = clean_excel_cell_str(p.get("target_std_code"), treat_placeholder_empty=True)
+            if sc_clean:
+                codes_to_fetch.append(sc_clean)
+            if tc_clean:
+                codes_to_fetch.append(tc_clean)
         std_map = self.ctx.standard_catalog.get_items_by_codes(codes_to_fetch)
 
         now = self.ctx.store._now_str()
         col_rows_to_insert: List[Tuple[Any, ...]] = []
         for idx, p in enumerate(pairings, start=1):
-            s_col = clean_identifier_input(str(p.get("source_col") or ""))
-            t_col = clean_identifier_input(str(p.get("target_col") or ""))
-            s_code = str(p.get("source_std_code") or "").strip()
-            t_code = str(p.get("target_std_code") or "").strip()
+            s_col = clean_identifier_input(clean_excel_cell_str(p.get("source_col"), treat_placeholder_empty=True))
+            t_col = clean_identifier_input(clean_excel_cell_str(p.get("target_col"), treat_placeholder_empty=True))
+            s_code = clean_excel_cell_str(p.get("source_std_code"), treat_placeholder_empty=True)
+            t_code = clean_excel_cell_str(p.get("target_std_code"), treat_placeholder_empty=True)
             if not s_col and not t_col:
                 continue
 
@@ -1171,29 +1183,17 @@ class CrossComparatorService:
         filename: str,
         content: bytes,
         format_profile: str = "AUTO",
+        progress_cb: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
-        """批量上传跨环境对应关系铺底表."""
+        """批量上传跨环境对应关系铺底表（自动提取公式最终值、识别 #N/A 为空）."""
+        report = progress_cb or noop_progress
+        report(15.0, "校验与读取工作簿", "正在读取跨环境映射表（提取公式计算结果并过滤 #N/A）...", 0, 0)
         validate_xlsx_bytes(filename, content)
-        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-        try:
-            all_sheets_rows: List[List[Any]] = []
-            for ws in wb.worksheets:
-                t_norm = (ws.title or "").strip().lower()
-                if t_norm in ("填写说明", "填表说明", "使用说明", "说明", "目录", "封面", "readme"):
-                    continue
-                sheet_rows = list(ws.iter_rows(values_only=True))
-                if sheet_rows:
-                    all_sheets_rows.append(sheet_rows)
-        finally:
-            wb.close()
-
-        if not all_sheets_rows:
-            raise ValueError("映射铺底表为空，请下载系统模板填写后再上传")
+        self.ctx.standard_catalog.purge_invalid_error_bindings()
 
         def _norm(v: Any) -> str:
             return (
-                str(v or "")
-                .strip()
+                clean_excel_cell_str(v)
                 .lower()
                 .replace("（", "(")
                 .replace("）", ")")
@@ -1212,90 +1212,134 @@ class CrossComparatorService:
             "target_std": {"目标数据项编号(选填)", "目标数据项编号", "目标标准编号", "targetstdcode"},
         }
 
-        rows: List[Any] = []
-        h_idx = -1
-        cmap: Dict[str, int] = {}
-        for candidate_rows in all_sheets_rows:
-            for r_i, row in enumerate(candidate_rows[:15]):
-                normed = [_norm(c) for c in row]
-                cand: Dict[str, int] = {}
-                for k, al_set in aliases.items():
-                    for c_i, txt in enumerate(normed):
-                        if txt in al_set and k not in cand:
-                            cand[k] = c_i
-                            break
-                if ("source_col" in cand or "target_col" in cand) and (
-                    "source_table" in cand or "target_table" in cand
-                ):
-                    h_idx = r_i
-                    cmap = cand
-                    rows = candidate_rows
-                    break
-            if h_idx != -1:
-                break
+        matched_sheets: List[Tuple[int, Dict[str, int], List[List[Any]]]] = []
+        has_any_rows = False
+        with ResolvedWorkbook(content, read_only_preferred=True) as rwb:
+            for sh_title in rwb.sheetnames:
+                t_norm = (sh_title or "").strip().lower()
+                if t_norm in ("填写说明", "填表说明", "使用说明", "说明", "目录", "封面", "readme", "instructions"):
+                    continue
+                probe = list(rwb.iter_sheet_rows(sh_title, max_rows=15))
+                if not probe:
+                    continue
+                has_any_rows = True
+                found_h = -1
+                found_map: Dict[str, int] = {}
+                for r_i, row in enumerate(probe):
+                    normed = [_norm(c) for c in row]
+                    cand: Dict[str, int] = {}
+                    for k, al_set in aliases.items():
+                        for c_i, txt in enumerate(normed):
+                            if txt in al_set and k not in cand:
+                                cand[k] = c_i
+                                break
+                    if ("source_col" in cand or "target_col" in cand) and (
+                        "source_table" in cand or "target_table" in cand
+                    ):
+                        found_h = r_i
+                        found_map = cand
+                        break
+                if found_h != -1:
+                    full_rows = rwb.extract_sheet_rows_with_merged(
+                        sh_title,
+                        row_progress_cb=lambda done_r, tot_r, _st=sh_title: report(
+                            min(36.0, 17.0 + 19.0 * done_r / max(1, tot_r)),
+                            "读取工作表并计算公式最终值",
+                            f"正在解析 [{_st}] 第 {done_r} / {max(done_r, tot_r)} 行...",
+                            done_r,
+                            max(done_r, tot_r),
+                        ),
+                    )
+                    if len(full_rows) >= found_h + 2:
+                        matched_sheets.append((found_h, found_map, full_rows))
 
-        if h_idx == -1 or len(rows) < 2:
+        if not has_any_rows:
+            raise ValueError("映射铺底表为空，请下载系统模板填写后再上传")
+        if not matched_sheets:
             raise ValueError("未识别到跨环境映射模板表头，请点击「下载模板」查看标准列名")
 
         grouped: Dict[str, Dict[str, Any]] = {}
         total_rows = 0
-        for row in rows[h_idx + 1 :]:
-            if not row or all(x is None or str(x).strip() == "" for x in row):
-                continue
+        total_scan_target = sum(max(0, len(sr) - (hi + 1)) for hi, _, sr in matched_sheets)
+        scanned = 0
 
-            def _cell(k: str) -> str:
-                ci = cmap.get(k)
-                if ci is None or ci >= len(row) or row[ci] is None:
-                    return ""
-                return str(row[ci]).strip()
+        for h_idx, cmap, rows in matched_sheets:
+            for row in rows[h_idx + 1 :]:
+                scanned += 1
+                if scanned == 1 or scanned % 50 == 0 or scanned == total_scan_target:
+                    pct = 36.0 + (22.0 * scanned / max(1, total_scan_target))
+                    report(
+                        pct,
+                        "解析跨环境字段映射",
+                        f"已扫描 {scanned} / {total_scan_target} 行，解析有效映射 {total_rows} 条...",
+                        scanned,
+                        total_scan_target,
+                    )
+                if not row or all(clean_excel_cell_str(x) == "" for x in row):
+                    continue
 
-            s_sch = clean_identifier_input(_cell("source_schema")) or "public"
-            s_tbl = clean_identifier_input(_cell("source_table"))
-            s_col = clean_identifier_input(_cell("source_col"))
-            s_std = _cell("source_std")
+                def _cell(k: str) -> str:
+                    ci = cmap.get(k)
+                    if ci is None or ci >= len(row):
+                        return ""
+                    return clean_excel_cell_str(row[ci], treat_placeholder_empty=True)
 
-            t_sch = clean_identifier_input(_cell("target_schema")) or "public"
-            t_tbl = clean_identifier_input(_cell("target_table"))
-            t_col = clean_identifier_input(_cell("target_col"))
-            t_std = _cell("target_std")
+                s_sch = clean_identifier_input(_cell("source_schema")) or "public"
+                s_tbl = clean_identifier_input(_cell("source_table"))
+                s_col = clean_identifier_input(_cell("source_col"))
+                s_std = _cell("source_std")
 
-            if "." in s_tbl and not _cell("source_schema"):
-                s_sch, s_tbl = s_tbl.split(".", 1)
-            if "." in t_tbl and not _cell("target_schema"):
-                t_sch, t_tbl = t_tbl.split(".", 1)
+                t_sch = clean_identifier_input(_cell("target_schema")) or "public"
+                t_tbl = clean_identifier_input(_cell("target_table"))
+                t_col = clean_identifier_input(_cell("target_col"))
+                t_std = _cell("target_std")
 
-            t_key = clean_identifier_input(t_tbl or s_tbl).lower()
-            if not t_key or (not s_col and not t_col):
-                continue
+                if "." in s_tbl and not _cell("source_schema"):
+                    s_sch, s_tbl = s_tbl.split(".", 1)
+                if "." in t_tbl and not _cell("target_schema"):
+                    t_sch, t_tbl = t_tbl.split(".", 1)
 
-            grp = grouped.setdefault(
-                t_key,
-                {
-                    "std_table_key": t_key,
-                    "source_schema": s_sch,
-                    "source_table": s_tbl or t_tbl,
-                    "target_schema": t_sch,
-                    "target_table": t_tbl or s_tbl,
-                    "pairings": [],
-                },
-            )
-            p_item: Dict[str, Any] = {
-                "source_col": s_col,
-                "target_col": t_col,
-            }
-            if s_std:
-                p_item["source_std_code"] = s_std
-            if t_std:
-                p_item["target_std_code"] = t_std
-            grp["pairings"].append(p_item)
-            total_rows += 1
+                t_key = clean_identifier_input(t_tbl or s_tbl).lower()
+                if not t_key or (not s_col and not t_col):
+                    continue
+
+                grp = grouped.setdefault(
+                    t_key,
+                    {
+                        "std_table_key": t_key,
+                        "source_schema": s_sch,
+                        "source_table": s_tbl or t_tbl,
+                        "target_schema": t_sch,
+                        "target_table": t_tbl or s_tbl,
+                        "pairings": [],
+                    },
+                )
+                p_item: Dict[str, Any] = {
+                    "source_col": s_col,
+                    "target_col": t_col,
+                }
+                if s_std:
+                    p_item["source_std_code"] = s_std
+                if t_std:
+                    p_item["target_std_code"] = t_std
+                grp["pairings"].append(p_item)
+                total_rows += 1
 
         if not grouped:
             raise ValueError("未能从上传表中解析出有效映射关系行")
 
         last_key = ""
-        for t_key, grp in grouped.items():
+        grp_items = list(grouped.items())
+        for idx_g, (t_key, grp) in enumerate(grp_items, start=1):
             last_key = t_key
+            pct = 62.0 + (34.0 * idx_g / max(1, len(grp_items)))
+            report(
+                pct,
+                "保存双列映射与同步标准绑定",
+                f"正在保存表对 ({idx_g}/{len(grp_items)}): {grp['source_table']} ↔ {grp['target_table']}",
+                idx_g,
+                len(grp_items),
+            )
             self.save_pairings(
                 std_table_key=t_key,
                 source_schema=grp["source_schema"],
@@ -1507,9 +1551,17 @@ class CrossComparatorService:
             "message": f"已将 {len(tables)} 张表共 {len(items_to_push)} 条数标规则推送至『单库贯标执行台』！",
         }
 
-    def import_standard_or_bundle(self, filename: str, content: bytes) -> Dict[str, Any]:
+    def import_standard_or_bundle(
+        self,
+        filename: str,
+        content: bytes,
+        *,
+        progress_cb: Optional[ProgressCallback] = None,
+    ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         lower_fn = (filename or "").strip().lower()
         if lower_fn.endswith(".json"):
+            report(30.0, "解析绑定配置包", "正在读取 JSON 绑定包...", 0, 0)
             bundle = json.loads(content.decode("utf-8"))
             res = self.ctx.store.import_cross_bindings_bundle(bundle, filename=filename)
             self.ctx.store.add_log(
@@ -1519,45 +1571,91 @@ class CrossComparatorService:
             )
             return self.get_overview_state()
 
+        report(20.0, "校验与读取工作簿", "正在解析跨环境标准表（自动提取公式结果与过滤 #N/A）...", 0, 0)
         validate_xlsx_bytes(filename, content)
-        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        if len(rows) >= 2:
-            header_cells = [str(c or "").strip() for c in rows[0]]
-            if "数据标准字段名" in header_cells and "来源库绑定字段" in header_cells:
-                idx_map = {h: i for i, h in enumerate(header_cells)}
-                items: List[Dict[str, Any]] = []
-                for r in rows[1:]:
-                    if not r or all(x is None or str(x).strip() == "" for x in r):
-                        continue
-                    std_tbl = str(r[idx_map.get("标准表名", 2)] or "").strip()
-                    std_col = str(r[idx_map.get("数据标准字段名", 11)] or "").strip()
-                    if not std_tbl or not std_col:
-                        continue
-                    items.append(
-                        {
-                            "schema_name": str(r[idx_map.get("标准模式名", 1)] or "public").strip(),
-                            "table_name": std_tbl,
-                            "source_schema": str(r[idx_map.get("来源库模式", 3)] or "").strip(),
-                            "source_table": str(r[idx_map.get("来源库表名", 4)] or std_tbl).strip(),
-                            "bound_source_col": str(r[idx_map.get("来源库绑定字段", 5)] or "").strip(),
-                            "old_col_name": str(r[idx_map.get("清单原字段名", 8)] or "").strip(),
-                            "old_col_type": str(r[idx_map.get("清单原类型", 9)] or "").strip(),
-                            "old_col_comment": str(r[idx_map.get("清单原注释", 10)] or "").strip(),
-                            "new_col_name": std_col,
-                            "new_col_type": str(r[idx_map.get("数据标准类型", 12)] or "").strip(),
-                            "new_col_comment": str(r[idx_map.get("数据标准注释", 13)] or "").strip(),
-                            "target_schema": str(r[idx_map.get("目标库模式", 14)] or "").strip(),
-                            "target_table": str(r[idx_map.get("目标库表名", 15)] or std_tbl).strip(),
-                            "bound_target_col": str(r[idx_map.get("目标库绑定字段", 16)] or "").strip(),
-                        }
-                    )
-                if items:
-                    self.ctx.store.replace_cross_standards(items, filename, preserve_bindings=False)
-                    return self.get_overview_state()
 
-        parsed_items = parse_excel_checklist(content, filename)
+        bundle_rows: List[List[Any]] = []
+        with ResolvedWorkbook(content, read_only_preferred=True) as rwb:
+            first_sheet = rwb.sheetnames[0] if rwb.sheetnames else ""
+            probe = list(rwb.iter_sheet_rows(first_sheet, max_rows=2)) if first_sheet else []
+            if len(probe) >= 2:
+                probe_headers = [clean_excel_cell_str(c) for c in probe[0]]
+                if "数据标准字段名" in probe_headers and "来源库绑定字段" in probe_headers:
+                    bundle_rows = list(
+                        rwb.iter_sheet_rows(
+                            first_sheet,
+                            row_progress_cb=lambda done_r, tot_r: report(
+                                min(46.0, 22.0 + 24.0 * done_r / max(1, tot_r)),
+                                "读取跨环境标准与绑定表",
+                                f"正在读取 [{first_sheet}] 第 {done_r} / {max(done_r, tot_r)} 行...",
+                                done_r,
+                                max(done_r, tot_r),
+                            ),
+                        )
+                    )
+
+        if len(bundle_rows) >= 2:
+            header_cells = [clean_excel_cell_str(c) for c in bundle_rows[0]]
+            idx_map = {h: i for i, h in enumerate(header_cells)}
+            items: List[Dict[str, Any]] = []
+            data_rows = bundle_rows[1:]
+            total_data = len(data_rows)
+
+            def _rcell(r_vals: List[Any], h_name: str, fallback_idx: int, placeholder_empty: bool = False) -> str:
+                c_i = idx_map.get(h_name, fallback_idx)
+                if c_i >= len(r_vals):
+                    return ""
+                return clean_excel_cell_str(r_vals[c_i], treat_placeholder_empty=placeholder_empty)
+
+            for scanned_idx, r in enumerate(data_rows, start=1):
+                if r and not all(clean_excel_cell_str(x) == "" for x in r):
+                    std_tbl = _rcell(r, "标准表名", 2, True)
+                    std_col = _rcell(r, "数据标准字段名", 11, True)
+                    if std_tbl and std_col:
+                        items.append(
+                            {
+                                "schema_name": _rcell(r, "标准模式名", 1, True) or "public",
+                                "table_name": std_tbl,
+                                "source_schema": _rcell(r, "来源库模式", 3, True),
+                                "source_table": _rcell(r, "来源库表名", 4, True) or std_tbl,
+                                "bound_source_col": _rcell(r, "来源库绑定字段", 5, True),
+                                "old_col_name": _rcell(r, "清单原字段名", 8, True),
+                                "old_col_type": _rcell(r, "清单原类型", 9, True),
+                                "old_col_comment": _rcell(r, "清单原注释", 10, False),
+                                "new_col_name": std_col,
+                                "new_col_type": _rcell(r, "数据标准类型", 12, True),
+                                "new_col_comment": _rcell(r, "数据标准注释", 13, False),
+                                "target_schema": _rcell(r, "目标库模式", 14, True),
+                                "target_table": _rcell(r, "目标库表名", 15, True) or std_tbl,
+                                "bound_target_col": _rcell(r, "目标库绑定字段", 16, True),
+                            }
+                        )
+                if scanned_idx == 1 or scanned_idx % 50 == 0 or scanned_idx == total_data:
+                    pct = 46.0 + (26.0 * scanned_idx / max(1, total_data))
+                    report(
+                        pct,
+                        "解析跨环境标准映射",
+                        f"已解析 {scanned_idx} / {total_data} 行，识别有效标准字段 {len(items)} 条...",
+                        scanned_idx,
+                        total_data,
+                    )
+            if items:
+                report(75.0, "保存标准与映射", f"正在保存 {len(items)} 条跨环境标准字段...", len(items), len(items))
+                self.ctx.store.replace_cross_standards(items, filename, preserve_bindings=False)
+                return self.get_overview_state()
+
+        parsed_items = parse_excel_checklist(
+            content,
+            filename,
+            row_progress_cb=lambda done_r, tot_r: report(
+                min(68.0, 24.0 + 44.0 * done_r / max(1, tot_r)),
+                "解析跨环境标准清单与公式结果",
+                f"正在读取工作表并计算公式结果（已处理 {done_r} / {max(done_r, tot_r)} 行）...",
+                done_r,
+                max(done_r, tot_r),
+            ),
+        )
+        report(75.0, "保存标准清单", f"正在写入 {len(parsed_items)} 条标准规则...", len(parsed_items), len(parsed_items))
         self.ctx.store.replace_cross_standards(parsed_items, filename, preserve_bindings=True)
         return self.get_overview_state()
 

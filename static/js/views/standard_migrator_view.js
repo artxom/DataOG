@@ -295,13 +295,17 @@ export class StandardMigratorView {
       ],
       defaultMode: "merge",
       accept: ".xlsx,.xlsm",
-      onUpload: async (file, mode) => {
-        const res = await migratorApi.uploadBindings(file, {
-          connectionId: connId,
-          defaultSchema: this.activeSchema || "",
-          mode: mode || "merge",
-          formatProfile: this.formatProfile,
-        });
+      onUpload: async (file, mode, uploadCtx) => {
+        const res = await migratorApi.uploadBindings(
+          file,
+          {
+            connectionId: connId,
+            defaultSchema: this.activeSchema || "",
+            mode: mode || "merge",
+            formatProfile: this.formatProfile,
+          },
+          uploadCtx
+        );
         if (res.table_stats) this.tableStats = res.table_stats;
         if (res.active_table) {
           this.tableCheck = res.active_table;
@@ -313,6 +317,7 @@ export class StandardMigratorView {
           this.activeTable = res.tables[0].table?.table_name || this.activeTable;
         }
         Toast.success(res.message || "对照关系导入完成");
+        if (res.warning) Toast.warn(res.warning);
         this.tree.renderTreeBody();
         this.render();
         this.onStateUpdate?.();
@@ -335,11 +340,15 @@ export class StandardMigratorView {
       ],
       onDownloadBlankTemplate: () => migratorApi.downloadTemplate(),
       accept: ".xlsx,.xlsm",
-      onUpload: async (file) => {
-        const res = await migratorApi.uploadChecklist(file, {
-          defaultSchema: this.ws?.active_connection?.default_schema || this.activeSchema || "",
-          defaultTable: this.activeTable || "",
-        });
+      onUpload: async (file, _mode, uploadCtx) => {
+        const res = await migratorApi.uploadChecklist(
+          file,
+          {
+            defaultSchema: this.ws?.active_connection?.default_schema || this.activeSchema || "",
+            defaultTable: this.activeTable || "",
+          },
+          uploadCtx
+        );
         this._applyStateResponse(res);
       },
     });

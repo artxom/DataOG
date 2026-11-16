@@ -10,6 +10,7 @@ from fastapi import Request
 from core.platform.asset_store import AssetStore
 from core.platform.connection_hub import ConnectionHub
 from core.platform.driver_manager import DriverManager
+from core.platform.import_progress import ImportProgressHub
 from core.platform.llm_hub import LLMHub
 from core.platform.metadata_hub import MetadataHub
 from core.platform.query_engine import QueryEngine
@@ -42,6 +43,7 @@ class PlatformContext:
         self.asset_store = AssetStore(self.store, assets_dir=eff_assets_dir)
         self.llm_hub = LLMHub(self.store)
         self.standard_catalog = StandardCatalog(self.store)
+        self.import_progress = ImportProgressHub()
         self._registered_modules: List[Dict[str, str]] = []
 
     def register_module_manifest(

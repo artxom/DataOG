@@ -19,11 +19,14 @@ from core.dws_engine import DWSMigratorEngine
 from core.platform.context import PlatformContext
 from core.platform.dialects import clean_identifier_input
 from core.platform.excel_io import (
+    ResolvedWorkbook,
+    clean_excel_cell_str,
     export_report_excel,
     generate_template_excel,
     parse_excel_checklist,
     validate_xlsx_bytes,
 )
+from core.platform.import_progress import ProgressCallback, noop_progress
 
 
 class StandardMigratorService:
@@ -60,6 +63,8 @@ class StandardMigratorService:
         prof = self._sync_engine_with_active_profile()
         cid = prof.connection_id if prof else ""
         conn_public = prof.to_public_dict() if prof else None
+        if cid:
+            self.ctx.standard_catalog.purge_invalid_error_bindings(cid)
         catalog_tree = (
             self.ctx.metadata_hub.get_catalog_tree(cid, auto_refresh=False)
             if cid
@@ -149,7 +154,11 @@ class StandardMigratorService:
         content: bytes,
         default_schema: str = "",
         default_table: str = "",
+        *,
+        progress_cb: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
+        report(16.0, "校验与解析贯标清单", "正在读取工作簿并提取公式最终值...", 0, 0)
         validate_xlsx_bytes(filename, content)
         prof = self._sync_engine_with_active_profile()
         eff_schema = (
@@ -162,6 +171,20 @@ class StandardMigratorService:
             filename,
             default_schema=eff_schema,
             default_table=(default_table or "").strip(),
+            row_progress_cb=lambda done_r, tot_r: report(
+                min(54.0, 18.0 + 34.0 * done_r / max(1, tot_r)),
+                "解析贯标清单与公式结果",
+                f"正在读取工作表并计算公式结果（已处理 {done_r} 行）...",
+                done_r,
+                max(done_r, tot_r),
+            ),
+        )
+        report(
+            58.0,
+            "保存贯标清单",
+            f"已解析 {len(parsed_items)} 条改造字段规则，正在写入本地工作台...",
+            len(parsed_items),
+            len(parsed_items),
         )
         self.ctx.store.replace_all_items(parsed_items, filename, preserve_history=True)
         self.ctx.store.replace_cross_standards(
@@ -170,6 +193,7 @@ class StandardMigratorService:
 
         sync_warning = ""
         if prof:
+            report(78.0, "核验目标库状态", f"正在与数据源 [{prof.name}] 比对字段现状...", len(parsed_items), len(parsed_items))
             try:
                 self.sync_items()
             except Exception as exc:
@@ -411,6 +435,8 @@ class StandardMigratorService:
             if not self.ctx.store.get_meta("migrator_connection_id", ""):
                 self.ctx.store.save_meta("migrator_connection_id", prof.connection_id)
 
+        if cid:
+            self.ctx.standard_catalog.purge_invalid_error_bindings(cid)
         catalog_tree = (
             self.ctx.metadata_hub.get_catalog_tree(cid, auto_refresh=False)
             if cid
@@ -456,6 +482,7 @@ class StandardMigratorService:
         actual_schema = t_meta.schema_name or eff_schema
         actual_table = t_meta.table_name or eff_table
 
+        self.ctx.standard_catalog.purge_invalid_error_bindings(prof.connection_id)
         bindings_map = self.ctx.standard_catalog.get_table_field_bindings(
             prof.connection_id, actual_schema, actual_table
         )
@@ -734,7 +761,10 @@ class StandardMigratorService:
         tables: Optional[List[Any]] = None,
         format_profile: str = "AUTO",
         force_refresh: bool = True,
+        progress_cb: Optional[ProgressCallback] = None,
+        tolerate_probe_errors: bool = False,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         prof = self.ctx.connection_hub.require_profile(connection_id)
         targets = self._parse_table_targets(
             tables=tables,
@@ -762,14 +792,41 @@ class StandardMigratorService:
             "std_missing_cols": 0,
             "unbound_cols": 0,
         }
-        for sch, tbl in targets:
-            t_res = self.get_table_compliance(
-                prof.connection_id,
-                sch,
-                tbl,
-                format_profile=format_profile,
-                force_refresh=force_refresh,
+        total_targets = len(targets)
+        live_probe_broken = False
+        probe_warning = ""
+        skipped_probe_tables = 0
+
+        for idx, (sch, tbl) in enumerate(targets, start=1):
+            pct = 68.0 + (29.0 * (idx - 1) / max(1, total_targets))
+            report(
+                pct,
+                "核验库表落标状态",
+                f"正在核验表 ({idx}/{total_targets}): {sch}.{tbl}",
+                idx - 1,
+                total_targets,
             )
+            if tolerate_probe_errors and not force_refresh and live_probe_broken:
+                cached_meta = self.ctx.store.get_cached_table_meta(prof.connection_id, sch, tbl)
+                if cached_meta is None:
+                    skipped_probe_tables += 1
+                    continue
+            try:
+                t_res = self.get_table_compliance(
+                    prof.connection_id,
+                    sch,
+                    tbl,
+                    format_profile=format_profile,
+                    force_refresh=force_refresh,
+                )
+            except Exception as exc:
+                if not tolerate_probe_errors:
+                    raise
+                live_probe_broken = True
+                probe_warning = str(exc)
+                skipped_probe_tables += 1
+                continue
+
             table_results.append(t_res)
             s = t_res["summary"]
             agg["checked_tables"] += 1
@@ -809,6 +866,10 @@ class StandardMigratorService:
             "table_stats": self.ctx.standard_catalog.get_connection_binding_stats(prof.connection_id),
             "message": f"核验完成：{agg['checked_tables']} 张表共 {agg['total_cols']} 列，已落标 {agg['compliant_cols']} 列、未落标 {agg['non_compliant_cols']} 列、仅差注释 {agg['comment_only_cols']} 列",
         }
+        if probe_warning and skipped_probe_tables:
+            out["warning"] = (
+                f"数据源实时探查受限（已跳过 {skipped_probe_tables} 张未缓存表的在线拉取：{probe_warning}），对照绑定已成功入库"
+            )
         if len(table_results) == 1:
             out["active_table"] = table_results[0]
         return out
@@ -958,30 +1019,25 @@ class StandardMigratorService:
         default_schema: str = "",
         mode: str = "merge",
         format_profile: str = "AUTO",
+        progress_cb: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
+        report(
+            14.0,
+            "校验与读取工作簿",
+            "正在校验文件结构并解析工作表（自动提取公式最终值、将 #N/A 置空）...",
+            0,
+            0,
+        )
         prof = self.ctx.connection_hub.require_profile(connection_id)
         validate_xlsx_bytes(filename, content)
 
-        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-        try:
-            all_sheets_rows: List[List[Any]] = []
-            for ws in wb.worksheets:
-                t_norm = (ws.title or "").strip().lower()
-                if t_norm in ("填写说明", "填表说明", "使用说明", "说明", "目录", "封面", "readme"):
-                    continue
-                sheet_rows = list(ws.iter_rows(values_only=True))
-                if sheet_rows:
-                    all_sheets_rows.append(sheet_rows)
-        finally:
-            wb.close()
-
-        if not all_sheets_rows:
-            raise ValueError("对照关系表为空，请下载系统模板后填写再上传")
+        # 自动清理历史遗留的 #N/A 等错误占位绑定，确保增量合并后状态干净准确
+        self.ctx.standard_catalog.purge_invalid_error_bindings(prof.connection_id)
 
         def _norm(v: Any) -> str:
             return (
-                str(v or "")
-                .strip()
+                clean_excel_cell_str(v)
                 .lower()
                 .replace("（", "(")
                 .replace("）", ")")
@@ -998,80 +1054,168 @@ class StandardMigratorService:
             "std_cn_name": {"标准中文名称(选填)", "标准中文名称", "标准中文名", "中文名称", "cnname"},
         }
 
-        rows: List[Any] = []
-        header_idx = -1
-        col_map: Dict[str, int] = {}
-        for candidate_rows in all_sheets_rows:
-            for r_idx, row in enumerate(candidate_rows[:15]):
-                normed = [_norm(c) for c in row]
-                candidate: Dict[str, int] = {}
-                for k, aliases in alias_map.items():
-                    for c_i, cell_t in enumerate(normed):
-                        if cell_t in aliases and k not in candidate:
-                            candidate[k] = c_i
-                            break
-                if "table_name" in candidate and "column_name" in candidate:
-                    header_idx = r_idx
-                    col_map = candidate
-                    rows = candidate_rows
-                    break
-            if header_idx != -1:
-                break
+        matched_sheets: List[Tuple[str, int, Dict[str, int], List[List[Any]]]] = []
+        skipped_non_empty_sheet = False
 
-        if header_idx == -1 or len(rows) < 2:
-            raise ValueError("未识别到有效对照表头（需包含「表名」「物理字段名」「数据项编号」等列），请下载系统模板对照")
+        with ResolvedWorkbook(content, read_only_preferred=True) as rwb:
+            for sh_title in rwb.sheetnames:
+                t_norm = (sh_title or "").strip().lower()
+                if t_norm in (
+                    "填写说明",
+                    "填表说明",
+                    "使用说明",
+                    "说明",
+                    "目录",
+                    "封面",
+                    "readme",
+                    "instructions",
+                ):
+                    continue
+                probe_rows = list(rwb.iter_sheet_rows(sh_title, max_rows=15))
+                if not probe_rows:
+                    continue
+                skipped_non_empty_sheet = True
+                found_h_idx = -1
+                found_col_map: Dict[str, int] = {}
+                for r_idx, row in enumerate(probe_rows):
+                    normed = [_norm(c) for c in row]
+                    candidate: Dict[str, int] = {}
+                    for k, aliases in alias_map.items():
+                        for c_i, cell_t in enumerate(normed):
+                            if cell_t in aliases and k not in candidate:
+                                candidate[k] = c_i
+                                break
+                    if "table_name" in candidate and "column_name" in candidate:
+                        found_h_idx = r_idx
+                        found_col_map = candidate
+                        break
+                if found_h_idx != -1:
+                    full_rows = rwb.extract_sheet_rows_with_merged(
+                        sh_title,
+                        row_progress_cb=lambda done_r, tot_r, _st=sh_title: report(
+                            min(36.0, 16.0 + 20.0 * done_r / max(1, tot_r)),
+                            "读取工作表并计算公式最终值",
+                            f"正在解析 [{_st}] 第 {done_r} / {max(done_r, tot_r)} 行（自动计算公式与清洗 #N/A）...",
+                            done_r,
+                            max(done_r, tot_r),
+                        ),
+                    )
+                    if len(full_rows) >= found_h_idx + 2:
+                        matched_sheets.append((sh_title, found_h_idx, found_col_map, full_rows))
+
+        if not matched_sheets:
+            if not skipped_non_empty_sheet:
+                raise ValueError("对照关系表为空，请下载系统模板后填写再上传")
+            raise ValueError(
+                "未识别到有效对照表头（需包含「表名」「物理字段名」「数据项编号」等列），请下载系统模板对照"
+            )
 
         eff_default_schema = (default_schema or prof.default_schema or "public").strip()
+        eff_mode = (mode or "merge").strip().lower()
         parsed_bindings: List[Dict[str, Any]] = []
         unresolved_rows: List[str] = []
         touched_tables: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        match_cache: Dict[Tuple[str, str, str], str] = {}
 
-        for row_no, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
-            if not row or all(x is None or str(x).strip() == "" for x in row):
-                continue
+        total_data_rows = sum(max(0, len(s_rows) - (h_i + 1)) for _, h_i, _, s_rows in matched_sheets)
+        scanned_rows = 0
 
-            def _cell(k: str) -> str:
-                ci = col_map.get(k)
-                if ci is None or ci >= len(row) or row[ci] is None:
-                    return ""
-                return str(row[ci]).strip()
+        for sh_title, header_idx, col_map, rows in matched_sheets:
+            for row_no, row in enumerate(rows[header_idx + 1 :], start=header_idx + 2):
+                scanned_rows += 1
+                if scanned_rows == 1 or scanned_rows % 50 == 0 or scanned_rows == total_data_rows:
+                    pct = 36.0 + (22.0 * scanned_rows / max(1, total_data_rows))
+                    report(
+                        pct,
+                        "识别并匹配数据标准",
+                        f"已解析 {scanned_rows} / {total_data_rows} 行，识别有效绑定 {len(parsed_bindings)} 条（空值/#N/A 跳过 {len(unresolved_rows)} 行）",
+                        scanned_rows,
+                        total_data_rows,
+                    )
 
-            sch = clean_identifier_input(_cell("schema_name")) or eff_default_schema
-            tbl = clean_identifier_input(_cell("table_name"))
-            col = clean_identifier_input(_cell("column_name"))
-            if "." in tbl and not _cell("schema_name"):
-                sch, tbl = tbl.split(".", 1)
-            if not tbl or not col:
-                continue
+                if not row or all(clean_excel_cell_str(x) == "" for x in row):
+                    continue
 
-            raw_code = _cell("std_code")
-            std_en = clean_identifier_input(_cell("std_en_abbr"))
-            std_cn = _cell("std_cn_name")
-            matched_code = raw_code
-            if not matched_code and (std_en or std_cn):
-                cands = self.ctx.standard_catalog.match_standard_candidates(
-                    col_name=std_en or col,
-                    col_comment=std_cn,
+                def _cell(k: str, *, placeholder_empty: bool = False) -> str:
+                    ci = col_map.get(k)
+                    if ci is None or ci >= len(row):
+                        return ""
+                    return clean_excel_cell_str(
+                        row[ci], treat_placeholder_empty=placeholder_empty
+                    )
+
+                sch = clean_identifier_input(_cell("schema_name", placeholder_empty=True)) or eff_default_schema
+                tbl = clean_identifier_input(_cell("table_name", placeholder_empty=True))
+                col = clean_identifier_input(_cell("column_name", placeholder_empty=True))
+                if "." in tbl and not _cell("schema_name", placeholder_empty=True):
+                    sch, tbl = tbl.split(".", 1)
+                if not tbl or not col:
+                    continue
+                if _norm(tbl) in ("表名", "物理表名", "tablename") and _norm(col) in (
+                    "物理字段名",
+                    "字段名",
+                    "columnname",
+                ):
+                    continue
+
+                touched_tables.setdefault((sch, tbl), [])
+
+                raw_code = _cell("std_code", placeholder_empty=True)
+                std_en = clean_identifier_input(_cell("std_en_abbr", placeholder_empty=True))
+                std_cn = _cell("std_cn_name", placeholder_empty=True)
+                matched_code = raw_code
+                if not matched_code and (std_en or std_cn):
+                    cache_key = (std_en.lower(), std_cn, col.lower() if not std_en else "")
+                    if cache_key in match_cache:
+                        matched_code = match_cache[cache_key]
+                    else:
+                        cands = self.ctx.standard_catalog.match_standard_candidates(
+                            col_name=std_en,
+                            col_comment=std_cn,
+                        )
+                        if cands:
+                            picked_cand = cands[0]
+                            if not std_en and col:
+                                for c_item in cands:
+                                    if (
+                                        clean_identifier_input(c_item.get("en_abbr") or "").lower()
+                                        == col.lower()
+                                    ):
+                                        picked_cand = c_item
+                                        break
+                            matched_code = picked_cand["std_code"]
+                        else:
+                            matched_code = ""
+                        match_cache[cache_key] = matched_code
+
+                if not matched_code:
+                    unresolved_rows.append(f"第{row_no}行 {sch}.{tbl}.{col}")
+                    continue
+
+                entry = {
+                    "schema_name": sch,
+                    "table_name": tbl,
+                    "column_name": col,
+                    "std_code": matched_code,
+                }
+                parsed_bindings.append(entry)
+                touched_tables[(sch, tbl)].append(entry)
+
+        if not parsed_bindings and not (eff_mode == "replace_table" and touched_tables):
+            if unresolved_rows:
+                raise ValueError(
+                    f"共扫描 {len(unresolved_rows)} 行字段，但数据项编号均为空值（含 #N/A）且未匹配到标准，未产生有效对照绑定"
                 )
-                if cands:
-                    matched_code = cands[0]["std_code"]
-            if not matched_code:
-                unresolved_rows.append(f"第{row_no}行 {sch}.{tbl}.{col}")
-                continue
-
-            entry = {
-                "schema_name": sch,
-                "table_name": tbl,
-                "column_name": col,
-                "std_code": matched_code,
-            }
-            parsed_bindings.append(entry)
-            touched_tables.setdefault((sch, tbl), []).append(entry)
-
-        if not parsed_bindings:
             raise ValueError("未解析到包含有效数据项编号或匹配标准的对照行")
 
-        if (mode or "merge").strip().lower() == "replace_table":
+        report(
+            62.0,
+            "保存对照关系",
+            f"正在持久化 {len(parsed_bindings)} 条字段标准绑定（涉及 {len(touched_tables)} 张表）...",
+            len(parsed_bindings),
+            max(1, len(parsed_bindings)),
+        )
+        if eff_mode == "replace_table":
             for (sch, tbl), rows_for_tbl in touched_tables.items():
                 self.ctx.standard_catalog.replace_table_field_bindings(
                     prof.connection_id, sch, tbl, rows_for_tbl, bind_source="EXCEL"
@@ -1087,10 +1231,12 @@ class StandardMigratorService:
             tables=targets,
             format_profile=format_profile,
             force_refresh=False,
+            progress_cb=report,
+            tolerate_probe_errors=True,
         )
         msg = f"成功导入 {len(parsed_bindings)} 条字段标准对照关系（涉及 {len(touched_tables)} 张表）"
         if unresolved_rows:
-            msg += f"，另有 {len(unresolved_rows)} 行未填写编号且未匹配到标准"
+            msg += f"，另有 {len(unresolved_rows)} 行空值（含 #N/A）按未绑标跳过"
         check_res["imported_count"] = len(parsed_bindings)
         check_res["unresolved_count"] = len(unresolved_rows)
         check_res["message"] = msg

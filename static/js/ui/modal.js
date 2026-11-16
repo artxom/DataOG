@@ -14,6 +14,12 @@ export function bindDialogLightDismissFallback(dialog) {
   if (!dialog || boundDialogs.has(dialog)) return;
   boundDialogs.add(dialog);
 
+  dialog.addEventListener("cancel", (e) => {
+    if (dialog.dataset?.closeLocked === "1") {
+      e.preventDefault();
+    }
+  });
+
   if (!("closedBy" in HTMLDialogElement.prototype)) {
     const isOutside = (ev) => {
       const r = dialog.getBoundingClientRect();
@@ -26,9 +32,17 @@ export function bindDialogLightDismissFallback(dialog) {
     };
     let pressedOutside = false;
     dialog.addEventListener("pointerdown", (e) => {
+      if (dialog.dataset?.closeLocked === "1") {
+        pressedOutside = false;
+        return;
+      }
       pressedOutside = e.target === dialog && isOutside(e);
     });
     dialog.addEventListener("pointerup", (e) => {
+      if (dialog.dataset?.closeLocked === "1") {
+        pressedOutside = false;
+        return;
+      }
       if (pressedOutside && e.target === dialog && isOutside(e)) {
         dialog.close("cancel");
       }
@@ -45,17 +59,42 @@ function getDialogRefs() {
   const closeBtn = document.getElementById("global-modal-close");
 
   if (dialog && !boundDialogs.has(dialog)) {
-    closeBtn?.addEventListener("click", () => dialog.close("cancel"));
+    closeBtn?.addEventListener("click", () => {
+      if (dialog.dataset?.closeLocked !== "1") {
+        dialog.close("cancel");
+      }
+    });
     bindDialogLightDismissFallback(dialog);
   }
-  return { dialog, titleEl, bodyEl, footerEl };
+  return { dialog, titleEl, bodyEl, footerEl, closeBtn };
 }
 
 export const Modal = {
+  setCloseLocked(locked) {
+    const { dialog, closeBtn } = getDialogRefs();
+    const isLocked = Boolean(locked);
+    if (dialog) {
+      dialog.dataset.closeLocked = isLocked ? "1" : "0";
+      const mode = isLocked ? "none" : "any";
+      dialog.setAttribute("closedby", mode);
+      if ("closedBy" in dialog) {
+        try {
+          dialog.closedBy = mode;
+        } catch (_e) {
+          // 忽略只读实现差异
+        }
+      }
+    }
+    if (closeBtn) {
+      closeBtn.disabled = isLocked;
+    }
+  },
+
   open({ title, body, footer = [], width = "", onClose = null }) {
     const { dialog, titleEl, bodyEl, footerEl } = getDialogRefs();
     if (!dialog || !titleEl || !bodyEl || !footerEl) return;
 
+    this.setCloseLocked(false);
     if (dialog.open) {
       dialog.close("");
     }
@@ -65,20 +104,22 @@ export const Modal = {
     clearEl(bodyEl, body instanceof Node ? body : el("p", { style: { margin: "0" }, text: String(body || "") }));
     clearEl(footerEl, footer);
 
-    if (typeof onClose === "function") {
-      const handleClose = () => {
-        const val = dialog.returnValue;
-        dialog.returnValue = "";
-        dialog.removeEventListener("close", handleClose);
+    const handleClose = () => {
+      this.setCloseLocked(false);
+      const val = dialog.returnValue;
+      dialog.returnValue = "";
+      dialog.removeEventListener("close", handleClose);
+      if (typeof onClose === "function") {
         onClose(val);
-      };
-      dialog.addEventListener("close", handleClose);
-    }
+      }
+    };
+    dialog.addEventListener("close", handleClose);
 
     dialog.showModal();
   },
 
   close(returnValue = "") {
+    this.setCloseLocked(false);
     const { dialog } = getDialogRefs();
     if (dialog && dialog.open) {
       dialog.close(returnValue);
