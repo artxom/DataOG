@@ -8,6 +8,32 @@
 
 ---
 
+## [2.3.0] - 2026-11-16
+
+### Added
+- **平台统一数据标准字典中枢 (`core/platform/standard_catalog.py` — `/api/platform/standards*`)**：
+  - 以 `数据项编号` (`std_code`) 为唯一主键维护全行一套最新数据标准（SQLite 表 `standard_dictionary` 与字段绑定表 `field_standard_bindings`），完整兼容 46 列多库物理格式（含 `仓库DWS数据格式`、`数据仓库 集市`、`ArgoDB`、`MySQL`、`Oracle`、`OceanBase`、`达梦` 等，并精准处理同名 `仓库DWS数据格式` 列右侧主格式优先解析）。
+  - 支持流式只读高速解析大型标准字典工作簿、按 `数据项编号` 增量合并 Upsert（保留既有库表字段绑定）或全量覆盖导入、在线增删改查（修改编号自动级联更新所有绑定）、多维分页搜索以及 46 列脱敏系统模板下载与完整导出。
+- **第 2 步「落标绑定与贯标」全链路升级 (`modules/standard_migrator/` & `standard_migrator_view.js`)**：
+  - 采用左树（`DatabaseTree` 实时显示各表已绑标/已达标徽标）+ 右工作台，按数据源连接持久化字段标准绑定（自动共享给第 3 步跨环境比对）。
+  - 新增 `GET/POST /bindings/*` 接口：支持一键导出带当前已选表真实物理字段的待填对照模板、批量上传「表字段↔数据标准」对照表、智能预匹配、三维分级“检查是否落标”（字段名 + 归一化物理类型 + 中文注释），并支持勾选未达标字段一键生成贯标改造任务衔接原地 `ALTER` 或 DWS 物理列保序重建。
+- **第 3 步「跨环境比对」双列拟物书签工作台 (`modules/cross_comparator/` & `cross_comparator_view.js`)**：
+  - 重构为「来源库 | 目标库」双列对照布局 + 内侧中缝拟物书签桥 (`dual_rows`)：自动继承第 2 步在来源库与目标库维护的字段数标；左右已配对且数标编号一致时合拢为不惹眼的**淡绿色贯通拟物书签**（目标物理未达标时附“待贯标”角标），不一致或单侧未绑时在中缝断开为左右燕尾独立书签。
+  - 支持直接拖拽字段卡片调整/交换/配对与虚线空槽承载、点击书签实时选绑或更换数据标准、一键拆解配对、保存后双向同步回第 2 步数据源绑定（`/pairings/save`），以及导出当前两表预填映射模板与批量铺底上传（`/pairings/template.xlsx`、`/pairings/upload`）。
+- **全系统两步式模板导入向导 (`static/js/ui/upload_wizard_modal.js`)**：
+  - 统一全平台所有 Excel 上传交互为「第 1 步下载空白/预填系统模板（附带 `填写说明` Sheet）→ 第 2 步拖放/选择文件与策略导入」。
+- **原生 macOS 底部居中悬浮毛玻璃 Dock 栏 (`static/index.html` & `static/js/main.js`)**：
+  - 桌面中央保持纯净壁纸留白，底部居中悬浮毛玻璃 Dock 承载四大模块（悬停平滑放大、邻近抬起、名称气泡、运行圆点），最小化窗口收纳于 Dock 竖直分隔线右侧缩略区，全屏最大化时 Dock 自动下沉隐藏、鼠标贴底即可丝滑唤出。
+
+### Changed
+- `core/platform/dialects/types.py` 与 `core/dws_engine.py` 补充 `NVARCHAR` 至 `varchar` 归一化；`core/excel_handler.py` 将 Excel 安全上传上限提升至 `50MB` 并在解析清单时自动跳过 `填写说明` 等辅助工作表。
+- 升级 `app.py` 至 `2.3.0`，扩充自动化单测与端到端闭环测试至 **32 项**。
+
+### Security
+- 将本地参考样本 `Book1.xlsx` 加入 `.gitignore` 严格隔离防止敏感字典数据提交，系统内置模板均采用脱敏通用金融示例数据，全量前端新增视图与组件保持零 `innerHTML` 与零阻塞弹窗。
+
+---
+
 ## [2.2.0] - 2026-11-12
 
 ### Added

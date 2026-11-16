@@ -915,6 +915,145 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             self.assertIn("SET SESSION TRANSACTION READ ONLY", executed_sqls)
             self.assertIn("START TRANSACTION READ ONLY", executed_sqls)
 
+    def test_standard_catalog_bohai_46col_import_upsert_formats_and_compliance(self) -> None:
+        """验证 StandardCatalog 46 列渤海模板导入（右侧 DWS 列优先）、Upsert/Replace、多库格式解析与分级落标核验."""
+        from core.platform.standard_catalog import BOHAI_DICT_HEADERS, StandardCatalog
+
+        def _make_46col_xlsx(rows_data: List[List[str]]) -> bytes:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "数据字典"
+            ws.append(list(BOHAI_DICT_HEADERS))
+            for r in rows_data:
+                ws.append(r)
+            out = io.BytesIO()
+            wb.save(out)
+            return out.getvalue()
+
+        r1 = [""] * 46
+        r1[0] = "XTPO105525"
+        r1[1] = "业务数据"
+        r1[5] = "新凭证冠字号码"
+        r1[7] = "NEW_PREFIX"
+        r1[8] = "NEW_PREFIX"
+        r1[19] = "文本类10(nvarchar)"
+        r1[21] = "VARCHAR(10)"
+        r1[22] = "VARCHAR(40)"
+        r1[23] = "/"  # 同名旧 DWS 格式列为 '/'，必须取右侧第 45 列
+        r1[24] = "VARCHAR2(40)"
+        r1[29] = "1"
+        r1[36] = "文本类"
+        r1[41] = "VARCHAR(10)"  # argodb
+        r1[43] = "VARCHAR2(50)"  # 数据仓库 集市
+        r1[44] = "NVARCHAR2(50)"  # 第 45 列 仓库DWS数据格式
+
+        r2 = [""] * 46
+        r2[0] = "RDAM000426"
+        r2[1] = "业务数据"
+        r2[5] = "零售客户折人民币存款年日均金额"
+        r2[7] = "Retail Customer Year Avg Amt"
+        r2[8] = "RTL_CUST_CNY_DPST_Y_AVG_AMT"
+        r2[21] = "DECIMAL(18,2)"
+        r2[22] = "DECIMAL(18,2)"
+        r2[29] = "1"
+        r2[36] = "金额类"
+        r2[41] = "DECIMAL(18,2)"
+        r2[43] = "DECIMAL(18,2)"
+        r2[44] = "DECIMAL(18,2)"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(db_path=os.path.join(tmpdir, "dataog_state.db"))
+            cat = ctx.standard_catalog
+
+            # 1. 导入 46 列标准字典（同时在文件中间混入重复表头行测试去噪）
+            dup_hdr = list(BOHAI_DICT_HEADERS)
+            xlsx_bytes = _make_46col_xlsx([r1, dup_hdr, r2])
+            res_up = cat.import_dictionary_excel("bohai_dict.xlsx", xlsx_bytes, mode="upsert")
+            self.assertEqual(res_up["imported_count"], 2)
+
+            it1 = cat.get_item("XTPO105525")
+            self.assertIsNotNone(it1)
+            self.assertEqual(it1["type_dws"], "NVARCHAR2(50)")
+            self.assertEqual(it1["type_dw_mart"], "VARCHAR2(50)")
+            self.assertEqual(it1["type_argodb"], "VARCHAR(10)")
+
+            # 2. 多库物理格式自动路由与手动切换
+            self.assertEqual(cat.resolve_physical_type(it1, db_type="DWS"), "NVARCHAR2(50)")
+            self.assertEqual(cat.resolve_physical_type(it1, db_type="INCEPTOR"), "VARCHAR(10)")
+            self.assertEqual(cat.resolve_physical_type(it1, db_type="MYSQL"), "VARCHAR(10)")
+            self.assertEqual(cat.resolve_physical_type(it1, db_type="ORACLE"), "VARCHAR(40)")
+            self.assertEqual(cat.resolve_physical_type(it1, db_type="DM8"), "VARCHAR2(40)")
+            self.assertEqual(
+                cat.resolve_physical_type(it1, db_type="DWS", format_profile="type_dw_mart"),
+                "VARCHAR2(50)",
+            )
+
+            # 3. 三维分级落标核验 (COMPLIANT / COMMENT_ONLY / NON_COMPLIANT / UNBOUND / STD_MISSING)
+            ev_ok = StandardCatalog.evaluate_column_compliance(
+                col_name="new_prefix",
+                col_type="VARCHAR(50)",  # 与 NVARCHAR2(50) 归一化相等
+                col_comment="新凭证冠字号码（含补充说明）",
+                std_item=it1,
+                std_code="XTPO105525",
+                db_type="DWS",
+            )
+            self.assertEqual(ev_ok["status"], "COMPLIANT")
+
+            ev_comm = StandardCatalog.evaluate_column_compliance(
+                col_name="NEW_PREFIX",
+                col_type="NVARCHAR2(50)",
+                col_comment="冠字号",  # 缺少标准中文名
+                std_item=it1,
+                std_code="XTPO105525",
+                db_type="DWS",
+            )
+            self.assertEqual(ev_comm["status"], "COMMENT_ONLY")
+
+            ev_bad = StandardCatalog.evaluate_column_compliance(
+                col_name="old_prefix",
+                col_type="VARCHAR(20)",
+                col_comment="新凭证冠字号码",
+                std_item=it1,
+                std_code="XTPO105525",
+                db_type="DWS",
+            )
+            self.assertEqual(ev_bad["status"], "NON_COMPLIANT")
+
+            self.assertEqual(
+                StandardCatalog.evaluate_column_compliance(
+                    col_name="x", col_type="INT", col_comment="", std_item=None, std_code=""
+                )["status"],
+                "UNBOUND",
+            )
+            self.assertEqual(
+                StandardCatalog.evaluate_column_compliance(
+                    col_name="x", col_type="INT", col_comment="", std_item=None, std_code="NO_SUCH"
+                )["status"],
+                "STD_MISSING",
+            )
+
+            # 4. 绑定字段后执行 replace 模式重新导入与修改 std_code 级联更新
+            cat.upsert_field_bindings(
+                "conn_demo",
+                [{"schema_name": "public", "table_name": "t_vchr", "column_name": "new_prefix", "std_code": "XTPO105525"}],
+            )
+            cat.import_dictionary_excel("bohai_v2.xlsx", xlsx_bytes, mode="replace")
+            binds_after_replace = cat.get_table_field_bindings("conn_demo", "public", "t_vchr")
+            self.assertEqual(binds_after_replace["new_prefix"]["std_code"], "XTPO105525")
+
+            cat.update_item("XTPO105525", {**it1, "std_code": "XTPO105525_V2"})
+            binds_after_rename = cat.get_table_field_bindings("conn_demo", "public", "t_vchr")
+            self.assertEqual(binds_after_rename["new_prefix"]["std_code"], "XTPO105525_V2")
+
+            # 5. 验证 46 列系统模板生成与导出往返无损
+            tpl_bytes = cat.generate_dictionary_template_bytes()
+            tpl_parsed = cat.parse_standard_dictionary_excel("tpl.xlsx", tpl_bytes)
+            self.assertGreaterEqual(len(tpl_parsed), 4)
+
+            exp_bytes = cat.export_dictionary_excel_bytes()
+            exp_parsed = cat.parse_standard_dictionary_excel("exp.xlsx", exp_bytes)
+            self.assertEqual({x["std_code"] for x in exp_parsed}, {"XTPO105525_V2", "RDAM000426"})
+
 
 if __name__ == "__main__":
     unittest.main()

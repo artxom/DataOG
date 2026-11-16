@@ -198,88 +198,13 @@ html, body {
 }
 
 /* =========================================================================
-   3. 桌面主画布与四大模块超椭圆图标
+   3. 桌面主画布与超椭圆图标基元
    ========================================================================= */
 
 .desktop-surface {
   position: absolute;
   inset: 28px 0 0 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
   user-select: none;
-}
-
-.desktop-center-stage {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 34px;
-  transform: translateY(-14px);
-}
-
-.desktop-brand-hero {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 10px;
-}
-
-.desktop-brand-emblem {
-  width: 54px;
-  height: 54px;
-  border-radius: 14px;
-  overflow: hidden;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 12px 28px rgba(0, 113, 227, 0.24), inset 0 1px 0.5px rgba(255, 255, 255, 0.4);
-}
-
-.desktop-brand-title {
-  margin: 0;
-  font-size: 26px;
-  font-weight: 700;
-  letter-spacing: -0.03em;
-  color: var(--os-icon-label);
-  text-shadow: var(--os-icon-label-shadow);
-}
-
-.desktop-icon-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(96px, 112px));
-  gap: 20px;
-}
-
-@media (max-width: 580px) {
-  .desktop-icon-grid {
-    grid-template-columns: repeat(2, 108px);
-  }
-}
-
-.app-launcher {
-  border: none;
-  background: transparent;
-  font-family: inherit;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 9px;
-  padding: 12px 8px;
-  border-radius: 16px;
-  cursor: pointer;
-  position: relative;
-  transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1), background 0.15s ease;
-}
-
-.app-launcher:hover {
-  transform: translateY(-4px);
-  background: rgba(255, 255, 255, 0.14);
-}
-
-.app-launcher:active {
-  transform: scale(0.95);
 }
 
 .squircle-icon {
@@ -330,23 +255,6 @@ html, body {
   line-height: 1;
 }
 
-.app-launcher-label {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--os-icon-label);
-  text-shadow: var(--os-icon-label-shadow);
-  letter-spacing: -0.01em;
-}
-
-.app-running-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 999px;
-  background: var(--os-accent);
-  position: absolute;
-  bottom: 3px;
-}
-
 /* =========================================================================
    4. macOS 应用窗口骨架与红黄绿三键控制
    ========================================================================= */
@@ -374,7 +282,7 @@ html, body {
 }
 
 .app-window.normal {
-  inset: 40px 26px 52px 26px;
+  inset: 38px 24px 86px 24px;
   border-radius: 12px;
 }
 
@@ -472,63 +380,184 @@ html, body {
 }
 
 /* =========================================================================
-   5. 右下角毛玻璃最小化小抽屉
+   5. 原生 macOS 底部居中悬浮毛玻璃 Dock 栏（含最小化窗口收纳与全屏贴底唤出）
    ========================================================================= */
 
-.corner-drawer {
-  position: absolute;
-  right: 16px;
-  bottom: 12px;
-  z-index: 35;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px;
-  border-radius: 14px;
-  background: var(--os-drawer-bg);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22), 0 0 0 0.5px var(--os-border-strong);
+.dock-hover-zone {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 14px;
+  z-index: 34;
+  pointer-events: none;
 }
 
-.corner-drawer[hidden] {
-  display: none;
+.dock-hover-zone.is-active {
+  pointer-events: auto;
 }
 
-.drawer-chip {
-  border: 1px solid var(--os-border);
-  background: var(--os-win-bg);
-  color: var(--os-text);
-  font-family: inherit;
+.os-dock {
+  position: fixed;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%) translateY(0);
+  z-index: 36;
   display: inline-flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 8px;
-  padding: 4px 10px 4px 5px;
-  border-radius: 10px;
+  padding: 7px 11px 8px 11px;
+  border-radius: 20px;
+  background: var(--dock-bg);
+  border: 0.5px solid var(--dock-border);
+  backdrop-filter: blur(26px) saturate(190%);
+  -webkit-backdrop-filter: blur(26px) saturate(190%);
+  box-shadow: var(--dock-shadow);
+  user-select: none;
+  transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease;
+}
+
+.os-dock.is-autohide {
+  transform: translateX(-50%) translateY(calc(100% + 22px));
+  opacity: 0.01;
+}
+
+.os-dock.is-autohide.is-peek {
+  transform: translateX(-50%) translateY(0);
+  opacity: 1;
+}
+
+.dock-item {
+  position: relative;
+  border: none;
+  background: transparent;
+  padding: 0;
+  width: 48px;
+  height: 52px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
   cursor: pointer;
-  transition: transform 0.14s ease, border-color 0.14s ease;
+  transition: transform 0.18s cubic-bezier(0.2, 0.85, 0.25, 1), margin 0.18s ease;
+  transform-origin: bottom center;
 }
 
-.drawer-chip:hover {
-  transform: translateY(-2px);
-  border-color: var(--os-accent);
+.dock-item:hover {
+  transform: translateY(-7px) scale(1.22);
+  margin: 0 5px;
+  z-index: 2;
 }
 
-.drawer-chip-meta {
+.dock-item:has(+ .dock-item:hover),
+.dock-item:hover + .dock-item {
+  transform: translateY(-3px) scale(1.08);
+  margin: 0 2px;
+}
+
+.dock-item:active {
+  transform: translateY(-2px) scale(1.06);
+}
+
+.dock-icon-box .squircle-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.2), inset 0 1px 0.5px rgba(255, 255, 255, 0.36);
+}
+
+.dock-tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  padding: 4px 10px;
+  border-radius: 7px;
+  background: var(--os-drawer-bg);
+  border: 0.5px solid var(--os-border-strong);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  color: var(--os-text);
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+}
+
+.dock-item:hover .dock-tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.dock-dot {
+  width: 4.5px;
+  height: 4.5px;
+  border-radius: 999px;
+  margin-top: 3px;
+  background: transparent;
+  transition: background 0.15s ease, width 0.15s ease;
+}
+
+.dock-dot.is-visible {
+  background: var(--os-muted);
+}
+
+.dock-dot.is-visible.is-focused {
+  width: 10px;
+  background: var(--os-accent);
+}
+
+.dock-separator {
+  width: 1px;
+  height: 38px;
+  align-self: center;
+  margin: 0 4px 4px 4px;
+  background: var(--os-border-strong);
+  flex-shrink: 0;
+}
+
+.dock-minimized-tile {
+  position: relative;
+  width: 46px;
+  height: 44px;
+  border-radius: 8px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-win-bg);
+  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.16);
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  line-height: 1.2;
+  overflow: hidden;
 }
 
-.drawer-chip-title {
-  font-size: 12px;
-  font-weight: 600;
+.dock-mini-win-chrome {
+  height: 11px;
+  padding: 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 2.5px;
+  background: var(--os-toolbar-bg);
+  border-bottom: 0.5px solid var(--os-border);
 }
 
-.drawer-chip-sub {
-  font-size: 10.5px;
-  color: var(--os-muted);
+.dock-mini-win-chrome span {
+  width: 3.5px;
+  height: 3.5px;
+  border-radius: 999px;
+}
+
+.dock-mini-win-chrome span:nth-child(1) { background: #ff5f57; }
+.dock-mini-win-chrome span:nth-child(2) { background: #febc2e; }
+.dock-mini-win-chrome span:nth-child(3) { background: #28c840; }
+
+.dock-mini-app-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  transform: scale(0.76);
+  transform-origin: bottom right;
 }
 
 /* =========================================================================
@@ -1925,4 +1954,471 @@ dialog::backdrop {
   line-height: 1.45;
   resize: none;
   flex: 1;
+}
+
+/* =========================================================================
+   12. Data.O.G v2.3.0 两步式导入向导 · 数标选绑弹窗 · 拟物书签双列比对画布
+   ========================================================================= */
+
+.upload-wizard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.upload-wizard-step {
+  border: 1px solid var(--os-border);
+  border-radius: 10px;
+  background: var(--os-subtle-bg);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.upload-wizard-step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.wizard-col-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.upload-dropzone {
+  border: 1.5px dashed var(--os-border-strong);
+  border-radius: 9px;
+  background: var(--os-win-bg);
+  padding: 18px 14px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.upload-dropzone:hover,
+.upload-dropzone.is-dragover {
+  border-color: var(--os-accent);
+  background: color-mix(in srgb, var(--os-accent) 6%, var(--os-win-bg));
+}
+
+.wizard-file-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  text-align: center;
+  color: var(--os-text-secondary);
+}
+
+.wizard-mode-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.wizard-mode-opt {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+/* 标准字典选择器弹窗与点击单元格 */
+.std-picker-list {
+  max-height: 52vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 2px;
+}
+
+.std-picker-item {
+  width: 100%;
+  border: 1px solid var(--os-border);
+  border-radius: 8px;
+  background: var(--os-win-bg);
+  color: var(--os-text);
+  font-family: inherit;
+  padding: 9px 11px;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.std-picker-item:hover {
+  border-color: var(--os-accent);
+  background: var(--os-hover);
+}
+
+.std-picker-item.is-current {
+  border-color: var(--status-success);
+  background: var(--bookmark-unified-bg);
+}
+
+.std-picker-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.std-picker-item-sub {
+  font-size: 11px;
+  color: var(--os-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.std-cell-clickable {
+  padding: 4px 7px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.std-cell-clickable:hover {
+  background: var(--os-hover);
+}
+
+/* 第 3 步：双列跨环境比对 × 内侧中缝拟物书签 */
+.dual-lane-headers {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 270px minmax(0, 1fr);
+  border-bottom: 1px solid var(--os-border);
+  background: var(--os-subtle-bg);
+  flex-shrink: 0;
+}
+
+.dual-lane-head {
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-right: 1px solid var(--os-border);
+}
+
+.dual-lane-head:last-child {
+  border-right: none;
+}
+
+.dual-center-legend {
+  align-items: center;
+  justify-content: center;
+  background: var(--os-toolbar-bg);
+}
+
+.dual-compare-canvas {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px 24px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  background: var(--os-win-bg);
+}
+
+.dual-compare-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 270px minmax(0, 1fr);
+  align-items: stretch;
+  min-height: 50px;
+}
+
+.dual-field-card {
+  border: 1px solid var(--os-border-strong);
+  border-radius: 8px;
+  background: var(--os-win-bg);
+  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  cursor: grab;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease, opacity 0.14s ease;
+}
+
+.dual-field-card:hover {
+  border-color: var(--os-accent);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.06);
+}
+
+.dual-field-card.is-dragging {
+  opacity: 0.5;
+  cursor: grabbing;
+}
+
+.dual-field-card.is-drop-target,
+.drop-slot-empty.is-drop-target {
+  border-color: var(--os-accent);
+  background: var(--os-select);
+}
+
+.dual-compare-row.is-unified-row .dual-field-card {
+  border-color: var(--bookmark-unified-border);
+}
+
+.dual-field-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.drag-grip {
+  font-size: 11px;
+  color: var(--os-muted);
+  letter-spacing: -1px;
+  user-select: none;
+}
+
+.dual-field-sub {
+  font-size: 11px;
+  color: var(--os-text-secondary);
+  padding-left: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.drop-slot-empty {
+  border: 1.5px dashed var(--os-border-strong);
+  border-radius: 8px;
+  background: var(--os-subtle-bg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11.5px;
+  color: var(--os-muted);
+  min-height: 46px;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+/* 中缝拟物书签桥 */
+.bookmark-bridge {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  padding: 0 4px;
+  min-width: 0;
+}
+
+.bookmark-ribbon.is-unified {
+  width: 100%;
+  min-height: 36px;
+  padding: 4px 10px;
+  border: 1px solid var(--bookmark-unified-border);
+  border-left: 3px solid color-mix(in srgb, var(--bookmark-unified-text) 45%, var(--bookmark-unified-border));
+  border-right: 3px solid color-mix(in srgb, var(--bookmark-unified-text) 45%, var(--bookmark-unified-border));
+  border-radius: 4px;
+  background: var(--bookmark-unified-bg);
+  color: var(--bookmark-unified-text);
+  font-family: inherit;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(34, 92, 57, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  transition: filter 0.14s ease, transform 0.14s ease;
+}
+
+.bookmark-ribbon.is-unified:hover {
+  filter: brightness(0.97);
+}
+
+.bookmark-punch {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--os-win-bg);
+  border: 1px solid var(--bookmark-unified-border);
+  flex-shrink: 0;
+}
+
+.bookmark-ribbon-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.bookmark-code {
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.bookmark-cn {
+  font-size: 11.5px;
+  font-weight: 600;
+  max-width: 195px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bookmark-en {
+  font-size: 10px;
+  opacity: 0.78;
+  max-width: 195px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bookmark-unlink-btn {
+  position: absolute;
+  top: -4px;
+  right: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-win-bg);
+  color: var(--os-muted);
+  font-size: 11px;
+  line-height: 1;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.bookmark-bridge.is-unified:hover .bookmark-unlink-btn {
+  display: inline-flex;
+}
+
+.bookmark-unlink-btn:hover {
+  color: var(--status-danger);
+  border-color: var(--status-danger);
+}
+
+.bookmark-bridge.is-split {
+  justify-content: space-between;
+  gap: 4px;
+  padding: 0;
+}
+
+.bookmark-tab {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 36px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-subtle-bg);
+  color: var(--os-text);
+  font-family: inherit;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  transition: filter 0.13s ease, border-color 0.13s ease;
+}
+
+.bookmark-tab:hover {
+  border-color: var(--os-accent);
+}
+
+/* 左侧燕尾拟物书签（向右伸出带右侧燕尾缺口） */
+.bookmark-tab-left {
+  padding: 2px 13px 2px 7px;
+  border-left: 3px solid var(--os-accent);
+  border-radius: 3px 0 0 3px;
+  clip-path: polygon(0 0, 100% 0, calc(100% - 8px) 50%, 100% 100%, 0 100%);
+  justify-content: flex-start;
+}
+
+/* 右侧燕尾拟物书签（向左伸出带左侧燕尾缺口） */
+.bookmark-tab-right {
+  padding: 2px 7px 2px 13px;
+  border-right: 3px solid var(--status-warn);
+  border-radius: 0 3px 3px 0;
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 0 100%, 8px 50%);
+  justify-content: flex-end;
+  text-align: right;
+}
+
+.bookmark-tab.has-std {
+  background: color-mix(in srgb, var(--status-info) 11%, var(--os-win-bg));
+  border-color: color-mix(in srgb, var(--status-info) 38%, transparent);
+}
+
+.bookmark-tab.has-diff {
+  background: color-mix(in srgb, var(--status-warn) 14%, var(--os-win-bg));
+  border-color: color-mix(in srgb, var(--status-warn) 45%, transparent);
+}
+
+.bookmark-tab.is-empty {
+  border-left-color: var(--os-border-strong);
+  border-right-color: var(--os-border-strong);
+  color: var(--os-muted);
+}
+
+.bookmark-tab-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.15;
+  font-size: 10.5px;
+}
+
+.bookmark-tab-cn {
+  font-size: 10.5px;
+  color: var(--os-text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bookmark-tab-placeholder {
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.bookmark-gap-holder {
+  flex: 1;
+}
+
+.bookmark-diff-badge {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-win-bg);
+  color: var(--os-muted);
+  font-size: 11px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.bookmark-diff-badge.is-diff {
+  color: var(--status-danger);
+  border-color: color-mix(in srgb, var(--status-danger) 45%, transparent);
+}
+
+.bookmark-diff-badge:hover {
+  border-color: var(--os-accent);
+  color: var(--os-accent);
+}
+
+.bookmark-diff-dot {
+  width: 14px;
+  text-align: center;
+  color: var(--os-muted);
+  flex-shrink: 0;
 }

@@ -6,7 +6,7 @@ import json
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from fastapi.responses import JSONResponse
 
 from core.platform.context import PlatformContext, get_platform_context
@@ -14,6 +14,7 @@ from modules.cross_comparator.schemas import (
     BindRoleConnectionPayload,
     PushToMigratorPayload,
     SaveCrossBindingsPayload,
+    SaveCrossPairingsPayload,
 )
 from modules.cross_comparator.service import CrossComparatorService
 
@@ -28,11 +29,22 @@ def _err(msg: str, status_code: int = 400) -> JSONResponse:
 def api_cross_overview(
     table_key: Optional[str] = Query(default=None),
     force_refresh: bool = Query(default=False),
+    source_schema: Optional[str] = Query(default=None),
+    source_table: Optional[str] = Query(default=None),
+    target_schema: Optional[str] = Query(default=None),
+    target_table: Optional[str] = Query(default=None),
+    format_profile: str = Query(default="AUTO"),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
         return CrossComparatorService(ctx).get_overview_state(
-            selected_table_key=table_key, force_refresh=force_refresh
+            selected_table_key=table_key,
+            force_refresh=force_refresh,
+            source_schema=source_schema,
+            source_table=source_table,
+            target_schema=target_schema,
+            target_table=target_table,
+            format_profile=format_profile,
         )
     except Exception as exc:
         return _err(str(exc), 400)
@@ -140,7 +152,75 @@ def api_cross_push_to_migrator(
 ):
     try:
         return CrossComparatorService(ctx).push_to_migrator(
-            std_table_key=payload.std_table_key or None
+            std_table_key=payload.std_table_key or None,
+            format_profile=payload.format_profile,
+        )
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
+@router.post("/pairings/save")
+def api_cross_save_pairings(
+    payload: SaveCrossPairingsPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return CrossComparatorService(ctx).save_pairings(
+            std_table_key=payload.std_table_key,
+            source_schema=payload.source_schema,
+            source_table=payload.source_table,
+            target_schema=payload.target_schema,
+            target_table=payload.target_table,
+            pairings=payload.pairings,
+            format_profile=payload.format_profile,
+            force_refresh=payload.force_refresh,
+            sync_to_field_bindings=payload.sync_to_field_bindings,
+        )
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
+@router.get("/pairings/template.xlsx")
+def api_cross_pairings_template(
+    table_key: str = Query(default=""),
+    source_schema: str = Query(default=""),
+    source_table: str = Query(default=""),
+    target_schema: str = Query(default=""),
+    target_table: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        content = CrossComparatorService(ctx).generate_pairing_template_bytes(
+            std_table_key=table_key,
+            source_schema=source_schema,
+            source_table=source_table,
+            target_schema=target_schema,
+            target_table=target_table,
+        )
+        fn = quote("DataOG_跨环境字段映射铺底模板.xlsx")
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename=cross_pairings_template.xlsx; filename*=UTF-8''{fn}"
+            },
+        )
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
+@router.post("/pairings/upload")
+async def api_cross_pairings_upload(
+    file: UploadFile = File(...),
+    format_profile: str = Form(default="AUTO"),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        raw = await file.read()
+        return CrossComparatorService(ctx).upload_pairings_excel(
+            filename=file.filename or "cross_pairings.xlsx",
+            content=raw,
+            format_profile=format_profile,
         )
     except Exception as exc:
         return _err(str(exc), 400)

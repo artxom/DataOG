@@ -245,8 +245,8 @@ def create_app(
     )
     ctx.register_module_manifest(
         module_id="cross_comparator",
-        title="跨环境三栏数标比对",
-        subtitle="来源库 × 数据标准 × 目标库 16:9 三方映射与闭环推送",
+        title="跨环境双列拟物书签比对",
+        subtitle="来源库 × 目标库 双列拖拽配对、拟物数标书签与闭环推送",
         api_prefix="/api/modules/cross_comparator",
     )
     ctx.register_module_manifest(
@@ -272,7 +272,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.2.0",
+        version="2.3.0",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -395,7 +395,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.2.0 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.3.0 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")

@@ -123,6 +123,7 @@ def normalize_dws_type(raw_type: str) -> str:
     t = re.sub(r"^character varying\b", "varchar", t)
     t = re.sub(r"^varchar2\b", "varchar", t)
     t = re.sub(r"^nvarchar2\b", "varchar", t)
+    t = re.sub(r"^nvarchar\b", "varchar", t)
     t = re.sub(r"^character\b", "char", t)
     t = re.sub(r"^bpchar\b", "char", t)
     t = re.sub(r"^nchar\b", "char", t)

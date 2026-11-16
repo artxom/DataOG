@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,3 +30,35 @@ class TableRebuildPayload(BaseModel):
     table_name: str
     item_ids: Optional[List[int]] = None
     keep_backup: bool = True
+
+
+class SaveFieldBindingsPayload(BaseModel):
+    connection_id: str
+    format_profile: str = "AUTO"
+    bindings: List[Dict[str, Any]] = Field(default_factory=list)
+    active_schema: str = ""
+    active_table: str = ""
+
+
+class AutoMatchBindingsPayload(BaseModel):
+    connection_id: str
+    tables: List[Any] = Field(default_factory=list)
+    schema_name: str = ""
+    table_name: str = ""
+    format_profile: str = "AUTO"
+
+
+class CheckCompliancePayload(BaseModel):
+    connection_id: str
+    tables: List[Any] = Field(default_factory=list)
+    format_profile: str = "AUTO"
+    force_refresh: bool = True
+
+
+class StageMigrationFromBindingsPayload(BaseModel):
+    connection_id: str
+    schema_name: str
+    table_name: str
+    column_names: List[str] = Field(default_factory=list)
+    format_profile: str = "AUTO"
+    append: bool = False

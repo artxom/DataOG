@@ -39,17 +39,18 @@ class WorkbenchStore {
       },
       llmProviders: [],
       llmModels: [],
+      standardDictSummary: { total_count: 0, filename: "未导入", imported_at: "" },
       modules: [],
       logs: [],
 
       // 桌面窗口状态机
       activeApp: null, // null 表示显示纯净桌面；否则为 settings | explorer | standard | polyglot
-      minimizedApps: [], // 已最小化至右下角抽屉的应用 ID 列表（严格保留内存状态）
+      minimizedApps: [], // 已最小化至 Dock 右侧收纳区的应用 ID 列表（严格保留内存状态）
       maximizedApps: new Set(),
       appSummaries: {
         settings: "外观 · 连接 · AI",
         explorer: "SQL 查询",
-        standard: "贯标 · 比对",
+        standard: "字典 · 落标 · 比对",
         polyglot: "命名 · 方言",
       },
       moduleContext: null,
@@ -98,6 +99,9 @@ class WorkbenchStore {
     }
     this.state.llmProviders = data.llm_providers || [];
     this.state.llmModels = data.llm_models || [];
+    if (data.standard_dict_summary) {
+      this.state.standardDictSummary = data.standard_dict_summary;
+    }
     this.state.modules = data.modules || [];
     this.state.logs = data.logs || [];
     this.emit("bootstrap");
@@ -141,6 +145,12 @@ class WorkbenchStore {
   updateDrivers(drivers) {
     this.state.drivers = drivers || [];
     this.emit("drivers");
+  }
+
+  updateStandardDictSummary(summary) {
+    if (!summary) return;
+    this.state.standardDictSummary = summary;
+    this.emit("standards");
   }
 
   updateLogs(logs) {

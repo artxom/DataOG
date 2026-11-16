@@ -25,7 +25,7 @@ try:
 except ImportError:
     pass
 
-MAX_UPLOAD_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_UPLOAD_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB（兼容大型企业数标字典）
 XLSX_MAGIC_BYTES = b"PK\x03\x04"
 FORBIDDEN_XML_PATTERNS = re.compile(
     rb"<!DOCTYPE\s+|<!ENTITY\s+|http://www\.w3\.org/2001/XInclude",
@@ -339,12 +339,17 @@ STATUS_LABELS: Dict[str, str] = {
 }
 
 
-def validate_xlsx_bytes(filename: str, content: bytes) -> None:
+def validate_xlsx_bytes(
+    filename: str,
+    content: bytes,
+    max_size_bytes: int = MAX_UPLOAD_SIZE_BYTES,
+) -> None:
     """严格校验上传的 .xlsx 文件非空、大小上限、ZIP 魔数头、防路径穿越及防 XXE 注入."""
     if not content:
         raise ValueError("上传的 Excel 文件内容为空")
-    if len(content) > MAX_UPLOAD_SIZE_BYTES:
-        raise ValueError("上传的 Excel 文件超过 10MB 安全大小限制")
+    if len(content) > max_size_bytes:
+        limit_mb = max(1, max_size_bytes // (1024 * 1024))
+        raise ValueError(f"上传的 Excel 文件超过 {limit_mb}MB 安全大小限制")
     ext = os.path.splitext((filename or "").strip())[1].lower()
     if ext and ext not in (".xlsx", ".xlsm"):
         raise ValueError("仅支持标准 .xlsx 格式的 Excel 工作簿")
@@ -592,6 +597,9 @@ def parse_excel_checklist(
         clean_default_table = _clean_ident_value(default_table)
 
         for sheet in wb.worksheets:
+            title_norm = (sheet.title or "").strip().lower()
+            if title_norm in ("填写说明", "填表说明", "使用说明", "说明", "目录", "封面", "readme", "instructions"):
+                continue
             rows = _extract_sheet_rows_with_merged_cells(sheet)
             if not rows:
                 continue
@@ -800,6 +808,26 @@ def generate_template_excel() -> bytes:
         ws.append(row)
 
     _style_worksheet(ws, len(headers))
+
+    ws_note = wb.create_sheet(title="填写说明")
+    ws_note.append(["列名称", "是否必填", "填写说明"])
+    notes = [
+        ["模式名", "选填", "目标数据库 Schema 名称，留空时自动继承当前选定数据源的默认 Schema"],
+        ["表名", "必填", "需执行贯标改造的物理表英文名"],
+        ["修改前字段名", "必填", "数据库中当前已存在的物理字段名（若不改名可与修改后字段名一致）"],
+        ["修改前类型", "选填", "仅作参考，核验时会以库内实时元数据为准"],
+        ["修改前注释", "选填", "仅作参考"],
+        ["修改后字段名", "必填", "贯标后的标准英文字段名"],
+        ["修改后类型", "必填", "贯标后的目标物理类型，如 VARCHAR(64)、DECIMAL(18,2)"],
+        ["修改后注释", "选填", "贯标后的标准字段中文注释"],
+    ]
+    for r in notes:
+        ws_note.append(r)
+    _style_worksheet(ws_note, 3)
+    ws_note.column_dimensions["A"].width = 20
+    ws_note.column_dimensions["B"].width = 12
+    ws_note.column_dimensions["C"].width = 64
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -882,6 +910,26 @@ def export_report_excel(items: List[Dict[str, Any]]) -> bytes:
                 ws.cell(row=row_idx, column=col_i).fill = fill
 
     _style_worksheet(ws, len(headers))
+
+    ws_note = wb.create_sheet(title="填写说明")
+    ws_note.append(["列名称", "是否必填", "填写说明"])
+    notes = [
+        ["模式名", "选填", "目标数据库 Schema 名称，留空时自动继承当前选定数据源的默认 Schema"],
+        ["表名", "必填", "需执行贯标改造的物理表英文名"],
+        ["修改前字段名", "必填", "数据库中当前已存在的物理字段名（若不改名可与修改后字段名一致）"],
+        ["修改前类型", "选填", "仅作参考，核验时会以库内实时元数据为准"],
+        ["修改前注释", "选填", "仅作参考"],
+        ["修改后字段名", "必填", "贯标后的标准英文字段名"],
+        ["修改后类型", "必填", "贯标后的目标物理类型，如 VARCHAR(64)、DECIMAL(18,2)"],
+        ["修改后注释", "选填", "贯标后的标准字段中文注释"],
+    ]
+    for r in notes:
+        ws_note.append(r)
+    _style_worksheet(ws_note, 3)
+    ws_note.column_dimensions["A"].width = 20
+    ws_note.column_dimensions["B"].width = 12
+    ws_note.column_dimensions["C"].width = 64
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()

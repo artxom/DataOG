@@ -22,6 +22,9 @@ export function el(tag, props = {}, ...children) {
         node.textContent = String(v);
       } else if (k === "indeterminate") {
         node.indeterminate = Boolean(v);
+      } else if (k === "draggable") {
+        node.draggable = Boolean(v);
+        node.setAttribute("draggable", v ? "true" : "false");
       } else if (k === "dataset" && typeof v === "object") {
         for (const [dk, dv] of Object.entries(v)) {
           if (dv !== undefined && dv !== null) {
@@ -118,6 +121,11 @@ const ICON_PATHS = {
   view: "M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6zm10 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
   folder: "M3 6h6l2 2h10v10H3V6z",
   upload: "M12 16V4m0 0l-4 4m4-4l4 4M4 18v2h16v-2",
+  download: "M12 4v12m0 0l-4-4m4 4l4-4M4 20h16",
+  bookmark: "M6 3h12a1 1 0 0 1 1 1v17l-7-4-7 4V4a1 1 0 0 1 1-1z",
+  link: "M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71",
+  check: "M5 12l5 5L20 7",
+  book: "M4 19.5A2.5 2.5 0 0 1 6.5 17H20M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z",
   copy: "M9 9h10v11H9V9zm-4 6H4V4h10v1",
   plus: "M12 5v14M5 12h14",
   trash: "M4 7h16M9 7V4h6v3m-7 3v7m4-7v7m4-7v7M6 7l1 13h10l1-13",

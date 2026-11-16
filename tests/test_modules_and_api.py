@@ -1124,6 +1124,219 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 404,
             )
 
+    def test_three_step_standard_governance_bookmarks_templates_and_dock(self) -> None:
+        """端到端验证 v2.3.0：macOS 底部 Dock、全流程模板下载、标准字典 -> 字段绑定与落标检查 -> 跨环境拟物书签闭环."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_sqlite = os.path.join(tmpdir, "src_ods.sqlite")
+            tgt_sqlite = os.path.join(tmpdir, "tgt_dwd.sqlite")
+
+            with contextlib.closing(sqlite3.connect(src_sqlite)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE ods_cust_acct (
+                        cust_no VARCHAR(32),
+                        open_dt DATE,
+                        bal_amt DECIMAL(18,2),
+                        ext_note VARCHAR(100)
+                    );
+                    """
+                )
+            with contextlib.closing(sqlite3.connect(tgt_sqlite)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE dwd_cust_acct (
+                        CUST_ID VARCHAR(32),
+                        open_date VARCHAR(20),
+                        bal_amt DECIMAL(10,2),
+                        extra_tgt_col VARCHAR(20)
+                    );
+                    """
+                )
+
+            ctx = PlatformContext(
+                db_path=os.path.join(tmpdir, "dataog_state.db"),
+                drivers_dir=os.path.join(tmpdir, "drivers"),
+                assets_dir=os.path.join(tmpdir, "assets"),
+            )
+            app = create_app(ctx=ctx)
+            client = TestClient(app)
+
+            # 1. 验证桌面重构为底部 macOS Dock，不再使用中央图标网格与右下角抽屉
+            home_html = client.get("/").text
+            self.assertIn('id="os-dock"', home_html)
+            self.assertIn('id="dock-hover-zone"', home_html)
+            self.assertNotIn('id="desktop-icon-grid"', home_html)
+            self.assertNotIn('id="minimized-drawer"', home_html)
+
+            # 2. 创建来源库与目标库连接
+            src_cid = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "来源ODS库",
+                    "driver_track": "NATIVE",
+                    "db_type": "SQLITE",
+                    "sqlite_path": src_sqlite,
+                    "auto_refresh_metadata": True,
+                },
+            ).json()["connection"]["connection_id"]
+            tgt_cid = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "目标DWD库",
+                    "driver_track": "NATIVE",
+                    "db_type": "SQLITE",
+                    "sqlite_path": tgt_sqlite,
+                    "auto_refresh_metadata": True,
+                },
+            ).json()["connection"]["connection_id"]
+
+            # 3. 验证全系统全部 Excel 模板接口均可下载且附带「填写说明」工作表
+            for tpl_url in (
+                "/api/platform/standards/template.xlsx",
+                "/api/modules/standard_migrator/bindings/template.xlsx",
+                f"/api/modules/standard_migrator/bindings/template.xlsx?connection_id={tgt_cid}&schema_name=main&tables=main.dwd_cust_acct",
+                "/api/modules/cross_comparator/pairings/template.xlsx",
+                "/api/modules/standard_migrator/checklist/template.xlsx",
+            ):
+                r_tpl = client.get(tpl_url)
+                self.assertEqual(r_tpl.status_code, 200, f"模板下载失败: {tpl_url}")
+                wb_t = openpyxl.load_workbook(io.BytesIO(r_tpl.content), data_only=True)
+                self.assertIn("填写说明", wb_t.sheetnames, f"{tpl_url} 缺少填写说明工作表")
+                wb_t.close()
+
+            # 4. 第 1 步：先下载系统标准字典模板（含 CUST000101 / ACCT000205 / TXN000309 / COM000402）并直接上传导入
+            dict_tpl_bytes = client.get("/api/platform/standards/template.xlsx").content
+            r_up_dict = client.post(
+                "/api/platform/standards/upload",
+                files={
+                    "file": (
+                        "std_dict.xlsx",
+                        dict_tpl_bytes,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+                },
+                data={"mode": "upsert"},
+            ).json()
+            self.assertTrue(r_up_dict["ok"])
+            self.assertGreaterEqual(r_up_dict["imported_count"], 4)
+
+            # 5. 第 2 步：分别给来源库表与目标库表上传字段对照关系，并验证「检查是否落标」与「生成贯标任务」
+            # 5a) 来源库绑定：cust_no -> CUST000101, open_dt -> ACCT000205, bal_amt -> TXN000309
+            wb_src_bind = openpyxl.Workbook()
+            ws_sb = wb_src_bind.active
+            ws_sb.append(["模式名", "表名", "物理字段名", "数据项编号"])
+            ws_sb.append(["main", "ods_cust_acct", "cust_no", "CUST000101"])
+            ws_sb.append(["main", "ods_cust_acct", "open_dt", "ACCT000205"])
+            ws_sb.append(["main", "ods_cust_acct", "bal_amt", "TXN000309"])
+            buf_sb = io.BytesIO()
+            wb_src_bind.save(buf_sb)
+            r_sb = client.post(
+                "/api/modules/standard_migrator/bindings/upload",
+                files={"file": ("src_binds.xlsx", buf_sb.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"connection_id": src_cid, "mode": "merge"},
+            ).json()
+            self.assertTrue(r_sb["ok"])
+            self.assertEqual(r_sb["aggregate"]["bound_cols"], 3)
+
+            # 5b) 目标库绑定：CUST_ID -> CUST000101 (仅缺注释 -> COMMENT_ONLY), open_date -> ACCT000205 (NON_COMPLIANT), bal_amt -> COM000402 (故意绑错数标制造两侧不一致)
+            wb_tgt_bind = openpyxl.Workbook()
+            ws_tb = wb_tgt_bind.active
+            ws_tb.append(["模式名", "表名", "物理字段名", "数据项编号"])
+            ws_tb.append(["main", "dwd_cust_acct", "CUST_ID", "CUST000101"])
+            ws_tb.append(["main", "dwd_cust_acct", "open_date", "ACCT000205"])
+            ws_tb.append(["main", "dwd_cust_acct", "bal_amt", "COM000402"])
+            buf_tb = io.BytesIO()
+            wb_tgt_bind.save(buf_tb)
+            r_tb = client.post(
+                "/api/modules/standard_migrator/bindings/upload",
+                files={"file": ("tgt_binds.xlsx", buf_tb.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"connection_id": tgt_cid, "mode": "merge", "format_profile": "type_mysql"},
+            ).json()
+            self.assertTrue(r_tb["ok"])
+            cols_by_name = {c["column_name"]: c for c in r_tb["active_table"]["columns"]}
+            self.assertEqual(cols_by_name["CUST_ID"]["compliance_status"], "COMMENT_ONLY")
+            self.assertEqual(cols_by_name["open_date"]["compliance_status"], "NON_COMPLIANT")
+            self.assertEqual(cols_by_name["extra_tgt_col"]["compliance_status"], "UNBOUND")
+
+            # 生成待贯标队列
+            r_stage = client.post(
+                "/api/modules/standard_migrator/bindings/stage-migration",
+                json={
+                    "connection_id": tgt_cid,
+                    "schema_name": "main",
+                    "table_name": "dwd_cust_acct",
+                    "column_names": ["open_date"],
+                    "format_profile": "type_mysql",
+                },
+            ).json()
+            self.assertTrue(r_stage["ok"])
+            self.assertEqual(r_stage["staged_count"], 1)
+            self.assertEqual(r_stage["items"][0]["new_col_name"], "OPEN_DT")
+            self.assertEqual(r_stage["items"][0]["new_col_type"], "DATE")
+
+            # 6. 第 3 步：跨环境双列比对自动继承第 2 步绑定、同标合拢为淡绿贯通书签、异标断开、拖拽保存与铺底闭环
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "source", "connection_id": src_cid, "auto_refresh": True})
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "target", "connection_id": tgt_cid, "auto_refresh": True})
+
+            r_ov = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust_acct"
+                "&target_schema=main&target_table=dwd_cust_acct&format_profile=type_mysql"
+            ).json()
+            self.assertTrue(r_ov["ok"])
+            dual_rows = r_ov["active_comparison"]["dual_rows"]
+            # 自动按共同 std_code (CUST000101, ACCT000205) 和同名 (bal_amt) 对齐
+            by_src = {(r["source_col"]["column_name"] if r["source_col"] else ""): r for r in dual_rows}
+            self.assertEqual(by_src["cust_no"]["target_col"]["column_name"], "CUST_ID")
+            self.assertEqual(by_src["cust_no"]["bookmark_state"], "UNIFIED")
+            self.assertEqual(by_src["open_dt"]["target_col"]["column_name"], "open_date")
+            self.assertEqual(by_src["open_dt"]["bookmark_state"], "UNIFIED")
+            self.assertTrue(by_src["open_dt"]["target_needs_migration"])
+            self.assertEqual(by_src["bal_amt"]["bookmark_state"], "SPLIT_DIFF")
+
+            # 模拟界面拖拽调整与修改书签后保存，验证同步回写第 2 步数据源绑定
+            r_save_pair = client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "dwd_cust_acct",
+                    "source_schema": "main",
+                    "source_table": "ods_cust_acct",
+                    "target_schema": "main",
+                    "target_table": "dwd_cust_acct",
+                    "format_profile": "type_mysql",
+                    "pairings": [
+                        {"source_col": "cust_no", "target_col": "CUST_ID", "source_std_code": "CUST000101", "target_std_code": "CUST000101"},
+                        {"source_col": "open_dt", "target_col": "open_date", "source_std_code": "ACCT000205", "target_std_code": "ACCT000205"},
+                        {"source_col": "bal_amt", "target_col": "bal_amt", "source_std_code": "TXN000309", "target_std_code": "TXN000309"},
+                    ],
+                },
+            ).json()
+            self.assertTrue(r_save_pair["ok"])
+            self.assertEqual(r_save_pair["active_comparison"]["bookmark_summary"]["unified"], 3)
+
+            # 第 2 步目标库字段绑定应已同步更新为 TXN000309
+            tgt_binds_after = ctx.standard_catalog.get_table_field_bindings(tgt_cid, "main", "dwd_cust_acct")
+            self.assertEqual(tgt_binds_after["bal_amt"]["std_code"], "TXN000309")
+
+            # 验证导出跨环境预填映射模板与批量铺底上传
+            r_ptpl = client.get("/api/modules/cross_comparator/pairings/template.xlsx?table_key=dwd_cust_acct")
+            self.assertEqual(r_ptpl.status_code, 200)
+            r_pup = client.post(
+                "/api/modules/cross_comparator/pairings/upload",
+                files={"file": ("pair_up.xlsx", r_ptpl.content, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"format_profile": "type_mysql"},
+            ).json()
+            self.assertTrue(r_pup["ok"])
+            self.assertEqual(r_pup["imported_count"], 5)
+
+            # 从第 3 步一键推送回第 2 步贯标队列（应按标准字典生成 OPEN_DT / TXN_AMT 等目标规则）
+            r_push = client.post(
+                "/api/modules/cross_comparator/push-to-migrator",
+                json={"std_table_key": "dwd_cust_acct", "format_profile": "type_mysql"},
+            ).json()
+            self.assertTrue(r_push["ok"])
+            self.assertEqual(r_push["pushed_count"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

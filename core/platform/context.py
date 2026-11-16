@@ -13,6 +13,7 @@ from core.platform.driver_manager import DriverManager
 from core.platform.llm_hub import LLMHub
 from core.platform.metadata_hub import MetadataHub
 from core.platform.query_engine import QueryEngine
+from core.platform.standard_catalog import StandardCatalog
 from core.platform.storage import PlatformStateStore
 
 
@@ -40,6 +41,7 @@ class PlatformContext:
         self.query_engine = QueryEngine(self.store, self.connection_hub)
         self.asset_store = AssetStore(self.store, assets_dir=eff_assets_dir)
         self.llm_hub = LLMHub(self.store)
+        self.standard_catalog = StandardCatalog(self.store)
         self._registered_modules: List[Dict[str, str]] = []
 
     def register_module_manifest(
@@ -76,7 +78,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.2.0",
+            "version": "2.3.0",
             "appearance": self.asset_store.get_public_appearance(),
             "connections": connections,
             "catalog_trees": trees_summary,
@@ -85,6 +87,7 @@ class PlatformContext:
             "java_runtime": self.driver_manager.get_java_runtime_status(),
             "llm_providers": self.llm_hub.list_providers(),
             "llm_models": self.llm_hub.list_available_models(),
+            "standard_dict_summary": self.standard_catalog.get_summary(),
             "modules": list(self._registered_modules),
             "logs": self.store.list_logs(limit=150),
         }

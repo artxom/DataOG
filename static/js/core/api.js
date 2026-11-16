@@ -180,6 +180,55 @@ export const platformApi = {
   clearLogs: () => requestJson("/api/platform/logs/clear", { method: "POST" }),
 };
 
+export const standardsApi = {
+  list: ({ keyword = "", regCategory = "", dataCategory = "", page = 1, pageSize = 50 } = {}) => {
+    const qs = new URLSearchParams({
+      keyword: keyword || "",
+      reg_category: regCategory || "",
+      data_category: dataCategory || "",
+      page: String(page || 1),
+      page_size: String(pageSize || 50),
+    });
+    return requestJson(`/api/platform/standards?${qs.toString()}`);
+  },
+  lookup: (keyword = "", limit = 30) => {
+    const qs = new URLSearchParams({ keyword: keyword || "", limit: String(limit) });
+    return requestJson(`/api/platform/standards/lookup?${qs.toString()}`);
+  },
+  downloadTemplate: () =>
+    downloadApiFile("/api/platform/standards/template.xlsx", {
+      fallbackName: "DataOG_数据标准字典导入模板.xlsx",
+    }),
+  exportDictionary: ({ keyword = "", regCategory = "", dataCategory = "" } = {}) => {
+    const qs = new URLSearchParams();
+    if (keyword) qs.set("keyword", keyword);
+    if (regCategory) qs.set("reg_category", regCategory);
+    if (dataCategory) qs.set("data_category", dataCategory);
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return downloadApiFile(`/api/platform/standards/export.xlsx${suffix}`, {
+      fallbackName: "DataOG_企业数据标准字典导出.xlsx",
+    });
+  },
+  uploadDictionary: (file, mode = "upsert") => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("mode", mode || "upsert");
+    return uploadFormData("/api/platform/standards/upload", fd);
+  },
+  createItem: (payload) =>
+    requestJson("/api/platform/standards/items", { method: "POST", body: payload }),
+  updateItem: (stdCode, payload) =>
+    requestJson(`/api/platform/standards/items/${encodeURIComponent(stdCode)}`, {
+      method: "PUT",
+      body: payload,
+    }),
+  deleteItem: (stdCode) =>
+    requestJson(`/api/platform/standards/items/${encodeURIComponent(stdCode)}`, {
+      method: "DELETE",
+    }),
+  clear: () => requestJson("/api/platform/standards/clear", { method: "POST" }),
+};
+
 export const migratorApi = {
   getState: () => requestJson("/api/modules/standard_migrator/state"),
   bindConnection: (connectionId, autoSync = true) =>
@@ -188,9 +237,11 @@ export const migratorApi = {
       body: { connection_id: connectionId, auto_sync: autoSync },
     }),
   sync: () => requestJson("/api/modules/standard_migrator/sync", { method: "POST" }),
-  uploadChecklist: (file) => {
+  uploadChecklist: (file, { defaultSchema = "", defaultTable = "" } = {}) => {
     const fd = new FormData();
     fd.append("file", file);
+    if (defaultSchema) fd.append("default_schema", defaultSchema);
+    if (defaultTable) fd.append("default_table", defaultTable);
     return uploadFormData("/api/modules/standard_migrator/checklist/upload", fd);
   },
   loadFromDb: (payload) =>
@@ -217,19 +268,119 @@ export const migratorApi = {
     requestJson("/api/modules/standard_migrator/rebuild/preview", { method: "POST", body: payload }),
   executeRebuild: (payload) =>
     requestJson("/api/modules/standard_migrator/rebuild/execute", { method: "POST", body: payload }),
+
+  // 第 2 步：字段绑标 + 落标核验 + 对照模板
+  getBindingsOverview: (connectionId = "", formatProfile = "AUTO") => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    if (formatProfile) qs.set("format_profile", formatProfile);
+    return requestJson(`/api/modules/standard_migrator/bindings/overview?${qs.toString()}`);
+  },
+  getTableBindings: (
+    connectionId,
+    schemaName,
+    tableName,
+    formatProfile = "AUTO",
+    forceRefresh = false
+  ) => {
+    const qs = new URLSearchParams({
+      connection_id: connectionId,
+      schema_name: schemaName || "",
+      table_name: tableName || "",
+      format_profile: formatProfile || "AUTO",
+      force_refresh: forceRefresh ? "true" : "false",
+    });
+    return requestJson(`/api/modules/standard_migrator/bindings/table?${qs.toString()}`);
+  },
+  saveBindings: (payload) =>
+    requestJson("/api/modules/standard_migrator/bindings/save", { method: "POST", body: payload }),
+  autoMatchBindings: (payload) =>
+    requestJson("/api/modules/standard_migrator/bindings/auto-match", { method: "POST", body: payload }),
+  checkCompliance: (payload) =>
+    requestJson("/api/modules/standard_migrator/bindings/check-compliance", {
+      method: "POST",
+      body: payload,
+    }),
+  downloadBindingTemplate: ({ connectionId = "", schemaName = "", tables = "" } = {}) => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    if (schemaName) qs.set("schema_name", schemaName);
+    if (tables) qs.set("tables", tables);
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return downloadApiFile(`/api/modules/standard_migrator/bindings/template.xlsx${suffix}`, {
+      fallbackName: "DataOG_字段与数据标准对照模板.xlsx",
+    });
+  },
+  uploadBindings: (
+    file,
+    { connectionId, defaultSchema = "", mode = "merge", formatProfile = "AUTO" }
+  ) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("connection_id", connectionId);
+    fd.append("default_schema", defaultSchema || "");
+    fd.append("mode", mode || "merge");
+    fd.append("format_profile", formatProfile || "AUTO");
+    return uploadFormData("/api/modules/standard_migrator/bindings/upload", fd);
+  },
+  exportBindingReport: ({ connectionId = "", formatProfile = "AUTO", tables = "" } = {}) => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    if (formatProfile) qs.set("format_profile", formatProfile);
+    if (tables) qs.set("tables", tables);
+    return downloadApiFile(`/api/modules/standard_migrator/bindings/report.xlsx?${qs.toString()}`, {
+      fallbackName: "DataOG_单库字段落标检查报告.xlsx",
+    });
+  },
+  stageMigration: (payload) =>
+    requestJson("/api/modules/standard_migrator/bindings/stage-migration", {
+      method: "POST",
+      body: payload,
+    }),
 };
 
 export const crossApi = {
-  getOverview: (tableKey = "", forceRefresh = false) => {
+  getOverview: (tableKey = "", forceRefresh = false, extra = {}) => {
     const qs = new URLSearchParams();
     if (tableKey) qs.set("table_key", tableKey);
     if (forceRefresh) qs.set("force_refresh", "true");
+    if (extra.sourceSchema) qs.set("source_schema", extra.sourceSchema);
+    if (extra.sourceTable) qs.set("source_table", extra.sourceTable);
+    if (extra.targetSchema) qs.set("target_schema", extra.targetSchema);
+    if (extra.targetTable) qs.set("target_table", extra.targetTable);
+    if (extra.formatProfile) qs.set("format_profile", extra.formatProfile);
     return requestJson(`/api/modules/cross_comparator/overview?${qs.toString()}`);
   },
   bindRole: (payload) =>
     requestJson("/api/modules/cross_comparator/bind-role", { method: "POST", body: payload }),
   saveBindings: (payload) =>
     requestJson("/api/modules/cross_comparator/bindings/save", { method: "POST", body: payload }),
+  savePairings: (payload) =>
+    requestJson("/api/modules/cross_comparator/pairings/save", { method: "POST", body: payload }),
+  downloadPairingTemplate: ({
+    tableKey = "",
+    sourceSchema = "",
+    sourceTable = "",
+    targetSchema = "",
+    targetTable = "",
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (tableKey) qs.set("table_key", tableKey);
+    if (sourceSchema) qs.set("source_schema", sourceSchema);
+    if (sourceTable) qs.set("source_table", sourceTable);
+    if (targetSchema) qs.set("target_schema", targetSchema);
+    if (targetTable) qs.set("target_table", targetTable);
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return downloadApiFile(`/api/modules/cross_comparator/pairings/template.xlsx${suffix}`, {
+      fallbackName: "DataOG_跨环境字段映射铺底模板.xlsx",
+    });
+  },
+  uploadPairings: (file, formatProfile = "AUTO") => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("format_profile", formatProfile || "AUTO");
+    return uploadFormData("/api/modules/cross_comparator/pairings/upload", fd);
+  },
   uploadStandard: (file) => {
     const fd = new FormData();
     fd.append("file", file);
@@ -249,10 +400,10 @@ export const crossApi = {
       fallbackName: "Data.O.G_三栏比对报告.xlsx",
     });
   },
-  pushToMigrator: (stdTableKey = "") =>
+  pushToMigrator: (stdTableKey = "", formatProfile = "AUTO") =>
     requestJson("/api/modules/cross_comparator/push-to-migrator", {
       method: "POST",
-      body: { std_table_key: stdTableKey || null },
+      body: { std_table_key: stdTableKey || null, format_profile: formatProfile || "AUTO" },
     }),
 };
 
