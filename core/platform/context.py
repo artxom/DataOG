@@ -80,7 +80,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.3.1",
+            "version": "2.3.2",
             "appearance": self.asset_store.get_public_appearance(),
             "connections": connections,
             "catalog_trees": trees_summary,
