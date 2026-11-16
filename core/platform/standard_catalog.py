@@ -1214,15 +1214,15 @@ class StandardCatalog:
         target_type = cls.resolve_physical_type(
             std_item, db_type=db_type, format_profile=format_profile
         )
-        std_en = clean_identifier_input(std_item.get("en_abbr") or "")
+        std_en = clean_identifier_input(_clean_cell(std_item.get("en_abbr"), treat_slash_empty=True))
         actual_en = clean_identifier_input(col_name or "")
         name_ok = bool(std_en) and actual_en.lower() == std_en.lower()
 
         type_exact, type_compat = is_cross_type_compatible(col_type or "", target_type)
         type_ok = bool(type_exact)
 
-        std_cn = (std_item.get("cn_name") or "").strip()
-        actual_comm = (col_comment or "").strip()
+        std_cn = _clean_cell(std_item.get("cn_name"))
+        actual_comm = _clean_cell(col_comment)
         comment_ok = (not std_cn) or (std_cn in actual_comm)
 
         diffs: List[str] = []

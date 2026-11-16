@@ -920,6 +920,7 @@ class CrossComparatorService:
         format_profile: str = "AUTO",
         force_refresh: bool = False,
         sync_to_field_bindings: bool = True,
+        return_overview: bool = True,
     ) -> Dict[str, Any]:
         """保存双列拖拽调整后的字段映射关系与两侧数标，并可选双向回写第 2 步数据源绑定."""
         s_sch = (source_schema or "").strip() or "public"
@@ -1073,6 +1074,12 @@ class CrossComparatorService:
             f"跨环境双列映射 [{eff_key}]",
             f"已保存 {len(col_rows_to_insert)} 行字段映射与书签绑定（来源 {s_sch}.{s_tbl or eff_key} ↔ 目标 {t_sch}.{t_tbl or eff_key}）",
         )
+        if not return_overview:
+            return {
+                "ok": True,
+                "std_table_key": eff_key,
+                "saved_count": len(col_rows_to_insert),
+            }
         state = self.get_overview_state(
             selected_table_key=eff_key,
             force_refresh=force_refresh,
@@ -1350,6 +1357,7 @@ class CrossComparatorService:
                 format_profile=format_profile,
                 force_refresh=False,
                 sync_to_field_bindings=True,
+                return_overview=False,
             )
 
         state = self.get_overview_state(selected_table_key=last_key, format_profile=format_profile)
