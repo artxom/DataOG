@@ -10,6 +10,12 @@ import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from core.excel_formula import (
+    EXCEL_ERROR_TOKENS,
+    ResolvedWorkbook,
+    clean_excel_cell_str,
+    is_excel_error_value,
+)
 from core.excel_handler import (
     export_report_excel,
     generate_template_excel,
@@ -68,10 +74,14 @@ def export_tabular_xlsx_bytes(
 
 
 __all__ = [
+    "EXCEL_ERROR_TOKENS",
+    "ResolvedWorkbook",
+    "clean_excel_cell_str",
     "export_report_excel",
     "export_tabular_csv_bytes",
     "export_tabular_xlsx_bytes",
     "generate_template_excel",
+    "is_excel_error_value",
     "parse_excel_checklist",
     "validate_xlsx_bytes",
 ]
