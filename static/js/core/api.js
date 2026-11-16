@@ -39,7 +39,58 @@ export async function requestJson(url, { method = "GET", body = undefined } = {}
   return parseJsonOrThrow(resp);
 }
 
-export async function uploadFormData(url, formData) {
+export async function uploadFormData(url, formData, { onUploadProgress = null } = {}) {
+  if (typeof XMLHttpRequest !== "undefined") {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", url, true);
+      xhr.setRequestHeader("Accept", "application/json");
+      if (typeof onUploadProgress === "function" && xhr.upload) {
+        let reportedDone = false;
+        xhr.upload.addEventListener("progress", (ev) => {
+          if (ev.lengthComputable && ev.total > 0) {
+            if (ev.loaded >= ev.total) reportedDone = true;
+            onUploadProgress(ev.loaded / ev.total, ev.loaded, ev.total);
+          }
+        });
+        xhr.upload.addEventListener("load", () => {
+          if (!reportedDone) {
+            reportedDone = true;
+            onUploadProgress(1, 1, 1);
+          }
+        });
+      }
+      xhr.addEventListener("load", () => {
+        const rawText = xhr.responseText || "";
+        let payload = null;
+        try {
+          payload = rawText ? JSON.parse(rawText) : { ok: xhr.status >= 200 && xhr.status < 300 };
+        } catch (_e) {
+          payload = {
+            ok: xhr.status >= 200 && xhr.status < 300,
+            error: rawText || `HTTP ${xhr.status}`,
+          };
+        }
+        const httpOk = xhr.status >= 200 && xhr.status < 300;
+        if (!httpOk || (payload && payload.ok === false)) {
+          const msg =
+            (payload && (payload.error || payload.detail || payload.message)) ||
+            `请求失败 (HTTP ${xhr.status})`;
+          reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+          return;
+        }
+        resolve(payload);
+      });
+      xhr.addEventListener("error", () => {
+        reject(new Error("网络请求中断，请检查本地服务是否正在运行"));
+      });
+      xhr.addEventListener("abort", () => {
+        reject(new Error("上传已取消"));
+      });
+      xhr.send(formData);
+    });
+  }
+
   const resp = await fetch(url, {
     method: "POST",
     body: formData,
@@ -178,6 +229,8 @@ export const platformApi = {
 
   getLogs: (limit = 150) => requestJson(`/api/platform/logs?limit=${limit}`),
   clearLogs: () => requestJson("/api/platform/logs/clear", { method: "POST" }),
+  getImportProgress: (progressId) =>
+    requestJson(`/api/platform/import-progress/${encodeURIComponent(progressId)}`),
 };
 
 export const standardsApi = {
@@ -209,11 +262,12 @@ export const standardsApi = {
       fallbackName: "DataOG_企业数据标准字典导出.xlsx",
     });
   },
-  uploadDictionary: (file, mode = "upsert") => {
+  uploadDictionary: (file, mode = "upsert", { progressId = "", onUploadProgress = null } = {}) => {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("mode", mode || "upsert");
-    return uploadFormData("/api/platform/standards/upload", fd);
+    if (progressId) fd.append("progress_id", progressId);
+    return uploadFormData("/api/platform/standards/upload", fd, { onUploadProgress });
   },
   createItem: (payload) =>
     requestJson("/api/platform/standards/items", { method: "POST", body: payload }),
@@ -237,12 +291,17 @@ export const migratorApi = {
       body: { connection_id: connectionId, auto_sync: autoSync },
     }),
   sync: () => requestJson("/api/modules/standard_migrator/sync", { method: "POST" }),
-  uploadChecklist: (file, { defaultSchema = "", defaultTable = "" } = {}) => {
+  uploadChecklist: (
+    file,
+    { defaultSchema = "", defaultTable = "" } = {},
+    { progressId = "", onUploadProgress = null } = {}
+  ) => {
     const fd = new FormData();
     fd.append("file", file);
     if (defaultSchema) fd.append("default_schema", defaultSchema);
     if (defaultTable) fd.append("default_table", defaultTable);
-    return uploadFormData("/api/modules/standard_migrator/checklist/upload", fd);
+    if (progressId) fd.append("progress_id", progressId);
+    return uploadFormData("/api/modules/standard_migrator/checklist/upload", fd, { onUploadProgress });
   },
   loadFromDb: (payload) =>
     requestJson("/api/modules/standard_migrator/checklist/load-from-db", {
@@ -313,7 +372,8 @@ export const migratorApi = {
   },
   uploadBindings: (
     file,
-    { connectionId, defaultSchema = "", mode = "merge", formatProfile = "AUTO" }
+    { connectionId, defaultSchema = "", mode = "merge", formatProfile = "AUTO" },
+    { progressId = "", onUploadProgress = null } = {}
   ) => {
     const fd = new FormData();
     fd.append("file", file);
@@ -321,7 +381,8 @@ export const migratorApi = {
     fd.append("default_schema", defaultSchema || "");
     fd.append("mode", mode || "merge");
     fd.append("format_profile", formatProfile || "AUTO");
-    return uploadFormData("/api/modules/standard_migrator/bindings/upload", fd);
+    if (progressId) fd.append("progress_id", progressId);
+    return uploadFormData("/api/modules/standard_migrator/bindings/upload", fd, { onUploadProgress });
   },
   exportBindingReport: ({ connectionId = "", formatProfile = "AUTO", tables = "" } = {}) => {
     const qs = new URLSearchParams();
@@ -375,16 +436,22 @@ export const crossApi = {
       fallbackName: "DataOG_跨环境字段映射铺底模板.xlsx",
     });
   },
-  uploadPairings: (file, formatProfile = "AUTO") => {
+  uploadPairings: (
+    file,
+    formatProfile = "AUTO",
+    { progressId = "", onUploadProgress = null } = {}
+  ) => {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("format_profile", formatProfile || "AUTO");
-    return uploadFormData("/api/modules/cross_comparator/pairings/upload", fd);
+    if (progressId) fd.append("progress_id", progressId);
+    return uploadFormData("/api/modules/cross_comparator/pairings/upload", fd, { onUploadProgress });
   },
-  uploadStandard: (file) => {
+  uploadStandard: (file, { progressId = "", onUploadProgress = null } = {}) => {
     const fd = new FormData();
     fd.append("file", file);
-    return uploadFormData("/api/modules/cross_comparator/standard/upload", fd);
+    if (progressId) fd.append("progress_id", progressId);
+    return uploadFormData("/api/modules/cross_comparator/standard/upload", fd, { onUploadProgress });
   },
   syncFromMigrator: () =>
     requestJson("/api/modules/cross_comparator/standard/sync-from-migrator", { method: "POST" }),

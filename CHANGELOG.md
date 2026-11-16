@@ -8,6 +8,26 @@
 
 ---
 
+## [2.3.1] - 2026-11-16
+
+### Added
+- **Excel 导入双阶段实时进度条与服务端进度追踪中枢 (`core/platform/import_progress.py` & `static/js/ui/upload_wizard_modal.js`)**：
+  - 平台底座新增线程安全 `ImportProgressHub` 与轮询接口 `GET /api/platform/import-progress/{progress_id}`，将标准字典、表字段对照关系、单库贯标清单、跨环境映射铺底与标准包上传全部切换至线程池非阻塞执行（释放 FastAPI 主事件循环），同时覆盖大工作簿与小批量（`<400` 行）首行及中间阶段进度上报。
+  - 前端 `UploadWizardModal`、`Modal` 与 `uploadFormData` 升级为 `XMLHttpRequest` 字节流上传进度 + 服务端实时行级/表级解析核验进度条、动态计时面板与导入期间弹窗防误关锁定（`closedby="none"` / `Escape` 与背景点击拦截）。
+- **纯 Python Excel 公式最终值求值兜底引擎与全谱系错误值置空清洗 (`core/excel_formula.py`)**：
+  - 优先采用 Excel/WPS 缓存的公式最终计算结果（`data_only=True`，含显式空串 `<c t="str"><v/></c>` 识别与外部工作簿引用防劫持）；针对缺失 `<v>` 缓存、拖拽共享公式或文本态公式工作簿采用只读流式值加载 + 稀疏 XML 公式提取自动求值（支持跨 Sheet 与整列引用、名称管理器 `<definedNames>`、超级表结构化引用 `Table[列]`/`[@列]`、多条件数组匹配 `(A:A=x)*(B:B=y)`、`VLOOKUP`、`HLOOKUP`、`XLOOKUP`、`INDEX`+`MATCH`、`IF`/`IFS`/`IFERROR`/`IFNA`、字符串拼接与文本函数，并对查找列构建哈希索引）。
+  - 全系统数据标准字典、字段对照关系、单库贯标清单与跨环境比对统一将 `#N/A`、`#VALUE!`、`#REF!`、`#DIV/0!`、`#NUM!`、`#NAME?`、`#NULL!`、`#SPILL!`、`#CALC!` 等公式错误标记识别为空值，并支持历史残留 `#N/A` 脏绑定自动自愈清理。
+
+### Changed
+- 升级 `app.py` 与 `PlatformContext` 版本号至 `2.3.1`，扩充全量自动化单元测试与端到端闭环测试至 **34 项**。
+
+### Fixed
+- 修复多工作表（如同时携带数万行「数据字典」参考 Sheet）上传对照关系时全表非只读加载与离线数据源逐表超时导致的长时间“正在解析导入”卡顿问题。
+- 兼容第三方工具生成的 `.xlsx` 在 `.rels` 中写入无前导 `/` 的包根路径（如 `Target="xl/worksheets/..."`、`Target="xl/tables/..."`）或反斜杠路径，防止拼接为 `xl/xl/...` 导致工作表解析丢失。
+- 修复 `ReadOnlyWorksheet.reset_dimensions()` 清空 `<dimension>` 最大行元数据导致先探查表头后全量读取时总行数估计退化的问题。
+
+---
+
 ## [2.3.0] - 2026-11-16
 
 ### Added

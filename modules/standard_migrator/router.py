@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
 from modules.standard_migrator.schemas import (
@@ -59,17 +60,25 @@ async def api_migrator_upload_checklist(
     file: UploadFile = File(...),
     default_schema: str = Form(""),
     default_table: str = Form(""),
+    progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
         raw = await file.read()
-        return StandardMigratorService(ctx).upload_excel_checklist(
+        ctx.import_progress.start(progress_id, "解析单库贯标改造清单")
+        reporter = ctx.import_progress.make_reporter(progress_id)
+        res = await run_in_threadpool(
+            StandardMigratorService(ctx).upload_excel_checklist,
             file.filename or "checklist.xlsx",
             raw,
             default_schema=default_schema,
             default_table=default_table,
+            progress_cb=reporter,
         )
+        ctx.import_progress.finish(progress_id, detail=res.get("message", "导入完成"))
+        return res
     except Exception as exc:
+        ctx.import_progress.fail(progress_id, str(exc))
         return _err(str(exc), 400)
 
 
@@ -300,19 +309,32 @@ async def api_bindings_upload(
     default_schema: str = Form(default=""),
     mode: str = Form(default="merge"),
     format_profile: str = Form(default="AUTO"),
+    progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
         raw = await file.read()
-        return StandardMigratorService(ctx).upload_field_bindings_excel(
+        ctx.import_progress.start(progress_id, "解析表字段与数据标准对照关系")
+        reporter = ctx.import_progress.make_reporter(progress_id)
+        res = await run_in_threadpool(
+            StandardMigratorService(ctx).upload_field_bindings_excel,
             filename=file.filename or "bindings.xlsx",
             content=raw,
             connection_id=connection_id,
             default_schema=default_schema,
             mode=mode,
             format_profile=format_profile,
+            progress_cb=reporter,
         )
+        ctx.import_progress.finish(
+            progress_id,
+            detail=res.get("message", "对照关系导入完成"),
+            processed=int(res.get("imported_count", 0)),
+            total=int(res.get("imported_count", 0)),
+        )
+        return res
     except Exception as exc:
+        ctx.import_progress.fail(progress_id, str(exc))
         return _err(str(exc), 400)
 
 

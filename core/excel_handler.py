@@ -12,11 +12,18 @@ import io
 import os
 import re
 import zipfile
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+from core.excel_formula import (
+    EXCEL_ERROR_TOKENS,
+    ResolvedWorkbook,
+    clean_excel_cell_str,
+    is_excel_error_value,
+)
 
 try:
     import defusedxml  # type: ignore
@@ -370,9 +377,10 @@ def validate_xlsx_bytes(
 
 
 def _normalize_header(raw: Any) -> str:
-    if raw is None:
+    cleaned = clean_excel_cell_str(raw)
+    if not cleaned:
         return ""
-    text = str(raw).strip().lower()
+    text = cleaned.lower()
     # 统一全角括号与常见空白分隔符
     text = text.replace("（", "(").replace("）", ")")
     for ch in (" ", "\t", "\n", "\r", "_", "-", "\u200b", "\u3000", ":", "：", "*"):
@@ -384,31 +392,37 @@ _IDENT_QUOTE_CHARS = '"\'“”‘’`「」『』 \t\r\n\u200b\u3000\ufeff'
 
 
 def _clean_ident_value(raw: str) -> str:
-    """清理从 Excel 单元格读取的表名、模式名或字段名（去除零宽字符、全角空格、中英文单双引号及尾随括号中文说明）."""
-    if not raw:
+    """清理从 Excel 单元格读取的表名、模式名或字段名（去除零宽字符、全角空格、中英文单双引号、#N/A 及尾随括号中文说明）."""
+    cleaned_cell = clean_excel_cell_str(raw, treat_placeholder_empty=True)
+    if not cleaned_cell:
         return ""
     s = (
-        raw.replace("\u200b", "")
+        cleaned_cell.replace("\u200b", "")
         .replace("\u3000", " ")
         .replace("\ufeff", "")
         .strip(_IDENT_QUOTE_CHARS)
     )
+    if is_excel_error_value(s):
+        return ""
     # 如果表名/字段名写成 "dwd_cust_info(客户信息表)" 或 "dwd_cust_info（客户表）"，提取括号前的英文标识符
     m = re.match(r"^([^\s(（]+)\s*[(（].*[)）]$", s)
     if m:
         s = m.group(1).strip(_IDENT_QUOTE_CHARS)
-    return s.strip(_IDENT_QUOTE_CHARS)
+    s = s.strip(_IDENT_QUOTE_CHARS)
+    return "" if is_excel_error_value(s) else s
 
 
 def _clean_type_value(raw_type: str, raw_len: str = "") -> str:
-    """清理从 Excel 读取的数据类型字符串（转换全角括号/逗号，合并独立的长度/精度列）."""
-    t = (raw_type or "").replace("\u200b", "").replace("\u3000", " ").strip()
+    """清理从 Excel 读取的数据类型字符串（过滤 #N/A、转换全角括号/逗号，合并独立的长度/精度列）."""
+    base_raw = clean_excel_cell_str(raw_type, treat_placeholder_empty=True)
+    t = base_raw.replace("\u200b", "").replace("\u3000", " ").strip()
     t = t.replace("（", "(").replace("）", ")").replace("，", ",")
     t = " ".join(t.split())
     if not t:
         return ""
 
-    len_str = (raw_len or "").strip().replace("（", "").replace("）", "").replace("(", "").replace(")", "").replace("，", ",")
+    len_clean = clean_excel_cell_str(raw_len, treat_placeholder_empty=True)
+    len_str = len_clean.strip().replace("（", "").replace("）", "").replace("(", "").replace(")", "").replace("，", ",")
     if len_str and "(" not in t:
         # 处理类似 100.0 (Excel 数字格式) -> 100
         if re.match(r"^\d+\.0$", len_str):
@@ -582,35 +596,36 @@ def parse_excel_checklist(
     filename: str = "checklist.xlsx",
     default_schema: str = "public",
     default_table: str = "",
+    *,
+    row_progress_cb: Optional[Callable[[int, int], None]] = None,
 ) -> List[Dict[str, Any]]:
-    """解析上传的 Excel 贯标清单（支持多 Sheet 扫描、合并单元格展开、表头智能评分），返回标准化列表."""
+    """解析上传的 Excel 贯标清单（支持多 Sheet、合并单元格、公式结果提取与 #N/A 过滤），返回标准化列表."""
     validate_xlsx_bytes(filename, content)
 
-    # 不使用 read_only=True，避免第三方导出的 .xlsx 因 <dimension> 元数据缺失只读出第 1 列
-    wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-    try:
-        if not wb.worksheets:
+    with ResolvedWorkbook(content, read_only_preferred=True) as rwb:
+        sheet_titles = rwb.sheetnames
+        if not sheet_titles:
             raise ValueError("Excel 文件中未找到有效的工作表 (Sheet)")
 
         parsed_items: List[Dict[str, Any]] = []
         clean_default_schema = _clean_ident_value(default_schema) or "public"
         clean_default_table = _clean_ident_value(default_table)
 
-        for sheet in wb.worksheets:
-            title_norm = (sheet.title or "").strip().lower()
+        for sheet_title in sheet_titles:
+            title_norm = (sheet_title or "").strip().lower()
             if title_norm in ("填写说明", "填表说明", "使用说明", "说明", "目录", "封面", "readme", "instructions"):
                 continue
-            rows = _extract_sheet_rows_with_merged_cells(sheet)
-            if not rows:
+            probe_rows = rwb.extract_sheet_rows_with_merged(sheet_title, max_rows=30)
+            if not probe_rows:
                 continue
 
-            # 在前 30 行内评分寻找最佳表头行
+            # 在前 30 行内评分寻找最佳表头行（跳过同工作簿附带的大型参考数据字典页）
             best_header_idx = -1
             best_header_map: Dict[str, int] = {}
             best_score = 0
 
-            for idx, row in enumerate(rows[:30]):
-                non_empty = [c for c in row if c is not None and str(c).strip() != ""]
+            for idx, row in enumerate(probe_rows):
+                non_empty = [c for c in row if clean_excel_cell_str(c) != ""]
                 if len(non_empty) < 2:
                     continue
                 candidate_map = _match_headers(row)
@@ -627,10 +642,10 @@ def parse_excel_checklist(
                     best_header_map = candidate_map
 
             # 若该 Sheet 未通过名称匹配到表头，但工作簿只有 1 个 Sheet 且第 1 个非空行 >= 6 列，提供按列位置兜底
-            if best_header_idx == -1 and len(wb.worksheets) == 1:
-                for idx, row in enumerate(rows[:10]):
+            if best_header_idx == -1 and len(sheet_titles) == 1:
+                for idx, row in enumerate(probe_rows[:10]):
                     non_empty_indices = [
-                        i for i, c in enumerate(row) if c is not None and str(c).strip() != ""
+                        i for i, c in enumerate(row) if clean_excel_cell_str(c) != ""
                     ]
                     if len(non_empty_indices) >= 6:
                         best_header_idx = idx
@@ -672,23 +687,27 @@ def parse_excel_checklist(
             if best_header_idx == -1:
                 continue
 
+            rows = rwb.extract_sheet_rows_with_merged(
+                sheet_title,
+                row_progress_cb=row_progress_cb,
+            )
+
             header_map = best_header_map
-            sheet_default_table = clean_default_table or _guess_table_from_sheet_title(sheet.title)
+            sheet_default_table = clean_default_table or _guess_table_from_sheet_title(sheet_title)
             last_schema = clean_default_schema
             last_table = sheet_default_table
 
             for row_num, row in enumerate(
                 rows[best_header_idx + 1 :], start=best_header_idx + 2
             ):
-                if not row or all(c is None or str(c).strip() == "" for c in row):
+                if not row or all(clean_excel_cell_str(c) == "" for c in row):
                     continue
 
                 def _get_val(key: str) -> str:
                     col_idx = header_map.get(key)
                     if col_idx is None or col_idx >= len(row):
                         return ""
-                    val = row[col_idx]
-                    return "" if val is None else str(val).strip()
+                    return clean_excel_cell_str(row[col_idx])
 
                 raw_schema = _clean_ident_value(_get_val("schema_name"))
                 raw_table = _clean_ident_value(_get_val("table_name"))
@@ -735,7 +754,7 @@ def parse_excel_checklist(
 
                 if not table_val:
                     raise ValueError(
-                        f"工作表 [{sheet.title}] 第 {row_num} 行缺少「表名」，请在 Excel 中补充「表名」列或在上传弹窗中填写「默认表名」"
+                        f"工作表 [{sheet_title}] 第 {row_num} 行缺少「表名」，请在 Excel 中补充「表名」列或在上传弹窗中填写「默认表名」"
                     )
 
                 parsed_items.append(
@@ -759,8 +778,6 @@ def parse_excel_checklist(
             )
 
         return parsed_items
-    finally:
-        wb.close()
 
 
 def generate_template_excel() -> bytes:

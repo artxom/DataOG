@@ -19,8 +19,10 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from core.excel_formula import EXCEL_ERROR_TOKENS, ResolvedWorkbook, clean_excel_cell_str
 from core.excel_handler import validate_xlsx_bytes
 from core.platform.dialects import clean_identifier_input, is_cross_type_compatible
+from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.storage import PlatformStateStore
 
 # 严格对齐渤海银行标准数据字典模板的 46 列表头顺序（索引 23 与 44 同名为「仓库DWS数据格式」）
@@ -213,13 +215,11 @@ _HEADER_TO_FIELD: Dict[str, str] = {
     "字典级别": "extra::dict_level",
 }
 
-_INVALID_PLACEHOLDERS = {"/", "-", "--", "none", "null", "#n/a", "#value!", "#ref!"}
-
-
 def _norm_hdr(raw: Any) -> str:
-    if raw is None:
+    cleaned = clean_excel_cell_str(raw)
+    if not cleaned:
         return ""
-    s = str(raw).strip().lower()
+    s = cleaned.lower()
     s = s.replace("（", "(").replace("）", ")")
     for ch in (" ", "\t", "\n", "\r", "_", "-", "\u200b", "\u3000"):
         s = s.replace(ch, "")
@@ -227,19 +227,7 @@ def _norm_hdr(raw: Any) -> str:
 
 
 def _clean_cell(val: Any, *, treat_slash_empty: bool = False) -> str:
-    if val is None:
-        return ""
-    if isinstance(val, float) and val.is_integer():
-        s = str(int(val))
-    else:
-        s = str(val).replace("\u200b", "").replace("\ufeff", "").strip()
-    if not s:
-        return ""
-    if s.lower() == "#n/a":
-        return ""
-    if treat_slash_empty and s.lower() in _INVALID_PLACEHOLDERS:
-        return ""
-    return s
+    return clean_excel_cell_str(val, treat_placeholder_empty=treat_slash_empty)
 
 
 def _safe_excel_cell(val: Any) -> Any:
@@ -447,9 +435,9 @@ class StandardCatalog:
         return [self._row_to_item(r) for r in rows]
 
     def upsert_item(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        std_code = _clean_cell(payload.get("std_code"))
+        std_code = _clean_cell(payload.get("std_code"), treat_slash_empty=True)
         cn_name = _clean_cell(payload.get("cn_name"))
-        en_abbr = clean_identifier_input(_clean_cell(payload.get("en_abbr")))
+        en_abbr = clean_identifier_input(_clean_cell(payload.get("en_abbr"), treat_slash_empty=True))
         if not std_code:
             raise ValueError("数据项编号 (std_code) 不能为空")
         if not cn_name:
@@ -557,25 +545,64 @@ class StandardCatalog:
         self.store.save_meta("std_dict_imported_at", "")
 
     @staticmethod
-    def parse_standard_dictionary_excel(filename: str, content: bytes) -> List[Dict[str, Any]]:
-        """流式解析标准字典 Excel（兼容 46 列渤海模板及精简标准表头，处理同名 DWS 格式列）."""
+    def parse_standard_dictionary_excel(
+        filename: str,
+        content: bytes,
+        *,
+        progress_cb: Optional[ProgressCallback] = None,
+    ) -> List[Dict[str, Any]]:
+        """流式解析标准字典 Excel（兼容 46 列渤海模板、公式最终结果提取及 #N/A 置空清洗）."""
+        report = progress_cb or noop_progress
+        report(15.0, "安全校验与打开工作簿", "正在校验文件结构并读取工作表（自动提取公式最终计算值）...", 0, 0)
         validate_xlsx_bytes(filename, content)
-        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-        try:
-            if not wb.worksheets:
+
+        with ResolvedWorkbook(content, read_only_preferred=True) as rwb:
+            sheet_titles = rwb.sheetnames
+            if not sheet_titles:
                 raise ValueError("Excel 文件中未找到有效工作表")
+
+            skip_titles = {
+                "填写说明",
+                "填表说明",
+                "使用说明",
+                "说明",
+                "目录",
+                "封面",
+                "readme",
+            }
+            candidate_sheets = [
+                sh for sh in sheet_titles if (sh or "").strip().lower() not in skip_titles
+            ]
+            est_total_rows = sum(
+                max(0, rwb.estimate_sheet_rows(sh) - 1) for sh in candidate_sheets
+            )
 
             parsed: List[Dict[str, Any]] = []
             seen_order: Dict[str, int] = {}
+            scanned_rows = 0
 
-            for ws in wb.worksheets:
-                if hasattr(ws, "reset_dimensions"):
-                    try:
-                        ws.reset_dimensions()
-                    except Exception:
-                        pass
+            def _report_scan_progress() -> None:
+                if est_total_rows > 0:
+                    ratio = min(1.0, scanned_rows / float(max(est_total_rows, scanned_rows)))
+                    pct = 20.0 + 48.0 * ratio
+                    tot_hint = max(est_total_rows, scanned_rows)
+                    detail_txt = (
+                        f"已扫描 {scanned_rows} / {tot_hint} 行，识别有效数据标准 {len(parsed)} 条..."
+                    )
+                else:
+                    pct = min(68.0, 20.0 + 48.0 * (1.0 - 1.0 / (1.0 + scanned_rows / 400.0)))
+                    tot_hint = 0
+                    detail_txt = f"已扫描 {scanned_rows} 行，识别有效数据标准 {len(parsed)} 条..."
+                report(
+                    pct,
+                    "解析数据标准条目",
+                    detail_txt,
+                    len(parsed),
+                    tot_hint,
+                )
 
-                row_iter = ws.iter_rows(values_only=True)
+            for sh_title in candidate_sheets:
+                row_iter = rwb.iter_sheet_rows(sh_title)
                 header_indices: Optional[Dict[str, List[int]]] = None
                 extra_col_indices: List[Tuple[str, int]] = []
                 unknown_col_indices: List[Tuple[str, int]] = []
@@ -638,14 +665,22 @@ class StandardCatalog:
                 for row in row_iter:
                     if not row:
                         continue
-                    std_code = _pick_first(row, "std_code")
+                    scanned_rows += 1
+
+                    std_code = _pick_first(row, "std_code", slash_empty=True)
                     if not std_code or std_code in ("数据项编号", "标准编号", "std_code"):
+                        if scanned_rows == 1 or scanned_rows % 50 == 0:
+                            _report_scan_progress()
                         continue
 
                     cn_name = _pick_first(row, "cn_name")
-                    en_abbr_raw = _pick_first(row, "en_abbr") or _pick_first(row, "en_name")
+                    en_abbr_raw = _pick_first(row, "en_abbr", slash_empty=True) or _pick_first(
+                        row, "en_name", slash_empty=True
+                    )
                     en_abbr = clean_identifier_input(en_abbr_raw) or en_abbr_raw
                     if not cn_name and not en_abbr:
+                        if scanned_rows == 1 or scanned_rows % 50 == 0:
+                            _report_scan_progress()
                         continue
 
                     # 检查第 24 列遗留格式列，若存在独立值一并存入 extra_attrs 保真
@@ -674,21 +709,21 @@ class StandardCatalog:
                         "cat_l3": _pick_first(row, "cat_l3"),
                         "cn_name": cn_name or en_abbr,
                         "cn_alias": _pick_first(row, "cn_alias"),
-                        "en_name": _pick_first(row, "en_name") or en_abbr,
+                        "en_name": _pick_first(row, "en_name", slash_empty=True) or en_abbr,
                         "en_abbr": en_abbr,
                         "biz_definition": _pick_first(row, "biz_definition"),
                         "scope_desc": _pick_first(row, "scope_desc"),
                         "biz_rule": _pick_first(row, "biz_rule"),
                         "max_length": _pick_first(row, "max_length", slash_empty=True),
                         "min_scale": _pick_first(row, "min_scale", slash_empty=True),
-                        "ref_code_no": _pick_first(row, "ref_code_no"),
+                        "ref_code_no": _pick_first(row, "ref_code_no", slash_empty=True),
                         "ref_code_name": _pick_first(row, "ref_code_name"),
                         "ref_code_detail": _pick_first(row, "ref_code_detail"),
                         "security_level": _pick_first(row, "security_level"),
-                        "ref_std_no": _pick_first(row, "ref_std_no"),
+                        "ref_std_no": _pick_first(row, "ref_std_no", slash_empty=True),
                         "ref_std_name": _pick_first(row, "ref_std_name"),
                         "domain_name": _pick_first(row, "domain_name"),
-                        "domain_code": _pick_first(row, "domain_code"),
+                        "domain_code": _pick_first(row, "domain_code", slash_empty=True),
                         "data_category": _pick_first(row, "data_category"),
                         "data_format": _pick_first(row, "data_format", slash_empty=True),
                         "value_range": _pick_first(row, "value_range", slash_empty=True),
@@ -716,13 +751,21 @@ class StandardCatalog:
                         seen_order[std_code] = len(parsed)
                         parsed.append(item)
 
+                    if scanned_rows == 1 or scanned_rows % 50 == 0:
+                        _report_scan_progress()
+
             if not parsed:
                 raise ValueError(
                     "未能从 Excel 解析到有效的数据标准记录，请使用系统模板（需包含「数据项编号」「中文名称」「英文简称」）"
                 )
+            report(
+                70.0,
+                "解析完成",
+                f"共解析出 {len(parsed)} 条有效数据标准记录，准备写入字典库...",
+                len(parsed),
+                len(parsed),
+            )
             return parsed
-        finally:
-            wb.close()
 
     def import_dictionary_excel(
         self,
@@ -730,12 +773,16 @@ class StandardCatalog:
         content: bytes,
         *,
         mode: str = "upsert",
+        progress_cb: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         eff_mode = (mode or "upsert").strip().lower()
         if eff_mode not in ("upsert", "replace"):
             eff_mode = "upsert"
 
-        parsed = self.parse_standard_dictionary_excel(filename, content)
+        parsed = self.parse_standard_dictionary_excel(
+            filename, content, progress_cb=report
+        )
         now = self._now_str()
 
         tuples_to_write = [
@@ -791,15 +838,28 @@ class StandardCatalog:
         update_cols = ", ".join(
             f"{c} = excluded.{c}" for c in DICT_COLUMNS if c != "std_code"
         )
+        upsert_sql = (
+            f"INSERT INTO standard_dictionary ({col_list}) VALUES ({placeholders}) "
+            f"ON CONFLICT(std_code) DO UPDATE SET {update_cols}"
+        )
 
+        total_cnt = len(tuples_to_write)
+        chunk_size = 2000
         with self.store.module_db() as conn:
             if eff_mode == "replace":
                 conn.execute("DELETE FROM standard_dictionary")
-            conn.executemany(
-                f"INSERT INTO standard_dictionary ({col_list}) VALUES ({placeholders}) "
-                f"ON CONFLICT(std_code) DO UPDATE SET {update_cols}",
-                tuples_to_write,
-            )
+            for start_i in range(0, total_cnt, chunk_size):
+                batch = tuples_to_write[start_i : start_i + chunk_size]
+                conn.executemany(upsert_sql, batch)
+                done_cnt = min(total_cnt, start_i + len(batch))
+                pct = 72.0 + (25.0 * done_cnt / max(1, total_cnt))
+                report(
+                    pct,
+                    "写入标准字典库",
+                    f"已写入 {done_cnt} / {total_cnt} 条数据标准...",
+                    done_cnt,
+                    total_cnt,
+                )
 
         self.store.save_meta("std_dict_filename", filename)
         self.store.save_meta("std_dict_imported_at", now)
@@ -1129,7 +1189,7 @@ class StandardCatalog:
         format_profile: str = "AUTO",
     ) -> Dict[str, Any]:
         """三维分级落标核验（字段英文名 + 物理类型归一化为硬指标，中文注释包含为次级指标）."""
-        code = (std_code or "").strip()
+        code = _clean_cell(std_code, treat_slash_empty=True)
         if not code:
             return {
                 "status": "UNBOUND",
@@ -1247,9 +1307,68 @@ class StandardCatalog:
         res: Dict[str, Dict[str, Any]] = {}
         for r in rows:
             d = dict(r)
+            cleaned_code = _clean_cell(d.get("std_code"), treat_slash_empty=True)
+            if not cleaned_code:
+                continue
+            d["std_code"] = cleaned_code
             ck = clean_identifier_input(d["column_name"]).lower()
             res[ck] = d
         return res
+
+    def purge_invalid_error_bindings(self, connection_id: str = "") -> int:
+        """清理历史残留的 Excel 错误值与空占位符绑定（如旧版误入库的 #N/A、'#N/A、全角 ＃N/A、#REF! 等）."""
+        err_list = sorted(EXCEL_ERROR_TOKENS)
+        placeholders = ",".join("?" for _ in err_list)
+        deleted_total = 0
+        with self.store.module_db() as conn:
+            if connection_id:
+                cur = conn.execute(
+                    f"DELETE FROM field_standard_bindings WHERE connection_id = ? AND LOWER(TRIM(std_code)) IN ({placeholders})",
+                    [connection_id, *err_list],
+                )
+                deleted_total += int(cur.rowcount or 0)
+                suspects = conn.execute(
+                    "SELECT id, std_code FROM field_standard_bindings WHERE connection_id = ? AND (std_code LIKE '%#%' OR std_code LIKE '%＃%' OR LENGTH(TRIM(std_code)) <= 4)",
+                    (connection_id,),
+                ).fetchall()
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM field_standard_bindings WHERE LOWER(TRIM(std_code)) IN ({placeholders})",
+                    err_list,
+                )
+                deleted_total += int(cur.rowcount or 0)
+                suspects = conn.execute(
+                    "SELECT id, std_code FROM field_standard_bindings WHERE std_code LIKE '%#%' OR std_code LIKE '%＃%' OR LENGTH(TRIM(std_code)) <= 4"
+                ).fetchall()
+
+            bad_ids = [
+                int(r["id"])
+                for r in suspects
+                if not _clean_cell(r["std_code"], treat_slash_empty=True)
+            ]
+            if bad_ids:
+                id_ph = ",".join("?" for _ in bad_ids)
+                cur2 = conn.execute(
+                    f"DELETE FROM field_standard_bindings WHERE id IN ({id_ph})",
+                    bad_ids,
+                )
+                deleted_total += int(cur2.rowcount or 0)
+
+            # 同步清理跨环境映射表历史残留的 #N/A 等错误标准编码
+            cross_suspects = conn.execute(
+                "SELECT id, source_std_code, target_std_code FROM cross_column_bindings "
+                "WHERE (source_std_code != '' AND (source_std_code LIKE '%#%' OR source_std_code LIKE '%＃%' OR LENGTH(TRIM(source_std_code)) <= 4)) "
+                "OR (target_std_code != '' AND (target_std_code LIKE '%#%' OR target_std_code LIKE '%＃%' OR LENGTH(TRIM(target_std_code)) <= 4))"
+            ).fetchall()
+            for cr in cross_suspects:
+                s_clean = _clean_cell(cr["source_std_code"], treat_slash_empty=True)
+                t_clean = _clean_cell(cr["target_std_code"], treat_slash_empty=True)
+                if s_clean != (cr["source_std_code"] or "") or t_clean != (cr["target_std_code"] or ""):
+                    conn.execute(
+                        "UPDATE cross_column_bindings SET source_std_code = ?, target_std_code = ? WHERE id = ?",
+                        (s_clean, t_clean, int(cr["id"])),
+                    )
+        return deleted_total
 
     def upsert_field_bindings(
         self,
@@ -1270,7 +1389,7 @@ class StandardCatalog:
                 if not tbl or not col:
                     continue
                 col_key = self.make_col_key(sch, tbl, col)
-                std_code = _clean_cell(item.get("std_code"))
+                std_code = _clean_cell(item.get("std_code"), treat_slash_empty=True)
                 if not std_code:
                     cur = conn.execute(
                         "DELETE FROM field_standard_bindings WHERE connection_id = ? AND col_key = ?",
@@ -1411,14 +1530,14 @@ class StandardCatalog:
         preferred_code: str = "",
     ) -> List[Dict[str, Any]]:
         """按编号 > 英文简称+中文名 > 英文简称 > 中文名在标准字典中智能匹配候选标准."""
-        code = _clean_cell(preferred_code)
+        code = _clean_cell(preferred_code, treat_slash_empty=True)
         if code:
             exact = self.get_item(code)
             if exact:
                 return [exact]
 
         en = clean_identifier_input(col_name or "")
-        cn = _clean_cell(col_comment)
+        cn = _clean_cell(col_comment, treat_slash_empty=True)
         with self.store.module_db() as conn:
             if en and cn:
                 rows = conn.execute(

@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
 from modules.cross_comparator.schemas import (
@@ -88,14 +89,23 @@ def api_cross_save_bindings(
 @router.post("/standard/upload")
 async def api_cross_upload_standard(
     file: UploadFile = File(...),
+    progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
         raw = await file.read()
-        return CrossComparatorService(ctx).import_standard_or_bundle(
-            file.filename or "standard.xlsx", raw
+        ctx.import_progress.start(progress_id, "解析跨环境标准与绑定配置")
+        reporter = ctx.import_progress.make_reporter(progress_id)
+        res = await run_in_threadpool(
+            CrossComparatorService(ctx).import_standard_or_bundle,
+            file.filename or "standard.xlsx",
+            raw,
+            progress_cb=reporter,
         )
+        ctx.import_progress.finish(progress_id, detail="导入完成")
+        return res
     except Exception as exc:
+        ctx.import_progress.fail(progress_id, str(exc))
         return _err(str(exc), 400)
 
 
@@ -213,14 +223,27 @@ def api_cross_pairings_template(
 async def api_cross_pairings_upload(
     file: UploadFile = File(...),
     format_profile: str = Form(default="AUTO"),
+    progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
         raw = await file.read()
-        return CrossComparatorService(ctx).upload_pairings_excel(
+        ctx.import_progress.start(progress_id, "解析跨环境映射铺底表")
+        reporter = ctx.import_progress.make_reporter(progress_id)
+        res = await run_in_threadpool(
+            CrossComparatorService(ctx).upload_pairings_excel,
             filename=file.filename or "cross_pairings.xlsx",
             content=raw,
             format_profile=format_profile,
+            progress_cb=reporter,
         )
+        ctx.import_progress.finish(
+            progress_id,
+            detail=res.get("message", "映射铺底完成"),
+            processed=int(res.get("imported_count", 0)),
+            total=int(res.get("imported_count", 0)),
+        )
+        return res
     except Exception as exc:
+        ctx.import_progress.fail(progress_id, str(exc))
         return _err(str(exc), 400)

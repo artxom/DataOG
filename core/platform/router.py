@@ -7,6 +7,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
 from core.platform.schemas import (
@@ -388,6 +389,19 @@ def api_platform_clear_logs(ctx: PlatformContext = Depends(get_platform_context)
     return {"ok": True, "logs": []}
 
 
+@router.get("/import-progress/{progress_id}")
+async def api_platform_import_progress(
+    progress_id: str,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    prog = ctx.import_progress.get(progress_id)
+    return {
+        "ok": True,
+        "found": prog is not None,
+        "progress": prog,
+    }
+
+
 # =========================================================================
 # 外观壁纸与软件/模块图标本地持久化中心 (AssetStore)
 # =========================================================================
@@ -654,21 +668,34 @@ def api_export_standard_dict(
 async def api_upload_standard_dict(
     file: UploadFile = File(...),
     mode: str = Form(default="upsert"),
+    progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
         raw = await file.read()
-        res = ctx.standard_catalog.import_dictionary_excel(
+        ctx.import_progress.start(progress_id, "解析数据标准字典")
+        reporter = ctx.import_progress.make_reporter(progress_id)
+        res = await run_in_threadpool(
+            ctx.standard_catalog.import_dictionary_excel,
             file.filename or "standard_dict.xlsx",
             raw,
             mode=mode,
+            progress_cb=reporter,
+        )
+        msg = f"成功导入 {res['imported_count']} 条数据标准（{'全量覆盖' if res['mode'] == 'replace' else '增量合并'}）"
+        ctx.import_progress.finish(
+            progress_id,
+            detail=msg,
+            processed=int(res["imported_count"]),
+            total=int(res["imported_count"]),
         )
         return {
             "ok": True,
             **res,
-            "message": f"成功导入 {res['imported_count']} 条数据标准（{'全量覆盖' if res['mode'] == 'replace' else '增量合并'}）",
+            "message": msg,
         }
     except Exception as exc:
+        ctx.import_progress.fail(progress_id, str(exc))
         return _err(str(exc), 400)
 
 

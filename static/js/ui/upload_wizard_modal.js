@@ -1,11 +1,19 @@
 /**
  * Data.O.G 公共两步式模板导入向导弹窗 (UploadWizardModal)
- * 规范全平台所有数据导入入口：先下载标准系统模板（含可选预填模板），再上传填写好的工作簿
+ * 规范全平台所有数据导入入口：
+ * 1. 先下载标准系统模板（含可选预填模板），再上传填写好的工作簿；
+ * 2. 内置双阶段实时进度条（XHR 字节流上传进度 + 服务端实时行级/表级解析核验进度轮询 + 实时计时器）。
  */
 
+import { platformApi } from "../core/api.js";
 import { badge, clearEl, el, formatBytes, pickLocalFile, svgIcon } from "../core/dom.js";
 import { Modal } from "./modal.js";
 import { Toast } from "./toast.js";
+
+function makeProgressId() {
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `imp_${Date.now().toString(36)}_${rand}`;
+}
 
 /**
  * @param {Object} opts
@@ -18,7 +26,7 @@ import { Toast } from "./toast.js";
  * @param {Array<{value: string, label: string, desc?: string}>} [opts.modes]
  * @param {string} [opts.defaultMode]
  * @param {string} [opts.accept]
- * @param {(file: File, mode: string) => Promise<void>} opts.onUpload
+ * @param {(file: File, mode: string, uploadCtx: {progressId: string, onUploadProgress: (ratio: number, loaded: number, total: number) => void}) => Promise<void>} opts.onUpload
  */
 export function openUploadWizardModal(opts) {
   const {
@@ -37,14 +45,109 @@ export function openUploadWizardModal(opts) {
   let selectedFile = null;
   let selectedMode = defaultMode || (modes[0]?.value ?? "");
   let uploading = false;
+  let pollTimer = null;
+  let elapsedTimer = null;
+  let modalOpen = true;
+
+  const stopTimers = () => {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (elapsedTimer) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+  };
 
   const fileStatusEl = el("div", { className: "wizard-file-status" });
+  const cancelBtn = el("button", {
+    type: "button",
+    className: "mac-btn",
+    text: "取消",
+    onClick: () => {
+      if (!uploading) Modal.close("cancel");
+    },
+  });
   const uploadBtn = el("button", {
     type: "button",
     className: "mac-btn mac-btn-primary",
     disabled: true,
     text: "开始导入",
   });
+
+  // 实时导入进度条组件（默认隐藏，点击开始导入后展开）
+  const spinnerEl = el("span", { className: "upload-progress-spinner", "aria-hidden": "true" });
+  const stageTitleEl = el("strong", { className: "upload-progress-stage", text: "准备导入..." });
+  const progressMetaEl = el("span", { className: "upload-progress-meta", text: "0% · 0.0s" });
+  const progressFillEl = el("div", {
+    className: "upload-progress-fill",
+    style: { width: "0%" },
+  });
+  const progressTrackEl = el(
+    "div",
+    {
+      className: "upload-progress-track",
+      role: "progressbar",
+      "aria-label": "导入进度",
+      "aria-valuemin": "0",
+      "aria-valuemax": "100",
+      "aria-valuenow": "0",
+    },
+    progressFillEl
+  );
+  const progressDetailEl = el("div", {
+    className: "upload-progress-detail",
+    text: "等待上传工作簿...",
+  });
+  const progressPanelEl = el(
+    "div",
+    {
+      className: "upload-progress-panel",
+      style: { display: "none" },
+    },
+    el(
+      "div",
+      { className: "upload-progress-head" },
+      el("div", { className: "upload-progress-stage-wrap" }, spinnerEl, stageTitleEl),
+      progressMetaEl
+    ),
+    progressTrackEl,
+    progressDetailEl
+  );
+
+  let currentPercent = 0;
+  let startedAtMs = 0;
+
+  const updateProgressView = ({ percent = null, stage = null, detail = null, state = "active" } = {}) => {
+    if (percent !== null && Number.isFinite(percent)) {
+      currentPercent = Math.max(0, Math.min(100, percent));
+    }
+    if (stage !== null) {
+      stageTitleEl.textContent = stage;
+    }
+    if (detail !== null) {
+      progressDetailEl.textContent = detail;
+    }
+    const roundedPct = Math.round(currentPercent);
+    const elapsedSec = startedAtMs > 0 ? (( performance.now() - startedAtMs ) / 1000).toFixed(1) : "0.0";
+    progressFillEl.style.width = `${currentPercent.toFixed(1)}%`;
+    progressTrackEl.setAttribute("aria-valuenow", String(roundedPct));
+    progressMetaEl.textContent = `${roundedPct}% · 已用时 ${elapsedSec}s`;
+
+    progressPanelEl.classList.remove("is-active", "is-success", "is-error");
+    if (state === "success") {
+      progressPanelEl.classList.add("is-success");
+    } else if (state === "error") {
+      progressPanelEl.classList.add("is-error");
+    } else {
+      progressPanelEl.classList.add("is-active");
+    }
+
+    if (uploading && state === "active") {
+      uploadBtn.textContent = `正在导入 (${roundedPct}%)...`;
+    }
+  };
 
   const renderFileStatus = () => {
     if (!selectedFile) {
@@ -54,7 +157,7 @@ export function openUploadWizardModal(opts) {
         el("div", { style: { fontWeight: "500" }, text: "点击选择文件或将填写好的表格拖放至此" }),
         el("div", {
           style: { fontSize: "11px", color: "var(--os-muted)" },
-          text: `支持格式: ${accept}`,
+          text: `支持格式: ${accept}（自动取公式计算结果，#N/A 自动识别为空值）`,
         })
       );
       uploadBtn.disabled = true;
@@ -77,6 +180,8 @@ export function openUploadWizardModal(opts) {
     const f = await pickLocalFile(accept);
     if (!f) return;
     selectedFile = f;
+    progressPanelEl.style.display = "none";
+    uploadBtn.textContent = "开始导入";
     renderFileStatus();
   };
 
@@ -94,16 +199,20 @@ export function openUploadWizardModal(opts) {
         }
       },
       onDragover: (e) => {
+        if (uploading) return;
         e.preventDefault();
         dropzone.classList.add("is-dragover");
       },
       onDragleave: () => dropzone.classList.remove("is-dragover"),
       onDrop: (e) => {
+        if (uploading) return;
         e.preventDefault();
         dropzone.classList.remove("is-dragover");
         const f = e.dataTransfer?.files?.[0];
         if (f) {
           selectedFile = f;
+          progressPanelEl.style.display = "none";
+          uploadBtn.textContent = "开始导入";
           renderFileStatus();
         }
       },
@@ -118,6 +227,7 @@ export function openUploadWizardModal(opts) {
       type: "button",
       className: "mac-btn mac-btn-sm",
       onClick: async () => {
+        if (uploading) return;
         try {
           blankBtn.disabled = true;
           await onDownloadBlankTemplate?.();
@@ -125,7 +235,7 @@ export function openUploadWizardModal(opts) {
         } catch (err) {
           Toast.error(err.message);
         } finally {
-          blankBtn.disabled = false;
+          if (!uploading) blankBtn.disabled = false;
         }
       },
     },
@@ -141,6 +251,7 @@ export function openUploadWizardModal(opts) {
             type: "button",
             className: "mac-btn mac-btn-sm",
             onClick: async () => {
+              if (uploading) return;
               try {
                 prefillBtn.disabled = true;
                 await onDownloadPrefilledTemplate();
@@ -148,7 +259,7 @@ export function openUploadWizardModal(opts) {
               } catch (err) {
                 Toast.error(err.message);
               } finally {
-                prefillBtn.disabled = false;
+                if (!uploading) prefillBtn.disabled = false;
               }
             },
           },
@@ -187,6 +298,7 @@ export function openUploadWizardModal(opts) {
     )
   );
 
+  const radioInputs = [];
   const modeRadios = modes.length
     ? el(
         "div",
@@ -201,6 +313,7 @@ export function openUploadWizardModal(opts) {
               selectedMode = m.value;
             },
           });
+          radioInputs.push(radio);
           return el(
             "label",
             { className: "wizard-mode-opt" },
@@ -231,22 +344,133 @@ export function openUploadWizardModal(opts) {
       el("strong", { text: "选择或拖入填写完成的 Excel 文件" })
     ),
     dropzone,
-    modeRadios
+    modeRadios,
+    progressPanelEl
   );
+
+  const setControlsLocked = (locked) => {
+    uploadBtn.disabled = locked || !selectedFile;
+    cancelBtn.disabled = locked;
+    blankBtn.disabled = locked;
+    if (prefillBtn) prefillBtn.disabled = locked;
+    radioInputs.forEach((r) => {
+      r.disabled = locked;
+    });
+    dropzone.classList.toggle("is-disabled", locked);
+    Modal.setCloseLocked(locked);
+  };
 
   uploadBtn.addEventListener("click", async () => {
     if (!selectedFile || uploading) return;
     uploading = true;
-    uploadBtn.disabled = true;
-    uploadBtn.textContent = "正在解析导入...";
+    startedAtMs = performance.now();
+    currentPercent = 2;
+    progressPanelEl.style.display = "flex";
+    setControlsLocked(true);
+
+    const progressId = makeProgressId();
+    let serverReported = false;
+    let pollInFlight = false;
+
+    updateProgressView({
+      percent: 3,
+      stage: "正在上传文件",
+      detail: `准备传输 ${selectedFile.name} (${formatBytes(selectedFile.size)})...`,
+      state: "active",
+    });
+
+    const pollServerProgress = async () => {
+      if (!uploading || !modalOpen || pollInFlight) return;
+      pollInFlight = true;
+      try {
+        const res = await platformApi.getImportProgress(progressId);
+        if (!uploading || !modalOpen) return;
+        const p = res?.progress;
+        if (res?.found && p) {
+          serverReported = true;
+          const srvPct = Math.max(currentPercent, Number(p.percent || 0));
+          const pState =
+            p.status === "failed"
+              ? "error"
+              : p.status === "completed"
+              ? "success"
+              : "active";
+          updateProgressView({
+            percent: srvPct,
+            stage: p.stage || "正在解析导入",
+            detail: p.detail || "正在处理工作簿数据...",
+            state: pState,
+          });
+        }
+      } catch (_e) {
+        // 忽略偶发轮询抖动，以主请求最终结果为准
+      } finally {
+        pollInFlight = false;
+      }
+    };
+
+    elapsedTimer = setInterval(() => {
+      if (!uploading || !modalOpen) return;
+      // 当文件已上传完毕但大工作簿首轮 XML 解析尚未返回时，平滑微推进进度以提供明确活跃反馈
+      if (!serverReported && currentPercent >= 14 && currentPercent < 22) {
+        currentPercent = Math.min(22, currentPercent + 0.35);
+      }
+      updateProgressView({ state: "active" });
+    }, 100);
+
+    pollTimer = setInterval(pollServerProgress, 220);
+
+    const onUploadProgress = (ratio, loaded, total) => {
+      if (!uploading || serverReported) return;
+      const mappedPct = 2 + Math.min(1, Math.max(0, ratio)) * 12;
+      if (ratio >= 0.999) {
+        updateProgressView({
+          percent: Math.max(currentPercent, 14),
+          stage: "正在解析 Excel 工作簿",
+          detail: "文件已送达本地引擎，正在解析公式计算结果并匹配数据标准...",
+          state: "active",
+        });
+        setTimeout(() => {
+          pollServerProgress();
+        }, 35);
+      } else {
+        updateProgressView({
+          percent: Math.max(currentPercent, mappedPct),
+          stage: "正在上传文件",
+          detail: `已传输 ${formatBytes(loaded)} / ${formatBytes(total)}`,
+          state: "active",
+        });
+      }
+    };
+
     try {
-      await onUpload?.(selectedFile, selectedMode);
-      Modal.close("uploaded");
-    } catch (err) {
-      Toast.error(err.message);
+      await onUpload?.(selectedFile, selectedMode, { progressId, onUploadProgress });
+      stopTimers();
       uploading = false;
-      uploadBtn.disabled = false;
-      uploadBtn.textContent = "开始导入";
+      updateProgressView({
+        percent: 100,
+        stage: "导入完成",
+        detail: "全部记录已解析并入库完成",
+        state: "success",
+      });
+      uploadBtn.textContent = "导入完成";
+      await new Promise((r) => setTimeout(r, 180));
+      setControlsLocked(false);
+      if (modalOpen) {
+        Modal.close("uploaded");
+      }
+    } catch (err) {
+      stopTimers();
+      uploading = false;
+      setControlsLocked(false);
+      updateProgressView({
+        percent: Math.max(8, currentPercent),
+        stage: "导入未完成",
+        detail: err?.message || "解析导入失败，请检查文件后重试",
+        state: "error",
+      });
+      uploadBtn.textContent = "重新导入";
+      Toast.error(err.message);
     }
   });
 
@@ -256,9 +480,11 @@ export function openUploadWizardModal(opts) {
     title,
     width: "min(620px, 94vw)",
     body,
-    footer: [
-      el("button", { type: "button", className: "mac-btn", text: "取消", onClick: () => Modal.close("cancel") }),
-      uploadBtn,
-    ],
+    footer: [cancelBtn, uploadBtn],
+    onClose: () => {
+      modalOpen = false;
+      stopTimers();
+      Modal.setCloseLocked(false);
+    },
   });
 }

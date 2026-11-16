@@ -2028,6 +2028,143 @@ dialog::backdrop {
   cursor: pointer;
 }
 
+.upload-dropzone.is-disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* 实时导入进度条面板 */
+.upload-progress-panel {
+  margin-top: 4px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-win-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.upload-progress-panel.is-success {
+  border-color: color-mix(in srgb, var(--status-success) 45%, var(--os-border));
+}
+
+.upload-progress-panel.is-error {
+  border-color: color-mix(in srgb, var(--status-danger) 50%, var(--os-border));
+  background: color-mix(in srgb, var(--status-danger) 5%, var(--os-win-bg));
+}
+
+.upload-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.upload-progress-stage-wrap {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.upload-progress-stage {
+  color: var(--os-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.upload-progress-meta {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--os-text-secondary);
+  white-space: nowrap;
+}
+
+.upload-progress-spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid color-mix(in srgb, var(--os-accent) 25%, transparent);
+  border-top-color: var(--os-accent);
+  flex-shrink: 0;
+  animation: upload-spin 0.75s linear infinite;
+}
+
+.upload-progress-panel.is-success .upload-progress-spinner {
+  border-color: var(--status-success);
+  background: var(--status-success);
+  animation: none;
+}
+
+.upload-progress-panel.is-error .upload-progress-spinner {
+  border-color: var(--status-danger);
+  background: var(--status-danger);
+  animation: none;
+}
+
+.upload-progress-track {
+  width: 100%;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--os-hover);
+  overflow: hidden;
+  position: relative;
+}
+
+.upload-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--os-accent) 0%,
+    color-mix(in srgb, var(--os-accent) 76%, #ffffff) 50%,
+    var(--os-accent) 100%
+  );
+  background-size: 200% 100%;
+  transition: width 0.2s ease, background-color 0.2s ease;
+  animation: upload-bar-sheen 1.4s linear infinite;
+}
+
+.upload-progress-panel.is-success .upload-progress-fill {
+  background: var(--status-success);
+  animation: none;
+}
+
+.upload-progress-panel.is-error .upload-progress-fill {
+  background: var(--status-danger);
+  animation: none;
+}
+
+.upload-progress-detail {
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--os-muted);
+  word-break: break-word;
+}
+
+.upload-progress-panel.is-error .upload-progress-detail {
+  color: var(--status-danger);
+}
+
+@keyframes upload-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes upload-bar-sheen {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+
 /* 标准字典选择器弹窗与点击单元格 */
 .std-picker-list {
   max-height: 52vh;

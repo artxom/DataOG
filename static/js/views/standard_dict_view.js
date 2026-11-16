@@ -125,8 +125,8 @@ export class StandardDictView {
       ],
       defaultMode: "upsert",
       accept: ".xlsx,.xlsm",
-      onUpload: async (file, mode) => {
-        const res = await standardsApi.uploadDictionary(file, mode || "upsert");
+      onUpload: async (file, mode, uploadCtx) => {
+        const res = await standardsApi.uploadDictionary(file, mode || "upsert", uploadCtx);
         if (res.summary) store.updateStandardDictSummary(res.summary);
         Toast.success(res.message || `已导入 ${res.imported_count || 0} 条数据标准`);
         this.page = 1;
