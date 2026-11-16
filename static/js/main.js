@@ -29,7 +29,7 @@ import { StandardView } from "./views/standard_view.js";
 const DEFAULT_SUMMARIES = {
   settings: "外观 · 连接 · AI",
   explorer: "SQL 查询",
-  standard: "贯标 · 比对",
+  standard: "字典 · 落标 · 比对",
   polyglot: "命名 · 方言",
 };
 
@@ -148,25 +148,63 @@ function syncDesktopAppearance() {
     clearEl(menuBrandIcon, renderBrandMark(app, "sm"));
   }
 
-  const heroEmblem = document.getElementById("desktop-brand-emblem");
-  if (heroEmblem) {
-    clearEl(heroEmblem, renderBrandMark(app, "lg"));
-  }
-
-  renderDesktopLaunchers();
+  renderMacDock();
 }
 
-function renderDesktopLaunchers() {
-  const gridEl = document.getElementById("desktop-icon-grid");
-  if (!gridEl) return;
+function syncDockVisibility() {
+  const dockEl = document.getElementById("os-dock");
+  const hoverZone = document.getElementById("dock-hover-zone");
+  if (!dockEl) return;
+
+  const activeId = store.state.activeApp;
+  const isFullMax = Boolean(activeId && store.state.maximizedApps.has(activeId));
+  dockEl.classList.toggle("is-autohide", isFullMax);
+  if (hoverZone) {
+    hoverZone.classList.toggle("is-active", isFullMax);
+  }
+  if (!isFullMax) {
+    dockEl.classList.remove("is-peek");
+  }
+}
+
+function initDockAutoHideHover() {
+  const dockEl = document.getElementById("os-dock");
+  const hoverZone = document.getElementById("dock-hover-zone");
+  if (!dockEl || !hoverZone) return;
+
+  let hideTimer = null;
+  const showPeek = () => {
+    clearTimeout(hideTimer);
+    if (dockEl.classList.contains("is-autohide")) {
+      dockEl.classList.add("is-peek");
+    }
+  };
+  const scheduleHide = () => {
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(() => {
+      dockEl.classList.remove("is-peek");
+    }, 220);
+  };
+
+  hoverZone.addEventListener("mouseenter", showPeek);
+  hoverZone.addEventListener("mouseleave", scheduleHide);
+  dockEl.addEventListener("mouseenter", showPeek);
+  dockEl.addEventListener("mouseleave", scheduleHide);
+}
+
+function renderMacDock() {
+  const dockEl = document.getElementById("os-dock");
+  if (!dockEl) return;
 
   const appearance = store.state.appearance || {};
   const activeId = store.state.activeApp;
-  const minimizedSet = new Set(store.state.minimizedApps || []);
+  const minimizedList = store.state.minimizedApps || [];
+  const minimizedSet = new Set(minimizedList);
 
-  const nodes = DESKTOP_APPS.map((appItem) => {
+  const appNodes = DESKTOP_APPS.map((appItem) => {
+    const isActive = activeId === appItem.id;
     const isRunning =
-      activeId === appItem.id ||
+      isActive ||
       minimizedSet.has(appItem.id) ||
       appInstances.has(appItem.id);
 
@@ -174,17 +212,52 @@ function renderDesktopLaunchers() {
       "button",
       {
         type: "button",
-        className: "app-launcher",
+        className: `dock-item ${isActive ? "is-active" : ""}`.trim(),
         dataset: { appId: appItem.id },
+        "aria-label": appItem.title,
         onClick: () => store.openApp(appItem.id),
       },
-      renderAppSquircle(appItem.id, appearance, "lg"),
-      el("span", { className: "app-launcher-label", text: appItem.title }),
-      isRunning ? el("span", { className: "app-running-dot", title: "运行中" }) : null
+      el("span", { className: "dock-tooltip", text: appItem.title }),
+      el("span", { className: "dock-icon-box" }, renderAppSquircle(appItem.id, appearance, "lg")),
+      el("span", {
+        className: `dock-dot ${isRunning ? "is-visible" : ""} ${isActive ? "is-focused" : ""}`.trim(),
+        title: isRunning ? "运行中" : "",
+      })
     );
   });
 
-  clearEl(gridEl, nodes);
+  const minimizedNodes = [];
+  if (minimizedList.length > 0) {
+    minimizedNodes.push(el("span", { className: "dock-separator", role: "separator" }));
+    for (const appId of minimizedList) {
+      const sub = store.state.appSummaries[appId] || DEFAULT_SUMMARIES[appId] || "";
+      const tip = sub ? `${getAppTitle(appId)} · ${sub}` : getAppTitle(appId);
+      minimizedNodes.push(
+        el(
+          "button",
+          {
+            type: "button",
+            className: "dock-item dock-minimized-item",
+            dataset: { drawerApp: appId },
+            title: `点击恢复「${getAppTitle(appId)}」工作现场`,
+            "aria-label": `恢复最小化窗口 ${getAppTitle(appId)}`,
+            onClick: () => store.openApp(appId),
+          },
+          el("span", { className: "dock-tooltip", text: tip }),
+          el(
+            "span",
+            { className: "dock-minimized-tile" },
+            el("span", { className: "dock-mini-win-chrome" }, el("span"), el("span"), el("span")),
+            el("span", { className: "dock-mini-app-badge" }, renderAppSquircle(appId, appearance, "sm"))
+          ),
+          el("span", { className: "dock-dot is-visible" })
+        )
+      );
+    }
+  }
+
+  clearEl(dockEl, ...appNodes, ...minimizedNodes);
+  syncDockVisibility();
 }
 
 function syncMenubarIndicators() {
@@ -222,47 +295,8 @@ function syncMenubarIndicators() {
 }
 
 /* =========================================================================
-   3. macOS 应用窗口宿主与右下角毛玻璃最小化抽屉
+   3. macOS 应用窗口宿主
    ========================================================================= */
-
-function renderMinimizedDrawer() {
-  const drawerEl = document.getElementById("minimized-drawer");
-  if (!drawerEl) return;
-
-  const list = store.state.minimizedApps || [];
-  if (!list.length) {
-    drawerEl.hidden = true;
-    clearEl(drawerEl);
-    return;
-  }
-
-  const appearance = store.state.appearance || {};
-  const chips = list.map((appId) =>
-    el(
-      "button",
-      {
-        type: "button",
-        className: "drawer-chip",
-        dataset: { drawerApp: appId },
-        title: `点击恢复「${getAppTitle(appId)}」工作现场`,
-        onClick: () => store.openApp(appId),
-      },
-      renderAppSquircle(appId, appearance, "sm"),
-      el(
-        "span",
-        { className: "drawer-chip-meta" },
-        el("span", { className: "drawer-chip-title", text: getAppTitle(appId) }),
-        el("span", {
-          className: "drawer-chip-sub",
-          text: store.state.appSummaries[appId] || DEFAULT_SUMMARIES[appId] || "",
-        })
-      )
-    )
-  );
-
-  drawerEl.hidden = false;
-  clearEl(drawerEl, chips);
-}
 
 async function syncWindowHost() {
   const hostEl = document.getElementById("window-host");
@@ -625,6 +659,7 @@ export async function bootstrapWorkbench() {
   startMenubarClock();
   initSpotlightDialog();
   initLogsDialog();
+  initDockAutoHideHover();
 
   document.getElementById("btn-menubar-home")?.addEventListener("click", () => {
     store.showDesktop();
@@ -651,11 +686,10 @@ export async function bootstrapWorkbench() {
     }
     if (reason === "window") {
       syncWindowHost();
-      renderMinimizedDrawer();
-      renderDesktopLaunchers();
+      renderMacDock();
       syncMenubarIndicators();
     } else if (reason === "summary") {
-      renderMinimizedDrawer();
+      renderMacDock();
     } else if (reason === "llm" || reason === "logs" || reason === "bootstrap") {
       syncMenubarIndicators();
     }

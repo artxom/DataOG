@@ -18,6 +18,7 @@ export class DatabaseTree {
       onPreviewTable = null,
       onFocusSelectionChange = null,
       onActiveConnectionChange = null,
+      renderTableBadge = null,
       selectionMode = "single",
     } = {}
   ) {
@@ -25,6 +26,7 @@ export class DatabaseTree {
     this.onPreviewTable = onPreviewTable;
     this.onFocusSelectionChange = onFocusSelectionChange;
     this.onActiveConnectionChange = onActiveConnectionChange;
+    this.renderTableBadge = renderTableBadge;
     this.selectionMode = selectionMode === "multi" ? "multi" : "single";
 
     this.filterText = "";
@@ -521,6 +523,9 @@ export class DatabaseTree {
                   : null,
                 svgIcon(isView ? "view" : "table", 13),
                 el("span", { className: "tree-node-title", text: tbl.table_name }),
+                typeof this.renderTableBadge === "function"
+                  ? this.renderTableBadge(cid, schemaName, tbl)
+                  : null,
                 isView ? badge("V", "warn") : null
               );
               tableListNodes.push(tblRow);

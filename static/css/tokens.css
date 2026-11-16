@@ -79,6 +79,14 @@
   --status-danger: #ff3b30;
   --status-info: #0071e3;
 
+  /* Dock 毛玻璃与淡绿贯通拟物书签 (Light) */
+  --dock-bg: rgba(248, 250, 252, 0.62);
+  --dock-border: rgba(255, 255, 255, 0.56);
+  --dock-shadow: 0 18px 42px rgba(15, 23, 42, 0.16), 0 0 0 0.5px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  --bookmark-unified-bg: #ebf7ee;
+  --bookmark-unified-border: #b8dfc3;
+  --bookmark-unified-text: #225c39;
+
   /* 兼容旧组件别名 */
   --text-primary: var(--os-text);
   --text-secondary: var(--os-text-secondary);
@@ -126,6 +134,12 @@
     --wp-sonoma: linear-gradient(135deg, #0f2027 0%, #1b3b4b 48%, #243b55 100%);
     --wp-sequoia: linear-gradient(135deg, #2b1b2f 0%, #3b2439 50%, #191a2e 100%);
     --scrollbar-thumb: rgba(160, 160, 172, 0.34);
+    --dock-bg: rgba(28, 28, 34, 0.64);
+    --dock-border: rgba(255, 255, 255, 0.14);
+    --dock-shadow: 0 22px 50px rgba(0, 0, 0, 0.58), 0 0 0 0.5px rgba(255, 255, 255, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+    --bookmark-unified-bg: rgba(46, 179, 92, 0.14);
+    --bookmark-unified-border: rgba(74, 210, 120, 0.34);
+    --bookmark-unified-text: #8ee0a9;
   }
 }
 
@@ -156,6 +170,12 @@
   --wp-default: radial-gradient(120% 100% at 20% 0%, #1c2536 0%, #11131a 52%, #0b0c10 100%);
   --wp-sonoma: linear-gradient(135deg, #0f2027 0%, #1b3b4b 48%, #243b55 100%);
   --wp-sequoia: linear-gradient(135deg, #2b1b2f 0%, #3b2439 50%, #191a2e 100%);
+  --dock-bg: rgba(28, 28, 34, 0.64);
+  --dock-border: rgba(255, 255, 255, 0.14);
+  --dock-shadow: 0 22px 50px rgba(0, 0, 0, 0.58), 0 0 0 0.5px rgba(255, 255, 255, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  --bookmark-unified-bg: rgba(46, 179, 92, 0.14);
+  --bookmark-unified-border: rgba(74, 210, 120, 0.34);
+  --bookmark-unified-text: #8ee0a9;
 }
 
 :root:has(> head > meta[name="color-scheme"][content="light"]) {
@@ -181,9 +201,23 @@
   --os-icon-label: #1d1d1f;
   --os-icon-label-shadow: 0 1px 3px rgba(255, 255, 255, 0.85);
   --status-info: #0071e3;
+
+  /* Dock 毛玻璃与淡绿贯通拟物书签 (Light) */
+  --dock-bg: rgba(248, 250, 252, 0.62);
+  --dock-border: rgba(255, 255, 255, 0.56);
+  --dock-shadow: 0 18px 42px rgba(15, 23, 42, 0.16), 0 0 0 0.5px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  --bookmark-unified-bg: #ebf7ee;
+  --bookmark-unified-border: #b8dfc3;
+  --bookmark-unified-text: #225c39;
   --wp-default: radial-gradient(120% 100% at 15% 10%, #dceaff 0%, #edf1f7 46%, #e2e8f3 100%);
   --wp-sonoma: linear-gradient(135deg, #c2e9fb 0%, #a1c4fd 48%, #d4fc79 100%);
   --wp-sequoia: linear-gradient(135deg, #f6d365 0%, #fda085 50%, #a18cd1 100%);
+  --dock-bg: rgba(248, 250, 252, 0.62);
+  --dock-border: rgba(255, 255, 255, 0.56);
+  --dock-shadow: 0 18px 42px rgba(15, 23, 42, 0.16), 0 0 0 0.5px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.65);
+  --bookmark-unified-bg: #ebf7ee;
+  --bookmark-unified-border: #b8dfc3;
+  --bookmark-unified-text: #225c39;
 }
 
 @supports (color: light-dark(white, black)) {

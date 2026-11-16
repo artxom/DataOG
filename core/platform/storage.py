@@ -219,8 +219,82 @@ class PlatformStateStore:
                     std_col_comment TEXT NOT NULL DEFAULT '',
                     bound_source_col TEXT NOT NULL DEFAULT '',
                     bound_target_col TEXT NOT NULL DEFAULT '',
+                    source_std_code TEXT NOT NULL DEFAULT '',
+                    target_std_code TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS standard_dictionary (
+                    std_code TEXT PRIMARY KEY,
+                    reg_category TEXT NOT NULL DEFAULT '',
+                    cat_l1 TEXT NOT NULL DEFAULT '',
+                    cat_l2 TEXT NOT NULL DEFAULT '',
+                    cat_l3 TEXT NOT NULL DEFAULT '',
+                    cn_name TEXT NOT NULL DEFAULT '',
+                    cn_alias TEXT NOT NULL DEFAULT '',
+                    en_name TEXT NOT NULL DEFAULT '',
+                    en_abbr TEXT NOT NULL DEFAULT '',
+                    biz_definition TEXT NOT NULL DEFAULT '',
+                    scope_desc TEXT NOT NULL DEFAULT '',
+                    biz_rule TEXT NOT NULL DEFAULT '',
+                    max_length TEXT NOT NULL DEFAULT '',
+                    min_scale TEXT NOT NULL DEFAULT '',
+                    ref_code_no TEXT NOT NULL DEFAULT '',
+                    ref_code_name TEXT NOT NULL DEFAULT '',
+                    ref_code_detail TEXT NOT NULL DEFAULT '',
+                    security_level TEXT NOT NULL DEFAULT '',
+                    ref_std_no TEXT NOT NULL DEFAULT '',
+                    ref_std_name TEXT NOT NULL DEFAULT '',
+                    domain_name TEXT NOT NULL DEFAULT '',
+                    domain_code TEXT NOT NULL DEFAULT '',
+                    data_category TEXT NOT NULL DEFAULT '',
+                    data_format TEXT NOT NULL DEFAULT '',
+                    value_range TEXT NOT NULL DEFAULT '',
+                    source_system TEXT NOT NULL DEFAULT '',
+                    ddm_catalog TEXT NOT NULL DEFAULT '',
+                    is_standard_dict TEXT NOT NULL DEFAULT '',
+                    version_no TEXT NOT NULL DEFAULT '',
+                    remark TEXT NOT NULL DEFAULT '',
+                    type_dws TEXT NOT NULL DEFAULT '',
+                    type_dw_mart TEXT NOT NULL DEFAULT '',
+                    type_mysql TEXT NOT NULL DEFAULT '',
+                    type_oracle TEXT NOT NULL DEFAULT '',
+                    type_dameng TEXT NOT NULL DEFAULT '',
+                    type_goldendb TEXT NOT NULL DEFAULT '',
+                    type_ob_oracle TEXT NOT NULL DEFAULT '',
+                    type_ob_mysql TEXT NOT NULL DEFAULT '',
+                    type_argodb TEXT NOT NULL DEFAULT '',
+                    type_oceanbase TEXT NOT NULL DEFAULT '',
+                    extra_attrs_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_std_dict_en_abbr
+                    ON standard_dictionary (en_abbr COLLATE NOCASE);
+                CREATE INDEX IF NOT EXISTS idx_std_dict_cn_name
+                    ON standard_dictionary (cn_name);
+                CREATE INDEX IF NOT EXISTS idx_std_dict_reg
+                    ON standard_dictionary (reg_category);
+                CREATE INDEX IF NOT EXISTS idx_std_dict_data_cat
+                    ON standard_dictionary (data_category);
+
+                CREATE TABLE IF NOT EXISTS field_standard_bindings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    connection_id TEXT NOT NULL,
+                    schema_name TEXT NOT NULL DEFAULT 'public',
+                    table_name TEXT NOT NULL,
+                    column_name TEXT NOT NULL,
+                    col_key TEXT NOT NULL,
+                    std_code TEXT NOT NULL DEFAULT '',
+                    bind_source TEXT NOT NULL DEFAULT 'MANUAL',
+                    compliance_status TEXT NOT NULL DEFAULT 'UNCHECKED',
+                    compliance_detail TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    UNIQUE(connection_id, col_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_fsb_conn_table
+                    ON field_standard_bindings (connection_id, schema_name, table_name);
+                CREATE INDEX IF NOT EXISTS idx_fsb_std_code
+                    ON field_standard_bindings (std_code);
 
                 CREATE TABLE IF NOT EXISTS llm_providers (
                     provider_id TEXT PRIMARY KEY,
@@ -367,6 +441,58 @@ class PlatformStateStore:
                 ("std_col_comment", "TEXT NOT NULL DEFAULT ''"),
                 ("bound_source_col", "TEXT NOT NULL DEFAULT ''"),
                 ("bound_target_col", "TEXT NOT NULL DEFAULT ''"),
+                ("source_std_code", "TEXT NOT NULL DEFAULT ''"),
+                ("target_std_code", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "standard_dictionary": [
+                ("reg_category", "TEXT NOT NULL DEFAULT ''"),
+                ("cat_l1", "TEXT NOT NULL DEFAULT ''"),
+                ("cat_l2", "TEXT NOT NULL DEFAULT ''"),
+                ("cat_l3", "TEXT NOT NULL DEFAULT ''"),
+                ("cn_name", "TEXT NOT NULL DEFAULT ''"),
+                ("cn_alias", "TEXT NOT NULL DEFAULT ''"),
+                ("en_name", "TEXT NOT NULL DEFAULT ''"),
+                ("en_abbr", "TEXT NOT NULL DEFAULT ''"),
+                ("biz_definition", "TEXT NOT NULL DEFAULT ''"),
+                ("scope_desc", "TEXT NOT NULL DEFAULT ''"),
+                ("biz_rule", "TEXT NOT NULL DEFAULT ''"),
+                ("max_length", "TEXT NOT NULL DEFAULT ''"),
+                ("min_scale", "TEXT NOT NULL DEFAULT ''"),
+                ("ref_code_no", "TEXT NOT NULL DEFAULT ''"),
+                ("ref_code_name", "TEXT NOT NULL DEFAULT ''"),
+                ("ref_code_detail", "TEXT NOT NULL DEFAULT ''"),
+                ("security_level", "TEXT NOT NULL DEFAULT ''"),
+                ("ref_std_no", "TEXT NOT NULL DEFAULT ''"),
+                ("ref_std_name", "TEXT NOT NULL DEFAULT ''"),
+                ("domain_name", "TEXT NOT NULL DEFAULT ''"),
+                ("domain_code", "TEXT NOT NULL DEFAULT ''"),
+                ("data_category", "TEXT NOT NULL DEFAULT ''"),
+                ("data_format", "TEXT NOT NULL DEFAULT ''"),
+                ("value_range", "TEXT NOT NULL DEFAULT ''"),
+                ("source_system", "TEXT NOT NULL DEFAULT ''"),
+                ("ddm_catalog", "TEXT NOT NULL DEFAULT ''"),
+                ("is_standard_dict", "TEXT NOT NULL DEFAULT ''"),
+                ("version_no", "TEXT NOT NULL DEFAULT ''"),
+                ("remark", "TEXT NOT NULL DEFAULT ''"),
+                ("type_dws", "TEXT NOT NULL DEFAULT ''"),
+                ("type_dw_mart", "TEXT NOT NULL DEFAULT ''"),
+                ("type_mysql", "TEXT NOT NULL DEFAULT ''"),
+                ("type_oracle", "TEXT NOT NULL DEFAULT ''"),
+                ("type_dameng", "TEXT NOT NULL DEFAULT ''"),
+                ("type_goldendb", "TEXT NOT NULL DEFAULT ''"),
+                ("type_ob_oracle", "TEXT NOT NULL DEFAULT ''"),
+                ("type_ob_mysql", "TEXT NOT NULL DEFAULT ''"),
+                ("type_argodb", "TEXT NOT NULL DEFAULT ''"),
+                ("type_oceanbase", "TEXT NOT NULL DEFAULT ''"),
+                ("extra_attrs_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "field_standard_bindings": [
+                ("std_code", "TEXT NOT NULL DEFAULT ''"),
+                ("bind_source", "TEXT NOT NULL DEFAULT 'MANUAL'"),
+                ("compliance_status", "TEXT NOT NULL DEFAULT 'UNCHECKED'"),
+                ("compliance_detail", "TEXT NOT NULL DEFAULT ''"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
             "llm_providers": [
                 ("provider_type", "TEXT NOT NULL DEFAULT 'OPENAI_COMPATIBLE'"),
@@ -1572,6 +1698,16 @@ class PlatformStateStore:
                     or std_col_name
                     or old_col_name
                 ).strip(quote_chars)
+                src_std_code = str(
+                    item.get("source_std_code")
+                    or (prev_c.get("source_std_code", "") if prev_c else "")
+                    or ""
+                ).strip()
+                tgt_std_code = str(
+                    item.get("target_std_code")
+                    or (prev_c.get("target_std_code", "") if prev_c else "")
+                    or ""
+                ).strip()
 
                 col_rows_to_insert.append(
                     (
@@ -1585,6 +1721,8 @@ class PlatformStateStore:
                         std_col_comment,
                         bound_src,
                         bound_tgt,
+                        src_std_code,
+                        tgt_std_code,
                         now,
                     )
                 )
@@ -1604,8 +1742,8 @@ class PlatformStateStore:
                     std_table_key, row_index,
                     orig_col_name, orig_col_type, orig_col_comment,
                     std_col_name, std_col_type, std_col_comment,
-                    bound_source_col, bound_target_col, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bound_source_col, bound_target_col, source_std_code, target_std_code, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 col_rows_to_insert,
             )
@@ -1772,6 +1910,10 @@ class PlatformStateStore:
                 std_col = str(item.get("std_col_name") or "").strip(quote_chars)
                 bound_src = str(item.get("bound_source_col") or "").strip(quote_chars)
                 bound_tgt = str(item.get("bound_target_col") or "").strip(quote_chars)
+                has_src_std = "source_std_code" in item
+                has_tgt_std = "target_std_code" in item
+                src_std_code = str(item.get("source_std_code") or "").strip()
+                tgt_std_code = str(item.get("target_std_code") or "").strip()
                 target_id = raw_id if raw_id > 0 else by_std_col.get(std_col.lower(), 0)
                 if target_id > 0:
                     conn.execute(
@@ -1779,10 +1921,21 @@ class PlatformStateStore:
                         UPDATE cross_column_bindings
                         SET bound_source_col = ?,
                             bound_target_col = ?,
+                            source_std_code = CASE WHEN ? THEN ? ELSE source_std_code END,
+                            target_std_code = CASE WHEN ? THEN ? ELSE target_std_code END,
                             updated_at = ?
                         WHERE id = ?
                         """,
-                        (bound_src, bound_tgt, now, target_id),
+                        (
+                            bound_src,
+                            bound_tgt,
+                            1 if has_src_std else 0,
+                            src_std_code,
+                            1 if has_tgt_std else 0,
+                            tgt_std_code,
+                            now,
+                            target_id,
+                        ),
                     )
                 elif std_col:
                     orig_col = str(item.get("orig_col_name") or std_col).strip(quote_chars)
@@ -1794,8 +1947,9 @@ class PlatformStateStore:
                             std_table_key, row_index,
                             orig_col_name, orig_col_type, orig_col_comment,
                             std_col_name, std_col_type, std_col_comment,
-                            bound_source_col, bound_target_col, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            bound_source_col, bound_target_col,
+                            source_std_code, target_std_code, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             t_key,
@@ -1808,6 +1962,8 @@ class PlatformStateStore:
                             std_comm,
                             bound_src,
                             bound_tgt,
+                            src_std_code,
+                            tgt_std_code,
                             now,
                         ),
                     )
@@ -1904,6 +2060,8 @@ class PlatformStateStore:
                         str(c.get("std_col_comment") or c.get("new_col_comment") or "").strip(),
                         str(c.get("bound_source_col") or orig_name or std_name).strip(quote_chars),
                         str(c.get("bound_target_col") or std_name or orig_name).strip(quote_chars),
+                        str(c.get("source_std_code") or "").strip(),
+                        str(c.get("target_std_code") or "").strip(),
                         now,
                     )
                 )
@@ -1923,8 +2081,9 @@ class PlatformStateStore:
                     std_table_key, row_index,
                     orig_col_name, orig_col_type, orig_col_comment,
                     std_col_name, std_col_type, std_col_comment,
-                    bound_source_col, bound_target_col, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bound_source_col, bound_target_col,
+                    source_std_code, target_std_code, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 c_rows,
             )

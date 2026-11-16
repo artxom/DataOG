@@ -41,23 +41,15 @@
       </div>
     </header>
 
-    <!-- macOS 桌面层：品牌徽记 + 四大独立模块超椭圆图标 -->
-    <main id="desktop-surface" class="desktop-surface" aria-label="Data.O.G 桌面">
-      <div class="desktop-center-stage">
-        <div class="desktop-brand-hero">
-          <div id="desktop-brand-emblem" class="desktop-brand-emblem" aria-hidden="true"></div>
-          <h1 class="desktop-brand-title">Data.O.G</h1>
-        </div>
-
-        <nav id="desktop-icon-grid" class="desktop-icon-grid" aria-label="桌面应用模块"></nav>
-      </div>
-    </main>
+    <!-- 纯净 macOS 桌面壁纸画布 -->
+    <main id="desktop-surface" class="desktop-surface" aria-label="Data.O.G 桌面"></main>
 
     <!-- 活动模块窗口挂载层 -->
     <section id="window-host" class="window-host" hidden aria-live="polite"></section>
 
-    <!-- 屏幕右下角毛玻璃最小化小抽屉（保留挂起工作状态，点击即刻恢复） -->
-    <aside id="minimized-drawer" class="corner-drawer" hidden aria-label="已最小化的工作窗口"></aside>
+    <!-- 最大化全屏态底部贴边唤出热区与原生 macOS 毛玻璃 Dock 栏 -->
+    <div id="dock-hover-zone" class="dock-hover-zone" aria-hidden="true"></div>
+    <nav id="os-dock" class="os-dock" aria-label="应用程序坞"></nav>
   </div>
 
   <!-- Spotlight 全局秒级元数据检索 (<dialog>) -->

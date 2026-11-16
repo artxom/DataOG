@@ -79,3 +79,48 @@ class LLMProviderPayload(BaseModel):
     models: Optional[List[str]] = None
     is_default: Optional[bool] = None
 
+
+class StandardDictItemPayload(BaseModel):
+    std_code: str = Field(..., min_length=1, max_length=128)
+    reg_category: str = ""
+    cat_l1: str = ""
+    cat_l2: str = ""
+    cat_l3: str = ""
+    cn_name: str = Field(..., min_length=1, max_length=256)
+    cn_alias: str = ""
+    en_name: str = ""
+    en_abbr: str = Field(..., min_length=1, max_length=256)
+    biz_definition: str = ""
+    scope_desc: str = ""
+    biz_rule: str = ""
+    max_length: str = ""
+    min_scale: str = ""
+    ref_code_no: str = ""
+    ref_code_name: str = ""
+    ref_code_detail: str = ""
+    security_level: str = ""
+    ref_std_no: str = ""
+    ref_std_name: str = ""
+    domain_name: str = ""
+    domain_code: str = ""
+    data_category: str = ""
+    data_format: str = ""
+    value_range: str = ""
+    source_system: str = ""
+    ddm_catalog: str = ""
+    is_standard_dict: str = "1"
+    version_no: str = "1"
+    remark: str = ""
+    type_dws: str = ""
+    type_dw_mart: str = ""
+    type_mysql: str = ""
+    type_oracle: str = ""
+    type_dameng: str = ""
+    type_goldendb: str = ""
+    type_ob_oracle: str = ""
+    type_ob_mysql: str = ""
+    type_argodb: str = ""
+    type_oceanbase: str = ""
+    extra_attrs: Dict[str, Any] = Field(default_factory=dict)
+
+

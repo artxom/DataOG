@@ -1,18 +1,35 @@
 /**
  * Data.O.G 桌面模块 3：数据标准 (StandardView)
- * 窗口顶栏通过 macOS 分段控制器整合「贯标」与「比对」双模式
+ * 窗口顶栏通过 macOS 分段控制器整合三步递进闭环：
+ * 1. 标准字典 -> 2. 落标绑定与贯标 -> 3. 跨环境比对
  */
 
 import { clearEl, el } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { CrossComparatorView } from "./cross_comparator_view.js";
+import { StandardDictView } from "./standard_dict_view.js";
 import { StandardMigratorView } from "./standard_migrator_view.js";
+
+const MODE_LABELS = {
+  dictionary: "1. 标准字典",
+  migrator: "2. 落标绑定与贯标",
+  comparator: "3. 跨环境比对",
+};
 
 export class StandardView {
   constructor() {
-    this.mode = "migrator"; // migrator | comparator
+    this.mode = "dictionary"; // dictionary | migrator | comparator
     this.refreshHeader = null;
 
+    this.dictPane = new StandardDictView({
+      onStateUpdate: () => this.refreshHeader?.(),
+      onGoStep2: async () => {
+        this.mode = "migrator";
+        this.render();
+        this.refreshHeader?.();
+        await this.migratorPane.ensureLoaded();
+      },
+    });
     this.migratorPane = new StandardMigratorView({
       onStateUpdate: () => this.refreshHeader?.(),
     });
@@ -20,6 +37,7 @@ export class StandardView {
       onStateUpdate: () => this.refreshHeader?.(),
       onPushToMigrator: async () => {
         this.mode = "migrator";
+        this.migratorPane.subMode = "queue";
         this.render();
         this.refreshHeader?.();
         await this.migratorPane.reloadState();
@@ -31,17 +49,20 @@ export class StandardView {
     });
   }
 
-  destroy() {}
+  destroy() {
+    this.migratorPane?.destroy?.();
+  }
 
   getHeaderParts() {
-    store.setAppSummary("standard", this.mode === "migrator" ? "贯标" : "比对");
+    store.setAppSummary("standard", MODE_LABELS[this.mode] || "数据标准");
 
     const center = el(
       "div",
       { className: "seg-group" },
       [
-        { id: "migrator", label: "贯标" },
-        { id: "comparator", label: "比对" },
+        { id: "dictionary", label: "1. 标准字典" },
+        { id: "migrator", label: "2. 落标绑定与贯标" },
+        { id: "comparator", label: "3. 跨环境比对" },
       ].map((tab) =>
         el("button", {
           type: "button",
@@ -51,7 +72,8 @@ export class StandardView {
             this.mode = tab.id;
             this.render();
             this.refreshHeader?.();
-            if (this.mode === "migrator") await this.migratorPane.ensureLoaded();
+            if (this.mode === "dictionary") await this.dictPane.ensureLoaded();
+            else if (this.mode === "migrator") await this.migratorPane.ensureLoaded();
             else await this.comparatorPane.ensureLoaded();
           },
         })
@@ -59,7 +81,9 @@ export class StandardView {
     );
 
     const right =
-      this.mode === "migrator"
+      this.mode === "dictionary"
+        ? this.dictPane.renderHeaderActions()
+        : this.mode === "migrator"
         ? this.migratorPane.renderHeaderActions()
         : this.comparatorPane.renderHeaderActions();
 
@@ -68,10 +92,10 @@ export class StandardView {
 
   async mount(container, context = null, refreshHeader = null) {
     this.refreshHeader = refreshHeader;
-    if (context?.mode === "comparator") {
-      this.mode = "comparator";
-    } else if (context?.mode === "migrator") {
-      this.mode = "migrator";
+    if (context?.mode && ["dictionary", "migrator", "comparator"].includes(context.mode)) {
+      this.mode = context.mode;
+    } else if (!context?.mode && (store.state.standardDictSummary?.total_count || 0) === 0) {
+      this.mode = "dictionary";
     }
     if (context?.tableKey) {
       this.comparatorPane.activeTableKey = context.tableKey;
@@ -81,7 +105,9 @@ export class StandardView {
     this.render();
     this.refreshHeader?.();
 
-    if (this.mode === "migrator") {
+    if (this.mode === "dictionary") {
+      await this.dictPane.ensureLoaded();
+    } else if (this.mode === "migrator") {
       await this.migratorPane.ensureLoaded();
     } else {
       await this.comparatorPane.ensureLoaded();
@@ -89,7 +115,10 @@ export class StandardView {
   }
 
   render() {
-    if (this.mode === "migrator") {
+    if (this.mode === "dictionary") {
+      this.dictPane.render();
+      clearEl(this.root, this.dictPane.root);
+    } else if (this.mode === "migrator") {
       this.migratorPane.render();
       clearEl(this.root, this.migratorPane.root);
     } else {
