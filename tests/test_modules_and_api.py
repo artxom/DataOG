@@ -1337,6 +1337,336 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertTrue(r_push["ok"])
             self.assertEqual(r_push["pushed_count"], 3)
 
+    def test_upload_bindings_progress_tracking_na_empty_and_formula_evaluation(self) -> None:
+        """端到端验证：上传对照关系实时进度轮询、Excel 公式取最终结果、#N/A 自动识别为空及历史脏绑定自愈."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_sqlite = os.path.join(tmpdir, "biz_target.sqlite")
+            with contextlib.closing(sqlite3.connect(db_sqlite)) as conn:
+                conn.executescript(
+                    """
+                    CREATE TABLE dwd_party_acct (
+                        cust_id VARCHAR(32),
+                        open_dt DATE,
+                        txn_amt DECIMAL(18,2),
+                        unmapped_memo VARCHAR(100),
+                        legacy_na_col VARCHAR(50)
+                    );
+                    """
+                )
+
+            ctx = PlatformContext(
+                db_path=os.path.join(tmpdir, "dataog_state.db"),
+                drivers_dir=os.path.join(tmpdir, "drivers"),
+                assets_dir=os.path.join(tmpdir, "assets"),
+            )
+            app = create_app(ctx=ctx)
+            client = TestClient(app)
+
+            cid = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "业务目标库",
+                    "driver_track": "NATIVE",
+                    "db_type": "SQLITE",
+                    "sqlite_path": db_sqlite,
+                    "auto_refresh_metadata": True,
+                },
+            ).json()["connection"]["connection_id"]
+
+            # 1. 导入系统标准字典模板，并校验服务端进度查询接口
+            dict_bytes = client.get("/api/platform/standards/template.xlsx").content
+            r_dict = client.post(
+                "/api/platform/standards/upload",
+                files={"file": ("dict.xlsx", dict_bytes, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"mode": "upsert", "progress_id": "imp_std_dict_001"},
+            ).json()
+            self.assertTrue(r_dict["ok"])
+            prog_dict = client.get("/api/platform/import-progress/imp_std_dict_001").json()
+            self.assertTrue(prog_dict["found"])
+            self.assertEqual(prog_dict["progress"]["status"], "completed")
+            self.assertEqual(prog_dict["progress"]["percent"], 100.0)
+
+            # 模拟旧版历史残留：手动在库内注入一条 std_code='#N/A' 的脏绑定记录，验证重新上传 merge 时自动自愈清除
+            with ctx.store.module_db() as sconn:
+                sconn.execute(
+                    """
+                    INSERT INTO field_standard_bindings (
+                        connection_id, schema_name, table_name, column_name, col_key,
+                        std_code, bind_source, compliance_status, compliance_detail, updated_at
+                    ) VALUES (?, 'main', 'dwd_party_acct', 'legacy_na_col', 'main::dwd_party_acct::legacy_na_col',
+                              '#N/A', 'EXCEL', 'STD_MISSING', '旧版脏数据', '2026-01-01 00:00:00')
+                    """,
+                    (cid,),
+                )
+
+            # 2. 构造真实业务场景的「多 Sheet 公式 + 合并单元格 + #N/A」对照关系工作簿：
+            #    Sheet1: 字段与数据标准对照（含 INDEX+MATCH、_xlfn.XLOOKUP、VLOOKUP 返回 #N/A、编号 #N/A 回退英文简称匹配）
+            #    Sheet2: 数据字典（模拟银行大表同工作簿挂字典反查场景）
+            wb_bind = openpyxl.Workbook()
+            ws_b = wb_bind.active
+            ws_b.title = "字段与数据标准对照"
+            ws_b.append(["模式名", "表名", "物理字段名", "数据项编号", "标准英文简称(选填)", "标准中文名称(选填)"])
+            ws_b.append(
+                [
+                    "main",
+                    "dwd_party_acct",
+                    "cust_id",
+                    "=INDEX('数据字典'!A:A, MATCH(UPPER(C2), '数据字典'!C:C, 0))",
+                    "=VLOOKUP(D2, '数据字典'!$A$2:$C$10, 3, FALSE)",
+                    "#N/A",
+                ]
+            )
+            ws_b.append(
+                [
+                    None,  # 合并单元格向下填充
+                    None,
+                    "open_dt",
+                    "#N/A",  # 编号为 #N/A，但提供了标准英文简称 OPEN_DT，应识别 #N/A 为空并自动按 OPEN_DT 匹配 ACCT000205
+                    "OPEN_DT",
+                    "#VALUE!",
+                ]
+            )
+            ws_b.append(
+                [
+                    None,
+                    None,
+                    "txn_amt",
+                    "=_xlfn.XLOOKUP(UPPER(C4), '数据字典'!C:C, '数据字典'!A:A)",
+                    "#N/A",
+                    "#N/A",
+                ]
+            )
+            ws_b.append(
+                [
+                    None,
+                    None,
+                    "unmapped_memo",
+                    "=VLOOKUP(C5, '数据字典'!C:A, 1, 0)",  # 查找不到返回 #N/A -> 应按未绑标跳过
+                    "#N/A",
+                    "#REF!",
+                ]
+            )
+            ws_b.append(
+                [
+                    None,
+                    None,
+                    "legacy_na_col",
+                    "  #N/A  ",  # 仍为 #N/A -> 历史脏绑定也应已被清除，呈现 UNBOUND
+                    "",
+                    "",
+                ]
+            )
+            ws_b.merge_cells("A2:A6")
+            ws_b.merge_cells("B2:B6")
+
+            ws_ref = wb_bind.create_sheet("数据字典")
+            ws_ref.append(["数据项编号", "中文名称", "英文简称"])
+            ws_ref.append(["CUST000101", "客户统一编号", "CUST_ID"])
+            ws_ref.append(["ACCT000205", "账户开户日期", "OPEN_DT"])
+            ws_ref.append(["TXN000309", "交易发生金额", "TXN_AMT"])
+
+            buf_b = io.BytesIO()
+            wb_bind.save(buf_b)
+
+            r_up = client.post(
+                "/api/modules/standard_migrator/bindings/upload",
+                files={"file": ("formula_binds.xlsx", buf_b.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={
+                    "connection_id": cid,
+                    "mode": "merge",
+                    "format_profile": "type_mysql",
+                    "progress_id": "imp_bind_002",
+                },
+            ).json()
+            self.assertTrue(r_up["ok"], f"上传失败: {r_up}")
+            self.assertEqual(r_up["imported_count"], 3)
+            self.assertEqual(r_up["unresolved_count"], 2)
+
+            prog_bind = client.get("/api/platform/import-progress/imp_bind_002").json()
+            self.assertTrue(prog_bind["found"])
+            self.assertEqual(prog_bind["progress"]["status"], "completed")
+            self.assertEqual(prog_bind["progress"]["percent"], 100.0)
+            self.assertEqual(prog_bind["progress"]["processed"], 3)
+
+            cols = {c["column_name"]: c for c in r_up["active_table"]["columns"]}
+            self.assertEqual(cols["cust_id"]["std_code"], "CUST000101")
+            self.assertEqual(cols["open_dt"]["std_code"], "ACCT000205")
+            self.assertEqual(cols["txn_amt"]["std_code"], "TXN000309")
+            # 两个 #N/A 字段必须为 UNBOUND（未绑标），绝不能变成 STD_MISSING（标准缺失 [#N/A]）
+            self.assertEqual(cols["unmapped_memo"]["std_code"], "")
+            self.assertEqual(cols["unmapped_memo"]["compliance_status"], "UNBOUND")
+            self.assertEqual(cols["legacy_na_col"]["std_code"], "")
+            self.assertEqual(cols["legacy_na_col"]["compliance_status"], "UNBOUND")
+
+            # 3. 验证全表均为 #N/A 时返回清晰错误提示且进度状态置为 failed
+            wb_all_na = openpyxl.Workbook()
+            ws_na = wb_all_na.active
+            ws_na.append(["模式名", "表名", "物理字段名", "数据项编号"])
+            ws_na.append(["main", "dwd_party_acct", "unmapped_memo", "#N/A"])
+            buf_na = io.BytesIO()
+            wb_all_na.save(buf_na)
+            r_fail = client.post(
+                "/api/modules/standard_migrator/bindings/upload",
+                files={"file": ("all_na.xlsx", buf_na.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"connection_id": cid, "mode": "merge", "progress_id": "imp_fail_003"},
+            )
+            self.assertEqual(r_fail.status_code, 400)
+            self.assertIn("#N/A", r_fail.json()["error"])
+            prog_fail = client.get("/api/platform/import-progress/imp_fail_003").json()
+            self.assertEqual(prog_fail["progress"]["status"], "failed")
+
+            # 4. 验证第 3 步跨环境铺底上传同样支持公式最终结果与 #N/A 置空
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "source", "connection_id": cid})
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "target", "connection_id": cid})
+            wb_pair = openpyxl.Workbook()
+            ws_p = wb_pair.active
+            ws_p.append(["来源模式名", "来源表名", "来源字段名", "来源数据项编号", "目标模式名", "目标表名", "目标字段名", "目标数据项编号"])
+            ws_p.append(["main", "dwd_party_acct", "cust_id", '=UPPER("cust000101")', "main", "dwd_party_acct", "cust_id", "=D2"])
+            ws_p.append(["main", "dwd_party_acct", "unmapped_memo", "#N/A", "main", "dwd_party_acct", "#N/A", "#N/A"])
+            buf_p = io.BytesIO()
+            wb_pair.save(buf_p)
+            r_pair = client.post(
+                "/api/modules/cross_comparator/pairings/upload",
+                files={"file": ("pair_formula.xlsx", buf_p.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"format_profile": "type_mysql", "progress_id": "imp_pair_004"},
+            ).json()
+            self.assertTrue(r_pair["ok"])
+            self.assertEqual(r_pair["imported_count"], 2)
+            p_rows = {
+                (r["source_col"]["column_name"] if r["source_col"] else ""): r
+                for r in r_pair["active_comparison"]["dual_rows"]
+            }
+            self.assertEqual(p_rows["cust_id"]["source_std_code"], "CUST000101")
+            self.assertEqual(p_rows["cust_id"]["target_std_code"], "CUST000101")
+            self.assertEqual(p_rows["unmapped_memo"]["source_std_code"], "")
+            self.assertIsNone(p_rows["unmapped_memo"]["target_col"])
+
+            # 5. 验证目标数据库离线/未缓存探查异常熔断保护：对照绑定依然成功入库并返回 warning 而非卡死报错
+            offline_cid = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "离线模拟库",
+                    "driver_track": "NATIVE",
+                    "db_type": "PGSQL",
+                    "host": "127.0.0.1",
+                    "port": 1,
+                    "dbname": "unreachable_db",
+                    "user": "u",
+                    "password": "p",
+                    "auto_refresh_metadata": False,
+                },
+            ).json()["connection"]["connection_id"]
+            wb_off = openpyxl.Workbook()
+            ws_off = wb_off.active
+            ws_off.append(["模式名", "表名", "物理字段名", "数据项编号"])
+            ws_off.append(["public", "t_off_1", "cust_id", "CUST000101"])
+            ws_off.append(["public", "t_off_2", "open_dt", "ACCT000205"])
+            buf_off = io.BytesIO()
+            wb_off.save(buf_off)
+            r_off = client.post(
+                "/api/modules/standard_migrator/bindings/upload",
+                files={"file": ("off.xlsx", buf_off.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"connection_id": offline_cid, "mode": "merge"},
+            ).json()
+            self.assertTrue(r_off["ok"])
+            self.assertEqual(r_off["imported_count"], 2)
+            self.assertIn("warning", r_off)
+            saved_off = ctx.standard_catalog.get_table_field_bindings(offline_cid, "public", "t_off_1")
+            self.assertEqual(saved_off["cust_id"]["std_code"], "CUST000101")
+
+            # 6. 回归验证：
+            #    a) 当数据项编号与英文简称均为 #N/A、仅填了不存在的标准中文名称时，绝不因物理列名同名而误绑其他标准；
+            #    b) 跨环境比对历史残留的全角/引号 #N/A 脏记录自动自愈置空，不误报「字典缺失」。
+            wb_guard = openpyxl.Workbook()
+            ws_g = wb_guard.active
+            ws_g.append(["模式名", "表名", "物理字段名", "数据项编号", "标准英文简称(选填)", "标准中文名称(选填)"])
+            ws_g.append(["main", "dwd_party_acct", "open_dt", "ACCT000205", "#N/A", "#N/A"])
+            ws_g.append(["main", "dwd_party_acct", "cust_id", "#N/A", "#N/A", "不存在的虚构标准中文名"])
+            buf_g = io.BytesIO()
+            wb_guard.save(buf_g)
+            r_guard = client.post(
+                "/api/modules/standard_migrator/bindings/upload",
+                files={"file": ("guard.xlsx", buf_g.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"connection_id": cid, "mode": "replace_table"},
+            ).json()
+            self.assertTrue(r_guard["ok"])
+            self.assertEqual(r_guard["imported_count"], 1)
+            self.assertEqual(r_guard["unresolved_count"], 1)
+            g_cols = {c["column_name"]: c for c in r_guard["active_table"]["columns"]}
+            self.assertEqual(g_cols["cust_id"]["std_code"], "")
+            self.assertEqual(g_cols["cust_id"]["compliance_status"], "UNBOUND")
+            self.assertEqual(g_cols["open_dt"]["std_code"], "ACCT000205")
+
+            # 注入跨环境全角/引号 #N/A 脏数据并验证读取与自愈清洗
+            with ctx.store.module_db() as sconn:
+                sconn.execute(
+                    "UPDATE cross_column_bindings SET source_std_code = '＃Ｎ／Ａ', target_std_code = '''#N/A' WHERE std_table_key = 'dwd_party_acct'"
+                )
+            ov_clean = client.get("/api/modules/cross_comparator/overview?table_key=dwd_party_acct").json()
+            for dr in ov_clean["active_comparison"]["dual_rows"]:
+                self.assertNotIn("#", dr["source_std_code"])
+                self.assertNotIn("＃", dr["source_std_code"])
+                self.assertNotIn("#", dr["target_std_code"])
+
+            # 7. 验证小批量（<400 行）工作簿在标准字典解析与跨环境标准上传中均上报首行与中间阶段进度，且错误路径同步标记进度失败
+            dict_stages: List[Tuple[float, str]] = []
+            ctx.standard_catalog.import_dictionary_excel(
+                "small_dict.xlsx",
+                dict_bytes,
+                mode="upsert",
+                progress_cb=lambda pct, stg, _dtl, _proc, _tot: dict_stages.append((pct, stg)),
+            )
+            dict_stage_names = [s for _, s in dict_stages]
+            self.assertIn("解析数据标准条目", dict_stage_names)
+            self.assertEqual(dict_stages, sorted(dict_stages, key=lambda x: x[0]))
+
+            wb_cross_std = openpyxl.Workbook()
+            ws_cs = wb_cross_std.active
+            ws_cs.title = "贯标清单"
+            ws_cs.append(["模式名", "表名", "修改前字段名", "修改前类型", "修改前注释", "修改后字段名", "修改后类型", "修改后注释"])
+            ws_cs.append(["main", "dwd_party_acct", "cust_id", "varchar(32)", "#N/A", '=LOWER("CUST_ID")', "VARCHAR(32)", "客户统一编号"])
+            ws_cs.append(["main", "dwd_party_acct", "open_dt", "date", "开户日", "open_dt", "DATE", "#N/A"])
+            buf_cs = io.BytesIO()
+            wb_cross_std.save(buf_cs)
+
+            cross_stages: List[Tuple[float, str]] = []
+            from modules.cross_comparator.service import CrossComparatorService
+
+            CrossComparatorService(ctx).import_standard_or_bundle(
+                "small_cross_std.xlsx",
+                buf_cs.getvalue(),
+                progress_cb=lambda pct, stg, _dtl, _proc, _tot: cross_stages.append((pct, stg)),
+            )
+            cross_stage_names = [s for _, s in cross_stages]
+            self.assertIn("解析跨环境标准清单与公式结果", cross_stage_names)
+            self.assertIn("保存标准清单", cross_stage_names)
+
+            exported_cross_xlsx = client.get("/api/modules/cross_comparator/bindings/export.xlsx").content
+            bundle_stages: List[Tuple[float, str]] = []
+            CrossComparatorService(ctx).import_standard_or_bundle(
+                "exported_bundle.xlsx",
+                exported_cross_xlsx,
+                progress_cb=lambda pct, stg, _dtl, _proc, _tot: bundle_stages.append((pct, stg)),
+            )
+            bundle_stage_names = [s for _, s in bundle_stages]
+            self.assertIn("解析跨环境标准映射", bundle_stage_names)
+
+            wb_all_na = openpyxl.Workbook()
+            ws_na = wb_all_na.active
+            ws_na.append(["模式名", "表名", "物理字段名", "数据项编号"])
+            ws_na.append(["main", "dwd_party_acct", "cust_id", "#N/A"])
+            buf_na = io.BytesIO()
+            wb_all_na.save(buf_na)
+            r_all_na = client.post(
+                "/api/modules/standard_migrator/bindings/upload",
+                files={"file": ("all_na.xlsx", buf_na.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+                data={"connection_id": cid, "mode": "merge", "progress_id": "imp_fail_all_na"},
+            ).json()
+            self.assertFalse(r_all_na["ok"])
+            prog_fail = client.get("/api/platform/import-progress/imp_fail_all_na").json()
+            self.assertTrue(prog_fail["found"])
+            self.assertEqual(prog_fail["progress"]["status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

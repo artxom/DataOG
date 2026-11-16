@@ -1054,6 +1054,379 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             exp_parsed = cat.parse_standard_dictionary_excel("exp.xlsx", exp_bytes)
             self.assertEqual({x["std_code"] for x in exp_parsed}, {"XTPO105525_V2", "RDAM000426"})
 
+    def test_excel_formula_resolution_na_cleaning_and_import_progress_hub(self) -> None:
+        """验证 Excel 公式最终结果优先（含缓存与未缓存求值）、#N/A 全量错误值识别置空与 ImportProgressHub."""
+        from core.excel_formula import (
+            ResolvedWorkbook,
+            clean_excel_cell_str,
+            is_excel_error_value,
+        )
+        from core.platform.import_progress import ImportProgressHub
+        from core.platform.standard_catalog import BOHAI_DICT_HEADERS
+
+        # 1. 全谱系 Excel 错误值与空占位符清洗
+        for err_tok in (
+            "#N/A",
+            "#n/a",
+            "  #N/A  ",
+            "'#N/A",
+            "＃Ｎ／Ａ",
+            "#NA",
+            "#N/A!",
+            "#VALUE!",
+            "#REF!",
+            "#DIV/0!",
+            "#NUM!",
+            "#NAME?",
+            "#NULL!",
+            "#SPILL!",
+            "#CALC!",
+            "#GETTING_DATA",
+        ):
+            self.assertTrue(is_excel_error_value(err_tok), f"未识别错误标记: {err_tok!r}")
+            self.assertEqual(clean_excel_cell_str(err_tok), "")
+            self.assertEqual(clean_excel_cell_str(err_tok, treat_placeholder_empty=True), "")
+
+        self.assertEqual(clean_excel_cell_str(100101.0), "100101")
+        self.assertEqual(clean_excel_cell_str(float("nan")), "")
+        self.assertEqual(clean_excel_cell_str("0"), "0")
+        self.assertEqual(clean_excel_cell_str("=1:有效"), "=1:有效")
+        self.assertEqual(clean_excel_cell_str("/", treat_placeholder_empty=True), "")
+        self.assertEqual(clean_excel_cell_str("N/A", treat_placeholder_empty=True), "")
+        self.assertEqual(clean_excel_cell_str("/", treat_placeholder_empty=False), "/")
+
+        # 2. 验证 OOXML 既有缓存值 (<f>+<v>) 优先采用最终计算值，且 t="e" 的 #N/A 正确转为空
+        wb_base = openpyxl.Workbook()
+        buf_base = io.BytesIO()
+        wb_base.save(buf_base)
+        patched_buf = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(buf_base.getvalue()), "r") as zf_in, zipfile.ZipFile(
+            patched_buf, "w"
+        ) as zf_out:
+            for info in zf_in.infolist():
+                raw = zf_in.read(info.filename)
+                if info.filename == "xl/worksheets/sheet1.xml":
+                    raw = (
+                        '<?xml version="1.0" encoding="UTF-8"?>'
+                        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                        "<sheetData>"
+                        '<row r="1">'
+                        '<c r="A1" t="str"><f>CUSTOM_EXCEL_UDF(Z99)</f><v>CACHED_FINAL_CODE</v></c>'
+                        '<c r="B1" t="e"><f>VLOOKUP("x",D:E,2,0)</f><v>#N/A</v></c>'
+                        '<c r="C1" t="str"><f>IF(1=1,"","x")</f><v/></c>'
+                        "</row>"
+                        "</sheetData></worksheet>"
+                    ).encode("utf-8")
+                zf_out.writestr(info, raw)
+
+        with ResolvedWorkbook(patched_buf.getvalue()) as rwb_cached:
+            row0 = list(rwb_cached.iter_sheet_rows(rwb_cached.sheetnames[0]))[0]
+            self.assertEqual(clean_excel_cell_str(row0[0]), "CACHED_FINAL_CODE")
+            self.assertEqual(clean_excel_cell_str(row0[1]), "")
+            self.assertEqual(clean_excel_cell_str(row0[2]), "")
+
+        # 3. 验证无缓存公式工作簿（VLOOKUP / INDEX+MATCH / _xlfn.XLOOKUP / IFERROR / @整列交集 / 循环引用保护）
+        wb_f = openpyxl.Workbook()
+        ws_dict = wb_f.active
+        ws_dict.title = "数据字典"
+        ws_dict.append(list(BOHAI_DICT_HEADERS))
+
+        row_valid = [""] * 46
+        row_valid[0] = '=CONCATENATE("STD", TEXT(101, "0000"))'  # -> STD0101
+        row_valid[1] = "#N/A"  # 监管分类为 #N/A 应置空
+        row_valid[5] = '=VLOOKUP("STD0101", 参数表!A:B, 2, FALSE())'  # -> 客户风险等级
+        row_valid[8] = '=UPPER(TRIM("  cust_risk_lvl  "))'  # -> CUST_RISK_LVL
+        row_valid[12] = "=16+16"  # 最大录入长度 -> 32
+        row_valid[23] = "VARCHAR2(32)"  # 第 24 列遗留 DWS 格式
+        row_valid[44] = '=VLOOKUP("NO_MATCH", 参数表!A:B, 2, 0)'  # 第 45 列为 #N/A -> 自动回退第 24 列 VARCHAR2(32)
+        row_valid[45] = '=IFERROR(1/0, "#N/A")'  # 备注为 #N/A -> 置空
+        ws_dict.append(row_valid)
+
+        # 编号本身求值为 #N/A 的无效行应被自动忽略跳过
+        row_na_code = [""] * 46
+        row_na_code[0] = '=VLOOKUP("MISSING", 参数表!A:B, 2, 0)'
+        row_na_code[5] = "无效行"
+        row_na_code[8] = "INVALID_COL"
+        ws_dict.append(row_na_code)
+
+        # 自引用循环公式保护（不崩溃且置空）
+        row_cycle = [""] * 46
+        row_cycle[0] = "STD0202"
+        row_cycle[5] = "循环测试标准"
+        row_cycle[8] = '=@I:I'  # 自引用循环 -> #REF! -> 置空后回退 en_name
+        row_cycle[7] = "CYCLE_SAFE_COL"
+        row_cycle[44] = '="VARCHAR(" & 64 & ")"'
+        ws_dict.append(row_cycle)
+
+        ws_ref = wb_f.create_sheet("参数表")
+        ws_ref.append(["键", "值"])
+        ws_ref.append(["STD0101", "客户风险等级"])
+
+        buf_f = io.BytesIO()
+        wb_f.save(buf_f)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(db_path=os.path.join(tmpdir, "dataog_state.db"))
+            hub = ImportProgressHub(max_entries=16, ttl_seconds=60.0)
+            pid = "imp_unit_dict_01"
+            hub.start(pid, "导入字典测试")
+            res = ctx.standard_catalog.import_dictionary_excel(
+                "formula_dict.xlsx",
+                buf_f.getvalue(),
+                mode="upsert",
+                progress_cb=hub.make_reporter(pid),
+            )
+            hub.finish(pid, detail="完成", processed=res["imported_count"], total=res["imported_count"])
+            snap = hub.get(pid)
+            self.assertIsNotNone(snap)
+            self.assertEqual(snap["status"], "completed")
+            self.assertEqual(snap["percent"], 100.0)
+            self.assertIsNone(hub.get("../bad_id"))
+
+            self.assertEqual(res["imported_count"], 2)
+            s1 = ctx.standard_catalog.get_item("STD0101")
+            self.assertIsNotNone(s1)
+            self.assertEqual(s1["reg_category"], "")
+            self.assertEqual(s1["cn_name"], "客户风险等级")
+            self.assertEqual(s1["en_abbr"], "CUST_RISK_LVL")
+            self.assertEqual(s1["max_length"], "32")
+            self.assertEqual(s1["type_dws"], "VARCHAR2(32)")
+            self.assertEqual(s1["remark"], "")
+
+            s2 = ctx.standard_catalog.get_item("STD0202")
+            self.assertIsNotNone(s2)
+            self.assertEqual(s2["en_abbr"], "CYCLE_SAFE_COL")
+            self.assertEqual(s2["type_dws"], "VARCHAR(64)")
+
+        # 4. 验证单库贯标改造清单 parse_excel_checklist 同样支持公式计算最终值且 #N/A 自动回退原字段
+        from core.excel_handler import parse_excel_checklist
+
+        wb_cl = openpyxl.Workbook()
+        ws_cl = wb_cl.active
+        ws_cl.append(["模式名", "表名", "修改前字段名", "修改前类型", "修改后字段名", "修改后类型", "修改后注释"])
+        ws_cl.append(
+            [
+                "public",
+                "dwd_loan",
+                "loan_no",
+                "varchar(32)",
+                '=UPPER("party_loan_id")',
+                '="VARCHAR(" & (32*2) & ")"',
+                "#N/A",
+            ]
+        )
+        ws_cl.append(
+            [
+                "public",
+                "dwd_loan",
+                "keep_col",
+                "date",
+                "#N/A",  # 修改后字段名为 #N/A 时应识别为空并自动回退 keep_col
+                "#N/A",
+                '=IF(1=1, "贷款起息日", "ERR")',
+            ]
+        )
+        buf_cl = io.BytesIO()
+        wb_cl.save(buf_cl)
+        cl_items = parse_excel_checklist(buf_cl.getvalue(), "cl_formula.xlsx")
+        self.assertEqual(len(cl_items), 2)
+        self.assertEqual(cl_items[0]["new_col_name"], "PARTY_LOAN_ID")
+        self.assertEqual(cl_items[0]["new_col_type"], "VARCHAR(64)")
+        self.assertEqual(cl_items[0]["new_col_comment"], "")
+        self.assertEqual(cl_items[1]["new_col_name"], "keep_col")
+        self.assertEqual(cl_items[1]["new_col_type"], "date")
+        self.assertEqual(cl_items[1]["new_col_comment"], "贷款起息日")
+
+        # 5. 回归验证：
+        #    a) OOXML 显式缓存空串 <c t="str"><f>...</f><v/></c> 绝不误判为未缓存，且外部工作簿 [1]Sheet1! 绝不误劫持当前同名 Sheet1；
+        #    b) 拖拽共享公式 <f t="shared" si="0" ref="C2:C4">、DataTableFormula 不泄漏对象 repr；
+        #    c) 名称管理器 <definedNames>、超级表 Table[列]/[@列] 与多条件数组 INDEX+MATCH(1,(A=x)*(B=y),0) 精准求值。
+        import xml.etree.ElementTree as ET
+        from openpyxl.workbook.defined_name import DefinedName
+        from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+        from openpyxl.worksheet.table import Table
+        from core.excel_formula import inspect_xlsx_formula_state
+
+        self.assertEqual(clean_excel_cell_str(DataTableFormula(ref="C3")), "")
+        self.assertEqual(clean_excel_cell_str(ArrayFormula(ref="C2:C3", text="")), "")
+
+        wb_ext = openpyxl.Workbook()
+        ws_ext = wb_ext.active
+        ws_ext.title = "Sheet1"
+        ws_ext.append(["表名", "字段名", "数据项编号"])
+        ws_ext.append(["cust_id", "cust_id", "placeholder"])
+        ws_ext.append(["unmapped_col", "cust_id", "placeholder"])
+        buf_ext_raw = io.BytesIO()
+        wb_ext.save(buf_ext_raw)
+
+        z_ext_out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(buf_ext_raw.getvalue()), "r") as zin, zipfile.ZipFile(
+            z_ext_out, "w"
+        ) as zout:
+            for zinfo in zin.infolist():
+                zdata = zin.read(zinfo.filename)
+                if zinfo.filename == "xl/worksheets/sheet1.xml":
+                    ET.register_namespace("", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+                    xroot = ET.fromstring(zdata)
+                    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+                    for c_el in xroot.iter(f"{ns}c"):
+                        r_coord = c_el.attrib.get("r")
+                        if r_coord == "C2":
+                            c_el.attrib["t"] = "str"
+                            for ch in list(c_el):
+                                c_el.remove(ch)
+                            ET.SubElement(c_el, f"{ns}f").text = 'IFNA(VLOOKUP(B2,[1]Sheet1!$A:$B,2,0),"")'
+                            ET.SubElement(c_el, f"{ns}v").text = "STD_CACHED_EXT"
+                        elif r_coord == "C3":
+                            c_el.attrib["t"] = "str"
+                            for ch in list(c_el):
+                                c_el.remove(ch)
+                            ET.SubElement(c_el, f"{ns}f").text = 'IFNA(VLOOKUP(B3,[1]Sheet1!$A:$B,2,0),"")'
+                            ET.SubElement(c_el, f"{ns}v").text = ""
+                    zdata = ET.tostring(xroot, encoding="utf-8", xml_declaration=True)
+                zout.writestr(zinfo, zdata)
+
+        ext_xlsx_bytes = z_ext_out.getvalue()
+        has_uncached_flag, empty_map = inspect_xlsx_formula_state(ext_xlsx_bytes)
+        self.assertFalse(has_uncached_flag)
+        self.assertIn((3, 3), empty_map.get("Sheet1", set()))
+        with ResolvedWorkbook(ext_xlsx_bytes) as rwb_ext:
+            ext_rows = list(rwb_ext.iter_sheet_rows("Sheet1"))
+            self.assertEqual(ext_rows[1][2], "STD_CACHED_EXT")
+            self.assertEqual(ext_rows[2][2], "")
+
+        # 未缓存外部工作簿公式返回 #REF!（可被 IFERROR 捕获或置空，绝不劫持当前 Sheet1）
+        wb_unext = openpyxl.Workbook()
+        ws_u = wb_unext.active
+        ws_u.title = "Sheet1"
+        ws_u.append(["cust_id", "WRONG_LOCAL_VAL", "=VLOOKUP(A1,[1]Sheet1!$A:$B,2,0)", '=IFERROR(VLOOKUP(A1,[1]Sheet1!$A:$B,2,0),"SAFE_FB")'])
+        buf_unext = io.BytesIO()
+        wb_unext.save(buf_unext)
+        with ResolvedWorkbook(buf_unext.getvalue()) as rwb_u:
+            u_row = list(rwb_u.iter_sheet_rows("Sheet1"))[0]
+            self.assertEqual(clean_excel_cell_str(u_row[2]), "")
+            self.assertEqual(u_row[3], "SAFE_FB")
+
+        # 验证拖拽共享公式 + 名称管理器 + 超级表结构化引用 + 多条件 INDEX+MATCH
+        wb_adv = openpyxl.Workbook()
+        ws_map = wb_adv.active
+        ws_map.title = "对照"
+        ws_map.append(["字段", "中文", "命名区结果", "双条件编号", "超级表编号", "共享公式列"])
+        ws_map.append(
+            [
+                "amt",
+                "交易金额",
+                "=VLOOKUP(A2, DictNamedRange, 2, 0)",
+                "=INDEX(字典!$A$2:$A$4, MATCH(1, (字典!$B$2:$B$4=A2)*(字典!$C$2:$C$4=B2), 0))",
+                "=XLOOKUP([@字段], TblDict[英文], TblDict[编号])",
+                "placeholder",
+            ]
+        )
+        ws_map.append(["open_dt", "开户日期", "", "", "=VLOOKUP([@字段], TblDict, 1, 0)", "placeholder"])
+        ws_map.add_table(Table(displayName="TblMap", ref="A1:F3"))
+
+        ws_d2 = wb_adv.create_sheet("字典")
+        ws_d2.append(["编号", "英文", "中文"])
+        ws_d2.append(["STD_BAL", "amt", "账户余额"])
+        ws_d2.append(["STD_TXN", "amt", "交易金额"])
+        ws_d2.append(["STD_DT", "open_dt", "开户日期"])
+        ws_d2.add_table(Table(displayName="TblDict", ref="A1:C4"))
+        wb_adv.defined_names["DictNamedRange"] = DefinedName("DictNamedRange", attr_text="字典!$B$2:$C$4")
+
+        buf_adv_raw = io.BytesIO()
+        wb_adv.save(buf_adv_raw)
+        z_adv_out = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(buf_adv_raw.getvalue()), "r") as zin, zipfile.ZipFile(
+            z_adv_out, "w"
+        ) as zout:
+            for zinfo in zin.infolist():
+                zdata = zin.read(zinfo.filename)
+                if zinfo.filename == "xl/worksheets/sheet1.xml":
+                    ET.register_namespace("", "http://schemas.openxmlformats.org/spreadsheetml/2006/main")
+                    xroot = ET.fromstring(zdata)
+                    ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+                    for c_el in xroot.iter(f"{ns}c"):
+                        rc_str = c_el.attrib.get("r")
+                        if rc_str in ("F2", "F3"):
+                            c_el.attrib.pop("t", None)
+                            for ch in list(c_el):
+                                c_el.remove(ch)
+                            f_el = ET.SubElement(c_el, f"{ns}f", {"t": "shared", "si": "0"})
+                            if rc_str == "F2":
+                                f_el.attrib["ref"] = "F2:F3"
+                                f_el.text = "INDEX(字典!$A:$A, MATCH(A2, 字典!$B:$B, 0))"
+                    zdata = ET.tostring(xroot, encoding="utf-8", xml_declaration=True)
+                zout.writestr(zinfo, zdata)
+
+        with ResolvedWorkbook(z_adv_out.getvalue()) as rwb_adv:
+            adv_rows = list(rwb_adv.iter_sheet_rows("对照"))
+            self.assertEqual(adv_rows[1][2], "账户余额")
+            self.assertEqual(adv_rows[1][3], "STD_TXN")
+            self.assertEqual(adv_rows[1][4], "STD_BAL")
+            self.assertEqual(adv_rows[1][5], "STD_BAL")
+            self.assertEqual(adv_rows[2][5], "STD_DT")
+
+        # 验证第三方工具写入无前导 '/' 的 Target="xl/worksheets/..." / Target="xl/tables/..." 与反斜杠路径兼容，
+        # 以及先 probe 后全量读取时 <dimension> 总行数保留不退化
+        from core.excel_formula import _resolve_zip_rel_target
+
+        self.assertEqual(
+            _resolve_zip_rel_target("xl/workbook.xml", "xl/worksheets/sheet1.xml"),
+            "xl/worksheets/sheet1.xml",
+        )
+        self.assertEqual(
+            _resolve_zip_rel_target("xl/worksheets/sheet1.xml", "xl/tables/table1.xml"),
+            "xl/tables/table1.xml",
+        )
+        self.assertEqual(
+            _resolve_zip_rel_target("xl/workbook.xml", "worksheets\\sheet2.xml"),
+            "xl/worksheets/sheet2.xml",
+        )
+
+        z_norels_slash = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(z_adv_out.getvalue()), "r") as zin, zipfile.ZipFile(
+            z_norels_slash, "w"
+        ) as zout:
+            for zinfo in zin.infolist():
+                zdata = zin.read(zinfo.filename)
+                if zinfo.filename == "xl/_rels/workbook.xml.rels":
+                    zdata = (
+                        zdata.replace(b'Target="/xl/worksheets/sheet1.xml"', b'Target="xl/worksheets/sheet1.xml"')
+                        .replace(b'Target="worksheets/sheet1.xml"', b'Target="xl/worksheets/sheet1.xml"')
+                        .replace(b'Target="/xl/worksheets/sheet2.xml"', b'Target="xl\\worksheets\\sheet2.xml"')
+                        .replace(b'Target="worksheets/sheet2.xml"', b'Target="xl\\worksheets\\sheet2.xml"')
+                    )
+                elif zinfo.filename.startswith("xl/worksheets/_rels/") and zinfo.filename.endswith(".rels"):
+                    zdata = (
+                        zdata.replace(b'Target="../tables/', b'Target="xl/tables/')
+                        .replace(b'Target="/xl/tables/', b'Target="xl/tables/')
+                    )
+                zout.writestr(zinfo, zdata)
+
+        with ResolvedWorkbook(z_norels_slash.getvalue()) as rwb_ns:
+            ns_rows = list(rwb_ns.iter_sheet_rows("对照"))
+            self.assertEqual(ns_rows[1][3], "STD_TXN")
+            self.assertEqual(ns_rows[1][4], "STD_BAL")
+            self.assertEqual(ns_rows[2][5], "STD_DT")
+
+        wb_prog = openpyxl.Workbook()
+        ws_prog = wb_prog.active
+        ws_prog.title = "ProgSheet"
+        for i in range(1, 86):
+            ws_prog.append([f"col_{i}", i])
+        buf_prog = io.BytesIO()
+        wb_prog.save(buf_prog)
+        cb_records: List[Tuple[int, int]] = []
+        with ResolvedWorkbook(buf_prog.getvalue(), read_only_preferred=True) as rwb_p:
+            _ = list(rwb_p.iter_sheet_rows("ProgSheet", max_rows=10))
+            _ = rwb_p.extract_sheet_rows_with_merged(
+                "ProgSheet",
+                row_progress_cb=lambda d, t: cb_records.append((d, t)),
+            )
+        self.assertGreaterEqual(len(cb_records), 2)
+        self.assertEqual(cb_records[0], (1, 85))
+        self.assertEqual(cb_records[-1], (85, 85))
+
 
 if __name__ == "__main__":
     unittest.main()
