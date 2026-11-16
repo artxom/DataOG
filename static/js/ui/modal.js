@@ -69,6 +69,9 @@ function getDialogRefs() {
   return { dialog, titleEl, bodyEl, footerEl, closeBtn };
 }
 
+let modalSeq = 0;
+let activeModalSession = null;
+
 export const Modal = {
   setCloseLocked(locked) {
     const { dialog, closeBtn } = getDialogRefs();
@@ -94,17 +97,26 @@ export const Modal = {
     const { dialog, titleEl, bodyEl, footerEl } = getDialogRefs();
     if (!dialog || !titleEl || !bodyEl || !footerEl) return;
 
-    this.setCloseLocked(false);
-    if (dialog.open) {
-      dialog.close("");
+    if (activeModalSession) {
+      const prev = activeModalSession;
+      activeModalSession = null;
+      dialog.removeEventListener("close", prev.handleClose);
+      if (typeof prev.onClose === "function") {
+        prev.onClose(dialog.returnValue || "");
+      }
     }
+
+    this.setCloseLocked(false);
     dialog.returnValue = "";
     dialog.style.width = width || "";
     titleEl.textContent = String(title || "提示");
     clearEl(bodyEl, body instanceof Node ? body : el("p", { style: { margin: "0" }, text: String(body || "") }));
     clearEl(footerEl, footer);
 
+    const sessionId = ++modalSeq;
     const handleClose = () => {
+      if (dialog.open || activeModalSession?.id !== sessionId) return;
+      activeModalSession = null;
       this.setCloseLocked(false);
       const val = dialog.returnValue;
       dialog.returnValue = "";
@@ -113,9 +125,12 @@ export const Modal = {
         onClose(val);
       }
     };
+    activeModalSession = { id: sessionId, handleClose, onClose };
     dialog.addEventListener("close", handleClose);
 
-    dialog.showModal();
+    if (!dialog.open) {
+      dialog.showModal();
+    }
   },
 
   close(returnValue = "") {

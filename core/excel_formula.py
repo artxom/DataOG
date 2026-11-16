@@ -333,43 +333,84 @@ _TOKEN_MASTER_RE = re.compile(
     |(?P<ERR>\#(?:N/A!?|NA|VALUE!|REF!|DIV/0!|NUM!|NAME\?|NULL!|GETTING_DATA|SPILL!|CALC!|ERROR!))
     |(?P<QSHEET>'(?:''|[^'])+'!)
     |(?P<USHEET>(?:\[[^\]]+\])?[A-Za-z0-9_\u4e00-\u9fff.]+!)
+    |(?P<ROWREF>\$\d+)
     |(?P<NUM>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\.\d+)
-    |(?P<OP><=|>=|<>|[=<>+\-*/^&%@(),;:])
+    |(?P<OP><=|>=|<>|[=<>+\-*/^&%@(),;:{}])
     |(?P<IDENT>\$?[A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\u4e00-\u9fff$]*|\$[A-Za-z]{1,3})
     """,
     re.VERBOSE | re.IGNORECASE,
 )
 
 _COL_ONLY_RE = re.compile(r"^\$?([A-Za-z]{1,3})$")
+_ROW_R_ATTR_RE = re.compile(rb'<(?:\w+:)?row\b[^>]*\br=["\'](\d+)["\']')
+
+
+def _scan_balanced_brackets(expr: str, start_pos: int) -> Tuple[str, int]:
+    """扫描 Excel 结构化引用中的平衡方括号（如 `[英文]` 或 `[[#This Row],[字段名]]`）."""
+    depth = 0
+    i = start_pos
+    n = len(expr)
+    while i < n:
+        ch = expr[i]
+        if ch == "'":
+            # Excel 结构化引用中单引号转义特殊字符（如 ']）
+            i += 2
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return (expr[start_pos : i + 1], i + 1)
+        i += 1
+    raise ValueError("未闭合的结构化引用方括号")
 
 
 def _shift_shared_formula(master_expr: str, dr: int, dc: int) -> str:
-    """按共享公式偏移量 (dr, dc) 平移非绝对锁定的相对单元格与整列坐标."""
+    """按共享公式偏移量 (dr, dc) 平移非绝对锁定的相对单元格、整列与整行坐标（完整保护结构化表引用）."""
     if dr == 0 and dc == 0:
         return master_expr
     parts: List[str] = []
     pos = 0
     n = len(master_expr)
-    matches = list(_TOKEN_MASTER_RE.finditer(master_expr))
-    if not matches:
-        return master_expr
 
-    # 若存在结构化引用等非正则覆盖字符，采用逐段替换保护引号与工作表前缀
-    idx = 0
-    while idx < len(matches):
-        m = matches[idx]
-        if m.start() > pos:
-            parts.append(master_expr[pos : m.start()])
+    while pos < n:
+        if master_expr[pos] == "[":
+            try:
+                b_spec, b_end = _scan_balanced_brackets(master_expr, pos)
+                parts.append(b_spec)
+                pos = b_end
+                continue
+            except ValueError:
+                parts.append(master_expr[pos])
+                pos += 1
+                continue
+
+        m = _TOKEN_MASTER_RE.match(master_expr, pos)
+        if not m:
+            parts.append(master_expr[pos])
+            pos += 1
+            continue
+
         kind = m.lastgroup or ""
         val = m.group()
+        start_pos = m.start()
         pos = m.end()
 
+        if kind == "IDENT" and pos < n and master_expr[pos] == "[":
+            try:
+                b_spec, b_end = _scan_balanced_brackets(master_expr, pos)
+                parts.append(f"{val}{b_spec}")
+                pos = b_end
+                continue
+            except ValueError:
+                parts.append(val)
+                continue
+
         if kind == "IDENT":
-            # 检查后续非空标记是否为 '('（函数名不平移）或 '['（表名不平移）
             after = master_expr[pos:].lstrip()
             if after.startswith("(") or after.startswith("["):
                 parts.append(val)
-                idx += 1
                 continue
             mc = _SHIFT_COORD_RE.match(val)
             if mc:
@@ -381,10 +422,8 @@ def _shift_shared_formula(master_expr: str, dr: int, dc: int) -> str:
                 if not r_abs:
                     row_num = max(1, row_num + dr)
                 parts.append(f"{c_abs}{get_column_letter(col_num)}{r_abs}{row_num}")
-                idx += 1
                 continue
-            # 检查是否为整列引用如 A:B 中的列字母
-            prev_non_space = master_expr[: m.start()].rstrip()
+            prev_non_space = master_expr[:start_pos].rstrip()
             if after.startswith(":") or prev_non_space.endswith(":"):
                 mcol = _SHIFT_COL_RE.match(val)
                 if mcol:
@@ -393,24 +432,51 @@ def _shift_shared_formula(master_expr: str, dr: int, dc: int) -> str:
                     if not c_abs:
                         col_num = max(1, col_num + dc)
                     parts.append(f"{c_abs}{get_column_letter(col_num)}")
-                    idx += 1
                     continue
 
-        parts.append(val)
-        idx += 1
+        elif kind == "NUM" and val.isdigit() and dr != 0:
+            after = master_expr[pos:].lstrip()
+            prev_non_space = master_expr[:start_pos].rstrip()
+            if after.startswith(":") or prev_non_space.endswith(":"):
+                parts.append(str(max(1, int(val) + dr)))
+                continue
 
-    if pos < n:
-        parts.append(master_expr[pos:])
+        parts.append(val)
+
     return "".join(parts)
 
 
+def _estimate_xml_sheet_max_row(raw: bytes) -> int:
+    """从工作表 XML 尾部毫秒级提取真实最大行号（兼容 EasyExcel / POI SXSSF 写死 <dimension ref='A1:A1'/> 及 write_only 无 r 属性）."""
+    if not raw:
+        return 0
+    tail = raw[-65536:] if len(raw) > 65536 else raw
+    last_r = 0
+    for m in _ROW_R_ATTR_RE.finditer(tail):
+        last_r = max(last_r, int(m.group(1)))
+    if last_r > 0:
+        return last_r
+    if len(raw) > 65536:
+        for m in _ROW_R_ATTR_RE.finditer(raw):
+            last_r = max(last_r, int(m.group(1)))
+        if last_r > 0:
+            return last_r
+    return (
+        raw.count(b"<row>")
+        + raw.count(b"<row ")
+        + raw.count(b":row>")
+        + raw.count(b":row ")
+    )
+
+
 class _WorkbookPackageScan:
-    """单次 ZIP 扫描结果：记录是否含未缓存公式、显式空串坐标、稀疏公式表、命名区域与超级表."""
+    """单次 ZIP 扫描结果：记录是否含未缓存公式、显式空串坐标、稀疏公式表、真实行数、命名区域与超级表."""
 
     __slots__ = (
         "has_uncached",
         "cached_empty_by_title",
         "formulas_by_title",
+        "sheet_row_counts",
         "defined_names",
         "tables_meta",
         "normalized_content",
@@ -422,6 +488,7 @@ class _WorkbookPackageScan:
         has_uncached: bool = False,
         cached_empty_by_title: Optional[Dict[str, Set[Tuple[int, int]]]] = None,
         formulas_by_title: Optional[Dict[str, Dict[Tuple[int, int], str]]] = None,
+        sheet_row_counts: Optional[Dict[str, int]] = None,
         defined_names: Optional[Dict[Tuple[Optional[str], str], str]] = None,
         tables_meta: Optional[Dict[str, Dict[str, Any]]] = None,
         normalized_content: Optional[bytes] = None,
@@ -429,6 +496,7 @@ class _WorkbookPackageScan:
         self.has_uncached = has_uncached
         self.cached_empty_by_title = cached_empty_by_title or {}
         self.formulas_by_title = formulas_by_title or {}
+        self.sheet_row_counts = sheet_row_counts or {}
         self.defined_names = defined_names or {}
         self.tables_meta = tables_meta or {}
         self.normalized_content = normalized_content
@@ -495,6 +563,7 @@ def _scan_xlsx_package(content: bytes) -> _WorkbookPackageScan:
     has_uncached = False
     cached_empty_by_title: Dict[str, Set[Tuple[int, int]]] = {}
     formulas_by_title: Dict[str, Dict[Tuple[int, int], str]] = {}
+    sheet_row_counts: Dict[str, int] = {}
 
     try:
         with zipfile.ZipFile(io.BytesIO(content), "r") as zf:
@@ -508,15 +577,6 @@ def _scan_xlsx_package(content: bytes) -> _WorkbookPackageScan:
                     or name in xml_to_title
                 ):
                     continue
-                raw = zf.read(name)
-                if (
-                    b"<f>" not in raw
-                    and b"<f " not in raw
-                    and b":f>" not in raw
-                    and b":f " not in raw
-                ):
-                    continue
-
                 sh_title = xml_to_title.get(name, "")
                 if not sh_title:
                     m_idx = re.search(r"sheet(\d+)\.xml$", lower)
@@ -526,6 +586,19 @@ def _scan_xlsx_package(content: bytes) -> _WorkbookPackageScan:
                             sh_title = ordered_titles[i1 - 1]
                     if not sh_title:
                         sh_title = name
+
+                raw = zf.read(name)
+                est_rows = _estimate_xml_sheet_max_row(raw)
+                if est_rows > 0:
+                    sheet_row_counts[sh_title] = est_rows
+
+                if (
+                    b"<f>" not in raw
+                    and b"<f " not in raw
+                    and b":f>" not in raw
+                    and b":f " not in raw
+                ):
+                    continue
 
                 empty_set: Set[Tuple[int, int]] = set()
                 sheet_fmls: Dict[Tuple[int, int], str] = {}
@@ -643,6 +716,7 @@ def _scan_xlsx_package(content: bytes) -> _WorkbookPackageScan:
                 has_uncached=has_uncached,
                 cached_empty_by_title=cached_empty_by_title,
                 formulas_by_title=formulas_by_title,
+                sheet_row_counts=sheet_row_counts,
                 defined_names=defined_names,
                 tables_meta=tables_meta,
                 normalized_content=norm_bytes,
@@ -706,27 +780,6 @@ class _ArrayValue:
     @property
     def width(self) -> int:
         return len(self.rows[0]) if self.rows else 0
-
-
-def _scan_balanced_brackets(expr: str, start_pos: int) -> Tuple[str, int]:
-    """扫描 Excel 结构化引用中的平衡方括号（如 `[英文]` 或 `[[#This Row],[字段名]]`）."""
-    depth = 0
-    i = start_pos
-    n = len(expr)
-    while i < n:
-        ch = expr[i]
-        if ch == "'":
-            # Excel 结构化引用中单引号转义特殊字符（如 ']）
-            i += 2
-            continue
-        if ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                return (expr[start_pos : i + 1], i + 1)
-        i += 1
-    raise ValueError("未闭合的结构化引用方括号")
 
 
 def _tokenize_formula(expr: str) -> List[Tuple[str, str]]:
@@ -877,7 +930,17 @@ class _FormulaParser:
             self._eat()
             return ("lit", val[1:-1].replace('""', '"'))
 
+        if kind == "ROWREF":
+            nxt_r = self._peek(1)
+            if nxt_r and nxt_r[0] == "OP" and nxt_r[1] == ":":
+                return self._parse_ref_after_sheet(None)
+            self._eat()
+            return ("lit", "#REF!")
+
         if kind == "NUM":
+            nxt_n = self._peek(1)
+            if val.isdigit() and nxt_n and nxt_n[0] == "OP" and nxt_n[1] == ":":
+                return self._parse_ref_after_sheet(None)
             self._eat()
             fval = float(val)
             return (
@@ -897,6 +960,27 @@ class _FormulaParser:
             tbl_name = val[:b_idx].strip() if b_idx > 0 else ""
             spec = val[b_idx:] if b_idx >= 0 else val
             return ("sref", tbl_name or None, spec)
+
+        if kind == "OP" and val == "{":
+            self._eat()
+            arr_rows: List[List[Any]] = []
+            cur_row_nodes: List[Any] = []
+            while self._peek() and not (self._peek()[0] == "OP" and self._peek()[1] == "}"):
+                cur_row_nodes.append(self._parse_comparison())
+                sep = self._peek()
+                if sep and sep[0] == "OP" and sep[1] == ",":
+                    self._eat()
+                elif sep and sep[0] == "OP" and sep[1] == ";":
+                    self._eat()
+                    arr_rows.append(cur_row_nodes)
+                    cur_row_nodes = []
+                else:
+                    break
+            if cur_row_nodes or not arr_rows:
+                arr_rows.append(cur_row_nodes or [("lit", "")])
+            if self._peek() and self._peek()[0] == "OP" and self._peek()[1] == "}":
+                self._eat()
+            return ("arr_lit", arr_rows)
 
         if kind == "OP" and val == "(":
             self._eat()
@@ -972,8 +1056,10 @@ class _FormulaParser:
                 col1 = column_index_from_string(m1.group(1).upper())
                 col2 = column_index_from_string(m2.group(1).upper())
                 return ("range", sheet_name, 1, col1, 1048576, col2, True)
-            if first_str.isdigit() and second_str.isdigit():
-                r1_i, r2_i = int(first_str), int(second_str)
+            r1_raw = first_str.lstrip("$")
+            r2_raw = second_str.lstrip("$")
+            if r1_raw.isdigit() and r2_raw.isdigit():
+                r1_i, r2_i = int(r1_raw), int(r2_raw)
                 return ("range", sheet_name, r1_i, 1, r2_i, 16384, False)
             return ("lit", "#REF!")
 
@@ -1263,7 +1349,7 @@ class WorkbookFormulaEvaluator:
                 fml_expr, real_sheet, depth + 1, cur_row=row_1b, cur_col=col_1b
             )
         except Exception:
-            res = ""
+            res = "#VALUE!"
         finally:
             self._visiting.discard(key)
 
@@ -1338,12 +1424,22 @@ class WorkbookFormulaEvaluator:
             return self._intersect_array_scalar(val, cur_row, cur_col)
         return val
 
+    def _sheet_max_col(self, sheet: str) -> int:
+        val_mat = self._get_val_matrix(sheet)
+        v_w = max((len(r) for r in val_mat), default=0)
+        f_c = self._fml_max_dims.get(sheet, (0, 0))[1]
+        return max(v_w, f_c)
+
     def _bound_range(self, rng: _RangeValue) -> Tuple[str, int, int, int, int]:
         max_r = self._sheet_max_row(rng.sheet)
         if max_r < 1:
             return (rng.sheet, 1, rng.c1, 0, rng.c2)
         eff_r2 = min(rng.r2, max_r) if rng.whole_col or rng.r2 > max_r else rng.r2
-        return (rng.sheet, rng.r1, rng.c1, eff_r2, rng.c2)
+        eff_c2 = rng.c2
+        if rng.c2 >= 16384:
+            max_c = self._sheet_max_col(rng.sheet)
+            eff_c2 = max(rng.c1, min(rng.c2, max_c)) if max_c > 0 else rng.c1
+        return (rng.sheet, rng.r1, rng.c1, eff_r2, eff_c2)
 
     def _materialize_array(self, val: Any, depth: int) -> Optional[_ArrayValue]:
         if isinstance(val, _ArrayValue):
@@ -1565,6 +1661,14 @@ class WorkbookFormulaEvaluator:
         ntype = node[0]
         if ntype == "lit":
             return node[1]
+
+        if ntype == "arr_lit":
+            _, row_nodes = node
+            out_rows = [
+                [self._eval_scalar(el_n, current_sheet, depth + 1, cur_row, cur_col) for el_n in r_n]
+                for r_n in row_nodes
+            ]
+            return _ArrayValue(out_rows, 1, 1)
 
         if ntype == "cell":
             _, sh_opt, r, c = node
@@ -1825,8 +1929,6 @@ class WorkbookFormulaEvaluator:
                 return "#N/A"
 
             tbl_rng = _nd(args[1])
-            if not isinstance(tbl_rng, _RangeValue):
-                return "#REF!" if tbl_rng == "#REF!" else "#N/A"
             col_num_raw = _to_number(_sc(args[2]))
             if col_num_raw is None or int(col_num_raw) < 1:
                 return "#VALUE!"
@@ -1837,12 +1939,43 @@ class WorkbookFormulaEvaluator:
                 rl_val = _sc(args[3])
                 approx = _is_truthy_excel(rl_val)
 
+            nk = _norm_lookup_key(lookup_val)
+            if isinstance(tbl_rng, _ArrayValue):
+                if col_offset >= tbl_rng.width:
+                    return "#REF!"
+                if not tbl_rng.rows:
+                    return "#N/A"
+                if not approx:
+                    for r_row in tbl_rng.rows:
+                        cv = r_row[0] if r_row else None
+                        if cv is None or cv == "" or is_excel_error_value(cv):
+                            continue
+                        if _norm_lookup_key(cv) == nk:
+                            out = r_row[col_offset]
+                            return "" if out is None else out
+                    return "#N/A"
+                best_arr_row: Optional[List[Any]] = None
+                for r_row in tbl_rng.rows:
+                    cv = r_row[0] if r_row else None
+                    if cv is None or cv == "" or is_excel_error_value(cv):
+                        continue
+                    if _compare_excel_values(cv, lookup_val, "<="):
+                        best_arr_row = r_row
+                    else:
+                        break
+                if best_arr_row is None:
+                    return "#N/A"
+                out = best_arr_row[col_offset]
+                return "" if out is None else out
+
+            if not isinstance(tbl_rng, _RangeValue):
+                return "#REF!" if tbl_rng == "#REF!" else "#N/A"
+
             sh, r1, c1, r2, c2 = self._bound_range(tbl_rng)
             target_col = c1 + col_offset
             if target_col > c2 or r2 < r1:
                 return "#REF!" if target_col > c2 else "#N/A"
 
-            nk = _norm_lookup_key(lookup_val)
             if not approx:
                 idx_map = self._get_exact_col_index(sh, r1, r2, c1, depth)
                 hit_row = idx_map.get(nk)
@@ -2027,6 +2160,166 @@ class WorkbookFormulaEvaluator:
                 return "#REF!"
             out = self.get_cell_value(sh, eff_r, eff_c, depth + 1)
             return "" if out is None else out
+
+        if fname == "LOOKUP":
+            if len(args) < 2:
+                return "#VALUE!"
+            lookup_val = _sc(args[0])
+            if is_excel_error_value(lookup_val):
+                return str(lookup_val).upper()
+            if lookup_val is None or lookup_val == "":
+                return "#N/A"
+
+            look_raw = _nd(args[1])
+            look_arr = self._materialize_array(look_raw, depth)
+            if look_arr is None:
+                return "#REF!" if look_raw == "#REF!" else "#N/A"
+
+            if len(args) >= 3 and args[2] != ("lit", None):
+                res_raw = _nd(args[2])
+                res_arr = self._materialize_array(res_raw, depth)
+                if res_arr is None:
+                    return "#REF!" if res_raw == "#REF!" else "#N/A"
+                look_vec = self._flatten_1d_array(look_arr)
+                res_vec = self._flatten_1d_array(res_arr)
+                if look_vec is None or res_vec is None:
+                    return "#N/A"
+            else:
+                if look_arr.width >= look_arr.height and look_arr.height >= 2:
+                    look_vec = list(look_arr.rows[0])
+                    res_vec = list(look_arr.rows[-1])
+                elif look_arr.width >= 2:
+                    look_vec = [r[0] for r in look_arr.rows]
+                    res_vec = [r[-1] for r in look_arr.rows]
+                else:
+                    look_vec = self._flatten_1d_array(look_arr) or []
+                    res_vec = look_vec
+
+            lv_is_bool = isinstance(lookup_val, bool)
+            lv_is_num = isinstance(lookup_val, (int, float)) and not lv_is_bool
+            lv_is_str = isinstance(lookup_val, str)
+
+            hit_idx: Optional[int] = None
+            for i_pos, item in enumerate(look_vec):
+                if item is None or item == "" or is_excel_error_value(item):
+                    continue
+                it_is_bool = isinstance(item, bool)
+                it_is_num = isinstance(item, (int, float)) and not it_is_bool
+                it_is_str = isinstance(item, str)
+                if (lv_is_bool != it_is_bool) or (lv_is_num != it_is_num) or (lv_is_str != it_is_str):
+                    continue
+                if _compare_excel_values(item, lookup_val, "<="):
+                    hit_idx = i_pos
+            if hit_idx is None or hit_idx >= len(res_vec):
+                return "#N/A"
+            out = res_vec[hit_idx]
+            return "" if out is None else out
+
+        if fname == "CHOOSE":
+            if len(args) < 2:
+                return "#VALUE!"
+            idx_raw = _nd(args[0])
+            if isinstance(idx_raw, (_RangeValue, _ArrayValue)):
+                idx_arr = self._materialize_array(idx_raw, depth)
+                idx_vec = self._flatten_1d_array(idx_arr) if idx_arr else None
+                if not idx_vec:
+                    return "#VALUE!"
+                col_arrays: List[List[Any]] = []
+                max_h = 1
+                for raw_k in idx_vec:
+                    kn = _to_number(raw_k)
+                    if kn is None or int(kn) < 1 or int(kn) >= len(args):
+                        return "#VALUE!"
+                    chosen = _nd(args[int(kn)])
+                    c_arr = self._materialize_array(chosen, depth)
+                    if c_arr is not None:
+                        flat_c = self._flatten_1d_array(c_arr)
+                        vec_c = flat_c if flat_c is not None else [r[0] for r in c_arr.rows]
+                    else:
+                        vec_c = [chosen]
+                    max_h = max(max_h, len(vec_c))
+                    col_arrays.append(vec_c)
+                if max_h * len(col_arrays) > _MAX_ARRAY_CELLS:
+                    return "#VALUE!"
+                merged_rows = [
+                    [
+                        col_v[r_i] if r_i < len(col_v) else (col_v[0] if len(col_v) == 1 else "#N/A")
+                        for col_v in col_arrays
+                    ]
+                    for r_i in range(max_h)
+                ]
+                return _ArrayValue(merged_rows, 1, 1)
+
+            idx_sc = idx_raw
+            if is_excel_error_value(idx_sc):
+                return str(idx_sc).upper()
+            kn = _to_number(idx_sc)
+            if kn is None or int(kn) < 1 or int(kn) >= len(args):
+                return "#VALUE!"
+            return _nd(args[int(kn)])
+
+        if fname == "INDIRECT":
+            if not args or depth > 64:
+                return "#REF!"
+            ref_val = _sc(args[0])
+            if is_excel_error_value(ref_val):
+                return str(ref_val).upper()
+            ref_str = _to_excel_str(ref_val).strip()
+            if not ref_str or ("[" in ref_str and "]" in ref_str and "!" in ref_str):
+                return "#REF!"
+            try:
+                ref_ast = self._parse_expr_ast(ref_str)
+            except Exception:
+                return "#REF!"
+            if ref_ast[0] not in ("cell", "range", "name", "sref"):
+                return "#REF!"
+            return self._eval_node(ref_ast, current_sheet, depth + 1, cur_row, cur_col)
+
+        if fname == "OFFSET":
+            if len(args) < 3:
+                return "#VALUE!"
+            base_node = args[0]
+            if base_node[0] == "cell":
+                _, sh_opt, b_r1, b_c1 = base_node
+                b_sh = self._resolve_sheet_title(sh_opt, current_sheet)
+                if not b_sh:
+                    return "#REF!"
+                b_r2, b_c2 = b_r1, b_c1
+            else:
+                base_val = _nd(base_node)
+                if not isinstance(base_val, _RangeValue):
+                    return "#REF!" if base_val == "#REF!" else "#VALUE!"
+                b_sh, b_r1, b_c1, b_r2, b_c2 = (
+                    base_val.sheet,
+                    base_val.r1,
+                    base_val.c1,
+                    base_val.r2,
+                    base_val.c2,
+                )
+            dr_num = _to_number(_sc(args[1]))
+            dc_num = _to_number(_sc(args[2]))
+            if dr_num is None or dc_num is None:
+                return "#VALUE!"
+            h_num = (b_r2 - b_r1 + 1)
+            w_num = (b_c2 - b_c1 + 1)
+            if len(args) >= 4 and args[3] != ("lit", None):
+                hn = _to_number(_sc(args[3]))
+                if hn is None or int(hn) < 1:
+                    return "#REF!" if hn is not None and int(hn) < 1 else "#VALUE!"
+                h_num = int(hn)
+            if len(args) >= 5 and args[4] != ("lit", None):
+                wn = _to_number(_sc(args[4]))
+                if wn is None or int(wn) < 1:
+                    return "#REF!" if wn is not None and int(wn) < 1 else "#VALUE!"
+                w_num = int(wn)
+            nr1 = b_r1 + int(dr_num)
+            nc1 = b_c1 + int(dc_num)
+            if nr1 < 1 or nc1 < 1:
+                return "#REF!"
+            if h_num == 1 and w_num == 1:
+                out = self.get_cell_value(b_sh, nr1, nc1, depth + 1)
+                return "" if out is None else out
+            return _RangeValue(b_sh, nr1, nc1, nr1 + h_num - 1, nc1 + w_num - 1, False)
 
         # 3. 文本处理函数
         if fname in ("CONCAT", "CONCATENATE"):
@@ -2294,7 +2587,7 @@ class ResolvedWorkbook:
             )
             self._is_read_only = read_only_preferred
 
-        # 在 reset_dimensions() 清空 ReadOnlyWorksheet.max_row 之前缓存 XML <dimension> 行数估计值
+        # 在 reset_dimensions() 清空 ReadOnlyWorksheet.max_row 之前缓存 XML <dimension> 与真实 <row> 行数估计值
         self._initial_max_rows: Dict[str, int] = {}
         sheet_lower_map: Dict[str, str] = {}
         for title in self._wb.sheetnames:
@@ -2303,6 +2596,11 @@ class ResolvedWorkbook:
                 self._initial_max_rows[title] = int(getattr(self._wb[title], "max_row", 0) or 0)
             except Exception:
                 self._initial_max_rows[title] = 0
+
+        for sh_key, scan_rows in (self._scan.sheet_row_counts or {}).items():
+            resolved = sh_key if sh_key in self._initial_max_rows else sheet_lower_map.get(sh_key.strip().lower())
+            if resolved:
+                self._initial_max_rows[resolved] = max(self._initial_max_rows.get(resolved, 0), int(scan_rows))
 
         self._cached_empty: Dict[str, Set[Tuple[int, int]]] = {}
         for sh_key, coords in (self._scan.cached_empty_by_title or {}).items():
@@ -2319,7 +2617,9 @@ class ResolvedWorkbook:
     def close(self) -> None:
         if self._evaluator is not None:
             self._evaluator.close()
-        else:
+        if self._wb is not None and (
+            self._evaluator is None or self._wb is not self._evaluator._wb_val
+        ):
             try:
                 self._wb.close()
             except Exception:

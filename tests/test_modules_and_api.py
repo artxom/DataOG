@@ -1667,6 +1667,71 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertTrue(prog_fail["found"])
             self.assertEqual(prog_fail["progress"]["status"], "failed")
 
+            # 8. 回归验证：
+            #    a) 第三方流式导出的 <dimension ref="A1:A1"/> 对照表读取阶段进度平滑递增而非首行跳顶冻结；
+            #    b) 跨环境多表批量铺底上传仅在末尾拉取一次当前激活表概览，避免 N 张表触发 2*N 次冗余元数据探查。
+            wb_dim = openpyxl.Workbook(write_only=True)
+            ws_dim = wb_dim.create_sheet("对照")
+            ws_dim.append(["模式名", "表名", "物理字段名", "数据项编号"])
+            for i_col in range(1, 221):
+                ws_dim.append(["main", "dwd_party_acct", f"col_{i_col}", "CUST000101"])
+            buf_dim = io.BytesIO()
+            wb_dim.save(buf_dim)
+            buf_dim_a1 = io.BytesIO()
+            with zipfile.ZipFile(io.BytesIO(buf_dim.getvalue()), "r") as zin, zipfile.ZipFile(
+                buf_dim_a1, "w"
+            ) as zout:
+                for zinfo in zin.infolist():
+                    zdata = zin.read(zinfo.filename)
+                    if zinfo.filename == "xl/worksheets/sheet1.xml":
+                        zdata = re.sub(rb'<dimension\s+ref="[^"]*"\s*/>', b'<dimension ref="A1:A1"/>', zdata)
+                        if b"<dimension" not in zdata:
+                            zdata = zdata.replace(b"<sheetData>", b'<dimension ref="A1:A1"/><sheetData>', 1)
+                    zout.writestr(zinfo, zdata)
+
+            from modules.standard_migrator.service import StandardMigratorService
+
+            dim_pcts: List[float] = []
+            StandardMigratorService(ctx).upload_field_bindings_excel(
+                filename="easyexcel_a1.xlsx",
+                content=buf_dim_a1.getvalue(),
+                connection_id=cid,
+                progress_cb=lambda pct, stg, _dtl, _pr, _tot: dim_pcts.append(round(pct, 1))
+                if "读取工作表" in stg
+                else None,
+            )
+            self.assertGreaterEqual(len(dim_pcts), 3)
+            self.assertLess(dim_pcts[0], 18.0)
+            self.assertEqual(dim_pcts[-1], 36.0)
+            self.assertEqual(dim_pcts, sorted(dim_pcts))
+
+            wb_many = openpyxl.Workbook()
+            ws_many = wb_many.active
+            ws_many.append(["来源模式名", "来源表名", "来源字段名", "来源数据项编号", "目标模式名", "目标表名", "目标字段名", "目标数据项编号"])
+            for t_idx in range(1, 13):
+                ws_many.append(["public", f"src_tbl_{t_idx}", "c1", "CUST000101", "public", f"tgt_tbl_{t_idx}", "c1", "CUST000101"])
+            buf_many = io.BytesIO()
+            wb_many.save(buf_many)
+
+            orig_get_meta = ctx.metadata_hub.get_table_metadata
+            meta_probe_calls = 0
+
+            def _counting_get_meta(*args, **kwargs):
+                nonlocal meta_probe_calls
+                meta_probe_calls += 1
+                return orig_get_meta(*args, **kwargs)
+
+            ctx.metadata_hub.get_table_metadata = _counting_get_meta
+            try:
+                res_many = CrossComparatorService(ctx).upload_pairings_excel(
+                    filename="many_pairs.xlsx",
+                    content=buf_many.getvalue(),
+                )
+            finally:
+                ctx.metadata_hub.get_table_metadata = orig_get_meta
+            self.assertEqual(res_many["imported_count"], 12)
+            self.assertLessEqual(meta_probe_calls, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,8 @@ export function openUploadWizardModal(opts) {
   let uploading = false;
   let pollTimer = null;
   let elapsedTimer = null;
+  let kickPollTimer = null;
+  let attemptSeq = 0;
   let modalOpen = true;
 
   const stopTimers = () => {
@@ -57,6 +59,10 @@ export function openUploadWizardModal(opts) {
     if (elapsedTimer) {
       clearInterval(elapsedTimer);
       elapsedTimer = null;
+    }
+    if (kickPollTimer) {
+      clearTimeout(kickPollTimer);
+      kickPollTimer = null;
     }
   };
 
@@ -180,7 +186,9 @@ export function openUploadWizardModal(opts) {
     const f = await pickLocalFile(accept);
     if (!f) return;
     selectedFile = f;
+    currentPercent = 0;
     progressPanelEl.style.display = "none";
+    progressPanelEl.classList.remove("is-active", "is-success", "is-error");
     uploadBtn.textContent = "开始导入";
     renderFileStatus();
   };
@@ -211,7 +219,9 @@ export function openUploadWizardModal(opts) {
         const f = e.dataTransfer?.files?.[0];
         if (f) {
           selectedFile = f;
+          currentPercent = 0;
           progressPanelEl.style.display = "none";
+          progressPanelEl.classList.remove("is-active", "is-success", "is-error");
           uploadBtn.textContent = "开始导入";
           renderFileStatus();
         }
@@ -362,6 +372,8 @@ export function openUploadWizardModal(opts) {
 
   uploadBtn.addEventListener("click", async () => {
     if (!selectedFile || uploading) return;
+    stopTimers();
+    const myAttempt = ++attemptSeq;
     uploading = true;
     startedAtMs = performance.now();
     currentPercent = 2;
@@ -380,11 +392,11 @@ export function openUploadWizardModal(opts) {
     });
 
     const pollServerProgress = async () => {
-      if (!uploading || !modalOpen || pollInFlight) return;
+      if (!uploading || !modalOpen || myAttempt !== attemptSeq || pollInFlight) return;
       pollInFlight = true;
       try {
         const res = await platformApi.getImportProgress(progressId);
-        if (!uploading || !modalOpen) return;
+        if (!uploading || !modalOpen || myAttempt !== attemptSeq) return;
         const p = res?.progress;
         if (res?.found && p) {
           serverReported = true;
@@ -410,7 +422,7 @@ export function openUploadWizardModal(opts) {
     };
 
     elapsedTimer = setInterval(() => {
-      if (!uploading || !modalOpen) return;
+      if (!uploading || !modalOpen || myAttempt !== attemptSeq) return;
       // 当文件已上传完毕但大工作簿首轮 XML 解析尚未返回时，平滑微推进进度以提供明确活跃反馈
       if (!serverReported && currentPercent >= 14 && currentPercent < 22) {
         currentPercent = Math.min(22, currentPercent + 0.35);
@@ -421,7 +433,7 @@ export function openUploadWizardModal(opts) {
     pollTimer = setInterval(pollServerProgress, 220);
 
     const onUploadProgress = (ratio, loaded, total) => {
-      if (!uploading || serverReported) return;
+      if (!uploading || !modalOpen || myAttempt !== attemptSeq || serverReported) return;
       const mappedPct = 2 + Math.min(1, Math.max(0, ratio)) * 12;
       if (ratio >= 0.999) {
         updateProgressView({
@@ -430,7 +442,11 @@ export function openUploadWizardModal(opts) {
           detail: "文件已送达本地引擎，正在解析公式计算结果并匹配数据标准...",
           state: "active",
         });
-        setTimeout(() => {
+        if (kickPollTimer) {
+          clearTimeout(kickPollTimer);
+        }
+        kickPollTimer = setTimeout(() => {
+          kickPollTimer = null;
           pollServerProgress();
         }, 35);
       } else {
@@ -483,6 +499,7 @@ export function openUploadWizardModal(opts) {
     footer: [cancelBtn, uploadBtn],
     onClose: () => {
       modalOpen = false;
+      attemptSeq++;
       stopTimers();
       Modal.setCloseLocked(false);
     },

@@ -272,7 +272,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.3.1",
+        version="2.3.2",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -395,7 +395,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.3.1 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.3.2 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")

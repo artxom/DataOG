@@ -8,6 +8,20 @@
 
 ---
 
+## [2.3.2] - 2026-11-16
+
+### Added
+- **纯 Python 公式求值器扩展支持经典业务查找范式 (`core/excel_formula.py`)**：新增支持数组字面量 `{...}`、整行引用（`2:2` / `$2:$2`）、`LOOKUP`（含 `LOOKUP(1, 0/(...), ...)` 多条件逆向查找）、`CHOOSE`（含 `VLOOKUP(..., CHOOSE({1,2}, ...), 2, 0)` 数组拼列查找）、`INDIRECT` 与 `OFFSET`。
+
+### Fixed
+- **修复共享公式平移误改结构化表引用列名**：`_shift_shared_formula` 在拖拽平移坐标时完整跳过 `[...]` 平衡方括号，防止形如 `[@ID1]`、`Table1[[#This Row],[C2]]` 的列名被误识别为单元格坐标而偏移。
+- **修复流式导出 `.xlsx` 固定 `<dimension ref="A1:A1"/>` 导致读取进度首行跳顶冻结**：在工作簿包扫描阶段从工作表 XML 尾部毫秒级提取真实最大行号，保障 EasyExcel / POI `SXSSFWorkbook` / `write_only` 工作簿行级进度平滑单调递增。
+- **修复文本态公式双工作簿句柄泄漏与异常公式 `IFERROR` 捕获失效**：`ResolvedWorkbook.close()` 确保同时关闭主工作簿与懒加载公式求值工作簿；未缓存异常公式求值失败时返回 `#VALUE!` 以支持外层 `IFERROR` 兜底（顶层读取仍自动置空）。
+- **消除跨环境多表铺底上传 $O(N)$ 冗余数据库探查 (`modules/cross_comparator/service.py`)**：`upload_pairings_excel` 批量保存循环内跳过逐表 `get_overview_state()` 重算，仅在末尾汇总拉取一次当前激活表概览（离线数据源场景下消除 `2*N` 次超时等待）。
+- **修复前端 `<dialog>` 重入异步 `close` 事件与重试轮询竞态 (`static/js/ui/modal.js` & `static/js/ui/upload_wizard_modal.js`)**：`Modal.open` 引入会话代数守卫与原地顶层复用，防止已打开弹窗切换时异步 `close` 事件误关闭新弹窗状态；`UploadWizardModal` 引入 `attemptSeq` 轮次隔离与 `kickPollTimer` 清理，消除快速点击“重新导入”时上一轮失败状态残留覆盖当前进度的竞态。
+
+---
+
 ## [2.3.1] - 2026-11-16
 
 ### Added

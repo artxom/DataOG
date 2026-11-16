@@ -1,4 +1,4 @@
-# Data.O.G v2.3.1 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.3.2 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -44,7 +44,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.3.1 微内核入口（安全响应头、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.3.2 微内核入口（安全响应头、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
@@ -87,7 +87,8 @@ DataOG/
 | **`v2.1.1`** | `refactor/project-slim` → `main` | 全工程深度瘦身与轻量化打包：清理历史冗余模块与一次性脚本，以标准库替代 `openai` / `httpx` 重型依赖，Windows 发行包缩减 `29.2%` 至 `19.42 MB` |
 | **`v2.2.0`** | `feat/data-explorer-ai` → `main` | **数据探查 · AI 只读智能探查会话**：保留 DataGrip 四级数据库清单与自由 SQL 查询，新增目标驱动的多轮大模型自动采样探查、结论溯源与会话历史持久化，落地四道引擎级绝对只读硬隔离防线 |
 | **`v2.3.0`** | `feat/standard-governance-dock` → `main` | **三步式数据标准治理闭环与原生 macOS Dock**：重构为「1. 标准字典 → 2. 落标绑定与贯标 → 3. 跨环境比对」，落地双列拟物书签桥与字段拖拽配对、全流程两步模板导入向导及 macOS 底部居中悬浮毛玻璃 Dock 栏 |
-| **`v2.3.1`**（当前正式版） | `feat/excel-progress-formula-na` → `main` | **Excel 导入实时进度条、公式最终值求值与 `#N/A` 置空清洗**：新增 `ImportProgressHub` 与向导双阶段实时进度条，支持缓存优先 + 纯 Python 跨表公式兜底求值、全谱系 `#N/A` 错误值置空与历史脏绑定自愈 |
+| **`v2.3.1`** | `feat/excel-progress-formula-na` → `main` | **Excel 导入实时进度条、公式最终值求值与 `#N/A` 置空清洗**：新增 `ImportProgressHub` 与向导双阶段实时进度条，支持缓存优先 + 纯 Python 跨表公式兜底求值、全谱系 `#N/A` 错误值置空与历史脏绑定自愈 |
+| **`v2.3.2`**（当前正式版） | `fix/excel-eval-progress-modal-races` → `main` | **导入向导竞态加固、经典多条件公式扩展求值与流式大表平滑进度**：补齐 `LOOKUP` / `CHOOSE({1,2},...)` / `INDIRECT` / `OFFSET` 与整行引用求值，保护共享公式结构化表引用列名，准确还原流式 `<dimension ref="A1:A1"/>` 行数，消除跨环境多表铺底冗余探查与 `<dialog>` / 重试轮询异步竞态 |
 
 ---
 
