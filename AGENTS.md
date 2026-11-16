@@ -38,7 +38,7 @@
     - 顶部 28px 毛玻璃菜单栏（`Data.O.G` 品牌归位、活动应用名、AI 状态指示、`⌘K` Spotlight 搜索、运行日志弹窗、深浅色切换、实时时钟）。
     - 纯净桌面画布 + 底部居中悬浮毛玻璃 **macOS Dock 栏**承载四大独立应用：**`系统配置`** (`settings`)、**`数据探查`** (`explorer`)、**`数据标准`** (`standard`：整合 `1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`)、**`多邻国`** (`polyglot`：整合 `智能命名` | `方言翻译`)。
     - 左上角红黄绿三键语义：🔴 **关闭 (`✕`)** 回到桌面并彻底销毁重置当前工具运行时状态；🟡 **最小化 (`−`)** 收纳至 Dock 竖直分隔线右侧缩略窗口区（100% 保留内存 DOM、光标与未保存输入，点击 Dock 缩略窗口即刻恢复工作现场）；🟢 **最大化 (`+`)** 切换常规留白窗口（Dock 常驻底部）与全屏沉浸工作态（Dock 自动下沉隐藏、鼠标贴底唤出）。
-  - **公共 UI 组件库 (`static/js/ui/`)**：统一复用 `DatabaseTree`、`DataGrid`、`ObjectPicker`、`SqlCodeBox`、`UploadWizardModal`（两步式模板先导上传向导）、`StandardPickerModal`（标准字典实时检索绑定器）、`Modal`（原生 `<dialog>` + 坐标判定轻关闭兜底）、`Toast`，严格使用 `textContent` / `createElement` 等安全 DOM 操作杜绝 XSS。
+  - **公共 UI 组件库 (`static/js/ui/`)**：统一复用 `DatabaseTree`、`DataGrid`、`ObjectPicker`、`SqlCodeBox`、`UploadWizardModal`（两步式模板先导上传向导 + XHR 上传与服务端解析双阶段实时进度条）、`StandardPickerModal`（标准字典实时检索绑定器）、`Modal`（原生 `<dialog>` + 坐标判定轻关闭兜底与导入期防误关锁）、`Toast`，严格使用 `textContent` / `createElement` 等安全 DOM 操作杜绝 XSS。
 
 ## 3. 安全、数据兼容与跨平台打包红线
 - **安全与本地隔离**：默认仅监听 `127.0.0.1:18080`（启用 CSP 与 `Sec-Fetch-Site` 跨站请求防护）；`data/*.db`、`data/*.log`、驱动目录 `data/drivers/` 及个性化图片目录 `data/assets/` 必须被 `.gitignore` 排除，严禁将任何数据库密码、AI API Key 或本地状态提交至 Git；所有接口返回与日志输出必须脱敏密码与密钥；`.jar` 驱动与壁纸/图标上传均须严格限制体积、校验二进制魔数头并校验 `realpath` 目录边界防路径穿越，资产读取响应强制携带 `X-Content-Type-Options: nosniff` 与独立 `sandbox` CSP。
@@ -61,15 +61,17 @@
    - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
 
 ## 5. 当前代码基线快照（供下次会话快速定位）
-- **当前主干里程碑版本**：`v2.3.0`（官方品牌名 `Data.O.G`，三步式数据标准治理闭环 · 全流程系统模板先导 · 原生 macOS 底部 Dock 版，`main` 分支与 `v2.3.0` 标签同步至 `origin`）。
+- **当前主干里程碑版本**：`v2.3.1`（官方品牌名 `Data.O.G`，Excel 导入双阶段实时进度条 · 公式最终计算值求值 · `#N/A` 全谱系错误值置空清洗版，`main` 分支与 `v2.3.1` 标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI `2.3.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
+  - `app.py`：FastAPI `2.3.1` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
   - `requirements.txt`：保持 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），零新增第三方依赖。
   - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（去除重复静态资源拷贝、排除非运行时重型包与测试子模块、自动剥离 `.pyi`/`.pxd`/`__pycache__` 冗余元数据，保障冻结态 `--test` 自检）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
   - `context.py` (`PlatformContext`) / `router.py` / `schemas.py` / `models.py`
   - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，暴露线程安全 `module_db()` 上下文，核心与模块表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`standard_dictionary`、`field_standard_bindings`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_table_bindings`、`cross_column_bindings`、`explorer_sessions`、`explorer_messages`、`execution_logs`)
   - `standard_catalog.py` (`StandardCatalog`，管理全局 46 列标准字典 Upsert/Replace 导入与导出、脱敏系统模板生成、多库物理格式智能解析、三级落标判定与数据源字段数标绑定持久化，挂载 `/standards*`)
+  - `import_progress.py` (`ImportProgressHub`，线程安全导入实时阶段/行级/表级进度追踪中枢，挂载 `GET /import-progress/{progress_id}`)
+  - `excel_io.py` & `core/excel_formula.py`（统一提供 Excel 缓存结果优先读取、纯 Python 跨表公式兜底求值及 `#N/A` 等全谱系公式错误值置空清洗）
   - `readonly_guard.py` (`validate_readonly_sql` / `ReadOnlyViolationError`，双模态 ANSI + 反斜杠转义词法分词器、单语句校验、`SELECT`/`WITH ... SELECT`/`SHOW`/`DESCRIBE`/非 `ANALYZE` `EXPLAIN` 顶层白名单、全语句写/DDL/锁/`INTO` 与跨方言危险系统函数黑名单)
   - `asset_store.py` (`AssetStore`，管理壁纸预设、本地上传壁纸、`Data.O.G` 主图标与四大模块自定义图标持久化至 `data/assets/`，挂载 `/appearance*` 与 `/assets/{asset_name}`)
   - `llm_hub.py` (`LLMHub`，基于 Python 标准库 `urllib.request` 零额外依赖统一接入 DeepSeek、Google Gemini 与自定义 OpenAI 兼容网关，挂载 `/llm/providers*`、`/llm/test`、`/llm/models`)
@@ -89,10 +91,10 @@
     - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单并支持探查 SQL 一键同步至主编辑器）
     - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js` + `cross_comparator_view.js`（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
     - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
-- **全量自动化测试套件 (`tests/`，当前共 32 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
+- **全量自动化测试套件 (`tests/`，当前共 34 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
   - `tests/test_core.py`（13 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、DDL 互译与四层视图穿透核心引擎。
-  - `tests/test_platform.py`（11 项）：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`StandardCatalog` 46 列导入与多库格式解析及三级落标核验、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
-  - `tests/test_modules_and_api.py`（8 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 落标绑定核验 -> 跨环境拟物书签拖拽铺底闭环）、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
+  - `tests/test_platform.py`（12 项）：验证旧版状态库无损迁移、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索、`StandardCatalog` 46 列导入与多库格式解析及三级落标核验、Excel 公式最终结果求值与 `#N/A` 置空清洗、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
+  - `tests/test_modules_and_api.py`（9 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 落标绑定核验 -> 跨环境拟物书签拖拽铺底闭环）、对照关系导入实时进度追踪与离线探查熔断保护、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
 
 ## 6. AI 只读探查硬隔离铁律与后续演进守则
 - **绝对只读四道硬防线（后续任何涉及 AI 自动查询的功能均须严格复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束）**：
