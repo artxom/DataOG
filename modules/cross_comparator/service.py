@@ -141,16 +141,28 @@ class CrossComparatorService:
         target_table: Optional[str] = None,
     ) -> str:
         """根据 (source_table, target_table) 精确查找已保存的跨环境映射表键."""
+        def _split_tbl(raw_sch: Optional[str], raw_tbl: Optional[str]) -> Tuple[str, str]:
+            sch = clean_identifier_input(raw_sch or "").lower()
+            txt = (raw_tbl or "").strip()
+            if "." in txt:
+                p0, p1 = txt.split(".", 1)
+                if not sch:
+                    sch = clean_identifier_input(p0).lower()
+                txt = p1
+            return sch, clean_identifier_input(txt).lower()
+
         def _clean_tbl_low(raw: Optional[str]) -> str:
             txt = (raw or "").strip()
             if "." in txt:
                 txt = txt.split(".", 1)[1]
             return clean_identifier_input(txt).lower()
 
-        s_tbl = _clean_tbl_low(source_table)
-        t_tbl = _clean_tbl_low(target_table)
-        s_sch = clean_identifier_input(source_schema or "").lower()
-        t_sch = clean_identifier_input(target_schema or "").lower()
+        def _sch_compat(q_sch: str, saved_sch_raw: Any) -> bool:
+            saved_sch = clean_identifier_input(str(saved_sch_raw or "")).lower()
+            return not q_sch or not saved_sch or saved_sch == q_sch
+
+        s_sch, s_tbl = _split_tbl(source_schema, source_table)
+        t_sch, t_tbl = _split_tbl(target_schema, target_table)
 
         if s_tbl and t_tbl:
             # 1) 优先同时匹配表名与模式名
@@ -162,11 +174,13 @@ class CrossComparatorService:
                     and (not t_sch or clean_identifier_input(t.get("target_schema") or "").lower() == t_sch)
                 ):
                     return str(t["std_table_key"])
-            # 2) 次优匹配双方表名
+            # 2) 次优匹配：仅当查询侧或已保存侧的模式名为空时回退匹配双方表名（禁止跨模式错配）
             for t in tables:
                 if (
                     _clean_tbl_low(t.get("source_table")) == s_tbl
                     and _clean_tbl_low(t.get("target_table")) == t_tbl
+                    and _sch_compat(s_sch, t.get("source_schema"))
+                    and _sch_compat(t_sch, t.get("target_schema"))
                 ):
                     return str(t["std_table_key"])
             return ""
@@ -176,14 +190,14 @@ class CrossComparatorService:
                 if (
                     _clean_tbl_low(t.get("target_table")) == t_tbl
                     or str(t.get("std_table_key") or "").strip().lower() == t_tbl
-                ):
+                ) and _sch_compat(t_sch, t.get("target_schema")):
                     return str(t["std_table_key"])
         elif s_tbl:
             for t in tables:
                 if (
                     _clean_tbl_low(t.get("source_table")) == s_tbl
                     or str(t.get("std_table_key") or "").strip().lower() == s_tbl
-                ):
+                ) and _sch_compat(s_sch, t.get("source_schema")):
                     return str(t["std_table_key"])
         return ""
 
@@ -1289,18 +1303,50 @@ class CrossComparatorService:
 
         prefilled: List[List[str]] = []
         if std_table_key or source_table or target_table:
+            active_key = (std_table_key or "").strip().lower()
+            lookup_key = active_key
+            load_saved_binding = bool(active_key)
+            if not lookup_key:
+                tables = self.ctx.store.list_cross_tables()
+                matched_key = self._find_matching_table_key(
+                    tables,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_schema=target_schema,
+                    target_table=target_table,
+                )
+                if matched_key:
+                    lookup_key = matched_key
+                    load_saved_binding = True
+                else:
+                    raw_fb = (target_table or source_table or "").strip()
+                    if "." in raw_fb:
+                        raw_fb = raw_fb.split(".", 1)[1]
+                    lookup_key = clean_identifier_input(raw_fb).lower()
+                    load_saved_binding = False
             comp = self.compare_single_table(
-                (std_table_key or source_table or target_table).strip().lower(),
+                lookup_key,
                 override_source_schema=source_schema or None,
                 override_source_table=source_table or None,
                 override_target_schema=target_schema or None,
                 override_target_table=target_table or None,
                 persist_missing_binding=False,
+                load_saved_binding=load_saved_binding,
             )
             tb = comp.get("table_binding") or {}
-            s_sch = tb.get("source_schema") or source_schema or "public"
+            s_sch = (
+                tb.get("source_schema")
+                or source_schema
+                or (comp.get("source_panel") or {}).get("schema_name")
+                or "public"
+            )
             s_tbl = tb.get("source_table") or source_table or ""
-            t_sch = tb.get("target_schema") or target_schema or "public"
+            t_sch = (
+                tb.get("target_schema")
+                or target_schema
+                or (comp.get("target_panel") or {}).get("schema_name")
+                or "public"
+            )
             t_tbl = tb.get("target_table") or target_table or ""
             for dr in comp.get("dual_rows") or []:
                 sc = dr.get("source_col") or {}

@@ -2108,6 +2108,9 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 tc.execute(
                     "CREATE TABLE dwd_cust (cust_no TEXT, tgt_extra TEXT)"
                 )
+                tc.execute(
+                    "CREATE TABLE dwd_cust_v2 (tgt_new_a TEXT)"
+                )
                 tc.commit()
 
             app = create_app(
@@ -2455,6 +2458,69 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             }
             self.assertEqual(new_src_cols, {"new_col_a", "new_col_b"})
 
+            # 10) 跨模式同名来源表 other_sch.ods_cust -> main.dwd_cust 预览不得跨模式匹配 main.ods_cust 混入幽灵字段
+            from core.platform.models import ColumnMeta, TableMeta
+
+            ctx.store.save_table_meta(
+                src_cid,
+                TableMeta(
+                    schema_name="other_sch",
+                    table_name="ods_cust",
+                    columns=[
+                        ColumnMeta(1, "other_x", "TEXT"),
+                        ColumnMeta(2, "other_y", "TEXT"),
+                    ],
+                ),
+            )
+            ov_cross_sch = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=other_sch&source_table=ods_cust&target_schema=main&target_table=dwd_cust"
+            )
+            self.assertEqual(ov_cross_sch.status_code, 200)
+            ov_cross_data = ov_cross_sch.json()
+            self.assertEqual(ov_cross_data["active_table_key"], "")
+            cross_src_cols = {
+                (r.get("source_col") or {}).get("column_name")
+                for r in ov_cross_data["active_comparison"]["dual_rows"]
+                if r.get("source_col")
+            }
+            self.assertEqual(cross_src_cols, {"other_x", "other_y"})
+
+            # 11) 下载未保存表对预填模板时不得泄漏冲突 std_table_key 的幽灵字段
+            save_collide = client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "ods_cust",
+                    "source_schema": "main",
+                    "source_table": "ods_cust_v2",
+                    "target_schema": "main",
+                    "target_table": "ods_cust",
+                    "sync_to_field_bindings": False,
+                    "pairings": [
+                        {
+                            "source_col": "new_col_a",
+                            "target_col": "cust_id",
+                            "source_std_code": "STD001",
+                            "target_std_code": "STD001",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(save_collide.status_code, 200)
+            tpl_res = client.get(
+                "/api/modules/cross_comparator/pairings/template.xlsx"
+                "?source_schema=main&source_table=ods_cust&target_schema=main&target_table=dwd_cust_v2"
+            )
+            self.assertEqual(tpl_res.status_code, 200)
+            wb_tpl = openpyxl.load_workbook(io.BytesIO(tpl_res.content), data_only=True)
+            ws_tpl = wb_tpl["跨环境字段映射"]
+            tpl_rows = list(ws_tpl.iter_rows(min_row=2, values_only=True))
+            tpl_src_cols = {str(r[2] or "").strip() for r in tpl_rows if r[2]}
+            tpl_tgt_cols = {str(r[6] or "").strip() for r in tpl_rows if r[6]}
+            self.assertNotIn("new_col_a", tpl_src_cols)
+            self.assertEqual(tpl_src_cols, {"cust_id", "raw_extra"})
+            self.assertEqual(tpl_tgt_cols, {"tgt_new_a"})
+
     def test_cross_comparator_five_col_and_header_non_overlap_structure(self) -> None:
         """静态校验 R1 五虚拟列、R2 顶部防遮蔽与 R3 侧边栏标准选择器结构."""
         static_dir = resolve_static_dir()
@@ -2508,6 +2574,9 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
         self.assertIn("_markDirty()", cross_js)
         self.assertIn("this.onStateUpdate?.()", cross_js)
         self.assertNotIn("this.activeTableKey || target_table", cross_js)
+        self.assertNotIn("this.activeTableKey = nextKey", cross_js)
+        self.assertIn("_reloadCurrentComparison", cross_js)
+        self.assertIn("_deriveSaveTableKey", cross_js)
         self.assertIn("refreshOnActivate", std_view_js)
         self.assertIn("store.subscribe", cross_js)
         self.assertIn("comparatorPane?.destroy", std_view_js)

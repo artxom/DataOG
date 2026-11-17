@@ -135,6 +135,26 @@ export class CrossComparatorView {
     await this.loadOverview(this.activeTableKey, false);
   }
 
+  async _reloadCurrentComparison(extra = {}) {
+    const savedTables = this.overview?.tables || [];
+    const hasSavedActive = Boolean(
+      this.activeTableKey && savedTables.some((t) => t.std_table_key === this.activeTableKey)
+    );
+    if (hasSavedActive) {
+      return this.loadOverview(this.activeTableKey, false, extra);
+    }
+    if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
+      return this.loadOverview("", false, {
+        sourceSchema: this.draftTableBind.source_schema,
+        sourceTable: this.draftTableBind.source_table,
+        targetSchema: this.draftTableBind.target_schema,
+        targetTable: this.draftTableBind.target_table,
+        ...extra,
+      });
+    }
+    return this.loadOverview(this.activeTableKey, false, extra);
+  }
+
   async refreshOnActivate() {
     if (!this.loadedOnce) {
       await this.ensureLoaded(false);
@@ -145,22 +165,7 @@ export class CrossComparatorView {
       this.onStateUpdate?.();
       return;
     }
-    const savedTables = this.overview?.tables || [];
-    const hasSavedActive = Boolean(
-      this.activeTableKey && savedTables.some((t) => t.std_table_key === this.activeTableKey)
-    );
-    if (hasSavedActive) {
-      await this.loadOverview(this.activeTableKey, false);
-    } else if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
-      await this.loadOverview("", false, {
-        sourceSchema: this.draftTableBind.source_schema,
-        sourceTable: this.draftTableBind.source_table,
-        targetSchema: this.draftTableBind.target_schema,
-        targetTable: this.draftTableBind.target_table,
-      });
-    } else {
-      await this.loadOverview(this.activeTableKey, false);
-    }
+    await this._reloadCurrentComparison();
   }
 
   _markDirty() {
@@ -471,38 +476,102 @@ export class CrossComparatorView {
     }
   }
 
+  _deriveSaveTableKey() {
+    if (this.activeTableKey) return this.activeTableKey;
+    const cleanLow = (v) =>
+      String(v || "")
+        .trim()
+        .replace(/^["'“”‘’`「」『』\s]+|["'“”‘’`「」『』\s]+$/g, "")
+        .toLowerCase();
+    const stripTbl = (v) => {
+      const s = cleanLow(v);
+      const dotIdx = s.indexOf(".");
+      return dotIdx !== -1 ? s.slice(dotIdx + 1) : s;
+    };
+    const sTbl = stripTbl(this.draftTableBind.source_table);
+    const tTbl = stripTbl(this.draftTableBind.target_table);
+    const sSch = cleanLow(this.draftTableBind.source_schema);
+    const tSch = cleanLow(this.draftTableBind.target_schema);
+    const baseKey = tTbl || sTbl;
+    if (!baseKey) return "";
+
+    const savedTables = this.overview?.tables || [];
+    const isSamePair = (t) =>
+      stripTbl(t.source_table) === sTbl &&
+      stripTbl(t.target_table) === tTbl &&
+      (!sSch || !cleanLow(t.source_schema) || cleanLow(t.source_schema) === sSch) &&
+      (!tSch || !cleanLow(t.target_schema) || cleanLow(t.target_schema) === tSch);
+
+    const exactMatch = savedTables.find(isSamePair);
+    if (exactMatch?.std_table_key) {
+      return String(exactMatch.std_table_key).trim().toLowerCase();
+    }
+
+    const candidates = [baseKey];
+    if (sTbl && tTbl) candidates.push(`${sTbl}__${tTbl}`);
+    if (sSch && sTbl && tTbl) candidates.push(`${sSch}_${sTbl}__${tTbl}`);
+    if (sSch && sTbl && tSch && tTbl) candidates.push(`${sSch}_${sTbl}__${tSch}_${tTbl}`);
+
+    for (const cand of candidates) {
+      const existing = savedTables.find(
+        (t) => String(t.std_table_key || "").trim().toLowerCase() === cand
+      );
+      if (!existing || isSamePair(existing)) {
+        return cand;
+      }
+    }
+    const tail = candidates[candidates.length - 1];
+    let idx = 2;
+    while (
+      savedTables.some(
+        (t) => String(t.std_table_key || "").trim().toLowerCase() === `${tail}_${idx}`
+      )
+    ) {
+      idx += 1;
+    }
+    return `${tail}_${idx}`;
+  }
+
   async previewSelectedTables(forceRefresh = false) {
     const { source_schema, source_table, target_schema, target_table } = this.draftTableBind;
     if (!source_table && !target_table) {
       Toast.warn("请先在左侧或右侧选择表名");
       return;
     }
-    const sTbl = String(source_table || "").trim().toLowerCase();
-    const tTbl = String(target_table || "").trim().toLowerCase();
+    const stripTbl = (v) => {
+      const s = String(v || "").trim().toLowerCase();
+      const dotIdx = s.indexOf(".");
+      return dotIdx !== -1 ? s.slice(dotIdx + 1) : s;
+    };
+    const sTbl = stripTbl(source_table);
+    const tTbl = stripTbl(target_table);
     const sSch = String(source_schema || "").trim().toLowerCase();
     const tSch = String(target_schema || "").trim().toLowerCase();
+    const schCompat = (qSch, savedSchRaw) => {
+      const savedSch = String(savedSchRaw || "").trim().toLowerCase();
+      return !qSch || !savedSch || savedSch === qSch;
+    };
     const savedTables = this.overview?.tables || [];
     let matched = null;
     if (sTbl && tTbl) {
       matched =
         savedTables.find(
           (t) =>
-            String(t.source_table || "").trim().toLowerCase() === sTbl &&
-            String(t.target_table || "").trim().toLowerCase() === tTbl &&
+            stripTbl(t.source_table) === sTbl &&
+            stripTbl(t.target_table) === tTbl &&
             (!sSch || String(t.source_schema || "").trim().toLowerCase() === sSch) &&
             (!tSch || String(t.target_schema || "").trim().toLowerCase() === tSch)
         ) ||
         savedTables.find(
           (t) =>
-            String(t.source_table || "").trim().toLowerCase() === sTbl &&
-            String(t.target_table || "").trim().toLowerCase() === tTbl
+            stripTbl(t.source_table) === sTbl &&
+            stripTbl(t.target_table) === tTbl &&
+            schCompat(sSch, t.source_schema) &&
+            schCompat(tSch, t.target_schema)
         );
     }
-    const nextKey = String(matched?.std_table_key || tTbl || sTbl || "")
-      .trim()
-      .toLowerCase();
     this.activeTableKey = "";
-    const ok = await this.loadOverview(matched?.std_table_key || "", forceRefresh, {
+    await this.loadOverview(matched?.std_table_key || "", forceRefresh, {
       sourceSchema: source_schema,
       sourceTable: source_table,
       targetSchema: target_schema,
@@ -510,16 +579,10 @@ export class CrossComparatorView {
       sourceFormatProfile: this.sourceFormatProfile,
       targetFormatProfile: this.targetFormatProfile,
     });
-    if (ok && !this.activeTableKey && nextKey) {
-      this.activeTableKey = nextKey;
-    }
   }
 
   async saveCurrentPairings(forceRefresh = false) {
-    const key =
-      this.activeTableKey ||
-      this.draftTableBind.target_table ||
-      this.draftTableBind.source_table;
+    const key = this._deriveSaveTableKey();
     if (!key) {
       Toast.warn("请先选择或输入来源库/目标库表名");
       return false;
@@ -1071,9 +1134,13 @@ export class CrossComparatorView {
         className: "mac-btn mac-btn-sm mac-btn-primary",
         text: "推送贯标 →",
         onClick: async () => {
-          if (this.dirty) {
+          if (this.dirty || (!this.activeTableKey && this.centerRows.length > 0)) {
             const saved = await this.saveCurrentPairings(false);
             if (!saved) return;
+          }
+          if (!this.activeTableKey) {
+            Toast.warn("请先选择并保存包含已绑标准字段的映射表对后再推送贯标");
+            return;
           }
           const ok = await Modal.confirm({
             title: "推送至第 2 步贯标执行",
@@ -1113,6 +1180,9 @@ export class CrossComparatorView {
         "aria-label": role === "source" ? "选择来源库" : "选择目标库",
         onChange: async (e) => {
           try {
+            const hasUnsavedDraft =
+              !this.activeTableKey &&
+              Boolean(this.draftTableBind.source_table || this.draftTableBind.target_table);
             const res = await crossApi.bindRole({
               role,
               connection_id: e.target.value,
@@ -1127,11 +1197,15 @@ export class CrossComparatorView {
               this.targetFormatProfile =
                 res.target_connection?.standard_format || res.target_format_profile || "AUTO";
             }
+            if (!hasUnsavedDraft && res.active_table_key !== undefined) {
+              this.activeTableKey = res.active_table_key || "";
+            }
             if (
+              hasUnsavedDraft ||
               res.source_format_profile !== this.sourceFormatProfile ||
               res.target_format_profile !== this.targetFormatProfile
             ) {
-              await this.loadOverview(this.activeTableKey, false, {
+              await this._reloadCurrentComparison({
                 sourceFormatProfile: this.sourceFormatProfile,
                 targetFormatProfile: this.targetFormatProfile,
               });
@@ -1209,7 +1283,7 @@ export class CrossComparatorView {
         onChange: (e) => {
           if (side === "source") this.sourceFormatProfile = e.target.value;
           else this.targetFormatProfile = e.target.value;
-          this.loadOverview(this.activeTableKey, false, {
+          this._reloadCurrentComparison({
             sourceFormatProfile: this.sourceFormatProfile,
             targetFormatProfile: this.targetFormatProfile,
           });
@@ -1716,7 +1790,19 @@ export class CrossComparatorView {
           type: "button",
           className: "btn btn-xs",
           text: "导出 Excel",
-          onClick: () => crossApi.exportExcel(this.activeTableKey).catch((e) => Toast.error(e.message)),
+          onClick: () => {
+            if (!this.activeTableKey) {
+              if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
+                Toast.warn("当前预览表对尚未保存，请先点击「保存」后再导出 Excel");
+                return;
+              }
+              if (!(ov.tables || []).length) {
+                Toast.warn("暂无可导出的已保存映射表对");
+                return;
+              }
+            }
+            crossApi.exportExcel(this.activeTableKey).catch((e) => Toast.error(e.message));
+          },
         }),
         el("button", {
           type: "button",
