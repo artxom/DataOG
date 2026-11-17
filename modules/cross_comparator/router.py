@@ -35,6 +35,8 @@ def api_cross_overview(
     target_schema: Optional[str] = Query(default=None),
     target_table: Optional[str] = Query(default=None),
     format_profile: str = Query(default="AUTO"),
+    source_format_profile: str = Query(default="AUTO"),
+    target_format_profile: str = Query(default="AUTO"),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
@@ -46,6 +48,8 @@ def api_cross_overview(
             target_schema=target_schema,
             target_table=target_table,
             format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
         )
     except Exception as exc:
         return _err(str(exc), 400)
@@ -164,6 +168,8 @@ def api_cross_push_to_migrator(
         return CrossComparatorService(ctx).push_to_migrator(
             std_table_key=payload.std_table_key or None,
             format_profile=payload.format_profile,
+            source_format_profile=payload.source_format_profile,
+            target_format_profile=payload.target_format_profile,
         )
     except Exception as exc:
         return _err(str(exc), 400)
@@ -183,6 +189,8 @@ def api_cross_save_pairings(
             target_table=payload.target_table,
             pairings=payload.pairings,
             format_profile=payload.format_profile,
+            source_format_profile=payload.source_format_profile,
+            target_format_profile=payload.target_format_profile,
             force_refresh=payload.force_refresh,
             sync_to_field_bindings=payload.sync_to_field_bindings,
         )
@@ -223,6 +231,8 @@ def api_cross_pairings_template(
 async def api_cross_pairings_upload(
     file: UploadFile = File(...),
     format_profile: str = Form(default="AUTO"),
+    source_format_profile: str = Form(default="AUTO"),
+    target_format_profile: str = Form(default="AUTO"),
     progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
@@ -235,6 +245,8 @@ async def api_cross_pairings_upload(
             filename=file.filename or "cross_pairings.xlsx",
             content=raw,
             format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
             progress_cb=reporter,
         )
         ctx.import_progress.finish(

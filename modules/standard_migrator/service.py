@@ -445,6 +445,17 @@ class StandardMigratorService:
             return None
         return self.ctx.connection_hub.get_profile(cid)
 
+    @staticmethod
+    def _resolve_format_profile(prof: Optional[Any], requested: str = "AUTO") -> str:
+        req = (requested or "").strip()
+        if req and req != "AUTO":
+            return req
+        if prof is not None:
+            saved = (getattr(prof, "standard_format", "") or "").strip()
+            if saved:
+                return saved
+        return "AUTO"
+
     def get_bindings_overview(
         self,
         connection_id: str = "",
@@ -452,6 +463,7 @@ class StandardMigratorService:
     ) -> Dict[str, Any]:
         prof = self._resolve_binding_profile(connection_id)
         cid = prof.connection_id if prof else ""
+        eff_format = self._resolve_format_profile(prof, format_profile)
         if prof and prof.connection_id != self.ctx.store.get_meta("migrator_connection_id", ""):
             # 允许查看不同连接时不强制破坏历史执行台绑定，若当前未绑定则顺便绑定
             if not self.ctx.store.get_meta("migrator_connection_id", ""):
@@ -472,7 +484,7 @@ class StandardMigratorService:
             "catalog": catalog_tree,
             "dict_summary": self.ctx.standard_catalog.get_summary(),
             "format_profiles": self.ctx.standard_catalog.list_format_profiles(),
-            "format_profile": format_profile or "AUTO",
+            "format_profile": eff_format,
             "table_stats": self.ctx.standard_catalog.get_connection_binding_stats(cid) if cid else {},
             "migration_summary": self.ctx.store.get_summary(),
         }
@@ -628,6 +640,7 @@ class StandardMigratorService:
         purge_errors: bool = True,
     ) -> Dict[str, Any]:
         prof = self.ctx.connection_hub.require_profile(connection_id)
+        eff_format = self._resolve_format_profile(prof, format_profile)
         def_sch = prof.effective_default_schema()
         eff_schema = (schema_name or def_sch or "public").strip()
         eff_table = (table_name or "").strip()
@@ -681,7 +694,7 @@ class StandardMigratorService:
             t_meta=t_meta,
             bindings_map=bindings_map,
             std_dict_map=std_dict_map,
-            format_profile=format_profile,
+            format_profile=eff_format,
         )
         if compliance_updates:
             self.ctx.standard_catalog.update_binding_compliance_batch(
@@ -703,6 +716,7 @@ class StandardMigratorService:
         active_table: str = "",
     ) -> Dict[str, Any]:
         prof = self.ctx.connection_hub.require_profile(connection_id)
+        eff_format = self._resolve_format_profile(prof, format_profile)
         self.ctx.standard_catalog.upsert_field_bindings(
             prof.connection_id, bindings, bind_source="MANUAL"
         )
@@ -713,13 +727,14 @@ class StandardMigratorService:
                 prof.connection_id,
                 sch or prof.effective_default_schema(),
                 tbl,
-                format_profile=format_profile,
+                format_profile=eff_format,
                 force_refresh=False,
             )
             res["message"] = f"已保存 {actual_len_text(bindings)} 条字段标准绑定"
             return res
         return {
             "ok": True,
+            "format_profile": eff_format,
             "table_stats": self.ctx.standard_catalog.get_connection_binding_stats(prof.connection_id),
             "message": "字段标准绑定已更新",
         }
@@ -734,6 +749,7 @@ class StandardMigratorService:
         format_profile: str = "AUTO",
     ) -> Dict[str, Any]:
         prof = self.ctx.connection_hub.require_profile(connection_id)
+        eff_format = self._resolve_format_profile(prof, format_profile)
         targets = self._parse_table_targets(
             tables=tables,
             schema_name=schema_name,
@@ -827,7 +843,7 @@ class StandardMigratorService:
         batch_check = self.check_compliance(
             connection_id=prof.connection_id,
             tables=[{"schema_name": s, "table_name": t} for s, t in targets],
-            format_profile=format_profile,
+            format_profile=eff_format,
             force_refresh=False,
             tolerate_probe_errors=True,
         )
@@ -835,6 +851,7 @@ class StandardMigratorService:
 
         res: Dict[str, Any] = {
             "ok": True,
+            "format_profile": eff_format,
             "matched_count": matched_count,
             "checked_tables": len(targets),
             "table_stats": batch_check["table_stats"],
@@ -866,6 +883,7 @@ class StandardMigratorService:
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
         prof = self.ctx.connection_hub.require_profile(connection_id)
+        eff_format = self._resolve_format_profile(prof, format_profile)
         eff_def_schema = prof.effective_default_schema()
         targets = self._parse_table_targets(
             tables=tables,
@@ -988,7 +1006,7 @@ class StandardMigratorService:
                 t_meta=t_meta,
                 bindings_map=b_map,
                 std_dict_map=std_dict_map,
-                format_profile=format_profile,
+                format_profile=eff_format,
             )
             if c_updates:
                 if should_realign:
@@ -1050,7 +1068,7 @@ class StandardMigratorService:
         out: Dict[str, Any] = {
             "ok": True,
             "connection_id": prof.connection_id,
-            "format_profile": format_profile or "AUTO",
+            "format_profile": eff_format,
             "aggregate": agg,
             "tables": table_results,
             "table_stats": table_stats,
@@ -1220,6 +1238,7 @@ class StandardMigratorService:
             0,
         )
         prof = self.ctx.connection_hub.require_profile(connection_id)
+        eff_format = self._resolve_format_profile(prof, format_profile)
         validate_xlsx_bytes(filename, content)
 
         # 自动清理历史遗留的 #N/A 等错误占位绑定，确保增量合并后状态干净准确
@@ -1499,7 +1518,7 @@ class StandardMigratorService:
         check_res = self.check_compliance(
             connection_id=prof.connection_id,
             tables=targets,
-            format_profile=format_profile,
+            format_profile=eff_format,
             force_refresh=False,
             progress_cb=report,
             tolerate_probe_errors=True,
@@ -1526,6 +1545,7 @@ class StandardMigratorService:
         prof = self._resolve_binding_profile(connection_id)
         if not prof:
             raise ValueError("请先绑定目标数据源连接")
+        eff_format = self._resolve_format_profile(prof, format_profile)
 
         raw_list = [x.strip() for x in (tables or "").split(",") if x.strip()]
         targets = self._parse_table_targets(
@@ -1566,7 +1586,7 @@ class StandardMigratorService:
             batch_res = self.check_compliance(
                 connection_id=prof.connection_id,
                 tables=[{"schema_name": s, "table_name": t} for s, t in targets],
-                format_profile=format_profile,
+                format_profile=eff_format,
                 force_refresh=False,
                 tolerate_probe_errors=True,
             )
@@ -1625,11 +1645,13 @@ class StandardMigratorService:
         append: bool = False,
     ) -> Dict[str, Any]:
         """将已绑定数标的未达标字段生成贯标改造项，无缝衔接单条 ALTER 或 TABLE_REBUILD 保序重建."""
+        prof = self.ctx.connection_hub.require_profile(connection_id)
+        eff_format = self._resolve_format_profile(prof, format_profile)
         comp = self.get_table_compliance(
             connection_id,
             schema_name,
             table_name,
-            format_profile=format_profile,
+            format_profile=eff_format,
             force_refresh=False,
         )
         t_info = comp["table"]

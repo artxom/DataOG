@@ -37,6 +37,8 @@ class SaveCrossPairingsPayload(BaseModel):
     target_schema: str = ""
     target_table: str = ""
     format_profile: str = "AUTO"
+    source_format_profile: str = "AUTO"
+    target_format_profile: str = "AUTO"
     pairings: List[Dict[str, Any]] = Field(default_factory=list)
     force_refresh: bool = False
     sync_to_field_bindings: bool = True
@@ -45,3 +47,5 @@ class SaveCrossPairingsPayload(BaseModel):
 class PushToMigratorPayload(BaseModel):
     std_table_key: str = ""
     format_profile: str = "AUTO"
+    source_format_profile: str = "AUTO"
+    target_format_profile: str = "AUTO"

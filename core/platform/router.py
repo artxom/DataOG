@@ -14,6 +14,7 @@ from core.platform.schemas import (
     AppearanceResetPayload,
     AppearanceUpdatePayload,
     ConnectionPayload,
+    ConnectionStandardFormatPayload,
     LLMProviderPayload,
     MetadataRefreshPayload,
     QueryExecutePayload,
@@ -153,6 +154,28 @@ def api_update_connection(
             "catalog_tree": tree,
             "message": f"数据源 [{saved.name}] 已更新",
         }
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
+@router.put("/connections/{connection_id}/standard-format")
+def api_update_connection_standard_format(
+    connection_id: str,
+    payload: ConnectionStandardFormatPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        saved = ctx.connection_hub.update_standard_format(
+            connection_id, payload.standard_format
+        )
+        return {
+            "ok": True,
+            "connection": saved.to_public_dict(),
+            "connections": ctx.connection_hub.list_profiles(),
+            "message": f"数据源 [{saved.name}] 的落标标准格式已保存为 [{saved.standard_format}]",
+        }
+    except LookupError as exc:
+        return _err(str(exc), 404)
     except Exception as exc:
         return _err(str(exc), 400)
 

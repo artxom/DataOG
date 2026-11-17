@@ -1,9 +1,8 @@
 /**
  * Data.O.G 数据标准第 3 步：跨环境比对 (CrossComparatorView)
- * 双列对照画布（来源库 | 目标库）× 内侧中缝拟物书签桥接：
- * - 左右已配对且数据标准一致：合拢为不惹眼的淡绿贯通拟物书签（若目标库物理未达标则附「待贯标」角标）
- * - 不一致 / 单侧 / 未绑标：中缝断开为左右燕尾独立书签，分别展示各自数标
- * - 支持直接拖拽字段卡片调整配对、拆解配对、点击书签选绑数标及两步模板批量铺底
+ * macOS 风格五虚拟列工作台：
+ *   1. 来源表待选字段 | 2. 来源表已绑定数标字段 | 3. 数据标准 | 4. 目标表已绑定数标字段 | 5. 目标表待选字段
+ * 支持拖拽与点选双向绑标配对，两侧自动沿用各自数据库配置的落标标准格式。
  */
 
 import { crossApi } from "../core/api.js";
@@ -25,6 +24,7 @@ const DEFAULT_FORMAT_PROFILES = [
   { value: "type_ob_mysql", label: "ocenbase-mysql数据格式" },
   { value: "type_oceanbase", label: "ocenbase数据格式" },
   { value: "type_dameng", label: "DaMeng数据格式" },
+  { value: "type_goldendb", label: "GoldenDb(MySQL模式)" },
 ];
 
 export class CrossComparatorView {
@@ -35,9 +35,45 @@ export class CrossComparatorView {
     this.activeTableKey = "";
     this.loadedOnce = false;
     this.formatProfile = "AUTO";
+    this.sourceFormatProfile = "AUTO";
+    this.targetFormatProfile = "AUTO";
     this.formatProfiles = DEFAULT_FORMAT_PROFILES;
     this.dirty = false;
-    this.dragPayload = null; // { side: 'source'|'target', rowIdx: number }
+
+    this.dragPayload = null; // { kind: 'candidate'|'bound', side: 'source'|'target', colName: string, rowIdx?: number }
+    this.selectedCandidate = null; // { side: 'source'|'target', columnName: string }
+    this.srcCandidateFilter = "";
+    this.tgtCandidateFilter = "";
+    this.srcCandidateListMount = el("div", { className: "cross-cand-list" });
+    this.tgtCandidateListMount = el("div", { className: "cross-cand-list" });
+    this.srcSearchInput = el("input", {
+      className: "mac-input input-xs",
+      type: "search",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      placeholder: "筛选待选字段...",
+      style: { width: "100%" },
+      onInput: (e) => {
+        this.srcCandidateFilter = e.target.value;
+        this._populateCandidateList("source");
+      },
+    });
+    this.tgtSearchInput = el("input", {
+      className: "mac-input input-xs",
+      type: "search",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      placeholder: "筛选待选字段...",
+      style: { width: "100%" },
+      onInput: (e) => {
+        this.tgtCandidateFilter = e.target.value;
+        this._populateCandidateList("target");
+      },
+    });
 
     this.draftTableBind = {
       source_schema: "",
@@ -45,7 +81,9 @@ export class CrossComparatorView {
       target_schema: "",
       target_table: "",
     };
-    this.draftRows = [];
+    this.sourceCandidates = [];
+    this.targetCandidates = [];
+    this.centerRows = [];
 
     this.root = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
@@ -55,6 +93,45 @@ export class CrossComparatorView {
   async ensureLoaded(force = false) {
     if (this.loadedOnce && !force) return;
     await this.loadOverview(this.activeTableKey, false);
+  }
+
+  _pickResolvedType(stdItem, formatProfile = "AUTO", dbType = "DWS") {
+    if (!stdItem) return "";
+    if (formatProfile && formatProfile !== "AUTO" && stdItem[formatProfile]) {
+      return stdItem[formatProfile];
+    }
+    const dt = String(dbType || "DWS").toUpperCase();
+    if (dt === "INCEPTOR") {
+      return stdItem.type_argodb || stdItem.type_dws || stdItem.type_mysql || "";
+    }
+    if (dt === "MYSQL") {
+      return stdItem.type_mysql || stdItem.type_ob_mysql || stdItem.type_dws || "";
+    }
+    if (dt === "ORACLE") {
+      return stdItem.type_oracle || stdItem.type_ob_oracle || stdItem.type_dws || "";
+    }
+    if (dt === "DM8") {
+      return stdItem.type_dameng || stdItem.type_oracle || stdItem.type_dws || "";
+    }
+    return stdItem.type_dws || stdItem.type_dw_mart || stdItem.type_oracle || stdItem.type_mysql || "";
+  }
+
+  _toStdBrief(picked, side) {
+    if (!picked) return null;
+    const ov = this.overview || {};
+    const dbType =
+      side === "source"
+        ? ov.source_connection?.db_type || "DWS"
+        : ov.target_connection?.db_type || "DWS";
+    const fmt = side === "source" ? this.sourceFormatProfile : this.targetFormatProfile;
+    return {
+      std_code: picked.std_code,
+      cn_name: picked.cn_name,
+      en_abbr: picked.en_abbr,
+      resolved_type: picked.resolved_type || this._pickResolvedType(picked, fmt, dbType),
+      domain_name: picked.domain_name || "",
+      missing: Boolean(picked.missing),
+    };
   }
 
   _recomputeRowState(row) {
@@ -76,32 +153,44 @@ export class CrossComparatorView {
 
   _computeBookmarkSummary() {
     const sum = {
-      total_rows: this.draftRows.length,
+      total_rows: this.centerRows.length,
       paired_rows: 0,
       unified: 0,
       split_diff: 0,
       split_partial: 0,
-      split_unbound: 0,
+      unbound_src: this.sourceCandidates.length,
+      unbound_tgt: this.targetCandidates.length,
       target_needs_migration: 0,
     };
-    for (const r of this.draftRows) {
+    for (const r of this.centerRows) {
       this._recomputeRowState(r);
       if (r.paired) sum.paired_rows += 1;
       if (r.bookmark_state === "UNIFIED") sum.unified += 1;
       else if (r.bookmark_state === "SPLIT_DIFF") sum.split_diff += 1;
-      else if (r.bookmark_state === "SPLIT_PARTIAL") sum.split_partial += 1;
-      else sum.split_unbound += 1;
+      else sum.split_partial += 1;
       if (r.target_needs_migration) sum.target_needs_migration += 1;
     }
     return sum;
   }
 
+  _sortCandidates(list) {
+    return list.sort((a, b) => {
+      const ao = Number(a.ordinal_position || 999999);
+      const bo = Number(b.ordinal_position || 999999);
+      if (ao !== bo) return ao - bo;
+      return String(a.column_name || "").localeCompare(String(b.column_name || ""));
+    });
+  }
+
   _hydrateDraftFromComparison(comp) {
     this.dirty = false;
-    if (!comp) {
-      this.draftRows = [];
-      return;
-    }
+    this.selectedCandidate = null;
+    this.dragPayload = null;
+    this.sourceCandidates = [];
+    this.targetCandidates = [];
+    this.centerRows = [];
+    if (!comp) return;
+
     const tb = comp.table_binding || {};
     this.draftTableBind = {
       source_schema: tb.source_schema || comp.source_panel?.schema_name || "",
@@ -109,32 +198,103 @@ export class CrossComparatorView {
       target_schema: tb.target_schema || comp.target_panel?.schema_name || "",
       target_table: tb.target_table || comp.target_panel?.table_name || "",
     };
-    this.draftRows = (comp.dual_rows || []).map((dr) =>
-      this._recomputeRowState({
-        row_id: dr.row_id,
-        paired: Boolean(dr.paired),
-        bookmark_state: dr.bookmark_state,
-        source_col: dr.source_col ? { ...dr.source_col } : null,
-        target_col: dr.target_col ? { ...dr.target_col } : null,
-        source_std_code: dr.source_std_code || "",
-        target_std_code: dr.target_std_code || "",
-        source_std: dr.source_std ? { ...dr.source_std } : null,
-        target_std: dr.target_std ? { ...dr.target_std } : null,
-        target_compliance: dr.target_compliance ? { ...dr.target_compliance } : null,
-        target_needs_migration: Boolean(dr.target_needs_migration),
-      })
-    );
+
+    if (comp.source_format_profile) this.sourceFormatProfile = comp.source_format_profile;
+    if (comp.target_format_profile) this.targetFormatProfile = comp.target_format_profile;
+
+    const seenSrc = new Set();
+    const seenTgt = new Set();
+
+    for (const dr of comp.dual_rows || []) {
+      const sCol = dr.source_col ? { ...dr.source_col } : null;
+      const tCol = dr.target_col ? { ...dr.target_col } : null;
+      const sCode = String(dr.source_std_code || "").trim();
+      const tCode = String(dr.target_std_code || "").trim();
+
+      if (sCol && !sCode) {
+        const k = String(sCol.column_name || "").toLowerCase();
+        if (k && !seenSrc.has(k)) {
+          seenSrc.add(k);
+          this.sourceCandidates.push(sCol);
+        }
+      }
+      if (tCol && !tCode) {
+        const k = String(tCol.column_name || "").toLowerCase();
+        if (k && !seenTgt.has(k)) {
+          seenTgt.add(k);
+          this.targetCandidates.push(tCol);
+        }
+      }
+
+      const boundSrc = sCol && sCode ? sCol : null;
+      const boundTgt = tCol && tCode ? tCol : null;
+      if (boundSrc) seenSrc.add(String(boundSrc.column_name || "").toLowerCase());
+      if (boundTgt) seenTgt.add(String(boundTgt.column_name || "").toLowerCase());
+
+      if (boundSrc || boundTgt) {
+        this.centerRows.push(
+          this._recomputeRowState({
+            row_id: dr.row_id || `row_${this.centerRows.length + 1}`,
+            source_col: boundSrc,
+            target_col: boundTgt,
+            source_std_code: boundSrc ? sCode : "",
+            target_std_code: boundTgt ? tCode : "",
+            source_std: boundSrc && dr.source_std ? { ...dr.source_std } : null,
+            target_std: boundTgt && dr.target_std ? { ...dr.target_std } : null,
+            target_compliance: boundTgt && dr.target_compliance ? { ...dr.target_compliance } : null,
+            target_needs_migration: Boolean(boundTgt && dr.target_needs_migration),
+          })
+        );
+      }
+    }
+
+    for (const sc of comp.source_panel?.columns || []) {
+      const k = String(sc.column_name || "").toLowerCase();
+      if (k && !seenSrc.has(k)) {
+        seenSrc.add(k);
+        this.sourceCandidates.push({ ...sc });
+      }
+    }
+    for (const tc of comp.target_panel?.columns || []) {
+      const k = String(tc.column_name || "").toLowerCase();
+      if (k && !seenTgt.has(k)) {
+        seenTgt.add(k);
+        this.targetCandidates.push({ ...tc });
+      }
+    }
+
+    this._sortCandidates(this.sourceCandidates);
+    this._sortCandidates(this.targetCandidates);
+  }
+
+  _syncSideFormatsFromOverview(res) {
+    if (!res) return;
+    if (res.source_format_profile) {
+      this.sourceFormatProfile = res.source_format_profile;
+    } else if (res.source_connection?.standard_format) {
+      this.sourceFormatProfile = res.source_connection.standard_format;
+    }
+    if (res.target_format_profile) {
+      this.targetFormatProfile = res.target_format_profile;
+    } else if (res.target_connection?.standard_format) {
+      this.targetFormatProfile = res.target_connection.standard_format;
+    }
   }
 
   async loadOverview(tableKey = "", forceRefresh = false, extra = {}) {
     try {
+      const reqSourceFmt = extra.sourceFormatProfile ?? "AUTO";
+      const reqTargetFmt = extra.targetFormatProfile ?? "AUTO";
       const res = await crossApi.getOverview(tableKey, forceRefresh, {
         formatProfile: this.formatProfile,
+        sourceFormatProfile: reqSourceFmt,
+        targetFormatProfile: reqTargetFmt,
         ...extra,
       });
       this.loadedOnce = true;
       this.overview = res;
       if (res.format_profiles?.length) this.formatProfiles = res.format_profiles;
+      this._syncSideFormatsFromOverview(res);
       if (res.active_table_key !== undefined) {
         this.activeTableKey = res.active_table_key || "";
       }
@@ -158,6 +318,8 @@ export class CrossComparatorView {
       sourceTable: source_table,
       targetSchema: target_schema,
       targetTable: target_table,
+      sourceFormatProfile: this.sourceFormatProfile,
+      targetFormatProfile: this.targetFormatProfile,
     });
     if (!this.activeTableKey && key) {
       this.activeTableKey = key;
@@ -174,27 +336,44 @@ export class CrossComparatorView {
       return;
     }
     try {
-      const pairings = this.draftRows.map((r) => ({
-        source_col: r.source_col?.column_name || "",
-        target_col: r.target_col?.column_name || "",
-        source_std_code: r.source_std_code || "",
-        target_std_code: r.target_std_code || "",
-      }));
+      const pairings = [
+        ...this.centerRows.map((r) => ({
+          source_col: r.source_col?.column_name || "",
+          target_col: r.target_col?.column_name || "",
+          source_std_code: r.source_std_code || "",
+          target_std_code: r.target_std_code || "",
+        })),
+        ...this.sourceCandidates.map((c) => ({
+          source_col: c.column_name || "",
+          target_col: "",
+          source_std_code: "",
+          target_std_code: "",
+        })),
+        ...this.targetCandidates.map((c) => ({
+          source_col: "",
+          target_col: c.column_name || "",
+          source_std_code: "",
+          target_std_code: "",
+        })),
+      ];
       const res = await crossApi.savePairings({
         std_table_key: key,
         source_schema: this.draftTableBind.source_schema,
         source_table: this.draftTableBind.source_table,
         target_schema: this.draftTableBind.target_schema,
         target_table: this.draftTableBind.target_table,
-        format_profile: this.formatProfile,
+        format_profile: this.targetFormatProfile || this.formatProfile || "AUTO",
+        source_format_profile: this.sourceFormatProfile || "AUTO",
+        target_format_profile: this.targetFormatProfile || "AUTO",
         pairings,
         force_refresh: forceRefresh,
         sync_to_field_bindings: true,
       });
       this.overview = res;
+      this._syncSideFormatsFromOverview(res);
       this.activeTableKey = res.active_table_key || key;
       this._hydrateDraftFromComparison(res.active_comparison);
-      Toast.success(res.message || "映射关系与书签绑定已保存");
+      Toast.success(res.message || "映射关系与数标绑定已保存");
       this.render();
       this.onStateUpdate?.();
     } catch (err) {
@@ -202,174 +381,291 @@ export class CrossComparatorView {
     }
   }
 
-  smartPairRows() {
-    // 提取全部现有左右节点，按相同非空 std_code 或同名重新配对
-    const srcPool = [];
-    const tgtPool = [];
-    for (const r of this.draftRows) {
-      if (r.source_col) {
-        srcPool.push({
-          col: r.source_col,
-          std_code: r.source_std_code || "",
-          std: r.source_std || null,
-        });
-      }
-      if (r.target_col) {
-        tgtPool.push({
-          col: r.target_col,
-          std_code: r.target_std_code || "",
-          std: r.target_std || null,
-          target_compliance: r.target_compliance || null,
-          target_needs_migration: Boolean(r.target_needs_migration),
-        });
+  _evaluateProvisionalTargetCompliance(colObj, tgtStdBrief) {
+    if (!colObj || !tgtStdBrief) {
+      return { target_compliance: null, target_needs_migration: false };
+    }
+    const nameMatch =
+      !tgtStdBrief.en_abbr ||
+      String(colObj.column_name || "").toLowerCase() === String(tgtStdBrief.en_abbr || "").toLowerCase();
+    const typeMatch =
+      !tgtStdBrief.resolved_type ||
+      String(colObj.data_type || "").trim().toUpperCase() ===
+        String(tgtStdBrief.resolved_type || "").trim().toUpperCase();
+    const commMatch =
+      !tgtStdBrief.cn_name ||
+      String(colObj.column_comment || "").trim() === String(tgtStdBrief.cn_name || "").trim();
+    const compliant = nameMatch && typeMatch && commMatch;
+    return {
+      target_compliance: { status: compliant ? "COMPLIANT" : "NON_COMPLIANT" },
+      target_needs_migration: !compliant,
+    };
+  }
+
+  _takeCandidate(side, columnName) {
+    const list = side === "source" ? this.sourceCandidates : this.targetCandidates;
+    const idx = list.findIndex(
+      (c) => String(c.column_name || "").toLowerCase() === String(columnName || "").toLowerCase()
+    );
+    if (idx === -1) return null;
+    const [picked] = list.splice(idx, 1);
+    return picked;
+  }
+
+  _returnToCandidates(side, colObj) {
+    if (!colObj) return;
+    const list = side === "source" ? this.sourceCandidates : this.targetCandidates;
+    const exists = list.some(
+      (c) => String(c.column_name || "").toLowerCase() === String(colObj.column_name || "").toLowerCase()
+    );
+    if (!exists) {
+      list.push(colObj);
+      this._sortCandidates(list);
+    }
+  }
+
+  _bindFieldToRow(side, colObj, rowIdx, { removeFromRowIdx = -1 } = {}) {
+    const row = this.centerRows[rowIdx];
+    if (!row || !colObj) return;
+
+    const targetStdBrief =
+      side === "source"
+        ? row.source_std || row.target_std
+        : row.target_std || row.source_std;
+    const targetCode =
+      side === "source"
+        ? row.source_std_code || row.target_std_code || ""
+        : row.target_std_code || row.source_std_code || "";
+    if (!targetCode) return;
+
+    const displaced = row[`${side}_col`];
+    if (removeFromRowIdx !== -1 && removeFromRowIdx !== rowIdx) {
+      const prevRow = this.centerRows[removeFromRowIdx];
+      if (prevRow) {
+        prevRow[`${side}_col`] = null;
+        prevRow[`${side}_std_code`] = "";
+        prevRow[`${side}_std`] = null;
+        if (side === "target") {
+          prevRow.target_compliance = null;
+          prevRow.target_needs_migration = false;
+        }
+        if (!prevRow.source_col && !prevRow.target_col) {
+          this.centerRows.splice(removeFromRowIdx, 1);
+        }
       }
     }
-    const usedTgt = new Set();
-    const newRows = [];
 
-    for (const s of srcPool) {
-      let matchIdx = -1;
-      if (s.std_code) {
-        matchIdx = tgtPool.findIndex((t, i) => !usedTgt.has(i) && t.std_code === s.std_code);
-      }
-      if (matchIdx === -1) {
-        const sLower = (s.col.column_name || "").toLowerCase();
-        matchIdx = tgtPool.findIndex(
-          (t, i) => !usedTgt.has(i) && (t.col.column_name || "").toLowerCase() === sLower
-        );
-      }
-      if (matchIdx !== -1) {
-        usedTgt.add(matchIdx);
-        const t = tgtPool[matchIdx];
-        newRows.push(
-          this._recomputeRowState({
-            row_id: `pair_${s.col.column_name}_${t.col.column_name}`,
-            source_col: s.col,
-            target_col: t.col,
-            source_std_code: s.std_code,
-            target_std_code: t.std_code,
-            source_std: s.std,
-            target_std: t.std,
-            target_compliance: t.target_compliance,
-            target_needs_migration: t.target_needs_migration,
-          })
-        );
-      } else {
-        newRows.push(
-          this._recomputeRowState({
-            row_id: `src_${s.col.column_name}`,
-            source_col: s.col,
-            target_col: null,
-            source_std_code: s.std_code,
-            target_std_code: "",
-            source_std: s.std,
-            target_std: null,
-            target_compliance: null,
-            target_needs_migration: false,
-          })
-        );
-      }
+    const effBrief = targetStdBrief ? this._toStdBrief(targetStdBrief, side) : null;
+    row[`${side}_col`] = colObj;
+    row[`${side}_std_code`] = targetCode;
+    row[`${side}_std`] = effBrief;
+    if (side === "target") {
+      const ev = this._evaluateProvisionalTargetCompliance(colObj, effBrief);
+      row.target_compliance = ev.target_compliance;
+      row.target_needs_migration = ev.target_needs_migration;
     }
-    tgtPool.forEach((t, i) => {
-      if (usedTgt.has(i)) return;
-      newRows.push(
-        this._recomputeRowState({
-          row_id: `tgt_${t.col.column_name}`,
-          source_col: null,
-          target_col: t.col,
-          source_std_code: "",
-          target_std_code: t.std_code,
-          source_std: null,
-          target_std: t.std,
-          target_compliance: t.target_compliance,
-          target_needs_migration: t.target_needs_migration,
-        })
-      );
-    });
+    this._recomputeRowState(row);
 
-    this.draftRows = newRows;
+    if (displaced) {
+      this._returnToCandidates(side, displaced);
+    }
+    this.selectedCandidate = null;
     this.dirty = true;
-    Toast.info("已按数标编号与同名自动对齐字段，点击「保存对应关系」持久化");
     this.render();
   }
 
-  _handleDropOnSlot(targetSide, targetRowIdx) {
+  _unbindBoundField(side, rowIdx) {
+    const row = this.centerRows[rowIdx];
+    if (!row || !row[`${side}_col`]) return;
+    const colObj = row[`${side}_col`];
+    row[`${side}_col`] = null;
+    row[`${side}_std_code`] = "";
+    row[`${side}_std`] = null;
+    if (side === "target") {
+      row.target_compliance = null;
+      row.target_needs_migration = false;
+    }
+    this._returnToCandidates(side, colObj);
+    if (!row.source_col && !row.target_col) {
+      this.centerRows.splice(rowIdx, 1);
+    } else {
+      this._recomputeRowState(row);
+    }
+    this.dirty = true;
+    this.render();
+  }
+
+  _assignCandidateToRow(side, columnName, rowIdx) {
+    const colObj = this._takeCandidate(side, columnName);
+    if (!colObj) return;
+    this._bindFieldToRow(side, colObj, rowIdx);
+  }
+
+  _handleDropOnCenterTarget(targetRowIdx, fixedSide = null) {
     const payload = this.dragPayload;
     this.dragPayload = null;
     if (!payload) return;
-    const { side: dragSide, rowIdx: dragRowIdx } = payload;
-    if (dragRowIdx < 0 || dragRowIdx >= this.draftRows.length) return;
-    if (targetRowIdx < 0 || targetRowIdx >= this.draftRows.length) return;
-    if (dragRowIdx === targetRowIdx) return;
+    const side = fixedSide || payload.side;
+    if (payload.side !== side) return;
+    if (targetRowIdx < 0 || targetRowIdx >= this.centerRows.length) return;
 
-    // 当把 source 卡片拖到 target 卡片（或目标侧空槽）上，或同侧拖放排序置换
-    const dragRow = this.draftRows[dragRowIdx];
-    const dropRow = this.draftRows[targetRowIdx];
-    if (!dragRow || !dragRow[`${dragSide}_col`]) return;
-
-    const pickedCol = dragRow[`${dragSide}_col`];
-    const pickedCode = dragRow[`${dragSide}_std_code`];
-    const pickedStd = dragRow[`${dragSide}_std`];
-    const pickedComp = dragSide === "target" ? dragRow.target_compliance : null;
-    const pickedNeedsMig = dragSide === "target" ? dragRow.target_needs_migration : false;
-
-    const existingColAtDrop = dropRow[`${dragSide}_col`];
-    const existingCodeAtDrop = dropRow[`${dragSide}_std_code`];
-    const existingStdAtDrop = dropRow[`${dragSide}_std`];
-    const existingCompAtDrop = dragSide === "target" ? dropRow.target_compliance : null;
-    const existingNeedsMigAtDrop = dragSide === "target" ? dropRow.target_needs_migration : false;
-
-    const oppSide = dragSide === "source" ? "target" : "source";
-    const dragHadOpp = Boolean(dragRow[`${oppSide}_col`]);
-
-    // 将拖拽字段放入 dropRow[dragSide]
-    dropRow[`${dragSide}_col`] = pickedCol;
-    dropRow[`${dragSide}_std_code`] = pickedCode;
-    dropRow[`${dragSide}_std`] = pickedStd;
-    if (dragSide === "target") {
-      dropRow.target_compliance = pickedComp;
-      dropRow.target_needs_migration = pickedNeedsMig;
+    if (payload.kind === "candidate") {
+      this._assignCandidateToRow(side, payload.colName, targetRowIdx);
+      return;
     }
-
-    if (!existingColAtDrop) {
-      // 目标槽原本为空：清空 dragRow[dragSide]，若 dragRow 两侧均空则删除
-      dragRow[`${dragSide}_col`] = null;
-      dragRow[`${dragSide}_std_code`] = "";
-      dragRow[`${dragSide}_std`] = null;
-      if (dragSide === "target") {
-        dragRow.target_compliance = null;
-        dragRow.target_needs_migration = false;
-      }
-      if (!dragHadOpp) {
-        this.draftRows.splice(dragRowIdx, 1);
-      }
-    } else if (dragHadOpp) {
-      // 双方原来均有配对：直接互换同侧字段，保持两行完整
-      dragRow[`${dragSide}_col`] = existingColAtDrop;
-      dragRow[`${dragSide}_std_code`] = existingCodeAtDrop;
-      dragRow[`${dragSide}_std`] = existingStdAtDrop;
-      if (dragSide === "target") {
-        dragRow.target_compliance = existingCompAtDrop;
-        dragRow.target_needs_migration = existingNeedsMigAtDrop;
-      }
-    } else {
-      // dragRow 原为单侧游离字段，替换 dropRow 原字段后，原字段拆成游离行放在 dragRow 原位
-      dragRow[`${dragSide}_col`] = existingColAtDrop;
-      dragRow[`${dragSide}_std_code`] = existingCodeAtDrop;
-      dragRow[`${dragSide}_std`] = existingStdAtDrop;
-      if (dragSide === "target") {
-        dragRow.target_compliance = existingCompAtDrop;
-        dragRow.target_needs_migration = existingNeedsMigAtDrop;
-      }
+    if (payload.kind === "bound" && typeof payload.rowIdx === "number" && payload.rowIdx !== targetRowIdx) {
+      const fromRow = this.centerRows[payload.rowIdx];
+      const colObj = fromRow?.[`${side}_col`];
+      if (!colObj) return;
+      this._bindFieldToRow(side, colObj, targetRowIdx, { removeFromRowIdx: payload.rowIdx });
     }
+  }
 
+  _handleDropOnCandidatePool(targetSide) {
+    const payload = this.dragPayload;
+    this.dragPayload = null;
+    if (!payload || payload.kind !== "bound" || payload.side !== targetSide) return;
+    if (typeof payload.rowIdx === "number") {
+      this._unbindBoundField(targetSide, payload.rowIdx);
+    }
+  }
+
+  _openPickerForCandidate(side, columnName) {
+    const list = side === "source" ? this.sourceCandidates : this.targetCandidates;
+    const colObj = list.find(
+      (c) => String(c.column_name || "").toLowerCase() === String(columnName || "").toLowerCase()
+    );
+    if (!colObj) return;
+    const ov = this.overview || {};
+    const dbType =
+      side === "source"
+        ? ov.source_connection?.db_type || "DWS"
+        : ov.target_connection?.db_type || "DWS";
+    const fmt = side === "source" ? this.sourceFormatProfile : this.targetFormatProfile;
+
+    openStandardPickerModal({
+      title: `绑定${side === "source" ? "来源" : "目标"}字段标准 · ${colObj.column_name}`,
+      initialQuery: colObj.column_comment || colObj.column_name,
+      currentStdCode: "",
+      dbType,
+      formatProfile: fmt,
+      onSelect: (picked) => {
+        if (!picked) return;
+        const taken = this._takeCandidate(side, colObj.column_name);
+        if (!taken) return;
+        const stdCode = picked.std_code;
+        const brief = this._toStdBrief(picked, side);
+        const oppSide = side === "source" ? "target" : "source";
+
+        // 若已存在同标准编号且当前侧为空槽的半边行，自动合并对齐成 UNIFIED
+        const existingIdx = this.centerRows.findIndex(
+          (r) => !r[`${side}_col`] && r[`${oppSide}_std_code`] === stdCode
+        );
+        if (existingIdx !== -1) {
+          this._bindFieldToRow(side, taken, existingIdx);
+          return;
+        }
+
+        const newRow = {
+          row_id: `${side}_${taken.column_name}_${Date.now()}`,
+          source_col: side === "source" ? taken : null,
+          target_col: side === "target" ? taken : null,
+          source_std_code: side === "source" ? stdCode : "",
+          target_std_code: side === "target" ? stdCode : "",
+          source_std: side === "source" ? brief : null,
+          target_std: side === "target" ? brief : null,
+          target_compliance: null,
+          target_needs_migration: false,
+        };
+        if (side === "target") {
+          const ev = this._evaluateProvisionalTargetCompliance(taken, brief);
+          newRow.target_compliance = ev.target_compliance;
+          newRow.target_needs_migration = ev.target_needs_migration;
+        }
+        this.centerRows.push(this._recomputeRowState(newRow));
+        this.selectedCandidate = null;
+        this.dirty = true;
+        this.render();
+      },
+    });
+  }
+
+  _openBookmarkPicker(rowIdx, side) {
+    const row = this.centerRows[rowIdx];
+    if (!row) return;
+    const ov = this.overview || {};
+    const isBoth = side === "both";
+    const colObj = isBoth ? row.target_col || row.source_col : row[`${side}_col`];
+    if (!colObj) return;
+
+    const currentCode = isBoth
+      ? row.target_std_code || row.source_std_code
+      : row[`${side}_std_code`] || "";
+    const dbType =
+      side === "source"
+        ? ov.source_connection?.db_type || "DWS"
+        : ov.target_connection?.db_type || "DWS";
+    const fmt = side === "source" ? this.sourceFormatProfile : this.targetFormatProfile;
+
+    openStandardPickerModal({
+      title: isBoth
+        ? `调整数据标准 · ${row.source_col?.column_name} ↔ ${row.target_col?.column_name}`
+        : `调整${side === "source" ? "来源" : "目标"}字段标准 · ${colObj.column_name}`,
+      initialQuery: currentCode || colObj.column_comment || colObj.column_name,
+      currentStdCode: currentCode,
+      dbType,
+      formatProfile: fmt,
+      onSelect: (picked) => {
+        if (!picked) {
+          if (isBoth) {
+            if (row.source_col) this._returnToCandidates("source", row.source_col);
+            if (row.target_col) this._returnToCandidates("target", row.target_col);
+            this.centerRows.splice(rowIdx, 1);
+          } else {
+            this._unbindBoundField(side, rowIdx);
+            return;
+          }
+        } else {
+          const code = picked.std_code;
+          if (isBoth || side === "source") {
+            row.source_std_code = code;
+            row.source_std = this._toStdBrief(picked, "source");
+          }
+          if (isBoth || side === "target") {
+            row.target_std_code = code;
+            row.target_std = this._toStdBrief(picked, "target");
+            const ev = this._evaluateProvisionalTargetCompliance(row.target_col, row.target_std);
+            row.target_compliance = ev.target_compliance;
+            row.target_needs_migration = ev.target_needs_migration;
+          }
+          this._recomputeRowState(row);
+        }
+        this.dirty = true;
+        this.render();
+      },
+    });
+  }
+
+  _unifyDiffRow(rowIdx, keepSide) {
+    const row = this.centerRows[rowIdx];
+    if (!row) return;
+    if (keepSide === "source" && row.source_std_code) {
+      row.target_std_code = row.source_std_code;
+      row.target_std = row.source_std ? this._toStdBrief(row.source_std, "target") : null;
+      const ev = this._evaluateProvisionalTargetCompliance(row.target_col, row.target_std);
+      row.target_compliance = ev.target_compliance;
+      row.target_needs_migration = ev.target_needs_migration;
+    } else if (keepSide === "target" && row.target_std_code) {
+      row.source_std_code = row.target_std_code;
+      row.source_std = row.target_std ? this._toStdBrief(row.target_std, "source") : null;
+    }
+    this._recomputeRowState(row);
     this.dirty = true;
-    this._computeBookmarkSummary();
     this.render();
   }
 
   _splitRow(rowIdx) {
-    const row = this.draftRows[rowIdx];
+    const row = this.centerRows[rowIdx];
     if (!row || !row.source_col || !row.target_col) return;
     const srcOnly = this._recomputeRowState({
       row_id: `${row.row_id}_s`,
@@ -393,67 +689,107 @@ export class CrossComparatorView {
       target_compliance: row.target_compliance,
       target_needs_migration: row.target_needs_migration,
     });
-    this.draftRows.splice(rowIdx, 1, srcOnly, tgtOnly);
+    this.centerRows.splice(rowIdx, 1, srcOnly, tgtOnly);
     this.dirty = true;
     this.render();
   }
 
-  _openBookmarkPicker(rowIdx, side) {
-    const row = this.draftRows[rowIdx];
-    if (!row) return;
-    const ov = this.overview || {};
-    const isBoth = side === "both";
-    const colObj = isBoth ? row.target_col || row.source_col : row[`${side}_col`];
-    if (!colObj) return;
+  smartPairRows() {
+    let changed = false;
+    // 1. 合并同标准编号的单侧行
+    const srcSingles = [];
+    const tgtSingles = [];
+    const keptRows = [];
 
-    const currentCode = isBoth
-      ? row.target_std_code || row.source_std_code
-      : row[`${side}_std_code`] || "";
-    const dbType =
-      side === "source"
-        ? ov.source_connection?.db_type || "DWS"
-        : ov.target_connection?.db_type || "DWS";
+    for (const r of this.centerRows) {
+      if (r.source_col && !r.target_col && r.source_std_code) {
+        srcSingles.push(r);
+      } else if (r.target_col && !r.source_col && r.target_std_code) {
+        tgtSingles.push(r);
+      } else {
+        keptRows.push(r);
+      }
+    }
 
-    openStandardPickerModal({
-      title: isBoth
-        ? `调整贯通书签标准 · ${row.source_col?.column_name} ↔ ${row.target_col?.column_name}`
-        : `绑定${side === "source" ? "来源" : "目标"}字段标准 · ${colObj.column_name}`,
-      initialQuery: currentCode || colObj.column_comment || colObj.column_name,
-      currentStdCode: currentCode,
-      dbType,
-      formatProfile: this.formatProfile,
-      onSelect: (picked) => {
-        const brief = picked
-          ? {
-              std_code: picked.std_code,
-              cn_name: picked.cn_name,
-              en_abbr: picked.en_abbr,
-              resolved_type:
-                picked[this.formatProfile] || picked.type_dws || picked.type_dw_mart || "",
-              domain_name: picked.domain_name || "",
-            }
-          : null;
-        const code = picked ? picked.std_code : "";
-        if (isBoth || side === "source") {
-          row.source_std_code = code;
-          row.source_std = brief ? { ...brief } : null;
-        }
-        if (isBoth || side === "target") {
-          row.target_std_code = code;
-          row.target_std = brief ? { ...brief } : null;
-        }
-        this._recomputeRowState(row);
-        this.dirty = true;
-        this.render();
-      },
+    const usedTgtIdx = new Set();
+    for (const sr of srcSingles) {
+      const mIdx = tgtSingles.findIndex(
+        (tr, i) => !usedTgtIdx.has(i) && tr.target_std_code === sr.source_std_code
+      );
+      if (mIdx !== -1) {
+        usedTgtIdx.add(mIdx);
+        const tr = tgtSingles[mIdx];
+        keptRows.push(
+          this._recomputeRowState({
+            row_id: `pair_${sr.source_col.column_name}_${tr.target_col.column_name}`,
+            source_col: sr.source_col,
+            target_col: tr.target_col,
+            source_std_code: sr.source_std_code,
+            target_std_code: tr.target_std_code,
+            source_std: sr.source_std,
+            target_std: tr.target_std,
+            target_compliance: tr.target_compliance,
+            target_needs_migration: tr.target_needs_migration,
+          })
+        );
+        changed = true;
+      } else {
+        keptRows.push(sr);
+      }
+    }
+    tgtSingles.forEach((tr, i) => {
+      if (!usedTgtIdx.has(i)) keptRows.push(tr);
     });
+
+    // 2. 对仍缺对侧字段的半边标准行，尝试从对侧待选池按同名自动绑标配对
+    for (const r of keptRows) {
+      if (r.source_col && !r.target_col && r.source_std_code) {
+        const sLower = String(r.source_col.column_name || "").toLowerCase();
+        const matchCand = this.targetCandidates.find(
+          (tc) => String(tc.column_name || "").toLowerCase() === sLower
+        );
+        if (matchCand) {
+          this._takeCandidate("target", matchCand.column_name);
+          r.target_col = matchCand;
+          r.target_std_code = r.source_std_code;
+          r.target_std = r.source_std ? this._toStdBrief(r.source_std, "target") : null;
+          const ev = this._evaluateProvisionalTargetCompliance(matchCand, r.target_std);
+          r.target_compliance = ev.target_compliance;
+          r.target_needs_migration = ev.target_needs_migration;
+          this._recomputeRowState(r);
+          changed = true;
+        }
+      } else if (r.target_col && !r.source_col && r.target_std_code) {
+        const tLower = String(r.target_col.column_name || "").toLowerCase();
+        const matchCand = this.sourceCandidates.find(
+          (sc) => String(sc.column_name || "").toLowerCase() === tLower
+        );
+        if (matchCand) {
+          this._takeCandidate("source", matchCand.column_name);
+          r.source_col = matchCand;
+          r.source_std_code = r.target_std_code;
+          r.source_std = r.target_std ? this._toStdBrief(r.target_std, "source") : null;
+          this._recomputeRowState(r);
+          changed = true;
+        }
+      }
+    }
+
+    this.centerRows = keptRows;
+    if (changed) {
+      this.dirty = true;
+      Toast.info("已完成智能配对，点击「保存」持久化");
+    } else {
+      Toast.info("当前已绑定字段无可自动合并或同名补齐项");
+    }
+    this.render();
   }
 
   openPairingUploadWizard() {
     openUploadWizardModal({
       title: "批量铺底跨环境映射关系",
       description:
-        "先下载系统映射模板（支持按当前已选来源/目标表直接导出预填模板），批量铺底后可直接在书签画布拖拽微调。",
+        "先下载系统映射模板（支持按当前已选来源/目标表直接导出预填模板），批量铺底后可直接在五虚拟列工作台微调。",
       templateColumns: [
         { name: "来源模式名" },
         { name: "来源表名", required: true },
@@ -482,8 +818,13 @@ export class CrossComparatorView {
           : null,
       accept: ".xlsx,.xlsm",
       onUpload: async (file, _mode, uploadCtx) => {
-        const res = await crossApi.uploadPairings(file, this.formatProfile, uploadCtx);
+        const res = await crossApi.uploadPairings(file, this.targetFormatProfile || "AUTO", {
+          ...uploadCtx,
+          sourceFormatProfile: this.sourceFormatProfile,
+          targetFormatProfile: this.targetFormatProfile,
+        });
         this.overview = res;
+        this._syncSideFormatsFromOverview(res);
         this.activeTableKey = res.active_table_key || "";
         this._hydrateDraftFromComparison(res.active_comparison);
         Toast.success(res.message || "跨环境映射铺底成功");
@@ -494,45 +835,9 @@ export class CrossComparatorView {
   }
 
   renderHeaderActions() {
-    const ov = this.overview || { tables: [] };
-
-    const tableSelect = el(
-      "select",
-      {
-        className: "mac-input mac-input-sm",
-        "aria-label": "选择映射表对",
-        onChange: (e) => {
-          this.activeTableKey = e.target.value;
-          this.loadOverview(this.activeTableKey, false);
-        },
-      },
-      [
-        el("option", { value: "", text: "已保存映射表对" }),
-        ...(ov.tables || []).map((t) => {
-          const o = el("option", {
-            value: t.std_table_key,
-            text: `${t.source_table || t.std_table_name} ↔ ${t.target_table || t.std_table_name}`,
-          });
-          if (t.std_table_key === this.activeTableKey) o.selected = true;
-          return o;
-        }),
-      ]
-    );
-
     return el(
       "div",
       { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
-      tableSelect,
-      el(
-        "button",
-        {
-          type: "button",
-          className: "mac-btn mac-btn-sm",
-          onClick: () => this.openPairingUploadWizard(),
-        },
-        svgIcon("upload", 13),
-        el("span", { text: "上传映射铺底" })
-      ),
       el("button", {
         type: "button",
         className: "mac-btn mac-btn-sm",
@@ -542,7 +847,7 @@ export class CrossComparatorView {
       el("button", {
         type: "button",
         className: "mac-btn mac-btn-sm",
-        text: this.dirty ? "保存对应关系 *" : "保存对应关系",
+        text: this.dirty ? "保存 *" : "保存",
         onClick: () => this.saveCurrentPairings(true),
       }),
       el("button", {
@@ -560,7 +865,14 @@ export class CrossComparatorView {
           });
           if (!ok) return;
           try {
-            const res = await crossApi.pushToMigrator(this.activeTableKey, this.formatProfile);
+            const res = await crossApi.pushToMigrator(
+              this.activeTableKey,
+              this.targetFormatProfile || this.formatProfile || "AUTO",
+              {
+                sourceFormatProfile: this.sourceFormatProfile,
+                targetFormatProfile: this.targetFormatProfile,
+              }
+            );
             Toast.success(`已推送 ${res.pushed_count ?? 0} 条规则`);
             this.onPushToMigrator?.();
           } catch (err) {
@@ -579,8 +891,9 @@ export class CrossComparatorView {
     return el(
       "select",
       {
-        className: "mac-input mac-input-sm",
-        style: { flex: "1", minWidth: "120px" },
+        className: "mac-input input-xs",
+        style: { flex: "1", minWidth: "110px" },
+        "aria-label": role === "source" ? "选择来源库" : "选择目标库",
         onChange: async (e) => {
           try {
             const res = await crossApi.bindRole({
@@ -590,6 +903,23 @@ export class CrossComparatorView {
               auto_refresh: true,
             });
             this.overview = res;
+            if (role === "source") {
+              this.sourceFormatProfile =
+                res.source_connection?.standard_format || res.source_format_profile || "AUTO";
+            } else {
+              this.targetFormatProfile =
+                res.target_connection?.standard_format || res.target_format_profile || "AUTO";
+            }
+            if (
+              res.source_format_profile !== this.sourceFormatProfile ||
+              res.target_format_profile !== this.targetFormatProfile
+            ) {
+              await this.loadOverview(this.activeTableKey, false, {
+                sourceFormatProfile: this.sourceFormatProfile,
+                targetFormatProfile: this.targetFormatProfile,
+              });
+              return;
+            }
             this._hydrateDraftFromComparison(res.active_comparison);
             this.render();
           } catch (err) {
@@ -619,7 +949,7 @@ export class CrossComparatorView {
       "select",
       {
         className: "mac-input input-xs",
-        style: { flex: "1", minWidth: "130px" },
+        style: { flex: "1", minWidth: "120px" },
         "aria-label": role === "source" ? "选择来源库表" : "选择目标库表",
         onChange: (e) => {
           const v = e.target.value;
@@ -635,7 +965,7 @@ export class CrossComparatorView {
         },
       },
       [
-        el("option", { value: "", text: tablesList.length ? "从已缓存库表快速选取..." : "无缓存库表，可手填右侧" }),
+        el("option", { value: "", text: tablesList.length ? "选取表/视图..." : "暂无缓存表" }),
         ...tablesList.map((t) => {
           const fq = `${t.schema_name}.${t.table_name}`;
           const o = el("option", {
@@ -649,12 +979,158 @@ export class CrossComparatorView {
     );
   }
 
-  _renderFieldCard(side, colObj, rowIdx, extraMeta = {}) {
+  _makeSideFormatSelect(side) {
+    const cur = side === "source" ? this.sourceFormatProfile : this.targetFormatProfile;
+    return el(
+      "select",
+      {
+        className: "mac-input input-xs",
+        style: { width: "145px", flexShrink: "0" },
+        "aria-label": side === "source" ? "来源库落标标准" : "目标库落标标准",
+        title: side === "source" ? "来源库沿用的落标标准格式" : "目标库沿用的落标标准格式",
+        onChange: (e) => {
+          if (side === "source") this.sourceFormatProfile = e.target.value;
+          else this.targetFormatProfile = e.target.value;
+          this.loadOverview(this.activeTableKey, false, {
+            sourceFormatProfile: this.sourceFormatProfile,
+            targetFormatProfile: this.targetFormatProfile,
+          });
+        },
+      },
+      this.formatProfiles.map((p) => {
+        const o = el("option", { value: p.value, text: p.label });
+        if (p.value === cur) o.selected = true;
+        return o;
+      })
+    );
+  }
+
+  _populateCandidateList(side) {
+    const isSrc = side === "source";
+    const list = isSrc ? this.sourceCandidates : this.targetCandidates;
+    const kw = (isSrc ? this.srcCandidateFilter : this.tgtCandidateFilter).trim().toLowerCase();
+    const filtered = kw
+      ? list.filter(
+          (c) =>
+            String(c.column_name || "").toLowerCase().includes(kw) ||
+            String(c.column_comment || "").toLowerCase().includes(kw) ||
+            String(c.data_type || "").toLowerCase().includes(kw)
+        )
+      : list;
+
+    const cards = filtered.length
+      ? filtered.map((col) => {
+          const isSelected =
+            this.selectedCandidate &&
+            this.selectedCandidate.side === side &&
+            this.selectedCandidate.columnName.toLowerCase() === String(col.column_name || "").toLowerCase();
+          return el(
+            "div",
+            {
+              className: `cross-cand-card ${isSelected ? "is-selected" : ""}`.trim(),
+              draggable: true,
+              title: `${col.column_name} (${col.data_type || "-"})${col.column_comment ? " · " + col.column_comment : ""}`,
+              onClick: () => {
+                if (isSelected) {
+                  this.selectedCandidate = null;
+                } else {
+                  this.selectedCandidate = { side, columnName: col.column_name };
+                }
+                this.render();
+              },
+              onDblclick: () => this._openPickerForCandidate(side, col.column_name),
+              onDragstart: (e) => {
+                this.dragPayload = { kind: "candidate", side, colName: col.column_name };
+                if (e.dataTransfer) {
+                  e.dataTransfer.effectAllowed = "move";
+                  e.dataTransfer.setData("text/plain", `${side}:${col.column_name}`);
+                }
+                e.currentTarget.classList.add("is-dragging");
+              },
+              onDragend: (e) => {
+                this.dragPayload = null;
+                e.currentTarget.classList.remove("is-dragging");
+              },
+            },
+            el(
+              "div",
+              { className: "cross-cand-top" },
+              el("span", { className: "mono cross-cand-name", text: col.column_name }),
+              el("button", {
+                type: "button",
+                className: "cross-cand-add-btn",
+                title: "选择数据标准绑定",
+                text: "+",
+                onClick: (e) => {
+                  e.stopPropagation();
+                  this._openPickerForCandidate(side, col.column_name);
+                },
+              })
+            ),
+            el(
+              "div",
+              { className: "cross-cand-meta" },
+              el("span", { className: "mono", text: col.data_type || "-" }),
+              col.column_comment
+                ? el("span", { className: "cross-cand-comment", text: col.column_comment })
+                : null
+            )
+          );
+        })
+      : [
+          el("div", {
+            style: { padding: "18px 8px", textAlign: "center", fontSize: "11.5px", color: "var(--os-muted)" },
+            text: list.length ? "无匹配字段" : "暂无待选字段",
+          }),
+        ];
+
+    const listMount = isSrc ? this.srcCandidateListMount : this.tgtCandidateListMount;
+    clearEl(listMount, cards);
+  }
+
+  _renderCandidateColumn(side) {
+    const isSrc = side === "source";
+    const searchInput = isSrc ? this.srcSearchInput : this.tgtSearchInput;
+    searchInput.value = isSrc ? this.srcCandidateFilter : this.tgtCandidateFilter;
+    const listMount = isSrc ? this.srcCandidateListMount : this.tgtCandidateListMount;
+    this._populateCandidateList(side);
+
+    return el(
+      "div",
+      {
+        className: `cross-cand-col ${isSrc ? "" : "is-right"}`.trim(),
+        onDragover: (e) => {
+          if (!this.dragPayload || this.dragPayload.kind !== "bound" || this.dragPayload.side !== side) return;
+          e.preventDefault();
+          e.currentTarget.classList.add("is-drop-target");
+        },
+        onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+        onDrop: (e) => {
+          e.preventDefault();
+          e.currentTarget.classList.remove("is-drop-target");
+          this._handleDropOnCandidatePool(side);
+        },
+      },
+      el("div", { className: "cross-cand-search" }, el("search", {}, searchInput)),
+      listMount
+    );
+  }
+
+  _renderBoundChipOrSlot(side, row, rowIdx) {
+    const colObj = row[`${side}_col`];
+    const hasSelectedForSide = this.selectedCandidate && this.selectedCandidate.side === side;
+
     if (!colObj) {
       return el(
         "div",
         {
-          className: "drop-slot-empty",
+          className: `cross-slot-target ${hasSelectedForSide ? "is-click-target" : ""}`.trim(),
+          title: hasSelectedForSide ? "点击绑定选中字段到此标准" : "拖入或点选待选字段至此",
+          onClick: () => {
+            if (hasSelectedForSide) {
+              this._assignCandidateToRow(side, this.selectedCandidate.columnName, rowIdx);
+            }
+          },
           onDragover: (e) => {
             if (!this.dragPayload || this.dragPayload.side !== side) return;
             e.preventDefault();
@@ -664,27 +1140,28 @@ export class CrossComparatorView {
           onDrop: (e) => {
             e.preventDefault();
             e.currentTarget.classList.remove("is-drop-target");
-            this._handleDropOnSlot(side, rowIdx);
+            this._handleDropOnCenterTarget(rowIdx, side);
           },
         },
-        el("span", { text: `拖入${side === "source" ? "来源" : "目标"}字段以配对` })
+        el("span", { text: hasSelectedForSide ? "+ 点击绑定" : "+" })
       );
     }
 
-    const isDraggingSource =
-      this.dragPayload && this.dragPayload.side === side && this.dragPayload.rowIdx === rowIdx;
+    const isUnified = row.bookmark_state === "UNIFIED";
+    const isTgt = side === "target";
+    const tgtCompliant = row.target_compliance?.status === "COMPLIANT";
 
     return el(
       "div",
       {
-        className: `dual-field-card ${isDraggingSource ? "is-dragging" : ""}`.trim(),
+        className: `cross-bound-chip ${isUnified ? "is-unified" : ""}`.trim(),
         draggable: true,
-        title: "按住拖动该字段到对侧或同侧任意行调整配对关系",
+        title: `${colObj.column_name} (${colObj.data_type || "-"})`,
         onDragstart: (e) => {
-          this.dragPayload = { side, rowIdx };
+          this.dragPayload = { kind: "bound", side, colName: colObj.column_name, rowIdx };
           if (e.dataTransfer) {
             e.dataTransfer.effectAllowed = "move";
-            e.dataTransfer.setData("text/plain", `${side}:${rowIdx}`);
+            e.dataTransfer.setData("text/plain", `bound:${side}:${rowIdx}`);
           }
           e.currentTarget.classList.add("is-dragging");
         },
@@ -693,7 +1170,7 @@ export class CrossComparatorView {
           e.currentTarget.classList.remove("is-dragging");
         },
         onDragover: (e) => {
-          if (!this.dragPayload) return;
+          if (!this.dragPayload || this.dragPayload.side !== side) return;
           e.preventDefault();
           e.currentTarget.classList.add("is-drop-target");
         },
@@ -701,171 +1178,293 @@ export class CrossComparatorView {
         onDrop: (e) => {
           e.preventDefault();
           e.currentTarget.classList.remove("is-drop-target");
-          this._handleDropOnSlot(side, rowIdx);
+          this._handleDropOnCenterTarget(rowIdx, side);
+        },
+        onClick: () => {
+          if (hasSelectedForSide) {
+            this._assignCandidateToRow(side, this.selectedCandidate.columnName, rowIdx);
+          }
         },
       },
       el(
         "div",
-        { className: "dual-field-top" },
+        { className: "cross-bound-chip-top" },
+        el("span", { className: "mono cross-cand-name", text: colObj.column_name }),
         el(
           "div",
-          { style: { display: "flex", alignItems: "center", gap: "5px", minWidth: "0" } },
-          el("span", { className: "drag-grip", text: "⋮⋮" }),
-          el("span", {
-            className: "mono",
-            style: { fontWeight: "600", overflow: "hidden", textOverflow: "ellipsis" },
-            text: colObj.column_name,
-          })
-        ),
-        el(
-          "div",
-          { style: { display: "flex", alignItems: "center", gap: "4px", flexShrink: "0" } },
-          extraMeta.needsMigration
+          { style: { display: "inline-flex", alignItems: "center", gap: "3px", flexShrink: "0" } },
+          isTgt && row.target_needs_migration
             ? badge("待贯标", "warn")
-            : extraMeta.compliant
+            : isTgt && tgtCompliant
             ? badge("已落标", "success")
             : null,
-          el("span", { className: "mono", style: { fontSize: "11px", color: "var(--os-muted)" }, text: colObj.data_type || "-" })
+          el("button", {
+            type: "button",
+            className: "cross-chip-remove",
+            title: "移回待选字段",
+            text: "×",
+            onClick: (e) => {
+              e.stopPropagation();
+              this._unbindBoundField(side, rowIdx);
+            },
+          })
         )
       ),
-      colObj.column_comment || colObj.lineage_source
-        ? el(
-            "div",
-            { className: "dual-field-sub" },
-            colObj.column_comment || "",
-            colObj.lineage_source ? ` · 血缘: ${colObj.lineage_source}` : ""
-          )
-        : null
+      el(
+        "div",
+        { className: "cross-cand-meta" },
+        el("span", { className: "mono", text: colObj.data_type || "-" }),
+        colObj.column_comment
+          ? el("span", { className: "cross-cand-comment", text: colObj.column_comment })
+          : null
+      )
     );
   }
 
-  _renderCenterBookmark(row, rowIdx) {
-    const state = row.bookmark_state;
+  _renderCenterStandardCard(row, rowIdx) {
+    const st = row.bookmark_state;
+    const hasSelected = Boolean(this.selectedCandidate);
 
-    if (state === "UNIFIED" && row.source_std) {
-      const s = row.source_std;
+    const commonDropHandlers = {
+      onDragover: (e) => {
+        if (!this.dragPayload) return;
+        e.preventDefault();
+        e.currentTarget.classList.add("is-drop-target");
+      },
+      onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+      onDrop: (e) => {
+        e.preventDefault();
+        e.currentTarget.classList.remove("is-drop-target");
+        this._handleDropOnCenterTarget(rowIdx);
+      },
+    };
+
+    if (st === "SPLIT_DIFF") {
+      const sStd = row.source_std || { std_code: row.source_std_code, cn_name: "未知标准", resolved_type: "" };
+      const tStd = row.target_std || { std_code: row.target_std_code, cn_name: "未知标准", resolved_type: "" };
       return el(
         "div",
-        { className: "bookmark-bridge is-unified" },
+        {
+          className: `cross-std-card is-diff ${hasSelected ? "is-click-target" : ""}`.trim(),
+          ...commonDropHandlers,
+        },
         el(
-          "button",
-          {
-            type: "button",
-            className: "bookmark-ribbon is-unified",
-            title: `${s.std_code} · ${s.cn_name} (${s.en_abbr}) — 点击可更换数标`,
-            onClick: () => this._openBookmarkPicker(rowIdx, "both"),
-          },
-          el("span", { className: "bookmark-punch" }),
+          "div",
+          { className: "cross-std-split-grid" },
           el(
-            "span",
-            { className: "bookmark-ribbon-content" },
-            el("span", { className: "mono bookmark-code", text: s.std_code }),
-            el("span", { className: "bookmark-cn", text: s.cn_name }),
-            el("span", { className: "mono bookmark-en", text: s.en_abbr })
+            "button",
+            {
+              type: "button",
+              className: "cross-std-split-pill",
+              title: `${sStd.std_code} · ${sStd.cn_name} (${sStd.resolved_type || "-"})`,
+              onClick: () => {
+                if (this.selectedCandidate) {
+                  this._assignCandidateToRow(this.selectedCandidate.side, this.selectedCandidate.columnName, rowIdx);
+                  return;
+                }
+                this._openBookmarkPicker(rowIdx, "source");
+              },
+            },
+            el("span", { className: "mono", style: { fontSize: "10px", fontWeight: "700" }, text: sStd.std_code }),
+            el("span", { className: "cross-cand-comment", style: { fontSize: "10.5px" }, text: sStd.cn_name })
           ),
-          el("span", { className: "bookmark-punch" })
+          el("span", {
+            style: { color: "var(--status-danger)", fontWeight: "700", fontSize: "13px", flexShrink: "0" },
+            text: "≠",
+          }),
+          el(
+            "button",
+            {
+              type: "button",
+              className: "cross-std-split-pill",
+              title: `${tStd.std_code} · ${tStd.cn_name} (${tStd.resolved_type || "-"})`,
+              onClick: () => {
+                if (this.selectedCandidate) {
+                  this._assignCandidateToRow(this.selectedCandidate.side, this.selectedCandidate.columnName, rowIdx);
+                  return;
+                }
+                this._openBookmarkPicker(rowIdx, "target");
+              },
+            },
+            el("span", { className: "mono", style: { fontSize: "10px", fontWeight: "700" }, text: tStd.std_code }),
+            el("span", { className: "cross-cand-comment", style: { fontSize: "10.5px" }, text: tStd.cn_name })
+          )
         ),
-        el("button", {
-          type: "button",
-          className: "bookmark-unlink-btn",
-          title: "拆解此对映射以便重新拖拽配对",
-          text: "×",
-          onClick: (e) => {
-            e.stopPropagation();
-            this._splitRow(rowIdx);
-          },
-        })
+        el(
+          "div",
+          { className: "cross-std-split-actions" },
+          el("button", {
+            type: "button",
+            className: "btn btn-xs",
+            text: "← 统一",
+            title: "两侧均采用来源标准",
+            onClick: () => this._unifyDiffRow(rowIdx, "source"),
+          }),
+          el("button", {
+            type: "button",
+            className: "btn btn-xs",
+            text: "统一 →",
+            title: "两侧均采用目标标准",
+            onClick: () => this._unifyDiffRow(rowIdx, "target"),
+          }),
+          el("button", {
+            type: "button",
+            className: "btn btn-xs btn-ghost",
+            text: "拆为两行",
+            onClick: () => this._splitRow(rowIdx),
+          })
+        )
       );
     }
 
-    const leftTag = row.source_col
-      ? el(
-          "button",
-          {
-            type: "button",
-            className: `bookmark-tab bookmark-tab-left ${row.source_std ? "has-std" : "is-empty"}`.trim(),
-            title: row.source_std
-              ? `来源数标: ${row.source_std.std_code} · ${row.source_std.cn_name}（点击调整）`
-              : "点击为来源字段绑定数据标准",
-            onClick: () => this._openBookmarkPicker(rowIdx, "source"),
-          },
-          row.source_std
-            ? el(
-                "span",
-                { className: "bookmark-tab-text" },
-                el("span", { className: "mono", style: { fontWeight: "700" }, text: row.source_std.std_code }),
-                el("span", { className: "bookmark-tab-cn", text: row.source_std.cn_name })
-              )
-            : el("span", { className: "bookmark-tab-placeholder", text: "+ 来源绑标" })
-        )
-      : el("span", { className: "bookmark-gap-holder" });
+    const rep = row.source_std || row.target_std;
+    const isUnified = st === "UNIFIED";
+    const sType = row.source_std?.resolved_type || "";
+    const tType = row.target_std?.resolved_type || "";
+    const typeLabel =
+      sType && tType && sType !== tType
+        ? `${sType} / ${tType}`
+        : tType || sType || "";
 
-    const midSep = row.paired
-      ? el("button", {
-          type: "button",
-          className: `bookmark-diff-badge ${state === "SPLIT_DIFF" ? "is-diff" : ""}`.trim(),
-          title:
-            state === "SPLIT_DIFF"
-              ? "两侧数据标准不一致（点击可拆解配对）"
-              : "点击可拆解当前配对",
-          text: state === "SPLIT_DIFF" ? "≠" : "↔",
-          onClick: () => this._splitRow(rowIdx),
+    return el(
+      "div",
+      {
+        className: `cross-std-card ${isUnified ? "is-unified" : "is-partial"} ${hasSelected ? "is-click-target" : ""}`.trim(),
+        ...commonDropHandlers,
+        onClick: () => {
+          if (this.selectedCandidate) {
+            this._assignCandidateToRow(this.selectedCandidate.side, this.selectedCandidate.columnName, rowIdx);
+            return;
+          }
+          const pickerSide =
+            isUnified ? "both" : row.source_col ? "source" : "target";
+          this._openBookmarkPicker(rowIdx, pickerSide);
+        },
+      },
+      el(
+        "div",
+        { className: "cross-std-card-main" },
+        el(
+          "div",
+          { style: { display: "flex", alignItems: "center", gap: "5px", minWidth: "0" } },
+          badge(rep?.std_code || "-", isUnified ? "success" : "info"),
+          el("span", {
+            style: { fontWeight: "600", fontSize: "12px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+            text: rep?.cn_name || "未知标准",
+          })
+        ),
+        isUnified
+          ? el("button", {
+              type: "button",
+              className: "cross-chip-remove",
+              title: "拆解此配对",
+              text: "×",
+              onClick: (e) => {
+                e.stopPropagation();
+                this._splitRow(rowIdx);
+              },
+            })
+          : null
+      ),
+      el(
+        "div",
+        { className: "cross-cand-meta" },
+        el("span", { className: "mono", text: rep?.en_abbr || "" }),
+        typeLabel ? el("span", { className: "mono", text: typeLabel }) : null
+      )
+    );
+  }
+
+  _renderCenterMatrix() {
+    const matrixRows = this.centerRows.map((row, idx) =>
+      el(
+        "div",
+        { className: "cross-matrix-row" },
+        this._renderBoundChipOrSlot("source", row, idx),
+        this._renderCenterStandardCard(row, idx),
+        this._renderBoundChipOrSlot("target", row, idx)
+      )
+    );
+
+    const hasSelected = Boolean(this.selectedCandidate);
+    const newStdDropzone = el(
+      "div",
+      {
+        className: "cross-matrix-row",
+      },
+      el("div", {}),
+      el(
+        "div",
+        {
+          className: `cross-new-std-dropzone ${hasSelected ? "is-click-target" : ""}`.trim(),
+          onClick: () => {
+            if (this.selectedCandidate) {
+              this._openPickerForCandidate(this.selectedCandidate.side, this.selectedCandidate.columnName);
+              return;
+            }
+            if (this.sourceCandidates.length) {
+              this._openPickerForCandidate("source", this.sourceCandidates[0].column_name);
+            } else if (this.targetCandidates.length) {
+              this._openPickerForCandidate("target", this.targetCandidates[0].column_name);
+            } else {
+              Toast.info("当前无可绑定的待选字段");
+            }
+          },
+          onDragover: (e) => {
+            if (!this.dragPayload || this.dragPayload.kind !== "candidate") return;
+            e.preventDefault();
+            e.currentTarget.classList.add("is-drop-target");
+          },
+          onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+          onDrop: (e) => {
+            e.preventDefault();
+            e.currentTarget.classList.remove("is-drop-target");
+            const payload = this.dragPayload;
+            this.dragPayload = null;
+            if (payload && payload.kind === "candidate") {
+              this._openPickerForCandidate(payload.side, payload.colName);
+            }
+          },
+        },
+        el("span", {
+          text: hasSelected
+            ? `+ 为「${this.selectedCandidate.columnName}」绑定新标准`
+            : "+ 绑定新标准",
         })
-      : el("span", { className: "bookmark-diff-dot", text: "·" });
+      ),
+      el("div", {})
+    );
 
-    const rightTag = row.target_col
-      ? el(
-          "button",
-          {
-            type: "button",
-            className: `bookmark-tab bookmark-tab-right ${
-              row.target_std
-                ? state === "SPLIT_DIFF"
-                  ? "has-diff"
-                  : "has-std"
-                : "is-empty"
-            }`.trim(),
-            title: row.target_std
-              ? `目标数标: ${row.target_std.std_code} · ${row.target_std.cn_name}（点击调整）`
-              : "点击为目标字段绑定数据标准",
-            onClick: () => this._openBookmarkPicker(rowIdx, "target"),
-          },
-          row.target_std
-            ? el(
-                "span",
-                { className: "bookmark-tab-text" },
-                el("span", { className: "mono", style: { fontWeight: "700" }, text: row.target_std.std_code }),
-                el("span", { className: "bookmark-tab-cn", text: row.target_std.cn_name })
-              )
-            : el("span", { className: "bookmark-tab-placeholder", text: "+ 目标绑标" })
-        )
-      : el("span", { className: "bookmark-gap-holder" });
-
-    return el("div", { className: "bookmark-bridge is-split" }, leftTag, midSep, rightTag);
+    return el("div", { className: "cross-matrix-pane" }, ...matrixRows, newStdDropzone);
   }
 
   render() {
-    const ov = this.overview || { active_comparison: null };
+    const ov = this.overview || { active_comparison: null, tables: [] };
     const comp = ov.active_comparison;
     const srcPanel = comp?.source_panel || {};
-    const tgtPanel = comp?.target_panel || {};
     const bkSum = this._computeBookmarkSummary();
 
-    const formatSelect = el(
+    const tableSelect = el(
       "select",
       {
-        className: "mac-input input-xs",
-        "aria-label": "目标比对格式列",
+        className: "mac-input input-xs cross-saved-pair-select",
+        "aria-label": "已保存映射表对",
         onChange: (e) => {
-          this.formatProfile = e.target.value;
+          this.activeTableKey = e.target.value;
           this.loadOverview(this.activeTableKey, false);
         },
       },
-      this.formatProfiles.map((p) => {
-        const o = el("option", { value: p.value, text: p.label });
-        if (p.value === this.formatProfile) o.selected = true;
-        return o;
-      })
+      [
+        el("option", { value: "", text: "已保存映射表对" }),
+        ...(ov.tables || []).map((t) => {
+          const o = el("option", {
+            value: t.std_table_key,
+            text: `${t.source_table || t.std_table_name} ↔ ${t.target_table || t.std_table_name}`,
+          });
+          if (t.std_table_key === this.activeTableKey) o.selected = true;
+          return o;
+        }),
+      ]
     );
 
     const subbar = el(
@@ -873,22 +1472,32 @@ export class CrossComparatorView {
       { className: "mac-subbar" },
       el(
         "div",
-        { className: "mac-subbar-group", style: { gap: "12px" } },
-        statusDot(`一致贯通 ${bkSum.unified}`, "success"),
-        statusDot(`数标差异 ${bkSum.split_diff}`, "danger"),
-        statusDot(`单侧/待绑 ${bkSum.split_partial + bkSum.split_unbound}`, "warn"),
+        { className: "mac-subbar-group", style: { gap: "10px" } },
+        tableSelect,
+        statusDot(`一致 ${bkSum.unified}`, "success"),
+        statusDot(`差异 ${bkSum.split_diff}`, "danger"),
+        statusDot(`单侧 ${bkSum.split_partial}`, "warn"),
         bkSum.target_needs_migration > 0
-          ? badge(`目标库待贯标 ${bkSum.target_needs_migration} 列`, "warn")
+          ? badge(`待贯标 ${bkSum.target_needs_migration}`, "warn")
           : null
       ),
       el(
         "div",
         { className: "mac-subbar-group" },
-        formatSelect,
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn btn-xs",
+            onClick: () => this.openPairingUploadWizard(),
+          },
+          svgIcon("upload", 12),
+          el("span", { text: "上传映射铺底" })
+        ),
         el("button", {
           type: "button",
           className: "btn btn-xs",
-          text: "导出比对 Excel",
+          text: "导出 Excel",
           onClick: () => crossApi.exportExcel(this.activeTableKey).catch((e) => Toast.error(e.message)),
         }),
         el("button", {
@@ -916,27 +1525,27 @@ export class CrossComparatorView {
     const srcTables = ov.source_connection?.tables || [];
     const tgtTables = ov.target_connection?.tables || [];
 
-    const laneHeaders = el(
+    const envStrip = el(
       "div",
-      { className: "dual-lane-headers" },
-      // 左侧来源库头部
+      { className: "cross-env-strip" },
       el(
         "div",
-        { className: "dual-lane-head" },
+        { className: "cross-env-lane" },
         el(
           "div",
-          { style: { display: "flex", alignItems: "center", gap: "6px" } },
-          badge("来源库", "info"),
+          { className: "cross-env-row" },
+          badge("来源", "info"),
           this._makeRoleConnSelect("source", ov.source_connection?.connection_id || "", "选择来源库"),
-          this._makeTableDropdown("source", srcTables)
+          this._makeTableDropdown("source", srcTables),
+          this._makeSideFormatSelect("source")
         ),
         el(
           "div",
-          { style: { display: "flex", alignItems: "center", gap: "5px" } },
+          { className: "cross-env-row" },
           el("input", {
             className: "mac-input input-xs",
             style: { width: "92px" },
-            placeholder: "来源 Schema",
+            placeholder: "Schema",
             value: this.draftTableBind.source_schema,
             onInput: (e) => (this.draftTableBind.source_schema = e.target.value.trim()),
           }),
@@ -961,34 +1570,33 @@ export class CrossComparatorView {
             : null
         )
       ),
-      // 中缝图例
       el(
         "div",
-        { className: "dual-lane-head dual-center-legend" },
-        el("div", { style: { fontWeight: "600", fontSize: "12px" }, text: "拟物数标书签桥" }),
-        el("div", {
-          style: { fontSize: "11px", color: "var(--os-muted)", textAlign: "center" },
-          text: "淡绿贯通=两侧标准一致 · 断开=差异/待绑 · 支持直接拖拽字段",
+        { className: "cross-env-center-pill" },
+        el("span", { style: { fontWeight: "600", color: "var(--os-text)" }, text: "标准对齐" }),
+        el("span", {
+          className: "mono",
+          text: `${this.centerRows.length} 组`,
         })
       ),
-      // 右侧目标库头部
       el(
         "div",
-        { className: "dual-lane-head" },
+        { className: "cross-env-lane" },
         el(
           "div",
-          { style: { display: "flex", alignItems: "center", gap: "6px" } },
-          badge("目标库", "neutral"),
+          { className: "cross-env-row" },
+          badge("目标", "neutral"),
           this._makeRoleConnSelect("target", ov.target_connection?.connection_id || "", "选择目标库"),
-          this._makeTableDropdown("target", tgtTables)
+          this._makeTableDropdown("target", tgtTables),
+          this._makeSideFormatSelect("target")
         ),
         el(
           "div",
-          { style: { display: "flex", alignItems: "center", gap: "5px" } },
+          { className: "cross-env-row" },
           el("input", {
             className: "mac-input input-xs",
             style: { width: "92px" },
-            placeholder: "目标 Schema",
+            placeholder: "Schema",
             value: this.draftTableBind.target_schema,
             onInput: (e) => (this.draftTableBind.target_schema = e.target.value.trim()),
           }),
@@ -1012,50 +1620,81 @@ export class CrossComparatorView {
       )
     );
 
-    const canvasRows = this.draftRows.length
-      ? this.draftRows.map((row, idx) => {
-          const tgtCompliant = row.target_compliance?.status === "COMPLIANT";
-          return el(
-            "div",
-            {
-              className: `dual-compare-row ${row.bookmark_state === "UNIFIED" ? "is-unified-row" : ""}`.trim(),
-            },
-            this._renderFieldCard("source", row.source_col, idx, {}),
-            this._renderCenterBookmark(row, idx),
-            this._renderFieldCard("target", row.target_col, idx, {
-              needsMigration: row.target_needs_migration,
-              compliant: tgtCompliant,
-            })
-          );
-        })
-      : [
+    const hasAnyField =
+      this.centerRows.length > 0 ||
+      this.sourceCandidates.length > 0 ||
+      this.targetCandidates.length > 0;
+
+    const mainBody = hasAnyField
+      ? el(
+          "div",
+          { className: "cross-five-workspace" },
           el(
             "div",
-            { className: "explorer-empty-state" },
+            { className: "cross-five-inner" },
             el(
               "div",
-              { className: "explorer-empty-card", style: { maxWidth: "520px", padding: "24px" } },
-              el("div", { style: { marginBottom: "8px", color: "var(--os-accent)" } }, svgIcon("bookmark", 30)),
-              el("h3", { style: { margin: "0 0 6px 0", fontSize: "14px" }, text: "来源库 × 目标库 双列书签比对" }),
-              el("p", {
-                style: { margin: "0 0 14px 0", fontSize: "12px", color: "var(--os-text-secondary)", lineHeight: "1.55" },
-                text: "请在左右两栏选择来源库表与目标库表，或点击右上角「上传映射铺底」下载系统模板批量导入对应关系。第 2 步已绑定的字段数据标准会自动呈现于中缝书签上。",
-              }),
+              { className: "cross-five-col-headers" },
               el(
-                "button",
-                {
-                  type: "button",
-                  className: "mac-btn mac-btn-sm mac-btn-primary",
-                  onClick: () => this.openPairingUploadWizard(),
-                },
-                "上传映射铺底（含系统模板）"
+                "div",
+                { className: "cross-col-head" },
+                el("span", { text: "来源表待选字段" }),
+                badge(String(this.sourceCandidates.length), "neutral")
+              ),
+              el(
+                "div",
+                { className: "cross-col-head" },
+                el("span", { text: "来源表已绑定数标字段" }),
+                badge(String(this.centerRows.filter((r) => Boolean(r.source_col)).length), "info")
+              ),
+              el(
+                "div",
+                { className: "cross-col-head is-center" },
+                el("span", { text: "数据标准" }),
+                badge(String(this.centerRows.length), "success")
+              ),
+              el(
+                "div",
+                { className: "cross-col-head" },
+                el("span", { text: "目标表已绑定数标字段" }),
+                badge(String(this.centerRows.filter((r) => Boolean(r.target_col)).length), "info")
+              ),
+              el(
+                "div",
+                { className: "cross-col-head" },
+                el("span", { text: "目标表待选字段" }),
+                badge(String(this.targetCandidates.length), "neutral")
               )
+            ),
+            el(
+              "div",
+              { className: "cross-five-body" },
+              this._renderCandidateColumn("source"),
+              this._renderCenterMatrix(),
+              this._renderCandidateColumn("target")
             )
-          ),
-        ];
+          )
+        )
+      : el(
+          "div",
+          { className: "explorer-empty-state" },
+          el(
+            "div",
+            { className: "explorer-empty-card", style: { maxWidth: "420px", padding: "22px" } },
+            el("div", { style: { marginBottom: "8px", color: "var(--os-accent)" } }, svgIcon("bookmark", 28)),
+            el("h3", { style: { margin: "0 0 12px 0", fontSize: "14px" }, text: "选择来源与目标库表开始比对" }),
+            el(
+              "button",
+              {
+                type: "button",
+                className: "mac-btn mac-btn-sm mac-btn-primary",
+                text: "上传映射铺底",
+                onClick: () => this.openPairingUploadWizard(),
+              }
+            )
+          )
+        );
 
-    const canvasBody = el("div", { className: "dual-compare-canvas" }, canvasRows);
-
-    clearEl(this.root, subbar, laneHeaders, canvasBody);
+    clearEl(this.root, subbar, envStrip, mainBody);
   }
 }

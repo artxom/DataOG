@@ -2054,6 +2054,91 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             self.assertTrue(flt.filter(rec_poll_500))
             self.assertTrue(flt.filter(rec_other))
 
+    def test_connection_profile_standard_format_persistence_and_migration(self) -> None:
+        """验证 connection_profiles.standard_format 幂等迁移、重启持久化、校验与密码脱敏."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "legacy_conn.db")
+            legacy = sqlite3.connect(db_path)
+            legacy.execute(
+                """
+                CREATE TABLE connection_profiles (
+                    connection_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    driver_track TEXT NOT NULL DEFAULT 'NATIVE',
+                    db_type TEXT NOT NULL DEFAULT 'DWS',
+                    host TEXT NOT NULL DEFAULT '',
+                    port INTEGER NOT NULL DEFAULT 8000,
+                    dbname TEXT NOT NULL DEFAULT '',
+                    default_schema TEXT NOT NULL DEFAULT 'public',
+                    user TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    sslmode TEXT NOT NULL DEFAULT 'prefer',
+                    auth_mode TEXT NOT NULL DEFAULT 'LDAP',
+                    sqlite_path TEXT NOT NULL DEFAULT '',
+                    jdbc_driver_id TEXT NOT NULL DEFAULT '',
+                    jdbc_url TEXT NOT NULL DEFAULT '',
+                    jdbc_driver_class TEXT NOT NULL DEFAULT '',
+                    extra_props_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            legacy.execute(
+                """
+                INSERT INTO connection_profiles (
+                    connection_id, name, db_type, host, port, dbname, user, password
+                ) VALUES ('conn_legacy_1', '历史DWS库', 'DWS', '127.0.0.1', 8000, 'dw', 'admin', 'secret123')
+                """
+            )
+            legacy.commit()
+            legacy.close()
+
+            ctx = PlatformContext(
+                db_path=db_path,
+                drivers_dir=os.path.join(tmp, "drivers"),
+                assets_dir=os.path.join(tmp, "assets"),
+            )
+            legacy_prof = ctx.connection_hub.get_profile("conn_legacy_1")
+            self.assertIsNotNone(legacy_prof)
+            assert legacy_prof is not None
+            self.assertEqual(legacy_prof.standard_format, "AUTO")
+
+            updated = ctx.connection_hub.update_standard_format("conn_legacy_1", "type_dw_mart")
+            self.assertEqual(updated.standard_format, "type_dw_mart")
+
+            created = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "conn_argo_1",
+                    "name": "星环Argo库",
+                    "db_type": "INCEPTOR",
+                    "host": "10.0.0.8",
+                    "port": 10000,
+                    "user": "hive",
+                    "password": "pw_argo",
+                    "standard_format": "type_argodb",
+                }
+            )
+            self.assertEqual(created.standard_format, "type_argodb")
+
+            with self.assertRaises(ValueError):
+                ctx.connection_hub.update_standard_format("conn_legacy_1", "invalid_format")
+            with self.assertRaises(LookupError):
+                ctx.connection_hub.update_standard_format("conn_not_exists", "type_dws")
+
+            reopened = PlatformContext(
+                db_path=db_path,
+                drivers_dir=os.path.join(tmp, "drivers"),
+                assets_dir=os.path.join(tmp, "assets"),
+            )
+            p1 = reopened.connection_hub.require_profile("conn_legacy_1").to_public_dict()
+            p2 = reopened.connection_hub.require_profile("conn_argo_1").to_public_dict()
+            self.assertEqual(p1["standard_format"], "type_dw_mart")
+            self.assertTrue(p1["has_saved_password"])
+            self.assertEqual(p1["password_masked"], "******")
+            self.assertNotIn("password", p1)
+            self.assertEqual(p2["standard_format"], "type_argodb")
+
 
 if __name__ == "__main__":
     unittest.main()

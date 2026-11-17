@@ -98,6 +98,7 @@ class PlatformStateStore:
                     jdbc_url TEXT NOT NULL DEFAULT '',
                     jdbc_driver_class TEXT NOT NULL DEFAULT '',
                     extra_props_json TEXT NOT NULL DEFAULT '{}',
+                    standard_format TEXT NOT NULL DEFAULT 'AUTO',
                     created_at TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL DEFAULT ''
                 );
@@ -382,6 +383,7 @@ class PlatformStateStore:
                 ("jdbc_url", "TEXT NOT NULL DEFAULT ''"),
                 ("jdbc_driver_class", "TEXT NOT NULL DEFAULT ''"),
                 ("extra_props_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("standard_format", "TEXT NOT NULL DEFAULT 'AUTO'"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
@@ -729,6 +731,8 @@ class PlatformStateStore:
                 extra_props = {}
         except Exception:
             extra_props = {}
+        row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+        raw_std_fmt = (row["standard_format"] if "standard_format" in row_keys else "AUTO") or "AUTO"
         return ConnectionProfile(
             connection_id=row["connection_id"],
             name=row["name"],
@@ -747,6 +751,7 @@ class PlatformStateStore:
             jdbc_url=row["jdbc_url"] or "",
             jdbc_driver_class=row["jdbc_driver_class"] or "",
             extra_props=extra_props,
+            standard_format=str(raw_std_fmt).strip() or "AUTO",
             created_at=row["created_at"] or "",
             updated_at=row["updated_at"] or "",
         )
@@ -773,6 +778,7 @@ class PlatformStateStore:
         created_at = profile.created_at or now
         updated_at = now
         extra_json = json.dumps(profile.extra_props or {}, ensure_ascii=False)
+        standard_format = (profile.standard_format or "AUTO").strip() or "AUTO"
         with self._lock, self._get_conn() as conn:
             conn.execute(
                 """
@@ -781,8 +787,8 @@ class PlatformStateStore:
                     host, port, dbname, default_schema, user, password,
                     sslmode, auth_mode, sqlite_path,
                     jdbc_driver_id, jdbc_url, jdbc_driver_class,
-                    extra_props_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    extra_props_json, standard_format, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(connection_id) DO UPDATE SET
                     name = excluded.name,
                     driver_track = excluded.driver_track,
@@ -800,6 +806,7 @@ class PlatformStateStore:
                     jdbc_url = excluded.jdbc_url,
                     jdbc_driver_class = excluded.jdbc_driver_class,
                     extra_props_json = excluded.extra_props_json,
+                    standard_format = excluded.standard_format,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -820,6 +827,7 @@ class PlatformStateStore:
                     profile.jdbc_url,
                     profile.jdbc_driver_class,
                     extra_json,
+                    standard_format,
                     created_at,
                     updated_at,
                 ),

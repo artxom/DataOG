@@ -104,6 +104,7 @@ class ConnectionProfile:
     jdbc_url: str = ""
     jdbc_driver_class: str = ""
     extra_props: Dict[str, Any] = field(default_factory=dict)
+    standard_format: str = "AUTO"
     created_at: str = ""
     updated_at: str = ""
 
@@ -145,6 +146,7 @@ class ConnectionProfile:
             "jdbc_url": self.jdbc_url,
             "jdbc_driver_class": self.jdbc_driver_class,
             "extra_props": dict(self.extra_props or {}),
+            "standard_format": self.standard_format or "AUTO",
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

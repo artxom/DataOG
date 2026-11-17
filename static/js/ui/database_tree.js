@@ -19,6 +19,7 @@ export class DatabaseTree {
       onFocusSelectionChange = null,
       onActiveConnectionChange = null,
       renderTableBadge = null,
+      renderConnectionBadge = null,
       selectionMode = "single",
     } = {}
   ) {
@@ -27,6 +28,7 @@ export class DatabaseTree {
     this.onFocusSelectionChange = onFocusSelectionChange;
     this.onActiveConnectionChange = onActiveConnectionChange;
     this.renderTableBadge = renderTableBadge;
+    this.renderConnectionBadge = renderConnectionBadge;
     this.selectionMode = selectionMode === "multi" ? "multi" : "single";
 
     this.filterText = "";
@@ -361,6 +363,8 @@ export class DatabaseTree {
         }),
         isMulti && focusSet.size > 0
           ? badge(String(focusSet.size), "info")
+          : typeof this.renderConnectionBadge === "function"
+          ? this.renderConnectionBadge(conn)
           : el("span", { style: { fontSize: "10.5px", color: "var(--os-muted)" }, text: conn.db_type }),
         el("button", {
           type: "button",

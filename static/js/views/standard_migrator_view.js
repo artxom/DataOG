@@ -4,7 +4,7 @@
  * 100% 保留物理列保序重建 (TABLE_REBUILD)、Kahn 拓扑改名、分区继承与多线程批量并发
  */
 
-import { migratorApi } from "../core/api.js";
+import { migratorApi, platformApi } from "../core/api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";
@@ -47,6 +47,20 @@ const DEFAULT_FORMAT_PROFILES = [
   { value: "type_goldendb", label: "GoldenDb(MySQL模式)" },
 ];
 
+const SHORT_FORMAT_LABELS = {
+  AUTO: "自动",
+  type_dws: "DWS",
+  type_dw_mart: "集市",
+  type_argodb: "Argo",
+  type_mysql: "MySQL",
+  type_oracle: "Oracle",
+  type_ob_oracle: "OB-O",
+  type_ob_mysql: "OB-M",
+  type_oceanbase: "OB",
+  type_dameng: "达梦",
+  type_goldendb: "Golden",
+};
+
 export class StandardMigratorView {
   constructor({ onStateUpdate = null } = {}) {
     this.onStateUpdate = onStateUpdate;
@@ -77,6 +91,12 @@ export class StandardMigratorView {
       className: "mac-split-view",
     });
     this.sidebarMount = el("aside", { className: "mac-sidebar mac-sidebar-wide" });
+    this.sidebarFormatMount = el("div", { className: "sidebar-format-inspector" });
+    this.treeMount = el("div", {
+      style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
+    });
+    clearEl(this.sidebarMount, this.sidebarFormatMount, this.treeMount);
+
     this.mainMount = el("section", { className: "mac-pane", style: { overflow: "hidden" } });
     this.tablistMount = el("div", {});
     this.subbarMount = el("div", {});
@@ -84,21 +104,36 @@ export class StandardMigratorView {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
     });
 
-    this.tree = new DatabaseTree(this.sidebarMount, {
+    this.tree = new DatabaseTree(this.treeMount, {
       selectionMode: "single",
+      renderConnectionBadge: (conn) => {
+        const fmt = conn.standard_format || "AUTO";
+        const shortTxt = SHORT_FORMAT_LABELS[fmt] || fmt;
+        return badge(shortTxt, fmt !== "AUTO" ? "info" : "neutral");
+      },
       onActiveConnectionChange: async (cid) => {
         if (cid && cid !== this.activeConnId) {
           this.activeConnId = cid;
+          this.activeSchema = "";
+          this.activeTable = "";
+          this.tableCheck = null;
+          this.selectedBindCols.clear();
+          this._syncFormatFromConnection(cid);
           await this.loadBindingsOverview();
         }
       },
       onPreviewTable: async ({ connectionId, schemaName, tableName }) => {
+        const switchedConn = connectionId !== this.activeConnId;
         this.activeConnId = connectionId;
         this.activeSchema = schemaName;
         this.activeTable = tableName;
         this.selectedBindCols.clear();
         if (this.subMode !== "bindings") {
           this.subMode = "bindings";
+        }
+        if (switchedConn) {
+          this._syncFormatFromConnection(connectionId);
+          await this.loadBindingsOverview({ skipRender: true });
         }
         await this.loadTableCompliance(false);
       },
@@ -166,17 +201,94 @@ export class StandardMigratorView {
     await this.reloadState();
   }
 
+  _findConnection(connId = this.activeConnId) {
+    const conns = store.state.connections?.length ? store.state.connections : this.ws?.connections || [];
+    return conns.find((c) => c.connection_id === connId) || null;
+  }
+
+  _syncFormatFromConnection(connId = this.activeConnId) {
+    const conn = this._findConnection(connId);
+    this.formatProfile = conn?.standard_format || "AUTO";
+    return this.formatProfile;
+  }
+
+  async _updateActiveConnectionFormat(nextFormat) {
+    if (!this.activeConnId) {
+      Toast.warn("请先选择一个数据源连接");
+      return;
+    }
+    const prev = this.formatProfile;
+    this.formatProfile = nextFormat || "AUTO";
+    try {
+      const res = await platformApi.updateConnectionStandardFormat(this.activeConnId, this.formatProfile);
+      if (Array.isArray(res.connections)) {
+        store.updateConnections(res.connections);
+        if (this.ws) this.ws.connections = res.connections;
+      }
+      Toast.success(res.message || "当前库落标标准已保存");
+      await this.loadBindingsOverview({ skipRender: Boolean(this.activeTable) });
+      if (this.activeTable) {
+        await this.loadTableCompliance(false);
+      }
+    } catch (err) {
+      this.formatProfile = prev;
+      this._renderSidebarFormatCard();
+      Toast.error(err.message);
+    }
+  }
+
+  _renderSidebarFormatCard() {
+    const conn = this._findConnection(this.activeConnId);
+    const fmtSelect = el(
+      "select",
+      {
+        className: "mac-input mac-input-sm",
+        "aria-label": "当前库落标标准",
+        disabled: !conn,
+        style: { width: "100%" },
+        onChange: (e) => this._updateActiveConnectionFormat(e.target.value),
+      },
+      this.formatProfiles.map((p) => {
+        const o = el("option", { value: p.value, text: p.label });
+        if (p.value === this.formatProfile) o.selected = true;
+        return o;
+      })
+    );
+
+    clearEl(
+      this.sidebarFormatMount,
+      el(
+        "div",
+        { className: "sidebar-format-card" },
+        el(
+          "div",
+          { className: "sidebar-format-head" },
+          el("span", { className: "sidebar-format-title", text: "当前库落标标准" }),
+          conn ? badge(conn.db_type || "DB", "neutral") : null
+        ),
+        el("div", {
+          className: "sidebar-format-dbname",
+          text: conn ? conn.name : "未选择数据源",
+          title: conn ? `${conn.name} (${conn.db_type})` : "",
+        }),
+        fmtSelect
+      )
+    );
+  }
+
   async reloadState() {
     try {
       const [wsRes, ovRes] = await Promise.all([
         migratorApi.getState(),
-        migratorApi.getBindingsOverview(this.activeConnId, this.formatProfile),
+        migratorApi.getBindingsOverview(this.activeConnId, "AUTO"),
       ]);
       this.loadedOnce = true;
       this.ws = wsRes;
       if (wsRes.logs) store.updateLogs(wsRes.logs);
+      if (Array.isArray(ovRes.connections)) store.updateConnections(ovRes.connections);
 
       this.activeConnId = ovRes.active_connection_id || wsRes.active_connection_id || store.state.connections[0]?.connection_id || "";
+      this.formatProfile = ovRes.active_connection?.standard_format || ovRes.format_profile || this._syncFormatFromConnection(this.activeConnId);
       this.tableStats = ovRes.table_stats || {};
       if (ovRes.format_profiles?.length) this.formatProfiles = ovRes.format_profiles;
       if (this.activeConnId) {
@@ -193,15 +305,21 @@ export class StandardMigratorView {
     }
   }
 
-  async loadBindingsOverview() {
+  async loadBindingsOverview({ skipRender = false } = {}) {
     try {
-      const ovRes = await migratorApi.getBindingsOverview(this.activeConnId, this.formatProfile);
+      const ovRes = await migratorApi.getBindingsOverview(this.activeConnId, "AUTO");
+      if (Array.isArray(ovRes.connections)) store.updateConnections(ovRes.connections);
       this.activeConnId = ovRes.active_connection_id || this.activeConnId;
+      this.formatProfile = ovRes.active_connection?.standard_format || ovRes.format_profile || this._syncFormatFromConnection(this.activeConnId);
       this.tableStats = ovRes.table_stats || {};
       if (ovRes.format_profiles?.length) this.formatProfiles = ovRes.format_profiles;
       this.tree.renderTreeBody();
-      this.render();
-      this.onStateUpdate?.();
+      if (!skipRender) {
+        this.render();
+        this.onStateUpdate?.();
+      } else {
+        this._renderSidebarFormatCard();
+      }
     } catch (err) {
       Toast.error(err.message);
     }
@@ -463,6 +581,7 @@ export class StandardMigratorView {
           this.activeTable = "";
           this.tableCheck = null;
           this.selectedBindCols.clear();
+          this._syncFormatFromConnection(cid);
           try {
             if (this.subMode === "queue") {
               const res = await migratorApi.bindConnection(cid, true);
@@ -527,33 +646,10 @@ export class StandardMigratorView {
       );
     }
 
-    const formatSelect = el(
-      "select",
-      {
-        className: "mac-input mac-input-sm",
-        "aria-label": "目标物理格式列",
-        title: "选择按哪一列标准物理格式检查落标",
-        onChange: async (e) => {
-          this.formatProfile = e.target.value;
-          if (this.activeConnId && this.activeTable) {
-            await this.loadTableCompliance(false);
-          } else {
-            this.render();
-          }
-        },
-      },
-      this.formatProfiles.map((p) => {
-        const o = el("option", { value: p.value, text: p.label });
-        if (p.value === this.formatProfile) o.selected = true;
-        return o;
-      })
-    );
-
     return el(
       "div",
       { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
       connSelect,
-      formatSelect,
       el(
         "button",
         {
@@ -820,6 +916,7 @@ export class StandardMigratorView {
   }
 
   render() {
+    this._renderSidebarFormatCard();
     const queueCount = (this.ws?.items || []).length;
     const tablist = el(
       "div",
