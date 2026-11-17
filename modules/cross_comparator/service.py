@@ -70,6 +70,7 @@ class CrossComparatorService:
                 "schema_name": "public",
                 "default_schema": "public",
                 "user": "",
+                "standard_format": "AUTO",
                 "schemas": [],
                 "tables": [],
             }
@@ -84,6 +85,23 @@ class CrossComparatorService:
             "schemas": [s["schema_name"] if isinstance(s, dict) else str(s) for s in cat["schemas"]],
             "tables": cat["tables"],
         }
+
+    @staticmethod
+    def _resolve_side_format_profile(
+        conn_info: Optional[Dict[str, Any]],
+        explicit_side: str = "AUTO",
+        fallback_single: str = "AUTO",
+    ) -> str:
+        exp = (explicit_side or "").strip()
+        if exp and exp != "AUTO":
+            return exp
+        fb = (fallback_single or "").strip()
+        if fb and fb != "AUTO":
+            return fb
+        saved = str((conn_info or {}).get("standard_format") or "").strip()
+        if saved:
+            return saved
+        return "AUTO"
 
     def bind_role_connection(
         self,
@@ -113,6 +131,76 @@ class CrossComparatorService:
         state["message"] = f"已将 [{prof.name}] 绑定为{'来源库 (左栏)' if role == 'source' else '目标库 (右栏)'}"
         return state
 
+    @staticmethod
+    def _find_matching_table_key(
+        tables: List[Dict[str, Any]],
+        *,
+        source_schema: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_schema: Optional[str] = None,
+        target_table: Optional[str] = None,
+    ) -> str:
+        """根据 (source_table, target_table) 精确查找已保存的跨环境映射表键."""
+        def _split_tbl(raw_sch: Optional[str], raw_tbl: Optional[str]) -> Tuple[str, str]:
+            sch = clean_identifier_input(raw_sch or "").lower()
+            txt = (raw_tbl or "").strip()
+            if "." in txt:
+                p0, p1 = txt.split(".", 1)
+                if not sch:
+                    sch = clean_identifier_input(p0).lower()
+                txt = p1
+            return sch, clean_identifier_input(txt).lower()
+
+        def _clean_tbl_low(raw: Optional[str]) -> str:
+            txt = (raw or "").strip()
+            if "." in txt:
+                txt = txt.split(".", 1)[1]
+            return clean_identifier_input(txt).lower()
+
+        def _sch_compat(q_sch: str, saved_sch_raw: Any) -> bool:
+            saved_sch = clean_identifier_input(str(saved_sch_raw or "")).lower()
+            return not q_sch or not saved_sch or saved_sch == q_sch
+
+        s_sch, s_tbl = _split_tbl(source_schema, source_table)
+        t_sch, t_tbl = _split_tbl(target_schema, target_table)
+
+        if s_tbl and t_tbl:
+            # 1) 优先同时匹配表名与模式名
+            for t in tables:
+                if (
+                    _clean_tbl_low(t.get("source_table")) == s_tbl
+                    and _clean_tbl_low(t.get("target_table")) == t_tbl
+                    and (not s_sch or clean_identifier_input(t.get("source_schema") or "").lower() == s_sch)
+                    and (not t_sch or clean_identifier_input(t.get("target_schema") or "").lower() == t_sch)
+                ):
+                    return str(t["std_table_key"])
+            # 2) 次优匹配：仅当查询侧或已保存侧的模式名为空时回退匹配双方表名（禁止跨模式错配）
+            for t in tables:
+                if (
+                    _clean_tbl_low(t.get("source_table")) == s_tbl
+                    and _clean_tbl_low(t.get("target_table")) == t_tbl
+                    and _sch_compat(s_sch, t.get("source_schema"))
+                    and _sch_compat(t_sch, t.get("target_schema"))
+                ):
+                    return str(t["std_table_key"])
+            return ""
+
+        if t_tbl:
+            for t in tables:
+                if (
+                    _clean_tbl_low(t.get("target_table")) == t_tbl
+                    or str(t.get("std_table_key") or "").strip().lower() == t_tbl
+                ) and _sch_compat(t_sch, t.get("target_schema")):
+                    return str(t["std_table_key"])
+        elif s_tbl:
+            for t in tables:
+                if (
+                    _clean_tbl_low(t.get("source_table")) == s_tbl
+                    and _sch_compat(s_sch, t.get("source_schema"))
+                ):
+                    return str(t["std_table_key"])
+        return ""
+
     def get_overview_state(
         self,
         selected_table_key: Optional[str] = None,
@@ -122,6 +210,8 @@ class CrossComparatorService:
         target_schema: Optional[str] = None,
         target_table: Optional[str] = None,
         format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
     ) -> Dict[str, Any]:
         tables = self.ctx.store.list_cross_tables()
         if not tables and self.ctx.store.list_items():
@@ -134,25 +224,60 @@ class CrossComparatorService:
         if not active_key and tables and not (source_table or target_table):
             active_key = tables[0]["std_table_key"]
 
+        src_conn = self.get_role_connection_info("source")
+        tgt_conn = self.get_role_connection_info("target")
+        eff_src_fmt = self._resolve_side_format_profile(
+            src_conn, source_format_profile, format_profile
+        )
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            tgt_conn, target_format_profile, format_profile
+        )
+
         comp = None
         if active_key or source_table or target_table:
+            lookup_key = active_key
+            load_saved_binding = bool(active_key)
+            if not lookup_key:
+                matched_key = self._find_matching_table_key(
+                    tables,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_schema=target_schema,
+                    target_table=target_table,
+                )
+                if matched_key:
+                    active_key = matched_key
+                    lookup_key = matched_key
+                    load_saved_binding = True
+                else:
+                    raw_fb = (target_table or source_table or "").strip()
+                    if "." in raw_fb:
+                        raw_fb = raw_fb.split(".", 1)[1]
+                    lookup_key = clean_identifier_input(raw_fb).lower()
+                    load_saved_binding = False
+
             comp = self.compare_single_table(
-                active_key or (source_table or target_table or "").strip().lower(),
+                lookup_key,
                 override_source_schema=source_schema,
                 override_source_table=source_table,
                 override_target_schema=target_schema,
                 override_target_table=target_table,
                 force_refresh=force_refresh,
                 format_profile=format_profile,
+                source_format_profile=eff_src_fmt,
+                target_format_profile=eff_tgt_fmt,
                 persist_missing_binding=bool(active_key),
+                load_saved_binding=load_saved_binding,
             )
         return {
             "ok": True,
             "connections": self.ctx.connection_hub.list_profiles(),
-            "source_connection": self.get_role_connection_info("source"),
-            "target_connection": self.get_role_connection_info("target"),
+            "source_connection": src_conn,
+            "target_connection": tgt_conn,
             "format_profiles": self.ctx.standard_catalog.list_format_profiles(),
             "format_profile": format_profile or "AUTO",
+            "source_format_profile": eff_src_fmt,
+            "target_format_profile": eff_tgt_fmt,
             "dict_summary": self.ctx.standard_catalog.get_summary(),
             "standard_meta": {
                 "filename": self.ctx.store.get_meta("cross_standard_filename", "未导入"),
@@ -175,9 +300,36 @@ class CrossComparatorService:
         override_target_table: Optional[str] = None,
         force_refresh: bool = False,
         format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
         persist_missing_binding: bool = True,
+        load_saved_binding: bool = True,
     ) -> Dict[str, Any]:
-        t_bind = self.ctx.store.get_cross_table_binding(std_table_key)
+        def _split_override(
+            raw_sch: Optional[str], raw_tbl: Optional[str]
+        ) -> Tuple[Optional[str], Optional[str]]:
+            sch = clean_identifier_input(raw_sch or "") or None
+            tbl_txt = (raw_tbl or "").strip()
+            if "." in tbl_txt:
+                p0, p1 = tbl_txt.split(".", 1)
+                if not sch:
+                    sch = clean_identifier_input(p0) or None
+                tbl_txt = p1
+            tbl = clean_identifier_input(tbl_txt) or None
+            return sch, tbl
+
+        override_source_schema, override_source_table = _split_override(
+            override_source_schema, override_source_table
+        )
+        override_target_schema, override_target_table = _split_override(
+            override_target_schema, override_target_table
+        )
+
+        t_bind = (
+            self.ctx.store.get_cross_table_binding(std_table_key)
+            if load_saved_binding
+            else None
+        )
         if not t_bind:
             if persist_missing_binding:
                 t_bind = self.ctx.store.upsert_cross_table_binding(
@@ -202,6 +354,12 @@ class CrossComparatorService:
 
         src_conn = self.get_role_connection_info("source")
         tgt_conn = self.get_role_connection_info("target")
+        eff_src_fmt = self._resolve_side_format_profile(
+            src_conn, source_format_profile, format_profile
+        )
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            tgt_conn, target_format_profile, format_profile
+        )
 
         src_schema = (
             override_source_schema
@@ -265,7 +423,11 @@ class CrossComparatorService:
             tgt_col_map[clean_identifier_input(c.column_name).lower()] = c
             tgt_col_map[c.column_name.lower()] = c
 
-        all_saved_std_cols = self.ctx.store.list_cross_columns(t_bind["std_table_key"])
+        all_saved_std_cols = (
+            self.ctx.store.list_cross_columns(t_bind["std_table_key"])
+            if load_saved_binding and t_bind.get("std_table_key")
+            else []
+        )
         std_cols = [
             sc
             for sc in all_saved_std_cols
@@ -491,6 +653,8 @@ class CrossComparatorService:
             tgt_table=tgt_meta.table_name if tgt_meta.exists else tgt_table,
             saved_cols=all_saved_std_cols,
             format_profile=format_profile,
+            source_format_profile=eff_src_fmt,
+            target_format_profile=eff_tgt_fmt,
         )
 
         return {
@@ -505,11 +669,14 @@ class CrossComparatorService:
             "bookmark_summary": bookmark_summary,
             "dual_rows": dual_rows,
             "format_profile": format_profile or "AUTO",
+            "source_format_profile": eff_src_fmt,
+            "target_format_profile": eff_tgt_fmt,
             "source_panel": {
                 "configured": bool(src_conn.get("configured")),
                 "connection_id": src_conn.get("connection_id", ""),
                 "connection_name": src_conn.get("name", ""),
                 "db_type": src_conn.get("db_type", "DWS"),
+                "standard_format": eff_src_fmt,
                 "schema_name": src_meta.schema_name if src_meta.exists else src_schema,
                 "table_name": src_meta.table_name if src_meta.exists else src_table,
                 "exists": src_meta.exists,
@@ -533,6 +700,7 @@ class CrossComparatorService:
                 "connection_id": tgt_conn.get("connection_id", ""),
                 "connection_name": tgt_conn.get("name", ""),
                 "db_type": tgt_conn.get("db_type", "DWS"),
+                "standard_format": eff_tgt_fmt,
                 "schema_name": tgt_meta.schema_name if tgt_meta.exists else tgt_schema,
                 "table_name": tgt_meta.table_name if tgt_meta.exists else tgt_table,
                 "exists": tgt_meta.exists,
@@ -560,12 +728,20 @@ class CrossComparatorService:
         tgt_table: str,
         saved_cols: List[Dict[str, Any]],
         format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """构建双列 + 内侧中缝拟物书签行模型（自动继承第 2 步字段级数标绑定）."""
         src_cid = str(src_conn.get("connection_id") or "")
         tgt_cid = str(tgt_conn.get("connection_id") or "")
         src_db_type = str(src_conn.get("db_type") or "DWS")
         tgt_db_type = str(tgt_conn.get("db_type") or "DWS")
+        eff_src_fmt = self._resolve_side_format_profile(
+            src_conn, source_format_profile, format_profile
+        )
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            tgt_conn, target_format_profile, format_profile
+        )
 
         src_field_binds = (
             self.ctx.standard_catalog.get_table_field_bindings(src_cid, src_schema, src_table)
@@ -767,13 +943,22 @@ class CrossComparatorService:
                 }
             )
 
+        src_has_step2 = bool(src_cid and src_table and (src_meta.exists or src_field_binds))
+        tgt_has_step2 = bool(tgt_cid and tgt_table and (tgt_meta.exists or tgt_field_binds))
+
         # 收集所有涉及的标准编号批量查表
         needed_codes: List[str] = []
         for rp in raw_pairs:
             s_n = rp["src_name"].lower()
             t_n = rp["tgt_name"].lower()
-            s_code = (src_field_binds.get(s_n, {}).get("std_code") or rp["saved_src_std"]).strip()
-            t_code = (tgt_field_binds.get(t_n, {}).get("std_code") or rp["saved_tgt_std"]).strip()
+            if s_n and s_n in src_field_binds:
+                s_code = (src_field_binds[s_n].get("std_code") or "").strip()
+            else:
+                s_code = "" if src_has_step2 else rp["saved_src_std"].strip()
+            if t_n and t_n in tgt_field_binds:
+                t_code = (tgt_field_binds[t_n].get("std_code") or "").strip()
+            else:
+                t_code = "" if tgt_has_step2 else rp["saved_tgt_std"].strip()
             rp["eff_src_code"] = s_code
             rp["eff_tgt_code"] = t_code
             if s_code:
@@ -783,7 +968,7 @@ class CrossComparatorService:
 
         std_map = self.ctx.standard_catalog.get_items_by_codes(needed_codes)
 
-        def _std_brief(code: str, db_type: str) -> Optional[Dict[str, Any]]:
+        def _std_brief(code: str, db_type: str, side_fmt: str) -> Optional[Dict[str, Any]]:
             if not code:
                 return None
             it = std_map.get(code)
@@ -801,7 +986,7 @@ class CrossComparatorService:
                 "cn_name": it["cn_name"],
                 "en_abbr": it["en_abbr"],
                 "resolved_type": self.ctx.standard_catalog.resolve_physical_type(
-                    it, db_type=db_type, format_profile=format_profile
+                    it, db_type=db_type, format_profile=side_fmt
                 ),
                 "domain_name": it.get("domain_name", ""),
                 "missing": False,
@@ -866,8 +1051,8 @@ class CrossComparatorService:
                 bk_summary["paired_rows"] += 1
             bk_summary["total_rows"] += 1
 
-            src_std_brief = _std_brief(s_code, src_db_type)
-            tgt_std_brief = _std_brief(t_code, tgt_db_type)
+            src_std_brief = _std_brief(s_code, src_db_type, eff_src_fmt)
+            tgt_std_brief = _std_brief(t_code, tgt_db_type, eff_tgt_fmt)
 
             # 判定目标库字段相对绑定标准的物理合规度（供淡绿书签附「待贯标」轻角标）
             target_compliance = None
@@ -881,7 +1066,7 @@ class CrossComparatorService:
                     std_item=t_item,
                     std_code=t_code,
                     db_type=tgt_db_type,
-                    format_profile=format_profile,
+                    format_profile=eff_tgt_fmt,
                 )
                 if target_compliance["status"] in ("NON_COMPLIANT", "COMMENT_ONLY", "STD_MISSING"):
                     target_needs_migration = True
@@ -918,24 +1103,41 @@ class CrossComparatorService:
         target_table: str,
         pairings: List[Dict[str, Any]],
         format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
         force_refresh: bool = False,
         sync_to_field_bindings: bool = True,
         return_overview: bool = True,
     ) -> Dict[str, Any]:
         """保存双列拖拽调整后的字段映射关系与两侧数标，并可选双向回写第 2 步数据源绑定."""
-        s_sch = (source_schema or "").strip() or "public"
+        src_cid = str(self.ctx.store.get_meta("cross_source_connection_id", "") or "")
+        tgt_cid = str(self.ctx.store.get_meta("cross_target_connection_id", "") or "")
+        src_prof = self.ctx.connection_hub.get_profile(src_cid) if src_cid else None
+        tgt_prof = self.ctx.connection_hub.get_profile(tgt_cid) if tgt_cid else None
+        src_def_sch = src_prof.effective_default_schema() if src_prof else "public"
+        tgt_def_sch = tgt_prof.effective_default_schema() if tgt_prof else "public"
+
+        s_sch = (source_schema or "").strip()
         s_tbl = (source_table or "").strip()
         if "." in s_tbl:
-            s_sch, s_tbl = s_tbl.split(".", 1)
+            p0, p1 = s_tbl.split(".", 1)
+            if not s_sch:
+                s_sch = p0.strip()
+            s_tbl = p1.strip()
+        s_sch = s_sch or src_def_sch
 
-        t_sch = (target_schema or "").strip() or "public"
+        t_sch = (target_schema or "").strip()
         t_tbl = (target_table or "").strip()
         if "." in t_tbl:
-            t_sch, t_tbl = t_tbl.split(".", 1)
+            p0, p1 = t_tbl.split(".", 1)
+            if not t_sch:
+                t_sch = p0.strip()
+            t_tbl = p1.strip()
+        t_sch = t_sch or tgt_def_sch
 
         eff_key = clean_identifier_input(std_table_key or "").lower()
         if not eff_key:
-            eff_key = clean_identifier_input(s_tbl or t_tbl).lower()
+            eff_key = clean_identifier_input(t_tbl or s_tbl).lower()
         if not eff_key:
             raise ValueError("请先在来源库或目标库中选择要映射的表或视图")
 
@@ -948,8 +1150,12 @@ class CrossComparatorService:
             target_table=t_tbl or eff_key,
         )
 
-        src_cid = str(self.ctx.store.get_meta("cross_source_connection_id", "") or "")
-        tgt_cid = str(self.ctx.store.get_meta("cross_target_connection_id", "") or "")
+        tgt_db_type = tgt_prof.db_type if tgt_prof else "DWS"
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            {"standard_format": getattr(tgt_prof, "standard_format", "AUTO")} if tgt_prof else {},
+            target_format_profile,
+            format_profile,
+        )
         src_sync_batch: List[Dict[str, Any]] = []
         tgt_sync_batch: List[Dict[str, Any]] = []
 
@@ -983,7 +1189,7 @@ class CrossComparatorService:
                 )
                 std_col_type = (
                     self.ctx.standard_catalog.resolve_physical_type(
-                        rep_item, format_profile=format_profile
+                        rep_item, db_type=tgt_db_type, format_profile=eff_tgt_fmt
                     )
                     if rep_item
                     else str(p.get("std_col_type") or "")
@@ -1084,6 +1290,8 @@ class CrossComparatorService:
             selected_table_key=eff_key,
             force_refresh=force_refresh,
             format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
         )
         state["message"] = "已保存双列映射与书签绑定"
         return state
@@ -1115,18 +1323,50 @@ class CrossComparatorService:
 
         prefilled: List[List[str]] = []
         if std_table_key or source_table or target_table:
+            active_key = (std_table_key or "").strip().lower()
+            lookup_key = active_key
+            load_saved_binding = bool(active_key)
+            if not lookup_key:
+                tables = self.ctx.store.list_cross_tables()
+                matched_key = self._find_matching_table_key(
+                    tables,
+                    source_schema=source_schema,
+                    source_table=source_table,
+                    target_schema=target_schema,
+                    target_table=target_table,
+                )
+                if matched_key:
+                    lookup_key = matched_key
+                    load_saved_binding = True
+                else:
+                    raw_fb = (target_table or source_table or "").strip()
+                    if "." in raw_fb:
+                        raw_fb = raw_fb.split(".", 1)[1]
+                    lookup_key = clean_identifier_input(raw_fb).lower()
+                    load_saved_binding = False
             comp = self.compare_single_table(
-                (std_table_key or source_table or target_table).strip().lower(),
+                lookup_key,
                 override_source_schema=source_schema or None,
                 override_source_table=source_table or None,
                 override_target_schema=target_schema or None,
                 override_target_table=target_table or None,
                 persist_missing_binding=False,
+                load_saved_binding=load_saved_binding,
             )
             tb = comp.get("table_binding") or {}
-            s_sch = tb.get("source_schema") or source_schema or "public"
+            s_sch = (
+                tb.get("source_schema")
+                or source_schema
+                or (comp.get("source_panel") or {}).get("schema_name")
+                or "public"
+            )
             s_tbl = tb.get("source_table") or source_table or ""
-            t_sch = tb.get("target_schema") or target_schema or "public"
+            t_sch = (
+                tb.get("target_schema")
+                or target_schema
+                or (comp.get("target_panel") or {}).get("schema_name")
+                or "public"
+            )
             t_tbl = tb.get("target_table") or target_table or ""
             for dr in comp.get("dual_rows") or []:
                 sc = dr.get("source_col") or {}
@@ -1190,6 +1430,8 @@ class CrossComparatorService:
         filename: str,
         content: bytes,
         format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
         progress_cb: Optional[ProgressCallback] = None,
     ) -> Dict[str, Any]:
         """批量上传跨环境对应关系铺底表（自动提取公式最终值、识别 #N/A 为空）."""
@@ -1357,6 +1599,11 @@ class CrossComparatorService:
         src_def_sch = src_prof.effective_default_schema() if src_prof else "public"
         tgt_def_sch = tgt_prof.effective_default_schema() if tgt_prof else "public"
         tgt_db_type = tgt_prof.db_type if tgt_prof else "DWS"
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            {"standard_format": getattr(tgt_prof, "standard_format", "AUTO")} if tgt_prof else {},
+            target_format_profile,
+            format_profile,
+        )
         all_codes: List[str] = []
         for grp in grouped.values():
             for p in grp["pairings"]:
@@ -1416,7 +1663,7 @@ class CrossComparatorService:
                     std_col_name = (rep_item.get("en_abbr") if rep_item else "") or t_col or s_col
                     std_col_type = (
                         self.ctx.standard_catalog.resolve_physical_type(
-                            rep_item, db_type=tgt_db_type, format_profile=format_profile
+                            rep_item, db_type=tgt_db_type, format_profile=eff_tgt_fmt
                         )
                         if rep_item
                         else ""
@@ -1546,7 +1793,12 @@ class CrossComparatorService:
             f"已从 [{filename}] 批量保存 {len(grouped)} 张表共 {len(col_rows_all)} 行双列映射与数标绑定",
         )
         report(96.0, "加载当前对比视图", f"正在读取表 [{last_key}] 对照预览...", total_rows, total_rows)
-        state = self.get_overview_state(selected_table_key=last_key, format_profile=format_profile)
+        state = self.get_overview_state(
+            selected_table_key=last_key,
+            format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
+        )
         state["imported_count"] = total_rows
         state["message"] = f"已从 [{filename}] 铺底导入 {len(grouped)} 张表共 {total_rows} 条字段映射关系"
         return state
@@ -1595,6 +1847,49 @@ class CrossComparatorService:
         )
         if column_bindings:
             self.ctx.store.upsert_cross_table_column_bindings(eff_key, column_bindings)
+            src_cid = str(self.ctx.store.get_meta("cross_source_connection_id", "") or "")
+            tgt_cid = str(self.ctx.store.get_meta("cross_target_connection_id", "") or "")
+            src_prof = self.ctx.connection_hub.get_profile(src_cid) if src_cid else None
+            tgt_prof = self.ctx.connection_hub.get_profile(tgt_cid) if tgt_cid else None
+            eff_s_sch = s_sch or (src_prof.effective_default_schema() if src_prof else "public")
+            eff_t_sch = t_sch or (tgt_prof.effective_default_schema() if tgt_prof else "public")
+            eff_s_tbl = s_tbl or eff_key
+            eff_t_tbl = t_tbl or eff_key
+            src_sync: List[Dict[str, Any]] = []
+            tgt_sync: List[Dict[str, Any]] = []
+            for cb in column_bindings:
+                b_src = clean_identifier_input(cb.get("bound_source_col") or "")
+                b_tgt = clean_identifier_input(cb.get("bound_target_col") or "")
+                if src_cid and b_src and "source_std_code" in cb:
+                    src_sync.append(
+                        {
+                            "schema_name": eff_s_sch,
+                            "table_name": eff_s_tbl,
+                            "column_name": b_src,
+                            "std_code": clean_excel_cell_str(
+                                cb.get("source_std_code"), treat_placeholder_empty=True
+                            ),
+                        }
+                    )
+                if tgt_cid and b_tgt and "target_std_code" in cb:
+                    tgt_sync.append(
+                        {
+                            "schema_name": eff_t_sch,
+                            "table_name": eff_t_tbl,
+                            "column_name": b_tgt,
+                            "std_code": clean_excel_cell_str(
+                                cb.get("target_std_code"), treat_placeholder_empty=True
+                            ),
+                        }
+                    )
+            if src_sync:
+                self.ctx.standard_catalog.upsert_field_bindings(
+                    src_cid, src_sync, bind_source="CROSS_SYNC"
+                )
+            if tgt_sync:
+                self.ctx.standard_catalog.upsert_field_bindings(
+                    tgt_cid, tgt_sync, bind_source="CROSS_SYNC"
+                )
 
         self.ctx.store.add_log(
             "INFO",
@@ -1615,6 +1910,8 @@ class CrossComparatorService:
         self,
         std_table_key: Optional[str] = None,
         format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
     ) -> Dict[str, Any]:
         """经由 PlatformStateStore 数据契约将待贯标字段推送至单库贯标队列（零跨模块导入）."""
         tables = (
@@ -1628,12 +1925,20 @@ class CrossComparatorService:
 
         tgt_conn_info = self.get_role_connection_info("target")
         tgt_db_type = str(tgt_conn_info.get("db_type") or "DWS")
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            tgt_conn_info, target_format_profile, format_profile
+        )
         items_to_push: List[Dict[str, Any]] = []
         row_idx = 1
 
         for t in tables:
             t_key = t["std_table_key"]
-            comp = self.compare_single_table(t_key, format_profile=format_profile)
+            comp = self.compare_single_table(
+                t_key,
+                format_profile=format_profile,
+                source_format_profile=source_format_profile,
+                target_format_profile=eff_tgt_fmt,
+            )
             tgt_panel = comp.get("target_panel") or {}
             tgt_schema = (
                 tgt_panel.get("schema_name")
@@ -1661,7 +1966,7 @@ class CrossComparatorService:
                     continue
                 dict_pushed_for_table = True
                 resolved_type = self.ctx.standard_catalog.resolve_physical_type(
-                    std_item, db_type=tgt_db_type, format_profile=format_profile
+                    std_item, db_type=tgt_db_type, format_profile=eff_tgt_fmt
                 )
                 old_c = clean_identifier_input(tc.get("column_name") or "")
                 new_c = clean_identifier_input(std_item.get("en_abbr") or old_c)
@@ -1683,7 +1988,25 @@ class CrossComparatorService:
             if dict_pushed_for_table:
                 continue
 
-            cols = (comp.get("standard_panel") or {}).get("columns") or self.ctx.store.list_cross_columns(t_key)
+            saved_cross_cols = self.ctx.store.list_cross_columns(t_key)
+            has_dict_paired_rows = any(
+                (c.get("source_std_code") or "").strip()
+                or (c.get("target_std_code") or "").strip()
+                for c in saved_cross_cols
+            )
+            has_legacy_checklist_rows = any(
+                not str(c.get("std_col_name") or "").startswith("__unpaired_")
+                and (
+                    (c.get("std_col_type") or "").strip()
+                    or (c.get("orig_col_type") or "").strip()
+                    or (c.get("std_col_comment") or "").strip()
+                )
+                for c in saved_cross_cols
+            )
+            if has_dict_paired_rows or not has_legacy_checklist_rows:
+                continue
+
+            cols = (comp.get("standard_panel") or {}).get("columns") or saved_cross_cols
             for c in cols:
                 t_col_meta = c.get("target_col_meta")
                 if isinstance(t_col_meta, dict) and t_col_meta.get("column_name"):

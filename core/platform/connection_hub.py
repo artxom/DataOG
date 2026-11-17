@@ -13,6 +13,7 @@ from typing import Any, Dict, Generator, List, Optional
 from core.platform.driver_manager import DriverManager, JdbcConnectionAdapter
 from core.platform.inceptor_client import InceptorThriftClient
 from core.platform.models import ConnectionProfile
+from core.platform.standard_catalog import VALID_FORMAT_PROFILE_VALUES
 from core.platform.storage import PlatformStateStore
 
 
@@ -143,8 +144,42 @@ class ConnectionHub:
                 else (existing.jdbc_driver_class if existing else "")
             ).strip(),
             extra_props=dict(payload.get("extra_props") or (existing.extra_props if existing else {})),
+            standard_format=self._resolve_valid_standard_format(
+                payload.get("standard_format") if "standard_format" in payload else None,
+                fallback=existing.standard_format if existing else "AUTO",
+            ),
             created_at=existing.created_at if existing else "",
         )
+
+    @staticmethod
+    def _resolve_valid_standard_format(
+        raw_value: Optional[str], fallback: str = "AUTO"
+    ) -> str:
+        if raw_value is None:
+            candidate = (fallback or "AUTO").strip() or "AUTO"
+        else:
+            candidate = str(raw_value).strip()
+            if not candidate:
+                raise ValueError(f"不支持的数据标准格式选项: {raw_value}")
+        if candidate not in VALID_FORMAT_PROFILE_VALUES:
+            raise ValueError(f"不支持的数据标准格式选项: {candidate}")
+        return candidate
+
+    def update_standard_format(
+        self, connection_id: str, standard_format: str
+    ) -> ConnectionProfile:
+        fmt = self._resolve_valid_standard_format(standard_format, fallback="AUTO")
+        existing = self.get_profile(connection_id)
+        if not existing:
+            raise LookupError(f"未找到数据源连接档案 ({connection_id})")
+        existing.standard_format = fmt
+        saved = self.store.upsert_connection_profile(existing)
+        self.store.add_log(
+            "INFO",
+            "连接中心",
+            f"已更新数据源 [{saved.name}] 默认数据标准格式为 [{saved.standard_format}]",
+        )
+        return saved
 
     def save_profile(
         self, payload: Dict[str, Any], connection_id: Optional[str] = None

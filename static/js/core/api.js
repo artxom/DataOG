@@ -178,6 +178,11 @@ export const platformApi = {
     requestJson("/api/platform/connections", { method: "POST", body: payload }),
   updateConnection: (connId, payload) =>
     requestJson(`/api/platform/connections/${encodeURIComponent(connId)}`, { method: "PUT", body: payload }),
+  updateConnectionStandardFormat: (connId, standardFormat) =>
+    requestJson(`/api/platform/connections/${encodeURIComponent(connId)}/standard-format`, {
+      method: "PUT",
+      body: { standard_format: standardFormat || "AUTO" },
+    }),
   deleteConnection: (connId) =>
     requestJson(`/api/platform/connections/${encodeURIComponent(connId)}`, { method: "DELETE" }),
   testUnsavedConnection: (payload) =>
@@ -415,6 +420,8 @@ export const crossApi = {
     if (extra.targetSchema) qs.set("target_schema", extra.targetSchema);
     if (extra.targetTable) qs.set("target_table", extra.targetTable);
     if (extra.formatProfile) qs.set("format_profile", extra.formatProfile);
+    if (extra.sourceFormatProfile) qs.set("source_format_profile", extra.sourceFormatProfile);
+    if (extra.targetFormatProfile) qs.set("target_format_profile", extra.targetFormatProfile);
     return requestJson(`/api/modules/cross_comparator/overview?${qs.toString()}`);
   },
   bindRole: (payload) =>
@@ -444,11 +451,13 @@ export const crossApi = {
   uploadPairings: (
     file,
     formatProfile = "AUTO",
-    { progressId = "", onUploadProgress = null } = {}
+    { progressId = "", onUploadProgress = null, sourceFormatProfile = "", targetFormatProfile = "" } = {}
   ) => {
     const fd = new FormData();
     fd.append("file", file);
     fd.append("format_profile", formatProfile || "AUTO");
+    if (sourceFormatProfile) fd.append("source_format_profile", sourceFormatProfile);
+    if (targetFormatProfile) fd.append("target_format_profile", targetFormatProfile);
     if (progressId) fd.append("progress_id", progressId);
     return uploadFormData("/api/modules/cross_comparator/pairings/upload", fd, { onUploadProgress });
   },
@@ -472,10 +481,15 @@ export const crossApi = {
       fallbackName: "Data.O.G_三栏比对报告.xlsx",
     });
   },
-  pushToMigrator: (stdTableKey = "", formatProfile = "AUTO") =>
+  pushToMigrator: (stdTableKey = "", formatProfile = "AUTO", { sourceFormatProfile = "", targetFormatProfile = "" } = {}) =>
     requestJson("/api/modules/cross_comparator/push-to-migrator", {
       method: "POST",
-      body: { std_table_key: stdTableKey || null, format_profile: formatProfile || "AUTO" },
+      body: {
+        std_table_key: stdTableKey || null,
+        format_profile: formatProfile || "AUTO",
+        source_format_profile: sourceFormatProfile || "AUTO",
+        target_format_profile: targetFormatProfile || "AUTO",
+      },
     }),
 };
 

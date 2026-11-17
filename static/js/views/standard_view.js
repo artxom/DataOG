@@ -51,6 +51,7 @@ export class StandardView {
 
   destroy() {
     this.migratorPane?.destroy?.();
+    this.comparatorPane?.destroy?.();
   }
 
   getHeaderParts() {
@@ -73,8 +74,8 @@ export class StandardView {
             this.render();
             this.refreshHeader?.();
             if (this.mode === "dictionary") await this.dictPane.ensureLoaded();
-            else if (this.mode === "migrator") await this.migratorPane.ensureLoaded();
-            else await this.comparatorPane.ensureLoaded();
+            else if (this.mode === "migrator") await this.migratorPane.refreshOnActivate();
+            else await this.comparatorPane.refreshOnActivate();
           },
         })
       )

@@ -2089,6 +2089,600 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertTrue(res_chk["ok"])
             self.assertLessEqual(chk_target_conns, 1)
 
+    def test_per_db_standard_format_reuse_and_five_col_pairing_flow(self) -> None:
+        """验证 R3 按库标准格式持久化与跨模块沿用，以及 R1 五虚拟列分列绑标配对闭环."""
+        with tempfile.TemporaryDirectory() as tmp:
+            state_db = os.path.join(tmp, "state.db")
+            src_db = os.path.join(tmp, "src.sqlite")
+            tgt_db = os.path.join(tmp, "tgt.sqlite")
+
+            with contextlib.closing(sqlite3.connect(src_db)) as sc:
+                sc.execute(
+                    "CREATE TABLE ods_cust (cust_id TEXT, raw_extra TEXT)"
+                )
+                sc.execute(
+                    "CREATE TABLE ods_cust_v2 (new_col_a TEXT, new_col_b TEXT)"
+                )
+                sc.commit()
+            with contextlib.closing(sqlite3.connect(tgt_db)) as tc:
+                tc.execute(
+                    "CREATE TABLE dwd_cust (cust_no TEXT, tgt_extra TEXT)"
+                )
+                tc.execute(
+                    "CREATE TABLE dwd_cust_v2 (tgt_new_a TEXT)"
+                )
+                tc.commit()
+
+            app = create_app(
+                db_path=state_db,
+            )
+            ctx: PlatformContext = app.state.platform_ctx
+            client = TestClient(app)
+
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "STD001",
+                    "cn_name": "客户编号",
+                    "en_abbr": "cust_id",
+                    "type_dws": "VARCHAR(32)",
+                    "type_dw_mart": "VARCHAR(64)",
+                    "type_argodb": "STRING",
+                }
+            )
+
+            r_src = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "源Argo库",
+                    "db_type": "SQLITE",
+                    "sqlite_path": src_db,
+                    "auto_refresh_metadata": True,
+                },
+            )
+            self.assertEqual(r_src.status_code, 200)
+            src_cid = r_src.json()["connection"]["connection_id"]
+
+            r_tgt = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "目标集市库",
+                    "db_type": "SQLITE",
+                    "sqlite_path": tgt_db,
+                    "auto_refresh_metadata": True,
+                },
+            )
+            self.assertEqual(r_tgt.status_code, 200)
+            tgt_cid = r_tgt.json()["connection"]["connection_id"]
+
+            # 1) 设定并持久化各库标准格式（含错误码检查）
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{src_cid}/standard-format",
+                    json={"standard_format": "bad_fmt"},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{src_cid}/standard-format",
+                    json={"standard_format": ""},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{src_cid}/standard-format",
+                    json={"standard_format": "   "},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                client.put(
+                    "/api/platform/connections/not_found/standard-format",
+                    json={"standard_format": "type_dws"},
+                ).status_code,
+                404,
+            )
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{src_cid}/standard-format",
+                    json={"standard_format": "type_argodb"},
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{src_cid}",
+                    json={"name": "源Argo库", "standard_format": ""},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{tgt_cid}/standard-format",
+                    json={"standard_format": "type_dw_mart"},
+                ).status_code,
+                200,
+            )
+
+            # 2) Step 2 切换库自动应用该库标准格式；来源字段 cust_id 先在 Step 2 绑标
+            ov2 = client.get(
+                f"/api/modules/standard_migrator/bindings/overview?connection_id={tgt_cid}"
+            )
+            self.assertEqual(ov2.status_code, 200)
+            self.assertEqual(ov2.json()["format_profile"], "type_dw_mart")
+
+            save2 = client.post(
+                "/api/modules/standard_migrator/bindings/save",
+                json={
+                    "connection_id": src_cid,
+                    "active_schema": "main",
+                    "active_table": "ods_cust",
+                    "bindings": [
+                        {
+                            "schema_name": "main",
+                            "table_name": "ods_cust",
+                            "column_name": "cust_id",
+                            "std_code": "STD001",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(save2.status_code, 200)
+            self.assertEqual(save2.json()["format_profile"], "type_argodb")
+            bound_col = next(
+                c for c in save2.json()["columns"] if c["column_name"] == "cust_id"
+            )
+            self.assertEqual(bound_col["std_target_type"], "STRING")
+
+            # 3) Step 3 绑定双库并加载对比：两侧各自沿用 type_argodb 与 type_dw_mart
+            client.post(
+                "/api/modules/cross_comparator/bind-role",
+                json={"role": "source", "connection_id": src_cid},
+            )
+            client.post(
+                "/api/modules/cross_comparator/bind-role",
+                json={"role": "target", "connection_id": tgt_cid},
+            )
+            ov3 = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust&target_schema=main&target_table=dwd_cust"
+            )
+            self.assertEqual(ov3.status_code, 200)
+            ov3_data = ov3.json()
+            self.assertEqual(ov3_data["source_format_profile"], "type_argodb")
+            self.assertEqual(ov3_data["target_format_profile"], "type_dw_mart")
+            comp = ov3_data["active_comparison"]
+            self.assertEqual(comp["source_format_profile"], "type_argodb")
+            self.assertEqual(comp["target_format_profile"], "type_dw_mart")
+
+            # 4) 在五虚拟列模型中将未绑标候选 cust_no 绑至 STD001 并与 cust_id 配对保存
+            save3 = client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "dwd_cust",
+                    "source_schema": "main",
+                    "source_table": "ods_cust",
+                    "target_schema": "main",
+                    "target_table": "dwd_cust",
+                    "source_format_profile": "type_argodb",
+                    "target_format_profile": "type_dw_mart",
+                    "sync_to_field_bindings": True,
+                    "pairings": [
+                        {
+                            "source_col": "cust_id",
+                            "target_col": "cust_no",
+                            "source_std_code": "STD001",
+                            "target_std_code": "STD001",
+                        },
+                        {
+                            "source_col": "raw_extra",
+                            "target_col": "",
+                            "source_std_code": "",
+                            "target_std_code": "",
+                        },
+                        {
+                            "source_col": "",
+                            "target_col": "tgt_extra",
+                            "source_std_code": "",
+                            "target_std_code": "",
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(save3.status_code, 200)
+            dual_rows = save3.json()["active_comparison"]["dual_rows"]
+            unified_row = next(r for r in dual_rows if r["bookmark_state"] == "UNIFIED")
+            self.assertEqual(unified_row["source_std"]["resolved_type"], "STRING")
+            self.assertEqual(unified_row["target_std"]["resolved_type"], "VARCHAR(64)")
+
+            tgt_binds = ctx.standard_catalog.get_table_field_bindings(tgt_cid, "main", "dwd_cust")
+            self.assertEqual(tgt_binds["cust_no"]["std_code"], "STD001")
+            self.assertNotIn("tgt_extra", tgt_binds)
+
+            # 5) 推送贯标时沿用目标库 type_dw_mart 的 VARCHAR(64)
+            push_res = client.post(
+                "/api/modules/cross_comparator/push-to-migrator",
+                json={"std_table_key": "dwd_cust"},
+            )
+            self.assertEqual(push_res.status_code, 200)
+            pushed_items = ctx.store.list_items()
+            self.assertEqual(pushed_items[0]["new_col_type"], "VARCHAR(64)")
+
+            # 6) 按 (source_table, target_table) 不传 table_key 读取概览可命中已保存表对 dwd_cust
+            ov_by_pair = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust&target_schema=main&target_table=dwd_cust"
+            )
+            self.assertEqual(ov_by_pair.status_code, 200)
+            ov_pair_data = ov_by_pair.json()
+            self.assertEqual(ov_pair_data["active_table_key"], "dwd_cust")
+            self.assertTrue(
+                any(
+                    r["bookmark_state"] == "UNIFIED" and r["source_std_code"] == "STD001"
+                    for r in ov_pair_data["active_comparison"]["dual_rows"]
+                )
+            )
+
+            # 7) Step 3 空 Schema 解绑与 Step 2 单独解绑均不会在 Step 3 概览幽灵复活
+            unbind_s3 = client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "dwd_cust",
+                    "source_schema": "",
+                    "source_table": "ods_cust",
+                    "target_schema": "",
+                    "target_table": "dwd_cust",
+                    "sync_to_field_bindings": True,
+                    "pairings": [
+                        {
+                            "source_col": "cust_id",
+                            "target_col": "",
+                            "source_std_code": "",
+                            "target_std_code": "",
+                        },
+                        {
+                            "source_col": "",
+                            "target_col": "cust_no",
+                            "source_std_code": "",
+                            "target_std_code": "STD001",
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(unbind_s3.status_code, 200)
+            self.assertEqual(
+                ctx.standard_catalog.get_table_field_bindings(src_cid, "main", "ods_cust"),
+                {},
+            )
+            ov_after_s3_unbind = client.get(
+                "/api/modules/cross_comparator/overview?table_key=dwd_cust"
+            ).json()
+            src_cust_row = next(
+                r
+                for r in ov_after_s3_unbind["active_comparison"]["dual_rows"]
+                if (r.get("source_col") or {}).get("column_name") == "cust_id"
+            )
+            self.assertEqual(src_cust_row["source_std_code"], "")
+
+            unbind_s2 = client.post(
+                "/api/modules/standard_migrator/bindings/save",
+                json={
+                    "connection_id": tgt_cid,
+                    "active_schema": "main",
+                    "active_table": "dwd_cust",
+                    "bindings": [
+                        {
+                            "schema_name": "main",
+                            "table_name": "dwd_cust",
+                            "column_name": "cust_no",
+                            "std_code": "",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(unbind_s2.status_code, 200)
+            ov_after_s2_unbind = client.get(
+                "/api/modules/cross_comparator/overview?table_key=dwd_cust"
+            ).json()
+            tgt_cust_row = next(
+                r
+                for r in ov_after_s2_unbind["active_comparison"]["dual_rows"]
+                if (r.get("target_col") or {}).get("column_name") == "cust_no"
+            )
+            self.assertEqual(tgt_cust_row["target_std_code"], "")
+
+            # 8) Step 2 全量解绑后推送贯标不得从旧 cross_column_bindings 复活未绑定字段
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/push-to-migrator",
+                    json={"std_table_key": "dwd_cust"},
+                ).status_code,
+                400,
+            )
+            client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "dwd_cust",
+                    "source_schema": "main",
+                    "source_table": "ods_cust",
+                    "target_schema": "main",
+                    "target_table": "dwd_cust",
+                    "sync_to_field_bindings": True,
+                    "pairings": [
+                        {
+                            "source_col": "cust_id",
+                            "target_col": "cust_no",
+                            "source_std_code": "STD001",
+                            "target_std_code": "STD001",
+                        }
+                    ],
+                },
+            )
+            client.post(
+                "/api/modules/standard_migrator/bindings/save",
+                json={
+                    "connection_id": tgt_cid,
+                    "active_schema": "main",
+                    "active_table": "dwd_cust",
+                    "bindings": [
+                        {
+                            "schema_name": "main",
+                            "table_name": "dwd_cust",
+                            "column_name": "cust_no",
+                            "std_code": "",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/push-to-migrator",
+                    json={"std_table_key": "dwd_cust"},
+                ).status_code,
+                400,
+            )
+
+            # 9) 用新的来源表 ods_cust_v2 预览已保存过的目标表 dwd_cust（不传 table_key）不得混入旧表幽灵字段
+            ov_new_src = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust_v2&target_schema=main&target_table=dwd_cust"
+            )
+            self.assertEqual(ov_new_src.status_code, 200)
+            ov_new_data = ov_new_src.json()
+            self.assertEqual(ov_new_data["active_table_key"], "")
+            new_src_cols = {
+                (r.get("source_col") or {}).get("column_name")
+                for r in ov_new_data["active_comparison"]["dual_rows"]
+                if r.get("source_col")
+            }
+            self.assertEqual(new_src_cols, {"new_col_a", "new_col_b"})
+
+            # 10) 跨模式同名来源表 other_sch.ods_cust -> main.dwd_cust 预览不得跨模式匹配 main.ods_cust 混入幽灵字段
+            from core.platform.models import ColumnMeta, TableMeta
+
+            ctx.store.save_table_meta(
+                src_cid,
+                TableMeta(
+                    schema_name="other_sch",
+                    table_name="ods_cust",
+                    columns=[
+                        ColumnMeta(1, "other_x", "TEXT"),
+                        ColumnMeta(2, "other_y", "TEXT"),
+                    ],
+                ),
+            )
+            ov_cross_sch = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=other_sch&source_table=ods_cust&target_schema=main&target_table=dwd_cust"
+            )
+            self.assertEqual(ov_cross_sch.status_code, 200)
+            ov_cross_data = ov_cross_sch.json()
+            self.assertEqual(ov_cross_data["active_table_key"], "")
+            cross_src_cols = {
+                (r.get("source_col") or {}).get("column_name")
+                for r in ov_cross_data["active_comparison"]["dual_rows"]
+                if r.get("source_col")
+            }
+            self.assertEqual(cross_src_cols, {"other_x", "other_y"})
+
+            # 11) 下载未保存表对预填模板时不得泄漏冲突 std_table_key 的幽灵字段
+            save_collide = client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "ods_cust",
+                    "source_schema": "main",
+                    "source_table": "ods_cust_v2",
+                    "target_schema": "main",
+                    "target_table": "ods_cust",
+                    "sync_to_field_bindings": False,
+                    "pairings": [
+                        {
+                            "source_col": "new_col_a",
+                            "target_col": "cust_id",
+                            "source_std_code": "STD001",
+                            "target_std_code": "STD001",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(save_collide.status_code, 200)
+            tpl_res = client.get(
+                "/api/modules/cross_comparator/pairings/template.xlsx"
+                "?source_schema=main&source_table=ods_cust&target_schema=main&target_table=dwd_cust_v2"
+            )
+            self.assertEqual(tpl_res.status_code, 200)
+            wb_tpl = openpyxl.load_workbook(io.BytesIO(tpl_res.content), data_only=True)
+            ws_tpl = wb_tpl["跨环境字段映射"]
+            tpl_rows = list(ws_tpl.iter_rows(min_row=2, values_only=True))
+            tpl_src_cols = {str(r[2] or "").strip() for r in tpl_rows if r[2]}
+            tpl_tgt_cols = {str(r[6] or "").strip() for r in tpl_rows if r[6]}
+            self.assertNotIn("new_col_a", tpl_src_cols)
+            self.assertEqual(tpl_src_cols, {"cust_id", "raw_extra"})
+            self.assertEqual(tpl_tgt_cols, {"tgt_new_a"})
+
+            # 12) 单侧 source_table 查询概览与下载模板不得被同名的 std_table_key 劫持
+            ov_single_src = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust&target_schema=&target_table="
+            )
+            self.assertEqual(ov_single_src.status_code, 200)
+            ov_single_data = ov_single_src.json()
+            self.assertNotEqual(ov_single_data["active_table_key"], "ods_cust")
+            single_src_cols = {
+                c["column_name"]
+                for c in ov_single_data["active_comparison"]["source_panel"]["columns"]
+            }
+            self.assertNotIn("new_col_a", single_src_cols)
+            self.assertEqual(single_src_cols, {"cust_id", "raw_extra"})
+
+            tpl_single_res = client.get(
+                "/api/modules/cross_comparator/pairings/template.xlsx"
+                "?source_schema=main&source_table=ods_cust&target_schema=&target_table="
+            )
+            self.assertEqual(tpl_single_res.status_code, 200)
+            wb_single = openpyxl.load_workbook(io.BytesIO(tpl_single_res.content), data_only=True)
+            ws_single = wb_single["跨环境字段映射"]
+            single_tpl_rows = list(ws_single.iter_rows(min_row=2, values_only=True))
+            single_tpl_src_cols = {str(r[2] or "").strip() for r in single_tpl_rows if r[2]}
+            self.assertNotIn("new_col_a", single_tpl_src_cols)
+            self.assertEqual(single_tpl_src_cols, {"cust_id", "raw_extra"})
+
+            ctx.store.save_table_meta(
+                src_cid,
+                TableMeta(
+                    schema_name="main",
+                    table_name="ods_cust_solo",
+                    columns=[ColumnMeta(1, "solo_col", "TEXT")],
+                ),
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "ods_cust_solo",
+                        "source_schema": "main",
+                        "source_table": "ods_cust_v2",
+                        "target_schema": "main",
+                        "target_table": "ods_cust_solo",
+                        "sync_to_field_bindings": False,
+                        "pairings": [
+                            {
+                                "source_col": "new_col_a",
+                                "target_col": "solo_col",
+                                "source_std_code": "STD001",
+                                "target_std_code": "STD001",
+                            }
+                        ],
+                    },
+                ).status_code,
+                200,
+            )
+            ov_solo = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust_solo&target_schema=&target_table="
+            )
+            self.assertEqual(ov_solo.status_code, 200)
+            ov_solo_data = ov_solo.json()
+            self.assertEqual(ov_solo_data["active_table_key"], "")
+            solo_src_cols = {
+                c["column_name"]
+                for c in ov_solo_data["active_comparison"]["source_panel"]["columns"]
+            }
+            self.assertEqual(solo_src_cols, {"solo_col"})
+
+            tpl_solo_res = client.get(
+                "/api/modules/cross_comparator/pairings/template.xlsx"
+                "?source_schema=main&source_table=ods_cust_solo&target_schema=&target_table="
+            )
+            self.assertEqual(tpl_solo_res.status_code, 200)
+            wb_solo = openpyxl.load_workbook(io.BytesIO(tpl_solo_res.content), data_only=True)
+            ws_solo = wb_solo["跨环境字段映射"]
+            solo_tpl_rows = list(ws_solo.iter_rows(min_row=2, values_only=True))
+            solo_tpl_src_cols = {str(r[2] or "").strip() for r in solo_tpl_rows if r[2]}
+            self.assertEqual(solo_tpl_src_cols, {"solo_col"})
+
+            # 13) 不传独立 schema 时，带点号表名 OTHER_SCH.ODS_CUST -> MAIN.DWD_CUST 仍隔离并正确加载 other_sch.ods_cust 字段
+            ov_dotted = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_table=OTHER_SCH.ODS_CUST&target_table=MAIN.DWD_CUST"
+            )
+            self.assertEqual(ov_dotted.status_code, 200)
+            ov_dot_data = ov_dotted.json()
+            self.assertEqual(ov_dot_data["active_table_key"], "")
+            dot_src_panel = ov_dot_data["active_comparison"]["source_panel"]
+            self.assertEqual(dot_src_panel["schema_name"].lower(), "other_sch")
+            self.assertEqual(
+                {c["column_name"] for c in dot_src_panel["columns"]},
+                {"other_x", "other_y"},
+            )
+
+    def test_cross_comparator_five_col_and_header_non_overlap_structure(self) -> None:
+        """静态校验 R1 五虚拟列、R2 顶部防遮蔽与 R3 侧边栏标准选择器结构."""
+        static_dir = resolve_static_dir()
+        with open(os.path.join(static_dir, "css", "workbench.css"), "r", encoding="utf-8") as f:
+            css_text = f.read()
+        with open(os.path.join(static_dir, "js", "views", "cross_comparator_view.js"), "r", encoding="utf-8") as f:
+            cross_js = f.read()
+        with open(os.path.join(static_dir, "js", "views", "standard_migrator_view.js"), "r", encoding="utf-8") as f:
+            mig_js = f.read()
+
+        # R2: .win-titlebar-center 受 z-index 保护，.win-titlebar-right 受 overflow: hidden 约束
+        self.assertRegex(css_text, r"\.win-titlebar-center\s*\{[^}]*z-index:\s*2")
+        self.assertRegex(css_text, r"\.win-titlebar-right\s*\{[^}]*overflow:\s*hidden")
+
+        # R2: renderHeaderActions 不得包含已保存映射表对或上传按钮，已保存映射表对迁移至 .mac-subbar
+        header_match = re.search(
+            r"renderHeaderActions\(\)\s*\{(?P<body>.*?)^\s{2}\}",
+            cross_js,
+            re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(header_match)
+        header_body = header_match.group("body")
+        self.assertNotIn("已保存映射表对", header_body)
+        self.assertNotIn("tableSelect", header_body)
+        self.assertNotIn("上传映射铺底", header_body)
+        self.assertIn("已保存映射表对", cross_js)
+
+        # R1: 五虚拟列完整呈现
+        for col_label in (
+            "来源表待选字段",
+            "来源表已绑定数标字段",
+            "数据标准",
+            "目标表已绑定数标字段",
+            "目标表待选字段",
+        ):
+            self.assertIn(col_label, cross_js)
+
+        # R3: Step 2 侧边栏包含按库标准选择器且顶部不再放置 formatSelect
+        self.assertIn("当前库落标标准", mig_js)
+        mig_header = re.search(
+            r"renderHeaderActions\(\)\s*\{(?P<body>.*?)^\s{2}\}",
+            mig_js,
+            re.DOTALL | re.MULTILINE,
+        )
+        self.assertIsNotNone(mig_header)
+        self.assertNotIn("formatSelect", mig_header.group("body"))
+
+        # Iter2 回归防线：dirty 状态通知、不复用旧 activeTableKey、跨页签状态同步
+        with open(os.path.join(static_dir, "js", "views", "standard_view.js"), "r", encoding="utf-8") as f:
+            std_view_js = f.read()
+        self.assertIn("_markDirty()", cross_js)
+        self.assertIn("this.onStateUpdate?.()", cross_js)
+        self.assertNotIn("this.activeTableKey || target_table", cross_js)
+        self.assertNotIn("this.activeTableKey = nextKey", cross_js)
+        self.assertIn("_reloadCurrentComparison", cross_js)
+        self.assertIn("_deriveSaveTableKey", cross_js)
+        self.assertIn("refreshOnActivate", std_view_js)
+        self.assertIn("store.subscribe", cross_js)
+        self.assertIn("comparatorPane?.destroy", std_view_js)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            client = TestClient(app)
+            self.assertEqual(client.get("/").status_code, 200)
+            self.assertEqual(client.get("/js/views/cross_comparator_view.js").status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

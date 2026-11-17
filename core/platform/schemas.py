@@ -27,7 +27,12 @@ class ConnectionPayload(BaseModel):
     jdbc_url: str = ""
     jdbc_driver_class: str = ""
     extra_props: Dict[str, Any] = Field(default_factory=dict)
+    standard_format: Optional[str] = None
     auto_refresh_metadata: bool = False
+
+
+class ConnectionStandardFormatPayload(BaseModel):
+    standard_format: str = "AUTO"
 
 
 class MetadataRefreshPayload(BaseModel):
