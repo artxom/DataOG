@@ -31,8 +31,8 @@
 3. **数据标准 (`standard`)**
    - 顶栏分段切换三步递进工作流：**`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`**：
      - **1. 标准字典**：以「数据项编号」为主键统一维护全行最新数据标准，完整支持 46 列多库物理格式数据字典（含 `仓库DWS数据格式`、`数据仓库 集市`、`ArgoDB`、`MySQL`、`Oracle`、`OceanBase`、`达梦` 等），支持先下载系统模板后按编号增量合并导入或在线增删改查。
-     - **2. 落标绑定与贯标**：左侧常驻数据库目录树（实时呈现各表绑标/达标状态徽标，并支持按数据库粒度设定并持久化各自的落标标准格式，如 `仓库DWS数据格式`、`数据仓库 集市`、`argodb数据格式` 等），右侧读取库表字段绑定标准，支持按当前表导出预填字段对照模板批量上传及智能预匹配，一键执行三维分级“检查是否落标”（字段名 + 归一化类型 + 中文注释），并可将未达标字段直接转入贯标改造队列执行原地 `ALTER` 或 DWS 物理列保序重建。
-     - **3. 跨环境比对**：采用 macOS 桌面级**五虚拟列图形化工作台**（`来源表待选字段` | `来源表已绑定数标字段` | `数据标准` | `目标表已绑定数标字段` | `目标表待选字段`），自动沿用第 2 步按库设定的标准格式与两侧字段绑定；支持拖拽或点选待选字段至中栏标准卡片完成绑标配对，中栏图形化呈现一致（`UNIFIED`）/ 异标对比（`SPLIT_DIFF`）/ 单侧绑定（`SPLIT_PARTIAL`），并将「已保存映射表对」内置于 `.mac-subbar` 工具栏彻底避免遮挡顶栏分段选择框。
+     - **2. 落标绑定与贯标**：左侧常驻数据库目录树（实时呈现各表绑标/达标状态徽标，并支持按数据库粒度设定并持久化各自的落标标准格式，如 `仓库DWS数据格式`、`数据仓库 集市`、`argodb数据格式` 等），右侧读取库表字段绑定标准，支持按当前表或全库（`scope=all`）导出预填字段对照模板批量上传及智能预匹配，一键执行三维分级“检查是否落标”（字段名 + 归一化类型 + 中文注释），支持免勾表直接导出**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集再生成，离线网页支持全库/单表交互筛选与一键导出单 Sheet Excel），并可将未达标字段直接转入贯标改造队列执行原地 `ALTER` 或 DWS 物理列保序重建。
+     - **3. 跨环境比对**：采用 macOS 桌面级**五虚拟列图形化工作台**（`来源表待选字段` | `来源表已绑定数标字段` | `数据标准` | `目标表已绑定数标字段` | `目标表待选字段`），自动沿用第 2 步按库设定的标准格式与两侧字段绑定；支持拖拽或点选待选字段至中栏标准卡片完成绑标配对，中栏图形化呈现一致（`UNIFIED`）/ 异标对比（`SPLIT_DIFF`）/ 单侧绑定（`SPLIT_PARTIAL`），并将「已保存映射表对」内置于 `.mac-subbar` 工具栏彻底避免遮挡顶栏分段选择框；支持一键导出跨环境**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集，同时输出已保存映射表对五栏看板与「推荐同名未配对表」清单，严格仅推荐不自动触发预比对）。
    - **全流程模板先导与智能公式解析**：全系统所有表格导入均采用统一的「先获取系统模板（含按已选库表导出预填模板）→ 再上传解析」两步导入向导，内置双阶段实时进度条（字节上传进度 + 服务端行级/表级解析核验进度与计时），自动提取 Excel 公式最终计算结果（支持跨表 `VLOOKUP` / `XLOOKUP` / `INDEX+MATCH` / 共享公式 / 超级表引用）并将 `#N/A` 等公式错误标记识别为空值。
 4. **多邻国 (`polyglot`)**
    - **智能命名**：输入中文表名或字段名清单，结合系统配置中的大模型 API（未配密钥时自动回退内置 170+ 金融与通用数仓标准词根引擎），按命名规范（`snake_case` / `UPPER_SNAKE` / `camelCase`、数仓分层前缀 `ods_/dwd_/dws_/ads_/dim_`、标准词根缩写）生成标准英文名、推荐 SQL 类型与建表草稿。
@@ -49,6 +49,7 @@ DataOG/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
 │   │   ├── standard_catalog.py   # 全局 46 列标准字典中枢、多库物理格式解析、单事务批量绑标与分级落标核验
+│   │   ├── offline_report.py     # 库级单 Sheet Excel (.xlsx) 与零依赖离线交互网页报告 (.html，内嵌纯 JS .xlsx 生成器) 引擎
 │   │   ├── import_progress.py    # 线程安全全平台任务/导入实时阶段进度、节流缩略微日志与 SSE 追踪中枢
 │   │   ├── llm_hub.py            # 零额外依赖标准库 DeepSeek / Gemini / OpenAI 兼容协议大模型中枢
 │   │   ├── readonly_guard.py     # 双模态词法/语法级只读 SQL 白名单沙箱校验器
@@ -62,14 +63,14 @@ DataOG/
 │   ├── excel_formula.py          # Excel 公式最终结果兜底求值（VLOOKUP/XLOOKUP/INDEX+MATCH）与 #N/A 错误值置空引擎
 │   └── excel_handler.py          # Excel 安全解析（防 XXE / Zip-Slip）、模板生成与结果导出
 ├── modules/                      # 相互独立的插件化业务模块（严格零跨模块私有导入）
-│   ├── standard_migrator/        # /api/modules/standard_migrator 落标绑定核验与单库批量贯标引擎
-│   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境五虚拟列图形化比对引擎（含 /compare-pair 与批量预热）
+│   ├── standard_migrator/        # /api/modules/standard_migrator 落标绑定核验、单库批量贯标与库级离线报告导出引擎
+│   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境五虚拟列图形化比对、/compare-pair 预热与库级离线报告导出引擎
 │   ├── ddl_translator/           # /api/modules/ddl_translator    多邻国（智能命名 + 跨方言翻译）
 │   └── data_explorer/            # /api/modules/data_explorer     AI 只读智能数据探查多轮会话引擎
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
-│   └── js/                       # main.js（底部 Dock 与窗口管理器）、core/、ui/（含 TaskActivityBar）、views/（四大模块视图）
-├── tests/                        # 40 项全量自动化测试（核心算法 / 平台底座与进度流 / 按库标准与五虚拟列比对 / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
+│   └── js/                       # main.js（底部 Dock 与窗口管理器）、core/、ui/（含 TaskActivityBar / ExportReportModal）、views/（四大模块视图）
+├── tests/                        # 42 项全量自动化测试（核心算法 / 平台底座与进度流 / 按库标准与五虚拟列比对 / 库级离线 HTML 与单 Sheet Excel 报告 / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -101,7 +102,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（40 项核心引擎、平台底座与任务进度流、按库标准与五虚拟列比对、批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（42 项核心引擎、平台底座与任务进度流、按库标准与五虚拟列比对、库级离线报告与单 Sheet Excel、批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检
