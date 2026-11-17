@@ -26,6 +26,12 @@
   - `MetadataHub` 新增 `120s` 不存在表内存负缓存（强制刷新时立即失效）与 `_shared_conn` 单连接四层递归视图血缘穿透复用，消除连续切表与多层视图的重复握手耗时。
 - 在 [app.py](file:///Users/artxom/code/DataOG/app.py) 访问日志过滤器中同步静默 `/api/platform/tasks/*` 正常 `200` 轮询；扩充单库/跨环境库级离线报告与 Node.js 内嵌 `.xlsx` 构建端到端测试至 **42 项**。
 
+### Fixed
+- **修复 `ExportReportModal` 弹窗主题令牌缺失与离线报告页签筛选导出错位 (`static/css/workbench.css`, `static/js/ui/export_report_modal.js`, `core/platform/offline_report.py`, `modules/standard_migrator/`)**：
+  - 修正 `.export-report-*` 样式中未定义的 `--os-panel*` / `--os-text-2` 变量为 `tokens.css` 标准令牌（`--os-win-bg` / `--os-subtle-bg` / `--os-text-secondary`），并将 `badgeTone` 由不存在的 `"ok"` 修正为 `.badge-success`。
+  - 修复离线 HTML 报告中 `hasActiveFilter()` / `exportFilteredExcel()` 未按当前活动页签隔离导致在贯标队列或告警页签误显/误导上一页签筛选明细的问题，并优化仅存在单侧独有表时的跨环境默认落点页签。
+  - 为 `GET /api/modules/standard_migrator/bindings/template.xlsx`（`scope=all`）补齐 `X-Task-Id` 异步任务进度追踪与 `public` 绑定回退匹配。
+
 ---
 
 ## [2.4.0] - 2026-11-17
