@@ -49,12 +49,12 @@ DataOG/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
 │   │   ├── standard_catalog.py   # 全局 46 列标准字典中枢、多库物理格式解析、单事务批量绑标与分级落标核验
-│   │   ├── import_progress.py    # 线程安全 Excel 导入实时阶段/行级/表级进度追踪中枢
+│   │   ├── import_progress.py    # 线程安全全平台任务/导入实时阶段进度、节流缩略微日志与 SSE 追踪中枢
 │   │   ├── llm_hub.py            # 零额外依赖标准库 DeepSeek / Gemini / OpenAI 兼容协议大模型中枢
 │   │   ├── readonly_guard.py     # 双模态词法/语法级只读 SQL 白名单沙箱校验器
 │   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载 + 硬件只读模式）
-│   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文（含 readonly_session 无条件回滚）
-│   │   ├── metadata_hub.py       # 双层单会话批量元数据探查器（含锁超时熔断）与本地 SQLite 缓存检索中枢
+│   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文（含 readonly_session 无条件回滚与 60s 温探查池）
+│   │   ├── metadata_hub.py       # 双层单会话批量元数据探查器（含 120s 负缓存、单连接视图穿透与锁超时熔断）与本地 SQLite 缓存检索中枢
 │   │   ├── query_engine.py       # 跨驱动安全截断查询、硬件级只读执行通道与 CSV/Excel 导出引擎
 │   │   ├── storage.py            # data/dataog_state.db WAL 状态库、旧版无损迁移与幂等列演进
 │   │   └── dialects/             # 标识符清洗、类型映射矩阵、DDL 生成与四层视图血缘穿透
@@ -63,13 +63,13 @@ DataOG/
 │   └── excel_handler.py          # Excel 安全解析（防 XXE / Zip-Slip）、模板生成与结果导出
 ├── modules/                      # 相互独立的插件化业务模块（严格零跨模块私有导入）
 │   ├── standard_migrator/        # /api/modules/standard_migrator 落标绑定核验与单库批量贯标引擎
-│   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境五虚拟列图形化比对引擎
+│   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境五虚拟列图形化比对引擎（含 /compare-pair 与批量预热）
 │   ├── ddl_translator/           # /api/modules/ddl_translator    多邻国（智能命名 + 跨方言翻译）
 │   └── data_explorer/            # /api/modules/data_explorer     AI 只读智能数据探查多轮会话引擎
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
-│   └── js/                       # main.js（底部 Dock 与窗口管理器）、core/、ui/、views/（四大模块视图）
-├── tests/                        # 38 项全量自动化测试（核心算法 / 平台底座 / 按库标准与五虚拟列比对 / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
+│   └── js/                       # main.js（底部 Dock 与窗口管理器）、core/、ui/（含 TaskActivityBar）、views/（四大模块视图）
+├── tests/                        # 40 项全量自动化测试（核心算法 / 平台底座与进度流 / 按库标准与五虚拟列比对 / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -101,7 +101,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（38 项核心引擎、平台底座、按库标准与五虚拟列比对、批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（40 项核心引擎、平台底座与任务进度流、按库标准与五虚拟列比对、批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检
