@@ -2158,6 +2158,20 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             )
             self.assertEqual(
                 client.put(
+                    f"/api/platform/connections/{src_cid}/standard-format",
+                    json={"standard_format": ""},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{src_cid}/standard-format",
+                    json={"standard_format": "   "},
+                ).status_code,
+                400,
+            )
+            self.assertEqual(
+                client.put(
                     "/api/platform/connections/not_found/standard-format",
                     json={"standard_format": "type_dws"},
                 ).status_code,
@@ -2169,6 +2183,13 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                     json={"standard_format": "type_argodb"},
                 ).status_code,
                 200,
+            )
+            self.assertEqual(
+                client.put(
+                    f"/api/platform/connections/{src_cid}",
+                    json={"name": "源Argo库", "standard_format": ""},
+                ).status_code,
+                400,
             )
             self.assertEqual(
                 client.put(
@@ -2282,6 +2303,89 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             pushed_items = ctx.store.list_items()
             self.assertEqual(pushed_items[0]["new_col_type"], "VARCHAR(64)")
 
+            # 6) 按 (source_table, target_table) 不传 table_key 读取概览可命中已保存表对 dwd_cust
+            ov_by_pair = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust&target_schema=main&target_table=dwd_cust"
+            )
+            self.assertEqual(ov_by_pair.status_code, 200)
+            ov_pair_data = ov_by_pair.json()
+            self.assertEqual(ov_pair_data["active_table_key"], "dwd_cust")
+            self.assertTrue(
+                any(
+                    r["bookmark_state"] == "UNIFIED" and r["source_std_code"] == "STD001"
+                    for r in ov_pair_data["active_comparison"]["dual_rows"]
+                )
+            )
+
+            # 7) Step 3 空 Schema 解绑与 Step 2 单独解绑均不会在 Step 3 概览幽灵复活
+            unbind_s3 = client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "dwd_cust",
+                    "source_schema": "",
+                    "source_table": "ods_cust",
+                    "target_schema": "",
+                    "target_table": "dwd_cust",
+                    "sync_to_field_bindings": True,
+                    "pairings": [
+                        {
+                            "source_col": "cust_id",
+                            "target_col": "",
+                            "source_std_code": "",
+                            "target_std_code": "",
+                        },
+                        {
+                            "source_col": "",
+                            "target_col": "cust_no",
+                            "source_std_code": "",
+                            "target_std_code": "STD001",
+                        },
+                    ],
+                },
+            )
+            self.assertEqual(unbind_s3.status_code, 200)
+            self.assertEqual(
+                ctx.standard_catalog.get_table_field_bindings(src_cid, "main", "ods_cust"),
+                {},
+            )
+            ov_after_s3_unbind = client.get(
+                "/api/modules/cross_comparator/overview?table_key=dwd_cust"
+            ).json()
+            src_cust_row = next(
+                r
+                for r in ov_after_s3_unbind["active_comparison"]["dual_rows"]
+                if (r.get("source_col") or {}).get("column_name") == "cust_id"
+            )
+            self.assertEqual(src_cust_row["source_std_code"], "")
+
+            unbind_s2 = client.post(
+                "/api/modules/standard_migrator/bindings/save",
+                json={
+                    "connection_id": tgt_cid,
+                    "active_schema": "main",
+                    "active_table": "dwd_cust",
+                    "bindings": [
+                        {
+                            "schema_name": "main",
+                            "table_name": "dwd_cust",
+                            "column_name": "cust_no",
+                            "std_code": "",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(unbind_s2.status_code, 200)
+            ov_after_s2_unbind = client.get(
+                "/api/modules/cross_comparator/overview?table_key=dwd_cust"
+            ).json()
+            tgt_cust_row = next(
+                r
+                for r in ov_after_s2_unbind["active_comparison"]["dual_rows"]
+                if (r.get("target_col") or {}).get("column_name") == "cust_no"
+            )
+            self.assertEqual(tgt_cust_row["target_std_code"], "")
+
     def test_cross_comparator_five_col_and_header_non_overlap_structure(self) -> None:
         """静态校验 R1 五虚拟列、R2 顶部防遮蔽与 R3 侧边栏标准选择器结构."""
         static_dir = resolve_static_dir()
@@ -2328,6 +2432,16 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
         )
         self.assertIsNotNone(mig_header)
         self.assertNotIn("formatSelect", mig_header.group("body"))
+
+        # Iter2 回归防线：dirty 状态通知、不复用旧 activeTableKey、跨页签状态同步
+        with open(os.path.join(static_dir, "js", "views", "standard_view.js"), "r", encoding="utf-8") as f:
+            std_view_js = f.read()
+        self.assertIn("_markDirty()", cross_js)
+        self.assertIn("this.onStateUpdate?.()", cross_js)
+        self.assertNotIn("this.activeTableKey || target_table", cross_js)
+        self.assertIn("refreshOnActivate", std_view_js)
+        self.assertIn("store.subscribe", cross_js)
+        self.assertIn("comparatorPane?.destroy", std_view_js)
 
         with tempfile.TemporaryDirectory() as tmp:
             app = create_app(db_path=os.path.join(tmp, "state.db"))

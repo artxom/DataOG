@@ -2123,6 +2123,18 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 ctx.connection_hub.update_standard_format("conn_legacy_1", "invalid_format")
+            with self.assertRaises(ValueError):
+                ctx.connection_hub.update_standard_format("conn_legacy_1", "")
+            with self.assertRaises(ValueError):
+                ctx.connection_hub.update_standard_format("conn_legacy_1", "   ")
+            with self.assertRaises(ValueError):
+                ctx.connection_hub.save_profile(
+                    {
+                        "connection_id": "conn_legacy_1",
+                        "standard_format": "",
+                    },
+                    connection_id="conn_legacy_1",
+                )
             with self.assertRaises(LookupError):
                 ctx.connection_hub.update_standard_format("conn_not_exists", "type_dws")
 

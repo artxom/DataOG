@@ -158,7 +158,9 @@ class ConnectionHub:
         if raw_value is None:
             candidate = (fallback or "AUTO").strip() or "AUTO"
         else:
-            candidate = str(raw_value).strip() or "AUTO"
+            candidate = str(raw_value).strip()
+            if not candidate:
+                raise ValueError(f"不支持的数据标准格式选项: {raw_value}")
         if candidate not in VALID_FORMAT_PROFILE_VALUES:
             raise ValueError(f"不支持的数据标准格式选项: {candidate}")
         return candidate

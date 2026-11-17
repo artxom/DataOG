@@ -181,9 +181,23 @@ export class StandardMigratorView {
         this._renderQueueView();
       },
     });
+
+    this._unsubStore = store.subscribe((state, reason) => {
+      if (reason === "connections" || reason === "bootstrap") {
+        if (this.ws && Array.isArray(state.connections)) {
+          this.ws.connections = state.connections;
+        }
+        if (this.loadedOnce && this.activeConnId) {
+          this._syncFormatFromConnection(this.activeConnId);
+          this._renderSidebarFormatCard();
+        }
+      }
+    });
   }
 
   destroy() {
+    this._unsubStore?.();
+    this._unsubStore = null;
     this.tree?.destroy();
   }
 
@@ -199,6 +213,21 @@ export class StandardMigratorView {
   async ensureLoaded(force = false) {
     if (this.loadedOnce && !force) return;
     await this.reloadState();
+  }
+
+  async refreshOnActivate() {
+    if (!this.loadedOnce) {
+      await this.ensureLoaded(false);
+      return;
+    }
+    if (this.subMode === "queue") {
+      await this.reloadState();
+      return;
+    }
+    await this.loadBindingsOverview({ skipRender: Boolean(this.activeTable) });
+    if (this.activeTable) {
+      await this.loadTableCompliance(false);
+    }
   }
 
   _findConnection(connId = this.activeConnId) {

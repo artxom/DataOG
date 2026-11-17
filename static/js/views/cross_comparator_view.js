@@ -5,7 +5,7 @@
  * 支持拖拽与点选双向绑标配对，两侧自动沿用各自数据库配置的落标标准格式。
  */
 
-import { crossApi } from "../core/api.js";
+import { crossApi, standardsApi } from "../core/api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
@@ -84,15 +84,163 @@ export class CrossComparatorView {
     this.sourceCandidates = [];
     this.targetCandidates = [];
     this.centerRows = [];
+    this.stdItemCache = new Map();
+    this._pendingLookupCodes = new Set();
 
     this.root = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
     });
+
+    this._unsubStore = store.subscribe((state, reason) => {
+      if (reason === "connections" || reason === "bootstrap") {
+        this._syncConnectionsFromStore(state.connections || []);
+      }
+    });
+  }
+
+  destroy() {
+    this._unsubStore?.();
+    this._unsubStore = null;
+  }
+
+  _syncConnectionsFromStore(connections) {
+    if (!this.overview || !Array.isArray(connections)) return;
+    this.overview.connections = connections;
+    const srcCid = this.overview.source_connection?.connection_id;
+    const tgtCid = this.overview.target_connection?.connection_id;
+    let changed = false;
+    if (srcCid) {
+      const sc = connections.find((c) => c.connection_id === srcCid);
+      if (sc && sc.standard_format && sc.standard_format !== this.overview.source_connection.standard_format) {
+        this.overview.source_connection.standard_format = sc.standard_format;
+        this.sourceFormatProfile = sc.standard_format;
+        changed = true;
+      }
+    }
+    if (tgtCid) {
+      const tc = connections.find((c) => c.connection_id === tgtCid);
+      if (tc && tc.standard_format && tc.standard_format !== this.overview.target_connection.standard_format) {
+        this.overview.target_connection.standard_format = tc.standard_format;
+        this.targetFormatProfile = tc.standard_format;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.render();
+    }
   }
 
   async ensureLoaded(force = false) {
     if (this.loadedOnce && !force) return;
     await this.loadOverview(this.activeTableKey, false);
+  }
+
+  async refreshOnActivate() {
+    if (!this.loadedOnce) {
+      await this.ensureLoaded(false);
+      return;
+    }
+    if (this.dirty) {
+      this.render();
+      this.onStateUpdate?.();
+      return;
+    }
+    const savedTables = this.overview?.tables || [];
+    const hasSavedActive = Boolean(
+      this.activeTableKey && savedTables.some((t) => t.std_table_key === this.activeTableKey)
+    );
+    if (hasSavedActive) {
+      await this.loadOverview(this.activeTableKey, false);
+    } else if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
+      await this.loadOverview("", false, {
+        sourceSchema: this.draftTableBind.source_schema,
+        sourceTable: this.draftTableBind.source_table,
+        targetSchema: this.draftTableBind.target_schema,
+        targetTable: this.draftTableBind.target_table,
+      });
+    } else {
+      await this.loadOverview(this.activeTableKey, false);
+    }
+  }
+
+  _markDirty() {
+    this.dirty = true;
+    this.render();
+    this.onStateUpdate?.();
+  }
+
+  _hasFormatColumns(item) {
+    if (!item || typeof item !== "object") return false;
+    return (
+      "type_dws" in item ||
+      "type_dw_mart" in item ||
+      "type_argodb" in item ||
+      "type_mysql" in item ||
+      "type_oracle" in item
+    );
+  }
+
+  _cacheStdItem(item) {
+    if (item?.std_code && this._hasFormatColumns(item)) {
+      this.stdItemCache.set(String(item.std_code), item);
+    }
+  }
+
+  _isSameSideFormatAndDialect() {
+    const ov = this.overview || {};
+    const sDb = String(ov.source_connection?.db_type || "DWS").toUpperCase();
+    const tDb = String(ov.target_connection?.db_type || "DWS").toUpperCase();
+    return (
+      this.sourceFormatProfile === this.targetFormatProfile &&
+      (this.sourceFormatProfile !== "AUTO" || sDb === tDb)
+    );
+  }
+
+  async _resolvePendingStdTypesAsync(codes) {
+    if (!standardsApi?.lookup) return;
+    const unique = [
+      ...new Set((codes || []).map((c) => String(c || "").trim()).filter(Boolean)),
+    ].filter((c) => !this.stdItemCache.has(c) && !this._pendingLookupCodes.has(c));
+    if (!unique.length) return;
+    unique.forEach((c) => this._pendingLookupCodes.add(c));
+    try {
+      await Promise.all(
+        unique.map(async (code) => {
+          try {
+            const res = await standardsApi.lookup(code, 10);
+            const match = (res?.items || []).find(
+              (it) => String(it.std_code || "").toUpperCase() === code.toUpperCase()
+            );
+            if (match) this._cacheStdItem(match);
+          } catch (_err) {
+            // 忽略单条异步补全失败
+          } finally {
+            this._pendingLookupCodes.delete(code);
+          }
+        })
+      );
+      let updated = false;
+      for (const row of this.centerRows) {
+        const sCode = String(row.source_std_code || "");
+        if (row.source_std?._pendingType && this.stdItemCache.has(sCode)) {
+          row.source_std = this._toStdBrief(this.stdItemCache.get(sCode), "source");
+          updated = true;
+        }
+        const tCode = String(row.target_std_code || "");
+        if (row.target_std?._pendingType && this.stdItemCache.has(tCode)) {
+          row.target_std = this._toStdBrief(this.stdItemCache.get(tCode), "target");
+          const ev = this._evaluateProvisionalTargetCompliance(row.target_col, row.target_std);
+          row.target_compliance = ev.target_compliance;
+          row.target_needs_migration = ev.target_needs_migration;
+          updated = true;
+        }
+      }
+      if (updated) {
+        this.render();
+      }
+    } finally {
+      unique.forEach((c) => this._pendingLookupCodes.delete(c));
+    }
   }
 
   _pickResolvedType(stdItem, formatProfile = "AUTO", dbType = "DWS") {
@@ -116,21 +264,36 @@ export class CrossComparatorView {
     return stdItem.type_dws || stdItem.type_dw_mart || stdItem.type_oracle || stdItem.type_mysql || "";
   }
 
-  _toStdBrief(picked, side) {
+  _toStdBrief(picked, side, { fromSide = null } = {}) {
     if (!picked) return null;
+    this._cacheStdItem(picked);
     const ov = this.overview || {};
     const dbType =
       side === "source"
         ? ov.source_connection?.db_type || "DWS"
         : ov.target_connection?.db_type || "DWS";
     const fmt = side === "source" ? this.sourceFormatProfile : this.targetFormatProfile;
+    const fullItem = this._hasFormatColumns(picked)
+      ? picked
+      : this.stdItemCache.get(String(picked.std_code || "")) || null;
+    let resolvedType = "";
+    let pendingType = false;
+    if (fullItem) {
+      resolvedType = this._pickResolvedType(fullItem, fmt, dbType);
+    } else if (!fromSide || fromSide === side || this._isSameSideFormatAndDialect()) {
+      resolvedType = picked.resolved_type || "";
+    } else {
+      resolvedType = "";
+      pendingType = true;
+    }
     return {
       std_code: picked.std_code,
       cn_name: picked.cn_name,
       en_abbr: picked.en_abbr,
-      resolved_type: picked.resolved_type || this._pickResolvedType(picked, fmt, dbType),
+      resolved_type: resolvedType,
       domain_name: picked.domain_name || "",
       missing: Boolean(picked.missing),
+      _pendingType: pendingType,
     };
   }
 
@@ -301,8 +464,10 @@ export class CrossComparatorView {
       this._hydrateDraftFromComparison(res.active_comparison);
       this.render();
       this.onStateUpdate?.();
+      return true;
     } catch (err) {
       Toast.error(err.message);
+      return false;
     }
   }
 
@@ -312,8 +477,32 @@ export class CrossComparatorView {
       Toast.warn("请先在左侧或右侧选择表名");
       return;
     }
-    const key = (this.activeTableKey || target_table || source_table || "").trim().toLowerCase();
-    await this.loadOverview("", forceRefresh, {
+    const sTbl = String(source_table || "").trim().toLowerCase();
+    const tTbl = String(target_table || "").trim().toLowerCase();
+    const sSch = String(source_schema || "").trim().toLowerCase();
+    const tSch = String(target_schema || "").trim().toLowerCase();
+    const savedTables = this.overview?.tables || [];
+    let matched = null;
+    if (sTbl && tTbl) {
+      matched =
+        savedTables.find(
+          (t) =>
+            String(t.source_table || "").trim().toLowerCase() === sTbl &&
+            String(t.target_table || "").trim().toLowerCase() === tTbl &&
+            (!sSch || String(t.source_schema || "").trim().toLowerCase() === sSch) &&
+            (!tSch || String(t.target_schema || "").trim().toLowerCase() === tSch)
+        ) ||
+        savedTables.find(
+          (t) =>
+            String(t.source_table || "").trim().toLowerCase() === sTbl &&
+            String(t.target_table || "").trim().toLowerCase() === tTbl
+        );
+    }
+    const nextKey = String(matched?.std_table_key || tTbl || sTbl || "")
+      .trim()
+      .toLowerCase();
+    this.activeTableKey = "";
+    const ok = await this.loadOverview(matched?.std_table_key || "", forceRefresh, {
       sourceSchema: source_schema,
       sourceTable: source_table,
       targetSchema: target_schema,
@@ -321,8 +510,8 @@ export class CrossComparatorView {
       sourceFormatProfile: this.sourceFormatProfile,
       targetFormatProfile: this.targetFormatProfile,
     });
-    if (!this.activeTableKey && key) {
-      this.activeTableKey = key;
+    if (ok && !this.activeTableKey && nextKey) {
+      this.activeTableKey = nextKey;
     }
   }
 
@@ -333,7 +522,7 @@ export class CrossComparatorView {
       this.draftTableBind.source_table;
     if (!key) {
       Toast.warn("请先选择或输入来源库/目标库表名");
-      return;
+      return false;
     }
     try {
       const pairings = [
@@ -376,13 +565,15 @@ export class CrossComparatorView {
       Toast.success(res.message || "映射关系与数标绑定已保存");
       this.render();
       this.onStateUpdate?.();
+      return true;
     } catch (err) {
       Toast.error(err.message);
+      return false;
     }
   }
 
   _evaluateProvisionalTargetCompliance(colObj, tgtStdBrief) {
-    if (!colObj || !tgtStdBrief) {
+    if (!colObj || !tgtStdBrief || tgtStdBrief._pendingType) {
       return { target_compliance: null, target_needs_migration: false };
     }
     const nameMatch =
@@ -424,18 +615,18 @@ export class CrossComparatorView {
     }
   }
 
-  _bindFieldToRow(side, colObj, rowIdx, { removeFromRowIdx = -1 } = {}) {
+  _bindFieldToRow(side, colObj, rowIdx, { removeFromRowIdx = -1, stdItem = null } = {}) {
     const row = this.centerRows[rowIdx];
     if (!row || !colObj) return;
 
-    const targetStdBrief =
-      side === "source"
-        ? row.source_std || row.target_std
-        : row.target_std || row.source_std;
+    const oppSide = side === "source" ? "target" : "source";
+    const sameSideBrief = row[`${side}_std`];
+    const oppSideBrief = row[`${oppSide}_std`];
     const targetCode =
-      side === "source"
+      stdItem?.std_code ||
+      (side === "source"
         ? row.source_std_code || row.target_std_code || ""
-        : row.target_std_code || row.source_std_code || "";
+        : row.target_std_code || row.source_std_code || "");
     if (!targetCode) return;
 
     const displaced = row[`${side}_col`];
@@ -455,7 +646,13 @@ export class CrossComparatorView {
       }
     }
 
-    const effBrief = targetStdBrief ? this._toStdBrief(targetStdBrief, side) : null;
+    const effBrief = stdItem
+      ? this._toStdBrief(stdItem, side)
+      : sameSideBrief
+      ? this._toStdBrief(sameSideBrief, side, { fromSide: side })
+      : oppSideBrief
+      ? this._toStdBrief(oppSideBrief, side, { fromSide: oppSide })
+      : null;
     row[`${side}_col`] = colObj;
     row[`${side}_std_code`] = targetCode;
     row[`${side}_std`] = effBrief;
@@ -470,8 +667,10 @@ export class CrossComparatorView {
       this._returnToCandidates(side, displaced);
     }
     this.selectedCandidate = null;
-    this.dirty = true;
-    this.render();
+    this._markDirty();
+    if (effBrief?._pendingType) {
+      this._resolvePendingStdTypesAsync([targetCode]);
+    }
   }
 
   _unbindBoundField(side, rowIdx) {
@@ -491,8 +690,7 @@ export class CrossComparatorView {
     } else {
       this._recomputeRowState(row);
     }
-    this.dirty = true;
-    this.render();
+    this._markDirty();
   }
 
   _assignCandidateToRow(side, columnName, rowIdx) {
@@ -551,6 +749,7 @@ export class CrossComparatorView {
       formatProfile: fmt,
       onSelect: (picked) => {
         if (!picked) return;
+        this._cacheStdItem(picked);
         const taken = this._takeCandidate(side, colObj.column_name);
         if (!taken) return;
         const stdCode = picked.std_code;
@@ -562,7 +761,7 @@ export class CrossComparatorView {
           (r) => !r[`${side}_col`] && r[`${oppSide}_std_code`] === stdCode
         );
         if (existingIdx !== -1) {
-          this._bindFieldToRow(side, taken, existingIdx);
+          this._bindFieldToRow(side, taken, existingIdx, { stdItem: picked });
           return;
         }
 
@@ -584,8 +783,7 @@ export class CrossComparatorView {
         }
         this.centerRows.push(this._recomputeRowState(newRow));
         this.selectedCandidate = null;
-        this.dirty = true;
-        this.render();
+        this._markDirty();
       },
     });
   }
@@ -627,6 +825,7 @@ export class CrossComparatorView {
           }
         } else {
           const code = picked.std_code;
+          this._cacheStdItem(picked);
           if (isBoth || side === "source") {
             row.source_std_code = code;
             row.source_std = this._toStdBrief(picked, "source");
@@ -640,8 +839,7 @@ export class CrossComparatorView {
           }
           this._recomputeRowState(row);
         }
-        this.dirty = true;
-        this.render();
+        this._markDirty();
       },
     });
   }
@@ -649,19 +847,28 @@ export class CrossComparatorView {
   _unifyDiffRow(rowIdx, keepSide) {
     const row = this.centerRows[rowIdx];
     if (!row) return;
+    const pendingCodes = [];
     if (keepSide === "source" && row.source_std_code) {
       row.target_std_code = row.source_std_code;
-      row.target_std = row.source_std ? this._toStdBrief(row.source_std, "target") : null;
+      row.target_std = row.source_std
+        ? this._toStdBrief(row.source_std, "target", { fromSide: "source" })
+        : null;
+      if (row.target_std?._pendingType) pendingCodes.push(row.target_std_code);
       const ev = this._evaluateProvisionalTargetCompliance(row.target_col, row.target_std);
       row.target_compliance = ev.target_compliance;
       row.target_needs_migration = ev.target_needs_migration;
     } else if (keepSide === "target" && row.target_std_code) {
       row.source_std_code = row.target_std_code;
-      row.source_std = row.target_std ? this._toStdBrief(row.target_std, "source") : null;
+      row.source_std = row.target_std
+        ? this._toStdBrief(row.target_std, "source", { fromSide: "target" })
+        : null;
+      if (row.source_std?._pendingType) pendingCodes.push(row.source_std_code);
     }
     this._recomputeRowState(row);
-    this.dirty = true;
-    this.render();
+    this._markDirty();
+    if (pendingCodes.length) {
+      this._resolvePendingStdTypesAsync(pendingCodes);
+    }
   }
 
   _splitRow(rowIdx) {
@@ -690,8 +897,7 @@ export class CrossComparatorView {
       target_needs_migration: row.target_needs_migration,
     });
     this.centerRows.splice(rowIdx, 1, srcOnly, tgtOnly);
-    this.dirty = true;
-    this.render();
+    this._markDirty();
   }
 
   smartPairRows() {
@@ -742,6 +948,7 @@ export class CrossComparatorView {
     });
 
     // 2. 对仍缺对侧字段的半边标准行，尝试从对侧待选池按同名自动绑标配对
+    const pendingCodes = [];
     for (const r of keptRows) {
       if (r.source_col && !r.target_col && r.source_std_code) {
         const sLower = String(r.source_col.column_name || "").toLowerCase();
@@ -752,7 +959,10 @@ export class CrossComparatorView {
           this._takeCandidate("target", matchCand.column_name);
           r.target_col = matchCand;
           r.target_std_code = r.source_std_code;
-          r.target_std = r.source_std ? this._toStdBrief(r.source_std, "target") : null;
+          r.target_std = r.source_std
+            ? this._toStdBrief(r.source_std, "target", { fromSide: "source" })
+            : null;
+          if (r.target_std?._pendingType) pendingCodes.push(r.target_std_code);
           const ev = this._evaluateProvisionalTargetCompliance(matchCand, r.target_std);
           r.target_compliance = ev.target_compliance;
           r.target_needs_migration = ev.target_needs_migration;
@@ -768,7 +978,10 @@ export class CrossComparatorView {
           this._takeCandidate("source", matchCand.column_name);
           r.source_col = matchCand;
           r.source_std_code = r.target_std_code;
-          r.source_std = r.target_std ? this._toStdBrief(r.target_std, "source") : null;
+          r.source_std = r.target_std
+            ? this._toStdBrief(r.target_std, "source", { fromSide: "target" })
+            : null;
+          if (r.source_std?._pendingType) pendingCodes.push(r.source_std_code);
           this._recomputeRowState(r);
           changed = true;
         }
@@ -777,12 +990,15 @@ export class CrossComparatorView {
 
     this.centerRows = keptRows;
     if (changed) {
-      this.dirty = true;
       Toast.info("已完成智能配对，点击「保存」持久化");
+      this._markDirty();
+      if (pendingCodes.length) {
+        this._resolvePendingStdTypesAsync(pendingCodes);
+      }
     } else {
       Toast.info("当前已绑定字段无可自动合并或同名补齐项");
+      this.render();
     }
-    this.render();
   }
 
   openPairingUploadWizard() {
@@ -856,7 +1072,8 @@ export class CrossComparatorView {
         text: "推送贯标 →",
         onClick: async () => {
           if (this.dirty) {
-            await this.saveCurrentPairings(false);
+            const saved = await this.saveCurrentPairings(false);
+            if (!saved) return;
           }
           const ok = await Modal.confirm({
             title: "推送至第 2 步贯标执行",
@@ -922,6 +1139,7 @@ export class CrossComparatorView {
             }
             this._hydrateDraftFromComparison(res.active_comparison);
             this.render();
+            this.onStateUpdate?.();
           } catch (err) {
             Toast.error(err.message);
           }
