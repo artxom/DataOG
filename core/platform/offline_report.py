@@ -1224,7 +1224,9 @@ _SINGLE_DB_APP_JS = r"""
   }
 
   function hasActiveFilter() {
-    return hasOverviewFilter() || hasQueueFilter();
+    if (state.tab === "overview") return hasOverviewFilter();
+    if (state.tab === "queue") return hasQueueFilter();
+    return false;
   }
 
   function filteredTablesList() {
@@ -1270,7 +1272,7 @@ _SINGLE_DB_APP_JS = r"""
 
   function exportFilteredExcel() {
     const dbSlug = String(CONN.name || "DataOG").replace(/[\\/:*?"<>|]/g, "_");
-    if (hasQueueFilter()) {
+    if (state.tab === "queue") {
       const qHeaders = ["序号", "模式名", "表名", "列序", "原字段名", "原类型", "标准字段名", "目标类型", "目标注释", "策略", "状态", "状态说明"];
       const qRows = filteredQueueList().map((it, i) => {
         const isReb = it.strategy === "TABLE_REBUILD" || Boolean(it.is_distribute_key) || String(it.table_orientation || "").toUpperCase() === "COLUMN";
@@ -1290,6 +1292,7 @@ _SINGLE_DB_APP_JS = r"""
       triggerDownload(blob, "DataOG_" + dbSlug + "_贯标筛选清单.xlsx");
       return;
     }
+    if (state.tab !== "overview") return;
     const tbls = state.selectedTableKey === "__ALL__"
       ? filteredTablesList()
       : TABLES.filter((t) => tblKey(t) === state.selectedTableKey);
@@ -1882,7 +1885,7 @@ _CROSS_ENV_APP_JS = r"""
 
   const state = {
     theme: window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
-    tab: PAIRS.length ? "pairs" : (REC_PAIRS.length ? "recommended" : "pairs"),
+    tab: PAIRS.length ? "pairs" : (REC_PAIRS.length ? "recommended" : ((SRC_ONLY.length || TGT_ONLY.length) ? "solo" : "pairs")),
     selectedPairKey: "__ALL__",
     pairViewMode: "five", // five | flat (for single pair)
     allPairMode: "summary", // summary | search (for __ALL__)
@@ -2115,7 +2118,10 @@ _CROSS_ENV_APP_JS = r"""
     if (state.tab === "solo") {
       return state.soloKeyword.trim() !== "";
     }
-    return hasPairsFilter();
+    if (state.tab === "pairs") {
+      return hasPairsFilter();
+    }
+    return false;
   }
 
   function exportAllExcel() {
@@ -2137,7 +2143,7 @@ _CROSS_ENV_APP_JS = r"""
     } else if (state.tab === "solo") {
       const { sList, tList } = filteredSoloLists();
       allRows = buildSoloExcelRows(sList, tList);
-    } else {
+    } else if (state.tab === "pairs") {
       const pairsSubset = state.selectedPairKey === "__ALL__"
         ? filteredPairsList()
         : PAIRS.filter((p) => (p.table_binding || {}).std_table_key === state.selectedPairKey);
@@ -2146,6 +2152,8 @@ _CROSS_ENV_APP_JS = r"""
           if (matchFlatRow(r)) allRows.push(rowToExcelObj(r));
         }
       }
+    } else {
+      return;
     }
     const numbered = allRows.map((o, idx) => ({ tone: o.tone, values: [idx + 1, ...o.values] }));
     const blob = buildSingleSheetXlsxBlob("跨环境筛选明细", HEADERS, numbered);

@@ -426,20 +426,38 @@ async def api_bindings_check_compliance(
 
 
 @router.get("/bindings/template.xlsx")
-def api_bindings_template(
+async def api_bindings_template(
+    request: Request,
     connection_id: str = Query(default=""),
     schema_name: str = Query(default=""),
     tables: str = Query(default=""),
     scope: str = Query(default=""),
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
-        content = StandardMigratorService(ctx).generate_binding_template_bytes(
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "生成预填对照模板 (.xlsx)",
+                detail="正在准备读取库表结构与已绑数据标准...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        content = await run_in_threadpool(
+            StandardMigratorService(ctx).generate_binding_template_bytes,
             connection_id=connection_id,
             schema_name=schema_name,
             tables=tables,
             scope=scope,
+            progress_cb=reporter,
         )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="模板已生成",
+                detail="字段与数据标准对照模板 (.xlsx) 生成完成",
+            )
         fn = quote("DataOG_字段与数据标准对照模板.xlsx")
         return Response(
             content=content,
@@ -449,6 +467,8 @@ def api_bindings_template(
             },
         )
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return _err(str(exc), 400)
 
 
