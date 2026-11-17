@@ -7,6 +7,13 @@
 ## [Unreleased]
 
 ### Added
+- **库级离线交互网页报告 (`.html`) 与单 Sheet 库级 Excel (`.xlsx`) 导出引擎 (`core/platform/offline_report.py`, `static/js/ui/export_report_modal.js`, `static/css/workbench.css`, `static/js/core/api.js`)**：
+  - 平台底座新增 `core/platform/offline_report.py`，统一生成单 Sheet 库级 Excel（`build_single_db_excel_bytes` / `build_cross_env_excel_bytes`，单 Sheet 汇总全库表及字段明细、首行冻结与自动筛选、公式注入转义与 `-` 占位符豁免）以及零外部网络依赖的离线交互网页（`build_single_db_html_bytes` / `build_cross_env_html_bytes`，安全转义嵌入 `<script type="application/json">`、内置纯 JS 单 Sheet OOXML `.xlsx` 构建器 `buildSingleSheetXlsxBlob` 支持网页内一键导出全库或当前筛选明细、明暗自适应与安全 DOM 渲染）。
+  - 公共 UI 新增通用导出弹窗 `ExportReportModal`（`openExportReportModal`），默认推荐离线交互网页报告 (`.html`) 并并列提供单 Sheet 库级 Excel (`.xlsx`) 与可重导入铺底模板/配置包入口；`downloadApiFile` 同步支持 `X-Task-Id` 与 `AbortSignal` 接入 `TaskActivityBar` 实时进度与取消控制。
+- **单库落标与贯标库级报告与全库模板 (`modules/standard_migrator/`, `static/js/views/standard_migrator_view.js`)**：
+  - 新增 `GET /api/modules/standard_migrator/bindings/report.html` 并升级 `GET /api/modules/standard_migrator/bindings/report.xlsx`：无需逐表勾选即按库级全量范围聚合全库表清单、绑标/落标状态、贯标改造队列与 SQL 折叠查阅（严格按 `migrator_connection_id` 隔离队列）；若当前数据源目录缓存为空，导出前先自动触发 `refresh_catalog` 采集全库目录后再生成报告；`GET /bindings/template.xlsx` 同步支持 `scope=all` 全库预填对照模板导出。
+- **跨环境库级比对离线报告与推荐同名未保存表 (`modules/cross_comparator/`, `static/js/views/cross_comparator_view.js`)**：
+  - 新增 `GET /api/modules/cross_comparator/report.html` 与 `GET /api/modules/cross_comparator/report.xlsx`：自动沿用来源库与目标库按库设定的落标标准格式，空缓存时先并发采集两侧目录（同库自比对仅刷新一次），导出全部已保存映射表对的五虚拟列看板与字段明细，同时附上未配对同名表推荐清单（`_compute_recommended_pairings` 区分同模式/跨模式同名，严格仅推荐不自动触发字段预比对）及单侧独有表清单。
 - **全平台实时任务进度条与间断缩略微日志底座 (`core/platform/import_progress.py`, `core/platform/router.py`, `static/js/ui/task_activity_bar.js`, `static/css/workbench.css`)**：
   - 将 `ImportProgressHub` 升级为通用 `TaskProgressHub`（向下兼容 `/import-progress/*`），新增 `threading.Condition` 实时变更唤醒、单调 `seq` 增量追踪、凭据脱敏与 `<=64` 字截断的 `0.35s` 节流 `recent_logs`（最多保留 8 条）及 `cancel()`/`is_cancelled()` 协作取消支持；新增 `/api/platform/tasks/{task_id}`、`/api/platform/tasks/{task_id}/cancel` 与原生 `StreamingResponse` SSE 流 `/api/platform/tasks/{task_id}/stream`。
   - 新增 macOS 毛玻璃内联活动条公共组件 `TaskActivityBar`（`180ms` 防闪烁静默宽限期、`2px` 顶部渐变进度条、`120ms` 渐进计时与平滑爬升、`EventSource` 主通道 + `250ms` 轮询自动兜底、单行翻页缩略微日志及可折叠 `步骤 (N) ▾` 气泡），覆盖跨环境比对切表/预览/保存/推送、左树刷新/表展开、第 2 步单表核验/批量检查/贯标执行、SQL 执行/预览、AI 多步只读探查与多邻国智能命名/方言翻译，并全面支持 `AbortController` 抢占取消防竞态。
@@ -17,7 +24,7 @@
 - **元数据探查 60 秒温连接池、120 秒负缓存与单连接四层视图穿透 (`core/platform/connection_hub.py`, `core/platform/metadata_hub.py`)**：
   - 新增 `ConnectionHub.probe_session`（非 SQLite 数据源空闲 `60s` 温连接复用、退出自动 `rollback()`、异常自动剔除并销毁、`save_profile`/`delete_profile` 失效清理，严格隔离 `readonly_session` 零复用；SQLite 默认直连免锁文件句柄）。
   - `MetadataHub` 新增 `120s` 不存在表内存负缓存（强制刷新时立即失效）与 `_shared_conn` 单连接四层递归视图血缘穿透复用，消除连续切表与多层视图的重复握手耗时。
-- 在 [app.py](file:///Users/artxom/code/DataOG/app.py) 访问日志过滤器中同步静默 `/api/platform/tasks/*` 正常 `200` 轮询；扩充聚焦单测至 **40 项**。
+- 在 [app.py](file:///Users/artxom/code/DataOG/app.py) 访问日志过滤器中同步静默 `/api/platform/tasks/*` 正常 `200` 轮询；扩充单库/跨环境库级离线报告与 Node.js 内嵌 `.xlsx` 构建端到端测试至 **42 项**。
 
 ---
 
