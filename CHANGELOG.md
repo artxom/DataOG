@@ -8,6 +8,25 @@
 
 ---
 
+## [2.4.0] - 2026-11-17
+
+### Added
+- **按数据库粒度设定与持久化落标标准格式 (`core/platform/`, `modules/standard_migrator/`, `modules/cross_comparator/`, `static/js/views/standard_migrator_view.js`, `static/js/ui/database_tree.js`)**：
+  - 数据源档案 `connection_profiles` 新增幂等迁移列 `standard_format`，支持通过 `PUT /api/platform/connections/{connection_id}/standard-format` 持久化保存各库落标标准（覆盖 `AUTO`、`仓库DWS数据格式`、`数据仓库 集市`、`argodb数据格式` 等，带白名单校验与密码严格脱敏）。
+  - 「2. 落标绑定与贯标」左侧边栏支持为每个已配置数据库独立设定落标标准并展示徽标，切换数据库时自动应用该库设定，并在「3. 跨环境比对」选择对应来源库或目标库时自动沿用。
+
+### Changed
+- **「3. 跨环境比对」macOS 五虚拟列图形化工作台重构 (`static/js/views/cross_comparator_view.js`, `static/css/workbench.css`, `modules/cross_comparator/service.py`)**：
+  - 将字段配对工作区重构为从左到右五虚拟列：`来源表待选字段` | `来源表已绑定数标字段` | `数据标准` | `目标表已绑定数标字段` | `目标表待选字段`，精简大段冗余文案并采用 macOS 桌面级图形卡片交互。
+  - 第 2 步已绑定标准字段自动归入两侧「已绑定数标字段」列并按中栏对齐，未绑标字段保留在两侧「待选字段」列；支持拖拽或点选待选字段至中栏标准卡片或新标准落点完成绑标配对，中栏清晰呈现一致合并单卡（`UNIFIED`）、异标双胶囊对比（`SPLIT_DIFF`）与单侧绑定（`SPLIT_PARTIAL`）。
+- 升级 `app.py` 与 `PlatformContext` 版本号至 `2.4.0`，补充按库标准格式持久化及五虚拟列/防遮蔽聚焦单测至 **38 项**。
+
+### Fixed
+- **彻底解决顶部「已保存映射表对」遮蔽中间选择框问题 (`static/js/views/cross_comparator_view.js`, `static/css/workbench.css`)**：将 `已保存映射表对`（`cross-saved-pair-select`）从窗口顶栏右区迁移至页面内部 `.mac-subbar` 工具栏，并为 `.win-titlebar-center`（`z-index: 2; min-width: 0`）与 `.win-titlebar-right`（`overflow: hidden; min-width: 0; z-index: 1`）补充溢出保护与层级隔离。
+- **修复跨 Schema 同名表冲突与单侧解绑回显边界缺陷 (`modules/cross_comparator/service.py`, `static/js/views/cross_comparator_view.js`)**：隔离 Schema 限定与带点表键解析，消除目标表重名幽灵列泄露，并保证第 2 步解绑后与第 3 步预览/保存状态同步一致。
+
+---
+
 ## [2.3.3] - 2026-11-17
 
 ### Fixed
