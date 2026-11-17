@@ -36,17 +36,22 @@ class ImportProgressHub:
         return bool(progress_id and _PROGRESS_ID_RE.match(progress_id.strip()))
 
     def _prune_locked(self, now: float) -> None:
+        running_ttl = max(3600.0, self._ttl_seconds * 6.0)
         expired = [
             k
             for k, v in self._items.items()
-            if now - float(v.get("updated_ts", now)) > self._ttl_seconds
+            if now - float(v.get("updated_ts", now))
+            > (running_ttl if v.get("status") == "running" else self._ttl_seconds)
         ]
         for k in expired:
             self._items.pop(k, None)
         while len(self._items) > self._max_entries:
             oldest_key = min(
                 self._items.keys(),
-                key=lambda k: float(self._items[k].get("updated_ts", 0.0)),
+                key=lambda k: (
+                    1 if self._items[k].get("status") == "running" else 0,
+                    float(self._items[k].get("updated_ts", 0.0)),
+                ),
             )
             self._items.pop(oldest_key, None)
 

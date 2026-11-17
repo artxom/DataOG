@@ -26,11 +26,14 @@ async function parseJsonOrThrow(resp) {
   return payload;
 }
 
-export async function requestJson(url, { method = "GET", body = undefined } = {}) {
+export async function requestJson(url, { method = "GET", body = undefined, cache = undefined } = {}) {
   const opts = {
     method,
     headers: { Accept: "application/json" },
   };
+  if (cache) {
+    opts.cache = cache;
+  }
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
@@ -230,7 +233,9 @@ export const platformApi = {
   getLogs: (limit = 150) => requestJson(`/api/platform/logs?limit=${limit}`),
   clearLogs: () => requestJson("/api/platform/logs/clear", { method: "POST" }),
   getImportProgress: (progressId) =>
-    requestJson(`/api/platform/import-progress/${encodeURIComponent(progressId)}`),
+    requestJson(`/api/platform/import-progress/${encodeURIComponent(progressId)}`, {
+      cache: "no-store",
+    }),
 };
 
 export const standardsApi = {
