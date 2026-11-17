@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
+import threading
 import time
 import uuid
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 from core.platform.driver_manager import DriverManager, JdbcConnectionAdapter
 from core.platform.inceptor_client import InceptorThriftClient
@@ -20,9 +22,87 @@ from core.platform.storage import PlatformStateStore
 class ConnectionHub:
     """统一管理命名数据源档案、密码安全留存、连通性探测与连接会话分发."""
 
-    def __init__(self, store: PlatformStateStore, driver_manager: DriverManager) -> None:
+    def __init__(
+        self,
+        store: PlatformStateStore,
+        driver_manager: DriverManager,
+        *,
+        warm_ttl_sec: float = 60.0,
+    ) -> None:
         self.store = store
         self.driver_manager = driver_manager
+        self.warm_ttl_sec = max(0.0, float(warm_ttl_sec))
+        self._warm_lock = threading.Lock()
+        self._warm_pool: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _profile_fingerprint(profile: ConnectionProfile) -> Tuple[Any, ...]:
+        return (
+            profile.driver_track,
+            profile.db_type,
+            profile.host,
+            int(profile.port or 0),
+            profile.dbname,
+            profile.default_schema,
+            profile.user,
+            profile.password,
+            profile.sslmode,
+            profile.auth_mode,
+            profile.sqlite_path,
+            profile.jdbc_driver_id,
+            profile.jdbc_url,
+            profile.jdbc_driver_class,
+            json.dumps(profile.extra_props or {}, sort_keys=True, ensure_ascii=False),
+        )
+
+    @staticmethod
+    def _safe_close_conn(conn: Any) -> None:
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_conn_alive(conn: Any) -> bool:
+        if conn is None:
+            return False
+        try:
+            if getattr(conn, "closed", 0) != 0:
+                return False
+            if not getattr(conn, "open", True):
+                return False
+            if (
+                isinstance(conn, InceptorThriftClient)
+                and hasattr(conn, "_sock")
+                and getattr(conn, "_sock") is None
+            ):
+                return False
+            if isinstance(conn, JdbcConnectionAdapter):
+                raw = getattr(conn, "raw_jdbc_conn", None)
+                if raw is not None and hasattr(raw, "isClosed") and raw.isClosed():
+                    return False
+        except Exception:
+            return False
+        return True
+
+    def close_warm_connections(self, connection_id: Optional[str] = None) -> None:
+        to_close: List[Any] = []
+        with self._warm_lock:
+            if connection_id is None:
+                to_close = [
+                    entry["conn"]
+                    for entry in self._warm_pool.values()
+                    if entry.get("conn") is not None
+                ]
+                self._warm_pool.clear()
+            else:
+                entry = self._warm_pool.pop(connection_id, None)
+                if entry and entry.get("conn") is not None:
+                    to_close.append(entry["conn"])
+        for conn in to_close:
+            self._safe_close_conn(conn)
 
     def list_profiles(self) -> List[Dict[str, Any]]:
         return [p.to_public_dict() for p in self.store.list_connection_profiles()]
@@ -186,6 +266,7 @@ class ConnectionHub:
     ) -> ConnectionProfile:
         profile = self.build_profile_from_payload(payload, connection_id=connection_id)
         saved = self.store.upsert_connection_profile(profile)
+        self.close_warm_connections(saved.connection_id)
         self.store.add_log(
             "INFO",
             "连接中心",
@@ -194,6 +275,7 @@ class ConnectionHub:
         return saved
 
     def delete_profile(self, connection_id: str) -> bool:
+        self.close_warm_connections(connection_id)
         ok = self.store.delete_connection_profile(connection_id)
         if ok:
             self.store.add_log("INFO", "连接中心", f"已移除数据源连接档案 [{connection_id}] 及其本地元数据缓存")
@@ -211,6 +293,80 @@ class ConnectionHub:
                 conn.close()
             except Exception:
                 pass
+
+    @contextlib.contextmanager
+    def probe_session(self, connection_id: str, timeout_sec: int = 15) -> Generator[Any, None, None]:
+        """按 connection_id 获取用于只读元数据探查的温连接复用会话（异常销毁，正常回滚后归还）."""
+        profile = self.require_profile(connection_id)
+        if profile.db_type == "SQLITE" and not getattr(self, "_pool_sqlite_for_test", False):
+            with self.session(connection_id, timeout_sec=timeout_sec) as conn:
+                yield conn
+            return
+
+        fp = self._profile_fingerprint(profile)
+        cur_open_fn = self.driver_manager.open_connection
+        now = time.monotonic()
+        stale_conns: List[Any] = []
+        pooled_conn: Any = None
+
+        with self._warm_lock:
+            expired_ids = [
+                cid
+                for cid, entry in self._warm_pool.items()
+                if (now - float(entry.get("last_used", 0.0))) > self.warm_ttl_sec
+            ]
+            for cid in expired_ids:
+                exp_entry = self._warm_pool.pop(cid, None)
+                if exp_entry and exp_entry.get("conn") is not None:
+                    stale_conns.append(exp_entry["conn"])
+
+            entry = self._warm_pool.pop(connection_id, None)
+            if entry is not None:
+                if entry.get("fingerprint") == fp and entry.get("open_fn") == cur_open_fn:
+                    pooled_conn = entry.get("conn")
+                elif entry.get("conn") is not None:
+                    stale_conns.append(entry["conn"])
+
+        for stale in stale_conns:
+            self._safe_close_conn(stale)
+
+        conn = pooled_conn
+        if conn is not None and not self._is_conn_alive(conn):
+            self._safe_close_conn(conn)
+            conn = None
+
+        if conn is None:
+            conn = cur_open_fn(profile, timeout_sec=timeout_sec)
+
+        try:
+            yield conn
+        except BaseException:
+            self._safe_close_conn(conn)
+            raise
+
+        try:
+            if hasattr(conn, "rollback") and not getattr(conn, "autocommit", False):
+                conn.rollback()
+        except Exception:
+            self._safe_close_conn(conn)
+            return
+
+        if not self._is_conn_alive(conn):
+            self._safe_close_conn(conn)
+            return
+
+        put_back = False
+        with self._warm_lock:
+            if connection_id not in self._warm_pool:
+                self._warm_pool[connection_id] = {
+                    "conn": conn,
+                    "fingerprint": fp,
+                    "open_fn": cur_open_fn,
+                    "last_used": time.monotonic(),
+                }
+                put_back = True
+        if not put_back:
+            self._safe_close_conn(conn)
 
     @contextlib.contextmanager
     def readonly_session(

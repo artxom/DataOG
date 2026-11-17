@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+import time
 from typing import Optional
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
+from core.platform.import_progress import ImportProgressHub
 from core.platform.schemas import (
     AppearanceResetPayload,
     AppearanceUpdatePayload,
@@ -28,6 +32,11 @@ router = APIRouter(prefix="/api/platform", tags=["platform"])
 
 def _err(message: str, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"ok": False, "error": message}, status_code=status_code)
+
+
+def extract_task_id(request: Request, query_task_id: str = "") -> str:
+    candidate = (query_task_id or request.headers.get("x-task-id", "") or "").strip()
+    return candidate if ImportProgressHub.is_valid_id(candidate) else ""
 
 
 @router.get("/bootstrap")
@@ -243,43 +252,95 @@ def api_get_metadata_tree(
 
 
 @router.post("/metadata/{connection_id}/refresh")
-def api_refresh_metadata_tree(
+async def api_refresh_metadata_tree(
     connection_id: str,
+    request: Request,
     payload: Optional[MetadataRefreshPayload] = None,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
         schema_name = payload.schema_name if payload else None
-        tree = ctx.metadata_hub.refresh_catalog(
-            connection_id, schema_name=schema_name
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "刷新数据源目录缓存",
+                detail=f"准备扫描 {schema_name or '全部模式'} 表与视图清单...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        tree = await run_in_threadpool(
+            ctx.metadata_hub.refresh_catalog,
+            connection_id,
+            schema_name=schema_name,
+            progress_cb=reporter,
         )
+        msg = f"成功刷新元数据缓存（共 {len(tree['schemas'])} 个模式、{len(tree['tables'])} 个对象）"
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="目录刷新完成",
+                detail=msg,
+                processed=len(tree["tables"]),
+                total=len(tree["tables"]),
+            )
         return {
             "ok": True,
             **tree,
-            "message": f"成功刷新元数据缓存（共 {len(tree['schemas'])} 个模式、{len(tree['tables'])} 个对象）",
+            "message": msg,
         }
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return _err(str(exc), 400)
 
 
 @router.get("/metadata/{connection_id}/table")
-def api_get_table_detail(
+async def api_get_table_detail(
     connection_id: str,
+    request: Request,
     table_name: str = Query(...),
     schema_name: str = Query(default=""),
     force_refresh: bool = Query(default=False),
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
-        meta = ctx.metadata_hub.get_table_metadata(
+        target_label = f"{schema_name}.{table_name}" if schema_name else table_name
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "加载库表元数据",
+                detail=f"正在读取 {target_label} 表结构...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        meta = await run_in_threadpool(
+            ctx.metadata_hub.get_table_metadata,
             connection_id,
             schema_name=schema_name,
             table_name=table_name,
             force_refresh=force_refresh,
             penetrate_views=True,
+            progress_cb=reporter,
         )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            detail_msg = (
+                f"已加载 {meta.schema_name}.{meta.table_name}（共 {len(meta.columns)} 列）"
+                if meta.exists
+                else f"对象 {meta.schema_name}.{meta.table_name} 不存在"
+            )
+            ctx.task_progress.finish(
+                tid,
+                stage="结构加载完成",
+                detail=detail_msg,
+                processed=len(meta.columns),
+                total=len(meta.columns),
+            )
         return {"ok": True, "table": meta.to_dict()}
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return _err(str(exc), 400)
 
 
@@ -302,19 +363,41 @@ def api_search_metadata(
 
 
 @router.post("/query/execute")
-def api_execute_query(
+async def api_execute_query(
     payload: QueryExecutePayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
-        result = ctx.query_engine.execute_sql(
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "执行 SQL 查询",
+                detail=f"正在准备执行 SQL（上限 {payload.limit} 行）...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        result = await run_in_threadpool(
+            ctx.query_engine.execute_sql,
             payload.connection_id,
             payload.sql,
             limit=payload.limit,
             timeout_sec=payload.timeout_sec,
+            progress_cb=reporter,
         )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="查询完成",
+                detail=result.message or f"返回 {result.row_count} 行",
+                processed=result.row_count,
+                total=result.row_count,
+            )
         return {"ok": True, "result": result.to_dict()}
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return _err(str(exc), 400)
 
 
@@ -337,22 +420,45 @@ def api_execute_readonly_query(
 
 
 @router.get("/query/preview")
-def api_preview_table(
+async def api_preview_table(
+    request: Request,
     connection_id: str = Query(...),
     table_name: str = Query(...),
     schema_name: str = Query(default=""),
     limit: int = Query(default=200, ge=1, le=2000),
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
-        result = ctx.query_engine.preview_table(
+        target_label = f"{schema_name}.{table_name}" if schema_name else table_name
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "预览表数据",
+                detail=f"正在采样 {target_label}（最多 {limit} 行）...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        result = await run_in_threadpool(
+            ctx.query_engine.preview_table,
             connection_id,
             schema_name=schema_name,
             table_name=table_name,
             limit=limit,
+            progress_cb=reporter,
         )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="数据预览完成",
+                detail=result.message or f"返回 {result.row_count} 行",
+                processed=result.row_count,
+                total=result.row_count,
+            )
         return {"ok": True, "result": result.to_dict()}
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return _err(str(exc), 400)
 
 
@@ -425,6 +531,107 @@ async def api_platform_import_progress(
             "progress": prog,
         },
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@router.get("/tasks/{task_id}")
+async def api_platform_task_status(
+    task_id: str,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    prog = ctx.task_progress.get(task_id)
+    return JSONResponse(
+        content={
+            "ok": True,
+            "found": prog is not None,
+            "task": prog,
+            "progress": prog,
+        },
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def api_platform_task_cancel(
+    task_id: str,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    cancelled = ctx.task_progress.cancel(task_id)
+    return JSONResponse(
+        content={"ok": True, "cancelled": cancelled},
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
+
+
+@router.get("/tasks/{task_id}/stream")
+async def api_platform_task_stream(
+    task_id: str,
+    request: Request,
+    max_wait_ms: int = Query(default=25000, ge=0, le=120000),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    async def _event_generator():
+        def _encode_event(snap_obj: Optional[dict]) -> str:
+            payload = {
+                "ok": True,
+                "found": snap_obj is not None,
+                "task": snap_obj,
+                "progress": snap_obj,
+            }
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        initial = ctx.task_progress.get(task_id)
+        if max_wait_ms == 0 or (
+            initial is not None
+            and initial.get("status") in ("completed", "failed", "cancelled")
+        ):
+            yield _encode_event(initial)
+            return
+
+        last_seq = 0
+        if initial is not None:
+            yield _encode_event(initial)
+            last_seq = int(initial.get("seq", 1))
+
+        deadline = time.monotonic() + (max_wait_ms / 1000.0)
+        while True:
+            if await request.is_disconnected():
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            snap = await run_in_threadpool(
+                ctx.task_progress.wait_for_change,
+                task_id,
+                last_seq,
+                min(0.35, remaining),
+            )
+            if snap is None:
+                if last_seq > 0:
+                    break
+                rem_after = deadline - time.monotonic()
+                if rem_after <= 0:
+                    break
+                await asyncio.sleep(min(0.05, rem_after))
+                continue
+
+            snap_seq = int(snap.get("seq", 1))
+            if snap_seq > last_seq:
+                yield _encode_event(snap)
+                last_seq = snap_seq
+                if snap.get("status") in ("completed", "failed", "cancelled"):
+                    break
+            elif snap.get("status") in ("completed", "failed", "cancelled"):
+                break
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

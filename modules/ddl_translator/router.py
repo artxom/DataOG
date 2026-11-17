@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
+from core.platform.router import extract_task_id
 from modules.ddl_translator.schemas import SmartNamingPayload, TranslateDdlPayload
 from modules.ddl_translator.service import DdlTranslatorService
 
@@ -41,24 +43,78 @@ def api_ddl_translator_options(ctx: PlatformContext = Depends(get_platform_conte
 
 
 @router.post("/naming")
-def api_smart_naming(
+async def api_smart_naming(
     payload: SmartNamingPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "智能标准命名",
+                detail="正在准备词根解析与标准英文命名转换...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
         svc = DdlTranslatorService(ctx)
-        return svc.smart_naming(payload.model_dump())
+        res = await run_in_threadpool(
+            svc.smart_naming,
+            payload.model_dump(),
+            progress_cb=reporter,
+        )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            items_cnt = len(res.get("items") or [])
+            ctx.task_progress.finish(
+                tid,
+                stage="命名完成",
+                detail=f"已完成 {items_cnt} 项标准命名 ({res.get('engine_label', '')})",
+                warning=str(res.get("warning") or ""),
+                processed=items_cnt,
+                total=items_cnt,
+            )
+        return res
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
 
 @router.post("/translate")
-def api_ddl_translate(
+async def api_ddl_translate(
     payload: TranslateDdlPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "跨方言 DDL 翻译",
+                detail=f"正在准备转换至目标方言 {payload.target_dialect}...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
         svc = DdlTranslatorService(ctx)
-        return svc.translate(payload.model_dump())
+        res = await run_in_threadpool(
+            svc.translate,
+            payload.model_dump(),
+            progress_cb=reporter,
+        )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            col_cnt = int(res.get("column_count") or 0)
+            ctx.task_progress.finish(
+                tid,
+                stage="方言翻译完成",
+                detail=f"已完成 {res.get('source_dialect', '')} → {res.get('target_dialect', '')} ({res.get('engine_mode', 'AST')})",
+                warning=str(res.get("warning") or ""),
+                processed=col_cnt,
+                total=col_cnt,
+            )
+        return res
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)

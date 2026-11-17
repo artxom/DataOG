@@ -2683,6 +2683,171 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertEqual(client.get("/").status_code, 200)
             self.assertEqual(client.get("/js/views/cross_comparator_view.js").status_code, 200)
 
+    def test_cross_compare_pair_lightweight_prefetch_and_task_activity_contracts(self) -> None:
+        """验证 /compare-pair 轻量切表、/prefetch-pairs 批量预热、跨模块 X-Task-Id 缩略日志与前端 TaskActivityBar 契约."""
+        from unittest.mock import patch
+
+        static_dir = resolve_static_dir()
+        with open(os.path.join(static_dir, "js", "ui", "task_activity_bar.js"), "r", encoding="utf-8") as f:
+            bar_js = f.read()
+        with open(os.path.join(static_dir, "js", "core", "api.js"), "r", encoding="utf-8") as f:
+            api_js = f.read()
+        for tok in ("class TaskActivityBar", "createTaskId", "graceMs", "EventSource", "cancel"):
+            self.assertIn(tok, bar_js)
+        for tok in ("isAbortError", "tasksApi", "comparePair", "prefetchPairs", "X-Task-Id"):
+            self.assertIn(tok, api_js)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src_db = os.path.join(tmp, "src.db")
+            tgt_db = os.path.join(tmp, "tgt.db")
+            for db_f, ddl in (
+                (src_db, "CREATE TABLE t_ord_s (id INTEGER PRIMARY KEY, amt TEXT); CREATE TABLE t_usr_s (uid TEXT);"),
+                (tgt_db, "CREATE TABLE t_ord_t (id INTEGER PRIMARY KEY, amt VARCHAR(32)); CREATE TABLE t_usr_t (uid VARCHAR(64));"),
+            ):
+                c = sqlite3.connect(db_f)
+                c.executescript(ddl)
+                c.commit()
+                c.close()
+
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            ctx = app.state.platform_ctx
+            client = TestClient(app)
+
+            ctx.connection_hub.save_profile({"connection_id": "src_c", "name": "SrcDB", "db_type": "SQLITE", "sqlite_path": src_db})
+            ctx.connection_hub.save_profile({"connection_id": "tgt_c", "name": "TgtDB", "db_type": "SQLITE", "sqlite_path": tgt_db})
+            ctx.standard_catalog.upsert_item({"std_code": "S_ID", "cn_name": "编号", "en_abbr": "ID", "type_dws": "VARCHAR(32)"})
+
+            self.assertEqual(client.post("/api/modules/cross_comparator/bind-role", json={"role": "source", "connection_id": "src_c"}).status_code, 200)
+            self.assertEqual(client.post("/api/modules/cross_comparator/bind-role", json={"role": "target", "connection_id": "tgt_c"}).status_code, 200)
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "ord_pair",
+                        "source_schema": "main",
+                        "source_table": "t_ord_s",
+                        "target_schema": "main",
+                        "target_table": "t_ord_t",
+                        "pairings": [{"source_col": "id", "target_col": "id", "source_std_code": "S_ID", "target_std_code": "S_ID"}],
+                    },
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "usr_pair",
+                        "source_schema": "main",
+                        "source_table": "t_usr_s",
+                        "target_schema": "main",
+                        "target_table": "t_usr_t",
+                        "pairings": [{"source_col": "uid", "target_col": "uid", "source_std_code": "S_ID", "target_std_code": "S_ID"}],
+                    },
+                ).status_code,
+                200,
+            )
+
+            # /compare-pair 绝不触发全库目录扫描或全量 cross_column_bindings 拉取，且正常上报 X-Task-Id 缩略微日志
+            orig_list_cross_cols = ctx.store.list_cross_columns
+
+            def _guarded_list_cross_cols(std_table_key=None):
+                if not std_table_key:
+                    raise AssertionError("unexpected full cross_column_bindings scan")
+                return orig_list_cross_cols(std_table_key)
+
+            with patch.object(ctx.metadata_hub, "get_catalog_tree", side_effect=AssertionError("unexpected catalog scan")), \
+                 patch.object(ctx.store, "list_cross_columns", side_effect=_guarded_list_cross_cols):
+                cmp_res = client.get(
+                    "/api/modules/cross_comparator/compare-pair?table_key=ord_pair",
+                    headers={"X-Task-Id": "cmp_light_01"},
+                )
+            self.assertEqual(cmp_res.status_code, 200)
+            cmp_data = cmp_res.json()
+            self.assertTrue(cmp_data["ok"])
+            self.assertEqual(cmp_data["active_table_key"], "ord_pair")
+            self.assertGreaterEqual(len(cmp_data["active_comparison"]["source_panel"]["columns"]), 1)
+
+            t_cmp = client.get("/api/platform/tasks/cmp_light_01").json()["task"]
+            self.assertEqual(t_cmp["status"], "completed")
+            self.assertGreaterEqual(len(t_cmp["recent_logs"]), 2)
+
+            # /prefetch-pairs 批量预热全部映射表对到本地元数据缓存
+            pf_res = client.post(
+                "/api/modules/cross_comparator/prefetch-pairs",
+                json={"max_pairs": 10},
+                headers={"X-Task-Id": "cmp_pf_01"},
+            )
+            self.assertEqual(pf_res.status_code, 200)
+            self.assertGreaterEqual(pf_res.json()["prefetched_source"], 1)
+            self.assertGreaterEqual(pf_res.json()["prefetched_target"], 1)
+            self.assertIsNotNone(ctx.store.get_cached_table_meta("src_c", "main", "t_usr_s"))
+            self.assertIsNotNone(ctx.store.get_cached_table_meta("tgt_c", "main", "t_usr_t"))
+            self.assertEqual(client.get("/api/platform/tasks/cmp_pf_01").json()["task"]["status"], "completed")
+
+            # 第 2 步 check-compliance 与第 4 步 AI 只读探查均携带 X-Task-Id 产生缩略微日志
+            chk_res = client.post(
+                "/api/modules/standard_migrator/bindings/check-compliance",
+                json={"connection_id": "src_c", "tables": [{"schema_name": "main", "table_name": "t_ord_s"}]},
+                headers={"X-Task-Id": "mig_chk_01"},
+            )
+            self.assertEqual(chk_res.status_code, 200)
+            t_mig = client.get("/api/platform/tasks/mig_chk_01").json()["task"]
+            self.assertEqual(t_mig["status"], "completed")
+            self.assertTrue(t_mig["recent_logs"])
+
+            ctx.llm_hub.save_provider(
+                {
+                    "provider_id": "p_mock_tsk",
+                    "name": "Mock",
+                    "provider_type": "CUSTOM",
+                    "base_url": "https://mock.local/v1",
+                    "api_key": "sk-mock-secret",
+                    "default_model": "gpt-mock",
+                    "enabled": True,
+                    "is_default": True,
+                }
+            )
+            llm_replies = [
+                {
+                    "provider_id": "p_mock_tsk",
+                    "provider_name": "Mock",
+                    "model": "gpt-mock",
+                    "content": json.dumps(
+                        {"action": "query", "thought": "统计行数", "sql": "SELECT COUNT(*) AS cnt FROM main.t_ord_s"},
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 15.0,
+                },
+                {
+                    "provider_id": "p_mock_tsk",
+                    "provider_name": "Mock",
+                    "model": "gpt-mock",
+                    "content": json.dumps(
+                        {"action": "conclude", "summary": "共 0 行", "findings": []},
+                        ensure_ascii=False,
+                    ),
+                    "elapsed_ms": 18.0,
+                },
+            ]
+            with patch.object(ctx.llm_hub, "chat_completion", side_effect=llm_replies):
+                exp_res = client.post(
+                    "/api/modules/data_explorer/explore",
+                    json={
+                        "connection_id": "src_c",
+                        "schema_name": "main",
+                        "focus_tables": ["main.t_ord_s"],
+                        "prompt": "统计行数",
+                        "max_steps": 3,
+                    },
+                    headers={"X-Task-Id": "exp_ai_01"},
+                )
+            self.assertEqual(exp_res.status_code, 200)
+            t_exp = client.get("/api/platform/tasks/exp_ai_01").json()["task"]
+            self.assertEqual(t_exp["status"], "completed")
+            stages = [x["stage"] for x in t_exp["recent_logs"]]
+            self.assertTrue(any("加载元数据" in s or "AI 规划" in s or "只读采样" in s for s in stages))
+
 
 if __name__ == "__main__":
     unittest.main()

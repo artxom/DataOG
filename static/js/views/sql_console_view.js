@@ -3,13 +3,14 @@
  * 共享左侧 DataGrip 风格四级数据库清单 (DatabaseTree) + 双模工作区（SQL 查询 | AI 只读智能探查）
  */
 
-import { platformApi } from "../core/api.js";
+import { isAbortError, platformApi } from "../core/api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";
 import { DatabaseTree } from "../ui/database_tree.js";
 import { ObjectPicker } from "../ui/object_picker.js";
 import { SqlCodeBox } from "../ui/sql_code_box.js";
+import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
 import { ExplorerAiPane } from "./explorer_ai_pane.js";
 
@@ -99,11 +100,16 @@ export class SqlConsoleView {
       },
     });
 
+    this.activityBar = new TaskActivityBar();
+    this.activityBar.el.style.margin = "6px 10px";
+    this.activityBar.el.style.flexShrink = "0";
+
     this.rightPane = el("div", { className: "mac-pane", style: { overflow: "hidden" } });
     this.root = el("div", { className: "mac-split-view" });
   }
 
   destroy() {
+    this.activityBar?.destroy();
     this.dbTree.destroy();
     this.aiPane.destroy();
   }
@@ -292,21 +298,43 @@ export class SqlConsoleView {
     this.connectionId = connectionId;
     this.schemaName = schemaName;
     this.tableName = tableName;
+    const targetLabel = `${schemaName ? `${schemaName}.` : ""}${tableName}`;
 
     try {
-      const [previewRes, metaRes] = await Promise.all([
-        platformApi.previewTable(connectionId, schemaName, tableName, Math.min(this.limit, 500)),
-        platformApi.getTableDetail(connectionId, schemaName, tableName, false).catch(() => null),
-      ]);
+      const { previewRes, metaRes } = await this.activityBar.track(
+        `预览表 ${targetLabel}`,
+        async ({ taskId, signal }) => {
+          const [pRes, mRes] = await Promise.all([
+            platformApi.previewTable(
+              connectionId,
+              schemaName,
+              tableName,
+              Math.min(this.limit, 500),
+              { taskId, signal }
+            ),
+            platformApi
+              .getTableDetail(connectionId, schemaName, tableName, false, { signal })
+              .catch(() => null),
+          ]);
+          return {
+            previewRes: pRes,
+            metaRes: mRes,
+            message: pRes?.result?.message || `已加载 ${targetLabel}`,
+            warning: pRes?.warning || "",
+          };
+        },
+        { prefix: "prv" }
+      );
       this.lastResult = previewRes.result;
       this.lastTableMeta = metaRes?.table || null;
       const shownSql = this.lastResult?.sql || this.lastResult?.executed_sql;
       if (shownSql) {
-        this.sqlBox.setValue(shownSql, `${schemaName ? schemaName + "." : ""}${tableName}`);
+        this.sqlBox.setValue(shownSql, targetLabel);
       }
       this.render();
       this.refreshHeader?.();
     } catch (err) {
+      if (isAbortError(err)) return;
       Toast.error(err.message);
     }
   }
@@ -323,17 +351,31 @@ export class SqlConsoleView {
       return;
     }
     try {
-      const res = await platformApi.executeSql({
-        connection_id: effConnId,
-        sql: sqlText,
-        limit: Number(this.limit) || 200,
-        timeout_sec: 30,
-      });
+      const res = await this.activityBar.track(
+        "执行 SQL 查询",
+        async ({ taskId, signal }) => {
+          const out = await platformApi.executeQuery(
+            {
+              connection_id: effConnId,
+              sql: sqlText,
+              limit: Number(this.limit) || 200,
+              timeout_sec: 30,
+            },
+            { taskId, signal }
+          );
+          return {
+            ...out,
+            message: out?.result?.message || `查询完成 (${out?.result?.row_count ?? 0} 行)`,
+          };
+        },
+        { prefix: "qry" }
+      );
       this.lastResult = res.result;
       this.activeTab = "rows";
       this.render();
       this.refreshHeader?.();
     } catch (err) {
+      if (isAbortError(err)) return;
       Toast.error(err.message);
     }
   }
@@ -531,6 +573,7 @@ export class SqlConsoleView {
     clearEl(
       this.rightPane,
       this.sqlBox.root,
+      this.activityBar.el,
       tabsBar,
       el(
         "div",

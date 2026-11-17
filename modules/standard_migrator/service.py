@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import io
+import threading
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import openpyxl
@@ -83,7 +84,14 @@ class StandardMigratorService:
             "logs": self.ctx.store.list_logs(limit=150),
         }
 
-    def bind_connection(self, connection_id: str, auto_sync: bool = True) -> Dict[str, Any]:
+    def bind_connection(
+        self,
+        connection_id: str,
+        auto_sync: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
+        report(16.0, "绑定数据源", f"正在校验数据源档案 [{connection_id}]...", 0, 1)
         prof = self.ctx.connection_hub.require_profile(connection_id)
         self.ctx.store.save_meta("migrator_connection_id", prof.connection_id)
         if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host:
@@ -100,13 +108,33 @@ class StandardMigratorService:
                     "sslmode": prof.sslmode,
                 },
             )
+        report(24.0, "绑定数据源", f"已绑定数据源 [{prof.name}] ({prof.db_type})", 0, 1)
 
         sync_warning = ""
         if auto_sync:
             try:
-                self.ctx.metadata_hub.refresh_catalog(prof.connection_id)
+                report(30.0, "同步目录缓存", f"正在刷新 [{prof.name}] 元数据目录缓存...", 0, 1)
+                self.ctx.metadata_hub.refresh_catalog(
+                    prof.connection_id,
+                    progress_cb=lambda pct, stg, dtl, proc=0, tot=0: report(
+                        30.0 + (min(100.0, max(0.0, float(pct))) / 100.0) * 35.0,
+                        stg or "同步目录缓存",
+                        dtl,
+                        proc,
+                        tot,
+                    ),
+                )
                 if self.ctx.store.list_items():
-                    self.sync_items()
+                    report(68.0, "核验目标库状态", f"正在比对贯标队列与 [{prof.name}] 库表结构...", 0, 1)
+                    self.sync_items(
+                        progress_cb=lambda pct, stg, dtl, proc=0, tot=0: report(
+                            68.0 + (min(100.0, max(0.0, float(pct))) / 100.0) * 28.0,
+                            stg or "核验目标库状态",
+                            dtl,
+                            proc,
+                            tot,
+                        )
+                    )
             except Exception as exc:
                 sync_warning = f"数据源已切换，但实时同步元数据未完成: {exc}"
 
@@ -118,8 +146,9 @@ class StandardMigratorService:
 
     def sync_items(
         self,
+        progress_cb: Optional[ProgressCallback] = noop_progress,
         *,
-        progress_cb: Optional[ProgressCallback] = None,
+        progress_start_pct: float = 20.0,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
         prof = self._sync_engine_with_active_profile()
@@ -128,21 +157,49 @@ class StandardMigratorService:
 
         items = self.ctx.store.list_items()
         if not items:
+            report(95.0, "核验目标库状态", "当前贯标队列为空，无需比对", 0, 0)
             return self.get_workspace_state()
 
+        start_pct = max(12.0, min(85.0, float(progress_start_pct)))
+        unique_targets = list(
+            dict.fromkeys((str(it["schema_name"]), str(it["table_name"])) for it in items)
+        )
+        report(
+            start_pct,
+            "核验目标库状态",
+            f"准备与 [{prof.name}] 核验 {len(items)} 条规则（涉及 {len(unique_targets)} 张表）...",
+            0,
+            len(unique_targets),
+        )
+
         if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host and prof.driver_track == "NATIVE":
+            mid_pct = start_pct + (92.0 - start_pct) * 0.35
+            report(
+                mid_pct,
+                "核验目标库状态",
+                f"正在从 [{prof.name}] 批量拉取 {len(unique_targets)} 张表系统目录与列序...",
+                0,
+                len(unique_targets),
+            )
             self.engine.sync_all_items_with_db()
+            report(
+                95.0,
+                "同步核验结果",
+                f"已完成 {len(items)} 条字段规则的库内元数据实时比对",
+                len(items),
+                len(items),
+            )
         else:
             # 跨任意驱动（含 SQLite / MySQL / 自定义 JDBC）单会话批量获取元数据并核验
-            unique_targets = list(
-                dict.fromkeys((str(it["schema_name"]), str(it["table_name"])) for it in items)
-            )
+            probe_start = start_pct + 2.0
+            probe_end = start_pct + (92.0 - start_pct) * 0.68
             meta_cache, _, _ = self.ctx.metadata_hub.get_tables_metadata_batch(
                 prof.connection_id,
                 unique_targets,
                 force_refresh=True,
                 on_progress=lambda done_c, tot_c, cs, ct: report(
-                    78.0 + 18.0 * (min(done_c, max(1, tot_c)) / max(1, tot_c)),
+                    probe_start
+                    + (probe_end - probe_start) * (min(done_c, max(1, tot_c)) / max(1, tot_c)),
                     "核验目标库状态",
                     f"正在读取库表结构 ({min(done_c + 1, tot_c)}/{tot_c}): {cs}.{ct}",
                     done_c,
@@ -151,7 +208,8 @@ class StandardMigratorService:
             )
             def_sch = prof.effective_default_schema().lower()
             updates: List[Dict[str, Any]] = []
-            for it in items:
+            tot_items = len(items)
+            for idx, it in enumerate(items, start=1):
                 key = (str(it["schema_name"]).lower(), str(it["table_name"]).lower())
                 t_meta = meta_cache.get(key) or meta_cache.get((def_sch, key[1]))
                 if t_meta is None:
@@ -164,6 +222,15 @@ class StandardMigratorService:
                     meta_cache[key] = t_meta
                 upd = self.engine._build_single_item_sync_update(it, t_meta)
                 updates.append(upd)
+                if idx == 1 or idx % 100 == 0 or idx == tot_items:
+                    pct = probe_end + (95.0 - probe_end) * (idx / max(1, tot_items))
+                    report(
+                        pct,
+                        "同步核验结果",
+                        f"正在比对字段规格 ({idx}/{tot_items}): {it['schema_name']}.{it['table_name']}.{it['old_col_name']}",
+                        idx,
+                        tot_items,
+                    )
             self.ctx.store.batch_update_items_sync(updates)
 
         state = self.get_workspace_state()
@@ -217,7 +284,7 @@ class StandardMigratorService:
         if prof:
             report(78.0, "核验目标库状态", f"正在与数据源 [{prof.name}] 比对字段现状...", len(parsed_items), len(parsed_items))
             try:
-                self.sync_items(progress_cb=report)
+                self.sync_items(progress_cb=report, progress_start_pct=78.0)
             except Exception as exc:
                 sync_warning = f"清单已导入，但自动连接数据库核验未完成: {exc}"
 
@@ -234,22 +301,59 @@ class StandardMigratorService:
         schema_name: str = "",
         table_name: str = "",
         max_tables: int = 30,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         if connection_id:
-            self.bind_connection(connection_id, auto_sync=False)
+            self.bind_connection(
+                connection_id,
+                auto_sync=False,
+                progress_cb=lambda pct, stg, dtl, p=0, t=0: report(
+                    min(18.0, float(pct)), stg, dtl, p, t
+                ),
+            )
         prof = self._sync_engine_with_active_profile()
         if not prof:
             raise ValueError("请先选择有效的目标数据源连接")
 
+        report(
+            22.0,
+            "扫描目标库表",
+            f"正在连接 [{prof.name}] 并检索目标物理表（上限 {max_tables} 张）...",
+            0,
+            1,
+        )
         if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host and prof.driver_track == "NATIVE":
+            report(
+                45.0,
+                "读取表字段结构",
+                f"正在批量拉取 {schema_name or '全部模式'}.{table_name or '*'} 列定义与注释...",
+                0,
+                1,
+            )
             cnt = self.engine.load_tables_from_database(
                 schema_name=schema_name,
                 table_name=table_name,
                 max_tables=max_tables,
             )
+            report(
+                94.0,
+                "同步执行台队列",
+                f"已读取 {cnt} 个表字段结构至贯标队列",
+                cnt,
+                cnt,
+            )
         else:
             tree = self.ctx.metadata_hub.refresh_catalog(
-                prof.connection_id, schema_name=schema_name or None
+                prof.connection_id,
+                schema_name=schema_name or None,
+                progress_cb=lambda pct, stg, dtl, p=0, t=0: report(
+                    22.0 + (min(100.0, max(0.0, float(pct))) / 100.0) * 26.0,
+                    stg or "扫描目标库表",
+                    dtl,
+                    p,
+                    t,
+                ),
             )
             matched_tables = [
                 t
@@ -259,7 +363,16 @@ class StandardMigratorService:
                 and (not table_name or t["table_name"].lower() == table_name.strip().lower())
             ][:max_tables]
             loaded_items: List[Dict[str, Any]] = []
-            for t in matched_tables:
+            tot_tbl = len(matched_tables)
+            for idx, t in enumerate(matched_tables, start=1):
+                pct = 48.0 + 34.0 * (idx / max(1, tot_tbl))
+                report(
+                    pct,
+                    "读取表字段结构",
+                    f"[{idx}/{tot_tbl}] 正在读取 {t['schema_name']}.{t['table_name']} 字段结构...",
+                    idx,
+                    tot_tbl,
+                )
                 t_meta = self.ctx.metadata_hub.get_table_metadata(
                     prof.connection_id, t["schema_name"], t["table_name"], force_refresh=True
                 )
@@ -280,8 +393,15 @@ class StandardMigratorService:
             cnt = len(loaded_items)
             if loaded_items:
                 label = f"{prof.name} [{schema_name or '全部模式'}.{table_name or f'共{len(matched_tables)}张表'}]"
+                report(
+                    84.0,
+                    "保存执行台队列",
+                    f"正在写入 {cnt} 个字段结构并初始化队列...",
+                    cnt,
+                    cnt,
+                )
                 self.ctx.store.replace_all_items(loaded_items, label, preserve_history=False)
-                self.sync_items()
+                self.sync_items(progress_cb=report, progress_start_pct=86.0)
 
         state = self.get_workspace_state()
         state["loaded_count"] = cnt
@@ -292,23 +412,182 @@ class StandardMigratorService:
         )
         return state
 
-    def execute_single(self, item_id: int) -> Dict[str, Any]:
+    def execute_single(
+        self,
+        item_id: int,
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
+        report(20.0, "准备执行贯标", f"正在加载字段任务 #{item_id} 与目标库连接...", 0, 1)
         self._sync_engine_with_active_profile()
+        item_before = self.ctx.store.get_item(item_id)
+        item_label = (
+            f"{item_before['schema_name']}.{item_before['table_name']}.{item_before['old_col_name']}"
+            if item_before
+            else f"任务 #{item_id}"
+        )
+        report(
+            48.0,
+            "执行原生 ALTER",
+            f"正在对 {item_label} 执行字段贯标与列序校验...",
+            0,
+            1,
+        )
         item = self.engine.execute_single_item_direct(item_id)
+        report(
+            92.0,
+            "刷新执行台状态",
+            f"{item_label} 状态: {item.get('status', 'DONE')}",
+            1,
+            1,
+        )
         state = self.get_workspace_state()
         state["item"] = item
+        if item.get("status") in ("FAILED", "MISSING_TABLE", "MISSING_COLUMN"):
+            state["warning"] = (
+                item.get("error_message") or item.get("status_detail") or f"{item_label} 贯标执行未通过"
+            )
+        else:
+            state["message"] = item.get("status_detail") or f"字段 {item_label} 贯标执行完成"
         return state
 
     def execute_batch(
-        self, item_ids: List[int], max_workers: int = 5, keep_backup: bool = True
+        self,
+        item_ids: List[int],
+        max_workers: int = 5,
+        keep_backup: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         self._sync_engine_with_active_profile()
-        batch_res = self.engine.execute_batch_items(
-            item_ids=item_ids, max_workers=max_workers, keep_backup=keep_backup
+
+        id_set = {int(x) for x in (item_ids or [])}
+        initial_items = self.ctx.store.list_items()
+        pending_items = [
+            it for it in initial_items if it["id"] in id_set and it["status"] != "COMPLETED"
+        ]
+        if not pending_items:
+            report(95.0, "调度并发贯标", "所选记录均已贯标完成，无需重复执行", 0, 0)
+            batch_res = self.engine.execute_batch_items(
+                item_ids=item_ids, max_workers=max_workers, keep_backup=keep_backup
+            )
+            state = self.get_workspace_state()
+            state["batch_result"] = batch_res
+            state["message"] = batch_res.get("message", "批量贯标任务执行完毕")
+            return state
+
+        table_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        table_labels: Dict[Tuple[str, str], str] = {}
+        orig_item_state: Dict[int, Tuple[str, str, str, str, str]] = {}
+        for it in pending_items:
+            sch_clean = clean_identifier_input(it["schema_name"]) or str(it["schema_name"])
+            tbl_clean = clean_identifier_input(it["table_name"]) or str(it["table_name"])
+            k = (sch_clean.lower(), tbl_clean.lower())
+            table_groups.setdefault(k, []).append(it)
+            table_labels.setdefault(k, f"{sch_clean}.{tbl_clean}")
+            orig_item_state[it["id"]] = (
+                str(it.get("status") or ""),
+                str(it.get("executed_at") or ""),
+                str(it.get("updated_at") or ""),
+                str(it.get("status_detail") or ""),
+                str(it.get("error_message") or ""),
+            )
+
+        total_tables = len(table_groups)
+        worker_count = max(1, min(int(max_workers or 5), total_tables))
+        report(
+            18.0,
+            "调度并发贯标",
+            f"共 {len(pending_items)} 个字段（{total_tables} 张表），启动 {worker_count} 线程按表并发执行...",
+            0,
+            total_tables,
         )
+
+        reported_tables: Set[Tuple[str, str]] = set()
+        report_lock = threading.Lock()
+        stop_evt = threading.Event()
+
+        def _scan_finished_tables(*, force_all: bool = False) -> None:
+            if report is noop_progress:
+                return
+            try:
+                cur_by_id = {it["id"]: it for it in self.ctx.store.list_items()}
+            except Exception:
+                return
+            with report_lock:
+                for t_key, grp in table_groups.items():
+                    if t_key in reported_tables:
+                        continue
+                    cur_grp = [cur_by_id.get(it["id"]) for it in grp]
+                    if any(c is None for c in cur_grp):
+                        continue
+                    all_changed = all(
+                        (
+                            str(c.get("status") or ""),
+                            str(c.get("executed_at") or ""),
+                            str(c.get("updated_at") or ""),
+                            str(c.get("status_detail") or ""),
+                            str(c.get("error_message") or ""),
+                        )
+                        != orig_item_state[c["id"]]
+                        for c in cur_grp
+                        if c is not None
+                    )
+                    if all_changed or force_all:
+                        reported_tables.add(t_key)
+                        done_n = len(reported_tables)
+                        ok_c = sum(1 for c in cur_grp if c and c.get("status") == "COMPLETED")
+                        err_c = sum(
+                            1
+                            for c in cur_grp
+                            if c
+                            and c.get("status")
+                            in ("FAILED", "MISSING_TABLE", "MISSING_COLUMN")
+                        )
+                        pct = 20.0 + 72.0 * (done_n / max(1, total_tables))
+                        tbl_lbl = table_labels[t_key]
+                        if all_changed:
+                            detail = f"[{done_n}/{total_tables}] 表 {tbl_lbl} 执行完成（成功 {ok_c} / 异常 {err_c}）"
+                        else:
+                            detail = f"[{done_n}/{total_tables}] 表 {tbl_lbl} 已处理"
+                        report(pct, "并发执行贯标", detail, done_n, total_tables)
+
+        watcher: Optional[threading.Thread] = None
+        if report is not noop_progress:
+            def _watch_loop() -> None:
+                while not stop_evt.wait(0.1):
+                    _scan_finished_tables(force_all=False)
+
+            watcher = threading.Thread(
+                target=_watch_loop,
+                name="MigratorBatchProgressWatcher",
+                daemon=True,
+            )
+            watcher.start()
+
+        try:
+            batch_res = self.engine.execute_batch_items(
+                item_ids=item_ids, max_workers=max_workers, keep_backup=keep_backup
+            )
+        finally:
+            stop_evt.set()
+            if watcher is not None:
+                watcher.join(timeout=1.5)
+
+        _scan_finished_tables(force_all=True)
+        report(
+            96.0,
+            "汇总批量结果",
+            batch_res.get("message", "批量贯标任务执行完毕"),
+            total_tables,
+            total_tables,
+        )
+
         state = self.get_workspace_state()
         state["batch_result"] = batch_res
         state["message"] = batch_res.get("message", "批量贯标任务执行完毕")
+        if int(batch_res.get("failed_count", 0) or 0) > 0:
+            state["warning"] = state["message"]
         return state
 
     def preview_rebuild(
@@ -373,14 +652,95 @@ class StandardMigratorService:
         table_name: str,
         item_ids: Optional[List[int]] = None,
         keep_backup: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         self._sync_engine_with_active_profile()
-        res = self.engine.execute_table_rebuild_migration(
-            schema_name, table_name, item_ids=item_ids, keep_backup=keep_backup
+
+        tbl_label = f"{schema_name}.{table_name}"
+        report(
+            20.0,
+            "分析列序与依赖",
+            f"正在分析 {tbl_label} 物理列序、分布/分区键及改名拓扑依赖...",
+            0,
+            3,
+        )
+
+        baseline_logs = self.ctx.store.list_logs(limit=1)
+        baseline_log_id = int(baseline_logs[0]["id"]) if baseline_logs else 0
+        stage_lock = threading.Lock()
+        stage_state = {"built_tmp": False}
+        stop_evt = threading.Event()
+
+        def _watch_rebuild_stage() -> None:
+            while not stop_evt.wait(0.1):
+                try:
+                    recent = self.ctx.store.list_logs(limit=10)
+                except Exception:
+                    continue
+                for lg in recent:
+                    if int(lg.get("id") or 0) <= baseline_log_id:
+                        continue
+                    msg = str(lg.get("message") or "")
+                    if "开始执行 [按原表字段顺序重建表迁移]" in msg:
+                        with stage_lock:
+                            if not stage_state["built_tmp"]:
+                                stage_state["built_tmp"] = True
+                                report(
+                                    52.0,
+                                    "构建保序临时表",
+                                    f"正在构建 {tbl_label} 保序临时表并按原列序迁移数据...",
+                                    1,
+                                    3,
+                                )
+                        return
+
+        watcher: Optional[threading.Thread] = None
+        if report is not noop_progress:
+            watcher = threading.Thread(
+                target=_watch_rebuild_stage,
+                name="MigratorRebuildProgressWatcher",
+                daemon=True,
+            )
+            watcher.start()
+
+        try:
+            res = self.engine.execute_table_rebuild_migration(
+                schema_name, table_name, item_ids=item_ids, keep_backup=keep_backup
+            )
+        finally:
+            stop_evt.set()
+            if watcher is not None:
+                watcher.join(timeout=1.5)
+
+        with stage_lock:
+            if not stage_state["built_tmp"]:
+                stage_state["built_tmp"] = True
+                report(
+                    52.0,
+                    "构建保序临时表",
+                    f"已构建 {tbl_label} 保序临时表并完成数据迁移",
+                    1,
+                    3,
+                )
+
+        report(
+            85.0,
+            "切换表名与恢复索引",
+            f"正在切换 {tbl_label} 表名、恢复注释与结构校验...",
+            2,
+            3,
         )
         state = self.get_workspace_state()
         state["rebuild_result"] = res
         state["message"] = res.get("message", "整表保序重建完成")
+        report(
+            96.0,
+            "切换表名与恢复索引",
+            state["message"],
+            3,
+            3,
+        )
         return state
 
     def clear_items(self) -> Dict[str, Any]:
@@ -638,7 +998,9 @@ class StandardMigratorService:
         force_refresh: bool = False,
         include_table_stats: bool = True,
         purge_errors: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         prof = self.ctx.connection_hub.require_profile(connection_id)
         eff_format = self._resolve_format_profile(prof, format_profile)
         def_sch = prof.effective_default_schema()
@@ -651,16 +1013,35 @@ class StandardMigratorService:
         if not eff_table:
             raise ValueError("表名不能为空")
 
+        meta_cb: ProgressCallback = noop_progress
+        if report is not noop_progress:
+            def _scaled_meta_cb(
+                pct: float, stage: str, detail: str = "", processed: int = 0, total: int = 0
+            ) -> None:
+                scaled = 15.0 + (min(100.0, max(0.0, float(pct))) / 100.0) * 53.0
+                report(scaled, stage, detail, processed, total)
+
+            meta_cb = _scaled_meta_cb
+
         t_meta = self.ctx.metadata_hub.get_table_metadata(
             prof.connection_id,
             schema_name=eff_schema,
             table_name=eff_table,
             force_refresh=force_refresh,
             penetrate_views=True,
+            progress_cb=meta_cb,
         )
         actual_schema = t_meta.schema_name or eff_schema
         actual_table = t_meta.table_name or eff_table
+        col_total = len(t_meta.columns)
 
+        report(
+            74.0,
+            "匹配数据标准",
+            f"正在加载 {actual_schema}.{actual_table} 绑标记录与标准字典...",
+            0,
+            col_total,
+        )
         if purge_errors:
             self.ctx.standard_catalog.purge_invalid_error_bindings(prof.connection_id)
         bindings_map: Dict[str, Dict[str, Any]] = {}
@@ -687,6 +1068,13 @@ class StandardMigratorService:
         ]
         std_dict_map = self.ctx.standard_catalog.get_items_by_codes(std_codes)
 
+        report(
+            86.0,
+            "核验字段落标状态",
+            f"正在对 {actual_schema}.{actual_table} 共 {col_total} 列执行三维落标核验...",
+            col_total,
+            col_total,
+        )
         res_dict, compliance_updates = self._evaluate_table_meta_compliance(
             prof=prof,
             eff_schema=eff_schema,
@@ -704,6 +1092,13 @@ class StandardMigratorService:
             res_dict["table_stats"] = self.ctx.standard_catalog.get_connection_binding_stats(
                 prof.connection_id
             )
+        report(
+            96.0,
+            "核验字段落标状态",
+            f"已完成 {actual_schema}.{actual_table} 落标判定（已落标 {res_dict['summary']['compliant_cols']}/{col_total}）",
+            col_total,
+            col_total,
+        )
         return res_dict
 
     def save_field_bindings(
@@ -747,7 +1142,9 @@ class StandardMigratorService:
         schema_name: str = "",
         table_name: str = "",
         format_profile: str = "AUTO",
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         prof = self.ctx.connection_hub.require_profile(connection_id)
         eff_format = self._resolve_format_profile(prof, format_profile)
         targets = self._parse_table_targets(
@@ -765,10 +1162,32 @@ class StandardMigratorService:
         if not targets:
             raise ValueError("当前连接暂无可匹配的数据表，请先刷新元数据或选择目标表")
 
+        tot_targets = len(targets)
+        report(
+            18.0,
+            "加载目标表结构",
+            f"正在读取 {tot_targets} 张表的字段与注释元数据...",
+            0,
+            tot_targets,
+        )
+
+        def _on_auto_probe(done_cnt: int, tot_cnt: int, cur_s: str, cur_t: str) -> None:
+            pct = 18.0 + 28.0 * (min(done_cnt, max(1, tot_cnt)) / max(1, tot_cnt))
+            report(
+                pct,
+                "加载目标表结构",
+                f"[{min(done_cnt + 1, tot_cnt)}/{tot_cnt}] 获取库表结构 {cur_s}.{cur_t}...",
+                done_cnt,
+                tot_cnt,
+            )
+
         matched_count = 0
         to_upsert: List[Dict[str, Any]] = []
         metas_map, _, _ = self.ctx.metadata_hub.get_tables_metadata_batch(
-            prof.connection_id, targets, force_refresh=False
+            prof.connection_id,
+            targets,
+            force_refresh=False,
+            on_progress=_on_auto_probe,
         )
         lookup_pairs = list(targets)
         for m_obj in metas_map.values():
@@ -794,48 +1213,73 @@ class StandardMigratorService:
                     continue
                 pending_queries.append((col_clean, (col.column_comment or "").strip()))
 
+        report(
+            48.0,
+            "模糊匹配标准字典",
+            f"正在检索 {len(pending_queries)} 个未绑字段的英文简称与中文标准候选...",
+            0,
+            max(1, len(pending_queries)),
+        )
         cand_cache = self.ctx.standard_catalog.match_standard_candidates_batch(pending_queries)
 
-        for sch, tbl in targets:
+        for idx_t, (sch, tbl) in enumerate(targets, start=1):
             t_meta = metas_map.get((sch.lower(), tbl.lower()))
-            if t_meta is None:
-                continue
-            actual_s = t_meta.schema_name or sch
-            actual_t = t_meta.table_name or tbl
-            existing = existing_batch.get((actual_s.lower(), actual_t.lower())) or existing_batch.get(
-                (sch.lower(), actual_t.lower()), {}
-            )
-            for col in t_meta.columns:
-                col_clean = clean_identifier_input(col.column_name) or col.column_name
-                cur_bind = existing.get(col_clean.lower())
-                if cur_bind and (cur_bind.get("std_code") or "").strip():
-                    continue
-                ck = (col_clean.lower(), (col.column_comment or "").strip())
-                cands = cand_cache.get(ck) or []
-                if not cands:
-                    continue
-                # 当仅 1 个精确命中，或首位为标准字典且与注释/英文简称强一致时采用
-                picked = cands[0]
-                exact_en = (
-                    clean_identifier_input(picked.get("en_abbr") or "").lower()
-                    == col_clean.lower()
-                )
-                exact_cn = (
-                    bool(col.column_comment)
-                    and picked.get("cn_name") == col.column_comment.strip()
-                )
-                if len(cands) == 1 or (exact_en and exact_cn) or picked.get("is_standard_dict") == "1":
-                    to_upsert.append(
-                        {
-                            "schema_name": actual_s,
-                            "table_name": actual_t,
-                            "column_name": col_clean,
-                            "std_code": picked["std_code"],
-                        }
+            if t_meta is not None:
+                actual_s = t_meta.schema_name or sch
+                actual_t = t_meta.table_name or tbl
+                existing = existing_batch.get(
+                    (actual_s.lower(), actual_t.lower())
+                ) or existing_batch.get((sch.lower(), actual_t.lower()), {})
+                for col in t_meta.columns:
+                    col_clean = clean_identifier_input(col.column_name) or col.column_name
+                    cur_bind = existing.get(col_clean.lower())
+                    if cur_bind and (cur_bind.get("std_code") or "").strip():
+                        continue
+                    ck = (col_clean.lower(), (col.column_comment or "").strip())
+                    cands = cand_cache.get(ck) or []
+                    if not cands:
+                        continue
+                    # 当仅 1 个精确命中，或首位为标准字典且与注释/英文简称强一致时采用
+                    picked = cands[0]
+                    exact_en = (
+                        clean_identifier_input(picked.get("en_abbr") or "").lower()
+                        == col_clean.lower()
                     )
-                    matched_count += 1
+                    exact_cn = (
+                        bool(col.column_comment)
+                        and picked.get("cn_name") == col.column_comment.strip()
+                    )
+                    if (
+                        len(cands) == 1
+                        or (exact_en and exact_cn)
+                        or picked.get("is_standard_dict") == "1"
+                    ):
+                        to_upsert.append(
+                            {
+                                "schema_name": actual_s,
+                                "table_name": actual_t,
+                                "column_name": col_clean,
+                                "std_code": picked["std_code"],
+                            }
+                        )
+                        matched_count += 1
+            if idx_t == 1 or idx_t % 5 == 0 or idx_t == tot_targets:
+                report(
+                    52.0 + 12.0 * (idx_t / max(1, tot_targets)),
+                    "模糊匹配标准字典",
+                    f"[{idx_t}/{tot_targets}] 匹配 {sch}.{tbl}（累计命中 {matched_count} 项）...",
+                    idx_t,
+                    tot_targets,
+                )
 
         if to_upsert:
+            report(
+                66.0,
+                "保存匹配绑定",
+                f"正在保存 {len(to_upsert)} 条智能匹配的标准绑定...",
+                len(to_upsert),
+                len(to_upsert),
+            )
             self.ctx.standard_catalog.upsert_field_bindings(
                 prof.connection_id, to_upsert, bind_source="AUTO_MATCH"
             )
@@ -845,7 +1289,9 @@ class StandardMigratorService:
             tables=[{"schema_name": s, "table_name": t} for s, t in targets],
             format_profile=eff_format,
             force_refresh=False,
+            progress_cb=report,
             tolerate_probe_errors=True,
+            progress_start_pct=70.0,
         )
         last_table_res = batch_check["tables"][-1] if batch_check.get("tables") else None
 
@@ -874,10 +1320,10 @@ class StandardMigratorService:
         tables: Optional[List[Any]] = None,
         format_profile: str = "AUTO",
         force_refresh: bool = True,
-        progress_cb: Optional[ProgressCallback] = None,
+        progress_cb: Optional[ProgressCallback] = noop_progress,
         tolerate_probe_errors: bool = False,
         purge_errors: bool = True,
-        progress_start_pct: float = 68.0,
+        progress_start_pct: float = 20.0,
         unqualified_tables: Optional[Set[Tuple[str, str]]] = None,
         realign_replace_mode: bool = False,
     ) -> Dict[str, Any]:
@@ -904,16 +1350,25 @@ class StandardMigratorService:
             self.ctx.standard_catalog.purge_invalid_error_bindings(prof.connection_id)
 
         total_targets = len(targets)
-        probe_end_pct = progress_start_pct + 18.0
+        start_pct = max(12.0, min(85.0, float(progress_start_pct)))
+        probe_end_pct = start_pct + (94.0 - start_pct) * 0.48
+
+        report(
+            start_pct,
+            "核验库表落标状态",
+            f"准备核验 {total_targets} 张库表的字段绑定与落标状态...",
+            0,
+            total_targets,
+        )
 
         def _on_meta_progress(done_cnt: int, tot_cnt: int, cur_s: str, cur_t: str) -> None:
-            pct = progress_start_pct + (probe_end_pct - progress_start_pct) * (
+            pct = start_pct + (probe_end_pct - start_pct) * (
                 min(done_cnt, max(1, tot_cnt)) / max(1, tot_cnt)
             )
             report(
                 pct,
                 "核验库表落标状态",
-                f"正在获取库表结构 ({min(done_cnt + 1, tot_cnt)}/{tot_cnt}): {cur_s}.{cur_t}",
+                f"[{min(done_cnt + 1, tot_cnt)}/{tot_cnt}] 获取库表结构 {cur_s}.{cur_t}...",
                 done_cnt,
                 tot_cnt,
             )
@@ -957,23 +1412,40 @@ class StandardMigratorService:
             "unbound_cols": 0,
         }
         skipped_probe_tables = 0
+        progress_step = 1 if total_targets <= 40 else (5 if total_targets <= 200 else 10)
 
         for idx, (sch, tbl) in enumerate(targets, start=1):
             req_k = (sch.lower(), tbl.lower())
             if req_k in skipped_keys:
                 skipped_probe_tables += 1
+                if idx == total_targets:
+                    report(
+                        96.5,
+                        "核验库表落标状态",
+                        f"[{idx}/{total_targets}] 核验 {sch}.{tbl} 落标状态...",
+                        idx,
+                        total_targets,
+                    )
                 continue
             t_meta = metas_map.get(req_k)
             if t_meta is None:
                 skipped_probe_tables += 1
+                if idx == total_targets:
+                    report(
+                        96.5,
+                        "核验库表落标状态",
+                        f"[{idx}/{total_targets}] 核验 {sch}.{tbl} 落标状态...",
+                        idx,
+                        total_targets,
+                    )
                 continue
 
-            if idx == 1 or idx % 20 == 0 or idx == total_targets:
+            if idx == 1 or idx % progress_step == 0 or idx == total_targets:
                 pct = probe_end_pct + (96.5 - probe_end_pct) * (idx / max(1, total_targets))
                 report(
                     pct,
                     "核验库表落标状态",
-                    f"正在核验表 ({idx}/{total_targets}): {sch}.{tbl}",
+                    f"[{idx}/{total_targets}] 核验 {sch}.{tbl} 落标状态...",
                     idx,
                     total_targets,
                 )

@@ -157,12 +157,15 @@ class SafeConsoleStreamHandler(logging.StreamHandler):
 
 
 class _QuietImportProgressAccessFilter(logging.Filter):
-    """过滤高频导入进度轮询的正常 200 访问日志，防止控制台与日志文件刷屏，保留非 200 异常记录."""
+    """过滤高频任务/导入进度轮询的正常 200 访问日志，防止控制台与日志文件刷屏，保留非 200 异常记录."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             msg = record.getMessage()
-            if "/api/platform/import-progress/" in msg and '" 200' in msg:
+            if (
+                "/api/platform/import-progress/" in msg
+                or "/api/platform/tasks/" in msg
+            ) and '" 200' in msg:
                 return False
         except Exception:
             pass

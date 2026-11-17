@@ -7,10 +7,12 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
+from core.platform.router import extract_task_id
 from modules.data_explorer.schemas import (
     AskExplorerPayload,
     CreateExplorerSessionPayload,
@@ -112,13 +114,24 @@ def api_delete_explorer_session(
 
 
 @router.post("/explore")
-def api_run_ai_exploration(
+async def api_run_ai_exploration(
     payload: AskExplorerPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     svc = DataExplorerService(ctx)
     try:
-        res = svc.ask_and_explore(
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "AI 只读智能探查",
+                detail="正在校验数据源连接与探查沙箱环境...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        res = await run_in_threadpool(
+            svc.ask_and_explore,
             session_id=payload.session_id,
             connection_id=payload.connection_id,
             schema_name=payload.schema_name,
@@ -129,7 +142,22 @@ def api_run_ai_exploration(
             model=payload.model,
             max_steps=payload.max_steps,
             sample_limit=payload.sample_limit,
+            progress_cb=reporter,
+            cancel_check=(lambda: ctx.task_progress.is_cancelled(tid)) if tid else None,
         )
+        asst_msg = res.get("assistant_message") or {}
+        step_cnt = len(asst_msg.get("steps") or [])
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="探查完成",
+                detail=f"已完成 AI 只读探查（共 {step_cnt} 步采样）",
+                warning=str(res.get("warning") or ""),
+                processed=step_cnt,
+                total=step_cnt,
+            )
         return {"ok": True, **res}
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return _err(str(exc), 400)

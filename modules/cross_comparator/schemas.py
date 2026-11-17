@@ -49,3 +49,7 @@ class PushToMigratorPayload(BaseModel):
     format_profile: str = "AUTO"
     source_format_profile: str = "AUTO"
     target_format_profile: str = "AUTO"
+
+
+class PrefetchPairsPayload(BaseModel):
+    max_pairs: int = Field(default=60, ge=1, le=200)

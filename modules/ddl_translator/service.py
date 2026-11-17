@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,6 +18,7 @@ from core.platform.dialects import (
     format_readable_sql_ddl,
     parse_view_sql_lineage,
 )
+from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.llm_hub import extract_json_payload
 from core.platform.models import ColumnMeta, TableMeta
 
@@ -456,6 +458,33 @@ def _parse_simple_create_table_sql(sql_text: str, default_schema: str = "public"
     )
 
 
+def _bind_progress_reporter(progress_cb: Optional[ProgressCallback]) -> ProgressCallback:
+    """兼容 3/4/5 参数进度回调签名，确保与平台 TaskProgressHub 及测试桩无摩擦适配."""
+    cb = progress_cb or noop_progress
+    if cb is noop_progress:
+        return noop_progress
+    try:
+        sig = inspect.signature(cb)
+        params = list(sig.parameters.values())
+        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        pos_count = sum(
+            1
+            for p in params
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+    except (TypeError, ValueError):
+        has_varargs = True
+        pos_count = 5
+
+    if has_varargs or pos_count >= 5:
+        return cb
+    if pos_count == 4:
+        return lambda pct, stg, dtl="", proc=0, _tot=0: cb(pct, stg, dtl, proc)
+    if pos_count == 3:
+        return lambda pct, stg, dtl="", _proc=0, _tot=0: cb(pct, stg, dtl)
+    return cb
+
+
 class DdlTranslatorService:
     """支持智能中文词根命名、跨库建表 DDL 翻译、四层视图血缘穿透与 AI 异构 SQL 方言深度适配."""
 
@@ -587,7 +616,12 @@ class DdlTranslatorService:
     # 功能一：多邻国 · 智能数仓标准命名 (中文表名/字段名 -> 标准英文标识符 + 推荐类型)
     # =========================================================================
 
-    def smart_naming(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def smart_naming(
+        self,
+        payload: Dict[str, Any],
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        report = _bind_progress_reporter(progress_cb)
         raw_lines: List[str] = []
         if isinstance(payload.get("items"), list):
             raw_lines.extend(str(x) for x in payload["items"])
@@ -621,6 +655,14 @@ class DdlTranslatorService:
         provider_id = str(payload.get("provider_id") or "").strip()
         model = str(payload.get("model") or "").strip()
 
+        report(
+            15.0,
+            "词根解析",
+            f"已解析 {len(terms)} 个待命名中文词条，准备匹配数仓标准词根...",
+            0,
+            len(terms),
+        )
+
         results: List[Dict[str, str]] = []
         ai_used = False
         engine_label = "内置数仓词根引擎"
@@ -637,6 +679,13 @@ class DdlTranslatorService:
 
         if use_ai and resolved_llm is not None:
             prof, eff_model = resolved_llm
+            report(
+                45.0,
+                "AI 智能命名",
+                f"正在调用大模型 ({prof.name} · {eff_model}) 语义生成标准英文名...",
+                0,
+                len(terms),
+            )
             abbrev_rule = (
                 "优先采用金融与企业数仓标准词根缩写（如 金额->amt, 余额->bal, 数量/笔数->cnt, 日期->dt, 时间->tm, 编号->no, 标识->id, 代码/编码->cd, 客户->cust, 账户->acct, 机构->org, 交易->txn, 状态->stat_cd, 是否->is_）"
                 if use_abbrev
@@ -723,6 +772,13 @@ class DdlTranslatorService:
         else:
             if use_ai and resolved_llm is None:
                 fallback_reason = "未配置 AI 模型密钥，已由内置数仓标准词根引擎即时生成"
+            report(
+                45.0,
+                "本地词根匹配",
+                f"正在通过内置 170+ 数仓标准词根引擎即时匹配 ({len(terms)} 项)...",
+                0,
+                len(terms),
+            )
             for orig_term in terms:
                 results.append(
                     _translate_single_term_locally(
@@ -735,6 +791,13 @@ class DdlTranslatorService:
                     )
                 )
 
+        report(
+            90.0,
+            "生成标准草稿",
+            f"已完成 {len(results)} 项命名转换，正在生成表结构草稿...",
+            len(results),
+            len(results),
+        )
         ddl_preview = ""
         if granularity == "column" and results:
             draft_meta = TableMeta(
@@ -797,6 +860,7 @@ class DdlTranslatorService:
         provider_id: str,
         model: str,
         is_freeform_sql: bool,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Optional[Dict[str, Any]]:
         resolved = self.ctx.llm_hub.resolve_provider_and_model(
             provider_id=provider_id, model=model, require_ready=False
@@ -804,6 +868,14 @@ class DdlTranslatorService:
         if resolved is None:
             return None
         prof, eff_model = resolved
+        report = _bind_progress_reporter(progress_cb)
+        report(
+            85.0,
+            "AI 语法适配",
+            f"正在调用大模型 ({prof.name} · {eff_model}) 深度适配 {target_dialect} 方言...",
+            0,
+            1,
+        )
 
         task_desc = (
             "将来源 SQL 语句（含异构函数、分析函数、日期处理、CTE、VIEW 或 DML/DDL 语法）精准转译为目标数据库原生可直接执行的等价 SQL。"
@@ -851,7 +923,12 @@ class DdlTranslatorService:
             "elapsed_ms": chat_res.get("elapsed_ms", 0.0),
         }
 
-    def translate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def translate(
+        self,
+        payload: Dict[str, Any],
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        report = _bind_progress_reporter(progress_cb)
         eff_mode = (
             str(payload.get("source_role") or payload.get("source_mode") or "connection")
             .strip()
@@ -883,6 +960,13 @@ class DdlTranslatorService:
             if not view_sql:
                 raise ValueError("请粘贴有效的 SQL、CREATE TABLE 或 CREATE VIEW 语句")
 
+            report(
+                20.0,
+                "提取源对象结构",
+                "正在解析粘贴的 SQL / 视图 / DDL 语句结构...",
+                0,
+                1,
+            )
             parsed_ct = _parse_simple_create_table_sql(view_sql, default_schema=source_schema or "public")
             parsed_v = (
                 None
@@ -935,6 +1019,13 @@ class DdlTranslatorService:
                 else:
                     source_dialect = source_dialect_hint or "VIEW_SQL"
 
+                report(
+                    45.0,
+                    "视图血缘穿透",
+                    f"正在对视图 [{v_sch}.{v_tbl}] 执行四层递归基表血缘穿透...",
+                    0,
+                    1,
+                )
                 meta = enrich_view_columns_by_lineage(
                     meta, fetch_object_fn=probe_fn, max_depth=4
                 )
@@ -950,6 +1041,7 @@ class DdlTranslatorService:
                     provider_id=provider_id,
                     model=model,
                     is_freeform_sql=True,
+                    progress_cb=report,
                 )
                 if ai_only is None:
                     raise ValueError(
@@ -988,6 +1080,13 @@ class DdlTranslatorService:
 
         # 模式 B：基于数据标准清单直接生成任意方言建表 DDL
         elif eff_mode == "standard":
+            report(
+                20.0,
+                "提取源对象结构",
+                "正在从全局数据标准清单提取标准表结构...",
+                0,
+                1,
+            )
             meta = self._build_meta_from_standard(
                 std_table_key=std_table_key or source_table,
                 fallback_schema=source_schema or "public",
@@ -1013,6 +1112,13 @@ class DdlTranslatorService:
             profile = self.ctx.connection_hub.require_profile(conn_id)
             if not source_table:
                 raise ValueError("请输入或选择要读取转换的来源表名/视图名")
+            report(
+                20.0,
+                "提取源对象结构",
+                f"正在从数据源 [{profile.name}] 提取对象 [{source_table}] 元数据...",
+                0,
+                1,
+            )
             meta = self.ctx.metadata_hub.get_table_metadata(
                 conn_id,
                 schema_name=source_schema or profile.default_schema,
@@ -1023,6 +1129,14 @@ class DdlTranslatorService:
             if not meta.exists or not meta.columns:
                 raise ValueError(
                     f"在数据源 [{profile.name}] 中未找到表或视图 [{source_schema or profile.default_schema}.{source_table}]"
+                )
+            if meta.penetrated_base_tables:
+                report(
+                    45.0,
+                    "视图血缘穿透",
+                    f"已完成视图 [{meta.schema_name}.{meta.table_name}] 基表血缘穿透 ({len(meta.penetrated_base_tables)} 张)...",
+                    0,
+                    1,
                 )
             from_live_db = True
             source_dialect = profile.db_type
@@ -1048,6 +1162,13 @@ class DdlTranslatorService:
         if meta.object_type in ("VIEW", "MATVIEW") and not target_table:
             eff_target_table = meta.table_name
 
+        report(
+            70.0,
+            "AST 方言转换",
+            f"正在通过确定性 AST 引擎转换方言 ({source_dialect} → {target_dialect})...",
+            0,
+            1,
+        )
         built = build_dialect_ddl(
             meta,
             source_dialect=source_dialect,
@@ -1074,6 +1195,7 @@ class DdlTranslatorService:
                 provider_id=provider_id,
                 model=model,
                 is_freeform_sql=False,
+                progress_cb=report,
             )
             if refined is not None:
                 final_ddl = refined["target_ddl"]
