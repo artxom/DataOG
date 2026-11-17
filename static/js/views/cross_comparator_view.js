@@ -476,31 +476,46 @@ export class CrossComparatorView {
     }
   }
 
-  _deriveSaveTableKey() {
-    if (this.activeTableKey) return this.activeTableKey;
+  _splitTbl(rawSch, rawTbl) {
     const cleanLow = (v) =>
       String(v || "")
         .trim()
         .replace(/^["'“”‘’`「」『』\s]+|["'“”‘’`「」『』\s]+$/g, "")
         .toLowerCase();
-    const stripTbl = (v) => {
-      const s = cleanLow(v);
-      const dotIdx = s.indexOf(".");
-      return dotIdx !== -1 ? s.slice(dotIdx + 1) : s;
-    };
-    const sTbl = stripTbl(this.draftTableBind.source_table);
-    const tTbl = stripTbl(this.draftTableBind.target_table);
-    const sSch = cleanLow(this.draftTableBind.source_schema);
-    const tSch = cleanLow(this.draftTableBind.target_schema);
+    let sch = cleanLow(rawSch);
+    let tbl = cleanLow(rawTbl);
+    const dotIdx = tbl.lastIndexOf(".");
+    if (dotIdx !== -1) {
+      if (!sch) sch = cleanLow(tbl.slice(0, dotIdx));
+      tbl = cleanLow(tbl.slice(dotIdx + 1));
+    }
+    return [sch, tbl];
+  }
+
+  _deriveSaveTableKey() {
+    if (this.activeTableKey) return this.activeTableKey;
+    const [sSch, sTbl] = this._splitTbl(
+      this.draftTableBind.source_schema,
+      this.draftTableBind.source_table
+    );
+    const [tSch, tTbl] = this._splitTbl(
+      this.draftTableBind.target_schema,
+      this.draftTableBind.target_table
+    );
     const baseKey = tTbl || sTbl;
     if (!baseKey) return "";
 
     const savedTables = this.overview?.tables || [];
-    const isSamePair = (t) =>
-      stripTbl(t.source_table) === sTbl &&
-      stripTbl(t.target_table) === tTbl &&
-      (!sSch || !cleanLow(t.source_schema) || cleanLow(t.source_schema) === sSch) &&
-      (!tSch || !cleanLow(t.target_schema) || cleanLow(t.target_schema) === tSch);
+    const isSamePair = (t) => {
+      const [tsSch, tsTbl] = this._splitTbl(t.source_schema, t.source_table);
+      const [ttSch, ttTbl] = this._splitTbl(t.target_schema, t.target_table);
+      return (
+        tsTbl === sTbl &&
+        ttTbl === tTbl &&
+        (!sSch || !tsSch || tsSch === sSch) &&
+        (!tSch || !ttSch || ttSch === tSch)
+      );
+    };
 
     const exactMatch = savedTables.find(isSamePair);
     if (exactMatch?.std_table_key) {
@@ -538,37 +553,33 @@ export class CrossComparatorView {
       Toast.warn("请先在左侧或右侧选择表名");
       return;
     }
-    const stripTbl = (v) => {
-      const s = String(v || "").trim().toLowerCase();
-      const dotIdx = s.indexOf(".");
-      return dotIdx !== -1 ? s.slice(dotIdx + 1) : s;
-    };
-    const sTbl = stripTbl(source_table);
-    const tTbl = stripTbl(target_table);
-    const sSch = String(source_schema || "").trim().toLowerCase();
-    const tSch = String(target_schema || "").trim().toLowerCase();
-    const schCompat = (qSch, savedSchRaw) => {
-      const savedSch = String(savedSchRaw || "").trim().toLowerCase();
-      return !qSch || !savedSch || savedSch === qSch;
-    };
+    const [sSch, sTbl] = this._splitTbl(source_schema, source_table);
+    const [tSch, tTbl] = this._splitTbl(target_schema, target_table);
+    const schCompat = (qSch, savedSch) => !qSch || !savedSch || savedSch === qSch;
     const savedTables = this.overview?.tables || [];
     let matched = null;
     if (sTbl && tTbl) {
       matched =
-        savedTables.find(
-          (t) =>
-            stripTbl(t.source_table) === sTbl &&
-            stripTbl(t.target_table) === tTbl &&
-            (!sSch || String(t.source_schema || "").trim().toLowerCase() === sSch) &&
-            (!tSch || String(t.target_schema || "").trim().toLowerCase() === tSch)
-        ) ||
-        savedTables.find(
-          (t) =>
-            stripTbl(t.source_table) === sTbl &&
-            stripTbl(t.target_table) === tTbl &&
-            schCompat(sSch, t.source_schema) &&
-            schCompat(tSch, t.target_schema)
-        );
+        savedTables.find((t) => {
+          const [tsSch, tsTbl] = this._splitTbl(t.source_schema, t.source_table);
+          const [ttSch, ttTbl] = this._splitTbl(t.target_schema, t.target_table);
+          return (
+            tsTbl === sTbl &&
+            ttTbl === tTbl &&
+            (!sSch || tsSch === sSch) &&
+            (!tSch || ttSch === tSch)
+          );
+        }) ||
+        savedTables.find((t) => {
+          const [tsSch, tsTbl] = this._splitTbl(t.source_schema, t.source_table);
+          const [ttSch, ttTbl] = this._splitTbl(t.target_schema, t.target_table);
+          return (
+            tsTbl === sTbl &&
+            ttTbl === tTbl &&
+            schCompat(sSch, tsSch) &&
+            schCompat(tSch, ttSch)
+          );
+        });
     }
     this.activeTableKey = "";
     await this.loadOverview(matched?.std_table_key || "", forceRefresh, {
@@ -1251,6 +1262,7 @@ export class CrossComparatorView {
             this.draftTableBind[schKey] = s;
             this.draftTableBind[tblKey] = t;
           } else {
+            this.draftTableBind[schKey] = "";
             this.draftTableBind[tblKey] = v;
           }
           this.previewSelectedTables(false);
@@ -1259,7 +1271,7 @@ export class CrossComparatorView {
       [
         el("option", { value: "", text: tablesList.length ? "选取表/视图..." : "暂无缓存表" }),
         ...tablesList.map((t) => {
-          const fq = `${t.schema_name}.${t.table_name}`;
+          const fq = t.schema_name ? `${t.schema_name}.${t.table_name}` : t.table_name;
           const o = el("option", {
             value: fq,
             text: t.object_type === "VIEW" ? `${fq} (视图)` : fq,

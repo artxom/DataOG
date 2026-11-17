@@ -2521,6 +2521,102 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertEqual(tpl_src_cols, {"cust_id", "raw_extra"})
             self.assertEqual(tpl_tgt_cols, {"tgt_new_a"})
 
+            # 12) 单侧 source_table 查询概览与下载模板不得被同名的 std_table_key 劫持
+            ov_single_src = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust&target_schema=&target_table="
+            )
+            self.assertEqual(ov_single_src.status_code, 200)
+            ov_single_data = ov_single_src.json()
+            self.assertNotEqual(ov_single_data["active_table_key"], "ods_cust")
+            single_src_cols = {
+                c["column_name"]
+                for c in ov_single_data["active_comparison"]["source_panel"]["columns"]
+            }
+            self.assertNotIn("new_col_a", single_src_cols)
+            self.assertEqual(single_src_cols, {"cust_id", "raw_extra"})
+
+            tpl_single_res = client.get(
+                "/api/modules/cross_comparator/pairings/template.xlsx"
+                "?source_schema=main&source_table=ods_cust&target_schema=&target_table="
+            )
+            self.assertEqual(tpl_single_res.status_code, 200)
+            wb_single = openpyxl.load_workbook(io.BytesIO(tpl_single_res.content), data_only=True)
+            ws_single = wb_single["跨环境字段映射"]
+            single_tpl_rows = list(ws_single.iter_rows(min_row=2, values_only=True))
+            single_tpl_src_cols = {str(r[2] or "").strip() for r in single_tpl_rows if r[2]}
+            self.assertNotIn("new_col_a", single_tpl_src_cols)
+            self.assertEqual(single_tpl_src_cols, {"cust_id", "raw_extra"})
+
+            ctx.store.save_table_meta(
+                src_cid,
+                TableMeta(
+                    schema_name="main",
+                    table_name="ods_cust_solo",
+                    columns=[ColumnMeta(1, "solo_col", "TEXT")],
+                ),
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "ods_cust_solo",
+                        "source_schema": "main",
+                        "source_table": "ods_cust_v2",
+                        "target_schema": "main",
+                        "target_table": "ods_cust_solo",
+                        "sync_to_field_bindings": False,
+                        "pairings": [
+                            {
+                                "source_col": "new_col_a",
+                                "target_col": "solo_col",
+                                "source_std_code": "STD001",
+                                "target_std_code": "STD001",
+                            }
+                        ],
+                    },
+                ).status_code,
+                200,
+            )
+            ov_solo = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust_solo&target_schema=&target_table="
+            )
+            self.assertEqual(ov_solo.status_code, 200)
+            ov_solo_data = ov_solo.json()
+            self.assertEqual(ov_solo_data["active_table_key"], "")
+            solo_src_cols = {
+                c["column_name"]
+                for c in ov_solo_data["active_comparison"]["source_panel"]["columns"]
+            }
+            self.assertEqual(solo_src_cols, {"solo_col"})
+
+            tpl_solo_res = client.get(
+                "/api/modules/cross_comparator/pairings/template.xlsx"
+                "?source_schema=main&source_table=ods_cust_solo&target_schema=&target_table="
+            )
+            self.assertEqual(tpl_solo_res.status_code, 200)
+            wb_solo = openpyxl.load_workbook(io.BytesIO(tpl_solo_res.content), data_only=True)
+            ws_solo = wb_solo["跨环境字段映射"]
+            solo_tpl_rows = list(ws_solo.iter_rows(min_row=2, values_only=True))
+            solo_tpl_src_cols = {str(r[2] or "").strip() for r in solo_tpl_rows if r[2]}
+            self.assertEqual(solo_tpl_src_cols, {"solo_col"})
+
+            # 13) 不传独立 schema 时，带点号表名 OTHER_SCH.ODS_CUST -> MAIN.DWD_CUST 仍隔离并正确加载 other_sch.ods_cust 字段
+            ov_dotted = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_table=OTHER_SCH.ODS_CUST&target_table=MAIN.DWD_CUST"
+            )
+            self.assertEqual(ov_dotted.status_code, 200)
+            ov_dot_data = ov_dotted.json()
+            self.assertEqual(ov_dot_data["active_table_key"], "")
+            dot_src_panel = ov_dot_data["active_comparison"]["source_panel"]
+            self.assertEqual(dot_src_panel["schema_name"].lower(), "other_sch")
+            self.assertEqual(
+                {c["column_name"] for c in dot_src_panel["columns"]},
+                {"other_x", "other_y"},
+            )
+
     def test_cross_comparator_five_col_and_header_non_overlap_structure(self) -> None:
         """静态校验 R1 五虚拟列、R2 顶部防遮蔽与 R3 侧边栏标准选择器结构."""
         static_dir = resolve_static_dir()

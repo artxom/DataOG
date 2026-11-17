@@ -196,8 +196,8 @@ class CrossComparatorService:
             for t in tables:
                 if (
                     _clean_tbl_low(t.get("source_table")) == s_tbl
-                    or str(t.get("std_table_key") or "").strip().lower() == s_tbl
-                ) and _sch_compat(s_sch, t.get("source_schema")):
+                    and _sch_compat(s_sch, t.get("source_schema"))
+                ):
                     return str(t["std_table_key"])
         return ""
 
@@ -305,6 +305,26 @@ class CrossComparatorService:
         persist_missing_binding: bool = True,
         load_saved_binding: bool = True,
     ) -> Dict[str, Any]:
+        def _split_override(
+            raw_sch: Optional[str], raw_tbl: Optional[str]
+        ) -> Tuple[Optional[str], Optional[str]]:
+            sch = clean_identifier_input(raw_sch or "") or None
+            tbl_txt = (raw_tbl or "").strip()
+            if "." in tbl_txt:
+                p0, p1 = tbl_txt.split(".", 1)
+                if not sch:
+                    sch = clean_identifier_input(p0) or None
+                tbl_txt = p1
+            tbl = clean_identifier_input(tbl_txt) or None
+            return sch, tbl
+
+        override_source_schema, override_source_table = _split_override(
+            override_source_schema, override_source_table
+        )
+        override_target_schema, override_target_table = _split_override(
+            override_target_schema, override_target_table
+        )
+
         t_bind = (
             self.ctx.store.get_cross_table_binding(std_table_key)
             if load_saved_binding
