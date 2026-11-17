@@ -1565,8 +1565,10 @@ class StandardMigratorService:
         schema_name: str = "",
         tables: str = "",
         scope: str = "",
+        progress_cb: ProgressCallback = noop_progress,
     ) -> bytes:
         """生成「数据标准-表字段对照关系」系统模板（支持空白模板、按选定库表或全库预填真实字段）."""
+        report = progress_cb or noop_progress
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "字段与数据标准对照"
@@ -1603,8 +1605,20 @@ class StandardMigratorService:
                         prof.connection_id
                     )
                     if not cat_tables:
+                        report(
+                            8.0,
+                            "采集全库目录",
+                            f"数据源 [{prof.name}] 目录缓存为空，先触发全库目录采集...",
+                            0,
+                            1,
+                        )
                         try:
-                            catalog = self.ctx.metadata_hub.refresh_catalog(prof.connection_id)
+                            catalog = self.ctx.metadata_hub.refresh_catalog(
+                                prof.connection_id,
+                                progress_cb=lambda pct, stg, msg, cur, tot: report(
+                                    8.0 + 18.0 * (pct / 100.0), stg, msg, cur, tot
+                                ),
+                            )
                             cat_tables = catalog.get("tables") or []
                         except Exception:
                             if not bound_tables:
@@ -1624,16 +1638,32 @@ class StandardMigratorService:
                             targets.append((s_c, t_c))
 
                 if targets:
+                    report(
+                        28.0,
+                        "探查表字段结构",
+                        f"正在读取 {len(targets)} 张库表结构与已绑标准...",
+                        0,
+                        len(targets),
+                    )
                     metas_map, _, _ = self.ctx.metadata_hub.get_tables_metadata_batch(
                         prof.connection_id,
                         targets,
                         force_refresh=False,
                         tolerate_errors=True,
+                        on_progress=lambda done_c, tot_c, cs, ct: report(
+                            28.0 + 52.0 * (min(done_c, max(1, tot_c)) / max(1, tot_c)),
+                            "探查表字段结构",
+                            f"正在读取库表结构 ({min(done_c + 1, tot_c)}/{tot_c}): {cs}.{ct}",
+                            done_c,
+                            tot_c,
+                        ),
                     )
                     lookup_pairs = list(targets)
                     for m_obj in metas_map.values():
                         if m_obj and m_obj.table_name:
                             lookup_pairs.append((m_obj.schema_name, m_obj.table_name))
+                            if (m_obj.schema_name or "").lower() != "public":
+                                lookup_pairs.append(("public", m_obj.table_name))
                     binds_batch = self.ctx.standard_catalog.get_tables_field_bindings_batch(
                         prof.connection_id, lookup_pairs
                     )
@@ -1656,7 +1686,11 @@ class StandardMigratorService:
                         if act_k in seen_actual_tpl_tbls:
                             continue
                         seen_actual_tpl_tbls.add(act_k)
-                        binds = dict(binds_batch.get((sch.lower(), actual_t.lower())) or {})
+                        binds: Dict[str, Dict[str, Any]] = {}
+                        if act_k[0] != "public":
+                            binds.update(binds_batch.get(("public", actual_t.lower())) or {})
+                        if sch.lower() != act_k[0]:
+                            binds.update(binds_batch.get((sch.lower(), actual_t.lower())) or {})
                         binds.update(binds_batch.get(act_k) or {})
                         for col in t_meta.columns:
                             col_clean = clean_identifier_input(col.column_name) or col.column_name
@@ -1675,6 +1709,13 @@ class StandardMigratorService:
                                     s_item.get("cn_name", "") if s_item else "",
                                 ]
                             )
+                    report(
+                        92.0,
+                        "写入预填模板",
+                        f"已聚合 {len(seen_actual_tpl_tbls)} 张表共 {len(prefilled_rows)} 个字段，正在生成 Excel...",
+                        len(seen_actual_tpl_tbls),
+                        len(seen_actual_tpl_tbls),
+                    )
 
         if prefilled_rows:
             for r in prefilled_rows:

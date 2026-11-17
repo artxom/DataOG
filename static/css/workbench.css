@@ -3414,13 +3414,13 @@ dialog::backdrop {
   gap: 8px;
   padding: 8px 10px;
   border-radius: 8px;
-  background: color-mix(in srgb, var(--os-accent) 7%, var(--os-panel-subtle));
+  background: color-mix(in srgb, var(--os-accent) 7%, var(--os-subtle-bg));
   border: 1px solid color-mix(in srgb, var(--os-accent) 20%, var(--os-border));
 }
 
 .export-report-scope-txt {
   font-size: 11.5px;
-  color: var(--os-text-2);
+  color: var(--os-text-secondary);
   line-height: 1.45;
 }
 
@@ -3436,7 +3436,7 @@ dialog::backdrop {
   padding: 11px 12px;
   border-radius: 10px;
   border: 1px solid var(--os-border-strong);
-  background: var(--os-panel);
+  background: var(--os-win-bg);
   color: var(--os-text);
   font-family: inherit;
   cursor: pointer;
@@ -3453,7 +3453,7 @@ dialog::backdrop {
 
 .export-report-opt.is-selected {
   border-color: var(--os-accent);
-  background: color-mix(in srgb, var(--os-accent) 8%, var(--os-panel));
+  background: color-mix(in srgb, var(--os-accent) 8%, var(--os-win-bg));
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--os-accent) 18%, transparent);
 }
 
@@ -3490,14 +3490,14 @@ dialog::backdrop {
 .export-report-radio.is-checked {
   border-color: var(--os-accent);
   background: var(--os-accent);
-  box-shadow: inset 0 0 0 3px var(--os-panel);
+  box-shadow: inset 0 0 0 3px var(--os-win-bg);
 }
 
 .export-report-opt-desc {
   padding-left: 21px;
   font-size: 11.5px;
   line-height: 1.5;
-  color: var(--os-text-2);
+  color: var(--os-text-secondary);
 }
 
 .export-report-secondary {

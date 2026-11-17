@@ -705,7 +705,7 @@ export class StandardMigratorView {
           id: "html",
           title: "离线交互网页报告 (.html)",
           badge: "推荐",
-          badgeTone: "ok",
+          badgeTone: "success",
           icon: "explorer",
           shortExt: ".html",
           ctaLabel: "导出离线网页报告 (.html)",

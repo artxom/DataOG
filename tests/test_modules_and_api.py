@@ -2630,6 +2630,21 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
         with open(os.path.join(static_dir, "js", "views", "standard_migrator_view.js"), "r", encoding="utf-8") as f:
             mig_js = f.read()
 
+        with open(os.path.join(static_dir, "css", "tokens.css"), "r", encoding="utf-8") as f:
+            tokens_css = f.read()
+        with open(os.path.join(static_dir, "js", "ui", "export_report_modal.js"), "r", encoding="utf-8") as f:
+            export_modal_js = f.read()
+
+        # 导出弹窗样式变量必须全部在 tokens.css 中定义，且仅使用 workbench.css 支持的 badge 语义色
+        defined_vars = set(re.findall(r"(--[a-zA-Z0-9_-]+)\s*:", tokens_css + "\n" + css_text))
+        for raw_call in re.findall(r"var\(([^)]+)\)", css_text):
+            if "," not in raw_call:
+                var_name = raw_call.strip()
+                self.assertIn(var_name, defined_vars, f"undefined CSS var without fallback: {var_name}")
+        self.assertNotIn('badgeTone: "ok"', mig_js)
+        self.assertNotIn('badgeTone: "ok"', cross_js)
+        self.assertNotIn('"ok"', export_modal_js)
+
         # R2: .win-titlebar-center 受 z-index 保护，.win-titlebar-right 受 overflow: hidden 约束
         self.assertRegex(css_text, r"\.win-titlebar-center\s*\{[^}]*z-index:\s*2")
         self.assertRegex(css_text, r"\.win-titlebar-right\s*\{[^}]*overflow:\s*hidden")
@@ -3015,28 +3030,43 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 self.assertEqual(len(scripts), 2)
                 dom_probe = (
                     "class Node{}\n"
-                    "function makeNode(tag){const n=new Node();Object.assign(n,{tagName:String(tag).toUpperCase(),children:[],style:{},dataset:{},_ev:{},className:'',type:'',placeholder:'',value:'',hidden:false,appendChild(c){this.children.push(c);return c;},removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);return c;},get firstChild(){return this.children[0]||null;},replaceChildren(...a){this.children=a;},addEventListener(e,f){(this._ev[e]||(this._ev[e]=[])).push(f);},dispatchEvent(ev){if(!ev.target)ev.target=this;(this._ev[ev.type]||[]).forEach(f=>f(ev));},setAttribute(k,v){this[k]=v;},getAttribute(k){return this[k];},querySelector(sel){const c=sel[0]==='.'?sel.slice(1):null;let f=null;const walk=x=>{if(f)return;if(c&&(x.className||'').split(/\\s+/).includes(c)){f=x;return;}(x.children||[]).forEach(walk);};walk(this);return f;},closest(){return null;},focus(){}});return n;}\n"
+                    "function makeNode(tag){const n=new Node();Object.assign(n,{tagName:String(tag).toUpperCase(),children:[],style:{},dataset:{},_ev:{},className:'',type:'',placeholder:'',value:'',hidden:false,appendChild(c){this.children.push(c);return c;},removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);return c;},remove(){},click(){this.dispatchEvent({type:'click'});},get firstChild(){return this.children[0]||null;},replaceChildren(...a){this.children=a;},addEventListener(e,f){(this._ev[e]||(this._ev[e]=[])).push(f);},dispatchEvent(ev){if(!ev.target)ev.target=this;ev.currentTarget=this;(this._ev[ev.type]||[]).forEach(f=>f(ev));},setAttribute(k,v){this[k]=v;},getAttribute(k){return this[k];},querySelector(sel){const c=sel[0]==='.'?sel.slice(1):null;let f=null;const walk=x=>{if(f)return;if(c&&(x.className||'').split(/\\s+/).includes(c)){f=x;return;}(x.children||[]).forEach(walk);};walk(this);return f;},closest(){return null;},focus(){}});return n;}\n"
+                    "const txtOf=n=>(n.textContent||'')+(n.children||[]).map(txtOf).join(' ');\n"
+                    "const findAll=(n,p,o=[])=>{if(p(n))o.push(n);(n.children||[]).forEach(c=>findAll(c,p,o));return o;};\n"
                     "global.Node=Node;\n"
                     "const _els={};const root=makeNode('div');root.id='app-root';_els['app-root']=root;\n"
                     "const dataEl=makeNode('script');dataEl.id='report-data';dataEl.textContent=" + json.dumps(m_json.group(1)) + ";_els['report-data']=dataEl;\n"
                     "global.window={matchMedia:()=>({matches:false})};\n"
                     "global.document={documentElement:makeNode('html'),body:makeNode('body'),createElement:makeNode,createTextNode:t=>Object.assign(new Node(),{nodeType:3,textContent:t}),getElementById:id=>_els[id]||null};\n"
-                    "global.URL={createObjectURL:()=>'blob:0',revokeObjectURL(){}};global.Blob=class{constructor(p){this._b=Buffer.concat(p.map(x=>Buffer.from(x)));}};\n"
+                    "const dlBlobs=[];global.URL={createObjectURL:b=>{dlBlobs.push(b);return 'blob:0';},revokeObjectURL(){}};global.Blob=class{constructor(p){this._b=Buffer.concat(p.map(x=>Buffer.from(x)));}};\n"
                     + scripts[1]
                     + "\nconst inputs=[];const findInputs=x=>{if(x.tagName==='INPUT')inputs.push(x);(x.children||[]).forEach(findInputs);};findInputs(root);\n"
                     + "if(!inputs.length) throw new Error('missing search input');\n"
                     + "const inp=inputs[0];inp.value='cust';inp.dispatchEvent({type:'input'});\n"
                     + "const inputs2=[];const findInputs2=x=>{if(x.tagName==='INPUT')inputs2.push(x);(x.children||[]).forEach(findInputs2);};findInputs2(root);\n"
                     + "if(inputs2[0]!==inp) throw new Error('input recreated on search');\n"
+                    + "const filterBtn=findAll(root,n=>n.tagName==='BUTTON'&&txtOf(n).includes('导出当前筛选'))[0];\n"
+                    + "if(!filterBtn||filterBtn.hidden) throw new Error('overview filter btn should be visible');\n"
+                    + "const qTabBtn=findAll(root,n=>n.tagName==='BUTTON'&&txtOf(n).includes('贯标改造执行清单'))[0];\n"
+                    + "qTabBtn.click();\n"
+                    + "if(!filterBtn.hidden) throw new Error('stale overview filter leaked onto queue tab');\n"
                 )
                 subprocess.run([node_bin, "-e", dom_probe], capture_output=True, text=True, check=True, timeout=10)
 
-            # 全库预填对照模板下载
-            tpl_res = client.get("/api/modules/standard_migrator/bindings/template.xlsx?connection_id=c_single&scope=all")
+            # 全库预填对照模板下载（含 X-Task-Id 进度追踪与 public->main 陈旧绑定回退预填）
+            tpl_res = client.get(
+                "/api/modules/standard_migrator/bindings/template.xlsx?connection_id=c_single&scope=all",
+                headers={"X-Task-Id": "tpl_all_01"},
+            )
             self.assertEqual(tpl_res.status_code, 200)
+            t_tpl = client.get("/api/platform/tasks/tpl_all_01").json()["task"]
+            self.assertEqual(t_tpl["status"], "completed")
             wb_tpl = openpyxl.load_workbook(io.BytesIO(tpl_res.content))
-            tpl_tbls = {r[1] for r in wb_tpl["字段与数据标准对照"].iter_rows(min_row=2, values_only=True)}
+            tpl_rows = list(wb_tpl["字段与数据标准对照"].iter_rows(min_row=2, values_only=True))
+            tpl_tbls = {r[1] for r in tpl_rows}
             self.assertTrue({"t_cust", "t_ord", "t_edge"}.issubset(tpl_tbls))
+            cust_tpl = next(r for r in tpl_rows if r[1] == "t_cust" and r[2] == "cust_id")
+            self.assertEqual(cust_tpl[5], "S_CUST_01")
 
     def test_cross_env_offline_html_single_sheet_excel_and_node_xlsx_roundtrip(self):
         """验证跨环境离线网页/单 Sheet Excel、推荐同名表不触发预比对及网页内嵌 JS 生成合法 .xlsx."""
@@ -3233,6 +3263,8 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                     timeout=10,
                 )
                 js_xlsx_bytes = base64.b64decode(proc.stdout.strip())
+                with zipfile.ZipFile(io.BytesIO(js_xlsx_bytes), "r") as zf_js:
+                    self.assertIsNone(zf_js.testzip())
                 wb_js = openpyxl.load_workbook(io.BytesIO(js_xlsx_bytes))
                 self.assertEqual(wb_js.sheetnames, ["跨环境库级比对报告"])
                 js_vals = list(wb_js.active.iter_rows(min_row=1, values_only=True))
@@ -3242,7 +3274,9 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
 
                 cross_dom_probe = (
                     "class Node{}\n"
-                    "function makeNode(tag){const n=new Node();Object.assign(n,{tagName:String(tag).toUpperCase(),children:[],style:{},dataset:{},_ev:{},className:'',type:'',placeholder:'',value:'',hidden:false,appendChild(c){this.children.push(c);return c;},removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);return c;},get firstChild(){return this.children[0]||null;},replaceChildren(...a){this.children=a;},addEventListener(e,f){(this._ev[e]||(this._ev[e]=[])).push(f);},dispatchEvent(ev){if(!ev.target)ev.target=this;(this._ev[ev.type]||[]).forEach(f=>f(ev));},setAttribute(k,v){this[k]=v;},getAttribute(k){return this[k];},querySelector(sel){const c=sel[0]==='.'?sel.slice(1):null;let f=null;const walk=x=>{if(f)return;if(c&&(x.className||'').split(/\\s+/).includes(c)){f=x;return;}(x.children||[]).forEach(walk);};walk(this);return f;},closest(){return null;},focus(){}});return n;}\n"
+                    "function makeNode(tag){const n=new Node();Object.assign(n,{tagName:String(tag).toUpperCase(),children:[],style:{},dataset:{},_ev:{},className:'',type:'',placeholder:'',value:'',hidden:false,appendChild(c){this.children.push(c);return c;},removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);return c;},remove(){},click(){this.dispatchEvent({type:'click'});},get firstChild(){return this.children[0]||null;},replaceChildren(...a){this.children=a;},addEventListener(e,f){(this._ev[e]||(this._ev[e]=[])).push(f);},dispatchEvent(ev){if(!ev.target)ev.target=this;ev.currentTarget=this;(this._ev[ev.type]||[]).forEach(f=>f(ev));},setAttribute(k,v){this[k]=v;},getAttribute(k){return this[k];},querySelector(sel){const c=sel[0]==='.'?sel.slice(1):null;let f=null;const walk=x=>{if(f)return;if(c&&(x.className||'').split(/\\s+/).includes(c)){f=x;return;}(x.children||[]).forEach(walk);};walk(this);return f;},closest(){return null;},focus(){}});return n;}\n"
+                    "const txtOf=n=>(n.textContent||'')+(n.children||[]).map(txtOf).join(' ');\n"
+                    "const findAll=(n,p,o=[])=>{if(p(n))o.push(n);(n.children||[]).forEach(c=>findAll(c,p,o));return o;};\n"
                     "global.Node=Node;\n"
                     "const _els={};const root=makeNode('div');root.id='app-root';_els['app-root']=root;\n"
                     "const dataEl=makeNode('script');dataEl.id='report-data';dataEl.textContent=" + json.dumps(m_json.group(1)) + ";_els['report-data']=dataEl;\n"
@@ -3255,6 +3289,23 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                     + "const inp=inputs[0];inp.value='saved';inp.dispatchEvent({type:'input'});\n"
                     + "const inputs2=[];const findInputs2=x=>{if(x.tagName==='INPUT')inputs2.push(x);(x.children||[]).forEach(findInputs2);};findInputs2(root);\n"
                     + "if(inputs2[0]!==inp) throw new Error('cross-env input recreated on search');\n"
+                    + "const filterBtn=findAll(root,n=>n.tagName==='BUTTON'&&txtOf(n).includes('导出当前筛选'))[0];\n"
+                    + "if(!filterBtn||filterBtn.hidden) throw new Error('cross pairs filter btn should be visible');\n"
+                    + "const soloTab=findAll(root,n=>n.tagName==='BUTTON'&&txtOf(n).includes('单侧独有表'))[0];\n"
+                    + "soloTab.click();\n"
+                    + "if(!filterBtn.hidden) throw new Error('stale pairs filter leaked onto solo tab');\n"
+                    + "const soloOnlyPayload=JSON.parse(dataEl.textContent);\n"
+                    + "soloOnlyPayload.pairs=[];soloOnlyPayload.recommended_pairings=[];soloOnlyPayload.warnings=['w1'];\n"
+                    + "const root2=makeNode('div');_els['app-root']=root2;dataEl.textContent=JSON.stringify(soloOnlyPayload);\n"
+                )
+                cross_dom_probe += (
+                    app_js
+                    + "\nconst activeTabs=findAll(root2,n=>n.tagName==='BUTTON'&&(n.className||'').includes('is-active'));\n"
+                    + "if(!activeTabs.length||!txtOf(activeTabs[0]).includes('单侧独有表')) throw new Error('expected solo initial tab');\n"
+                    + "const warnTab=findAll(root2,n=>n.tagName==='BUTTON'&&txtOf(n).includes('采集告警'))[0];\n"
+                    + "warnTab.click();\n"
+                    + "const fBtn2=findAll(root2,n=>n.tagName==='BUTTON'&&txtOf(n).includes('导出当前筛选'))[0];\n"
+                    + "if(!fBtn2.hidden) throw new Error('filter btn should be hidden on warnings tab');\n"
                 )
                 subprocess.run([node_bin, "-e", cross_dom_probe], capture_output=True, text=True, check=True, timeout=10)
 

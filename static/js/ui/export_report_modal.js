@@ -77,7 +77,7 @@ export function openExportReportModal({
               svgIcon(opt.icon || "download", 14),
               el("strong", { className: "export-report-opt-title", text: opt.title })
             ),
-            opt.badge ? badge(opt.badge, opt.badgeTone || (active ? "ok" : "neutral")) : null
+            opt.badge ? badge(opt.badge, opt.badgeTone || (active ? "success" : "neutral")) : null
           ),
           el("div", { className: "export-report-opt-desc", text: opt.desc || "" })
         );
