@@ -104,8 +104,8 @@ def build_executable() -> None:
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)
 
-    _install_resilient_rmtree()
     run_pre_build_tests(project_dir)
+    _install_resilient_rmtree()
 
     try:
         import PyInstaller.__main__
