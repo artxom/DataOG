@@ -4,7 +4,7 @@
  * 100% 保留物理列保序重建 (TABLE_REBUILD)、Kahn 拓扑改名、分区继承与多线程批量并发
  */
 
-import { migratorApi, platformApi } from "../core/api.js";
+import { isAbortError, migratorApi, platformApi } from "../core/api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";
@@ -12,8 +12,15 @@ import { DatabaseTree } from "../ui/database_tree.js";
 import { Modal } from "../ui/modal.js";
 import { SqlCodeBox } from "../ui/sql_code_box.js";
 import { openStandardPickerModal } from "../ui/standard_picker_modal.js";
+import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
 import { openUploadWizardModal } from "../ui/upload_wizard_modal.js";
+
+function makeAbortError() {
+  const err = new Error("AbortError");
+  err.name = "AbortError";
+  return err;
+}
 
 const MIG_STATUS_META = {
   COMPLETED: { label: "已达标", tone: "success" },
@@ -100,9 +107,14 @@ export class StandardMigratorView {
     this.mainMount = el("section", { className: "mac-pane", style: { overflow: "hidden" } });
     this.tablistMount = el("div", {});
     this.subbarMount = el("div", {});
+    this.activityBar = new TaskActivityBar();
+    this.activityBar.el.style.margin = "8px 14px 0";
+    this.activityBar.el.style.flexShrink = "0";
     this.gridMount = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
     });
+    this._destroyed = false;
+    clearEl(this.mainMount, this.tablistMount, this.subbarMount, this.activityBar.el, this.gridMount);
 
     this.tree = new DatabaseTree(this.treeMount, {
       selectionMode: "single",
@@ -196,9 +208,23 @@ export class StandardMigratorView {
   }
 
   destroy() {
+    this._destroyed = true;
     this._unsubStore?.();
     this._unsubStore = null;
+    this.activityBar?.destroy();
     this.tree?.destroy();
+  }
+
+  async _runTracked(title, fn, { cancellable = true, exclusive = true } = {}) {
+    return this.activityBar.track(
+      title,
+      async ({ taskId, signal }) => {
+        const res = await fn({ taskId, signal });
+        if (signal?.aborted) throw makeAbortError();
+        return res;
+      },
+      { prefix: "mig", cancellable, exclusive }
+    );
   }
 
   _isRebuildItem(it) {
@@ -359,14 +385,24 @@ export class StandardMigratorView {
       this.render();
       return;
     }
+    const targetLabel = this.activeSchema
+      ? `${this.activeSchema}.${this.activeTable}`
+      : this.activeTable;
     try {
-      const res = await migratorApi.getTableBindings(
-        this.activeConnId,
-        this.activeSchema,
-        this.activeTable,
-        this.formatProfile,
-        forceRefresh
+      const res = await this._runTracked(
+        `核验 ${targetLabel} 落标`,
+        ({ taskId, signal }) =>
+          migratorApi.getTableBindings(
+            this.activeConnId,
+            this.activeSchema,
+            this.activeTable,
+            this.formatProfile,
+            forceRefresh,
+            { taskId, signal }
+          ),
+        { exclusive: true }
       );
+      if (this._destroyed) return;
       this.tableCheck = res;
       if (res.table_stats) this.tableStats = res.table_stats;
       if (res.table) {
@@ -377,6 +413,7 @@ export class StandardMigratorView {
       this.render();
       this.onStateUpdate?.();
     } catch (err) {
+      if (isAbortError(err)) return;
       Toast.error(err.message);
     }
   }
@@ -518,27 +555,38 @@ export class StandardMigratorView {
       Toast.warn("请先选择要检查的数据源");
       return;
     }
+    const targets = this.activeTable
+      ? [{ schema_name: this.activeSchema || "public", table_name: this.activeTable }]
+      : [];
+    const title = this.activeTable
+      ? `检查 ${this.activeSchema || "public"}.${this.activeTable} 落标`
+      : "批量检查已绑表落标";
     try {
-      const targets = this.activeTable
-        ? [{ schema_name: this.activeSchema || "public", table_name: this.activeTable }]
-        : [];
-      const res = await migratorApi.checkCompliance({
-        connection_id: this.activeConnId,
-        tables: targets,
-        format_profile: this.formatProfile,
-        force_refresh: true,
-      });
+      const res = await this._runTracked(title, ({ taskId, signal }) =>
+        migratorApi.checkCompliance(
+          {
+            connection_id: this.activeConnId,
+            tables: targets,
+            format_profile: this.formatProfile,
+            force_refresh: true,
+          },
+          { taskId, signal }
+        )
+      );
+      if (this._destroyed) return;
       if (res.table_stats) this.tableStats = res.table_stats;
       if (res.active_table) {
         this.tableCheck = res.active_table;
       } else if (this.activeTable && res.tables?.length) {
         this.tableCheck = res.tables[0];
       }
-      Toast.success(res.message || "落标检查完成");
+      if (res.warning) Toast.warn(res.warning);
+      else Toast.success(res.message || "落标检查完成");
       this.tree.renderTreeBody();
       this.render();
       this.onStateUpdate?.();
     } catch (err) {
+      if (isAbortError(err)) return;
       Toast.error(err.message);
     }
   }
@@ -548,24 +596,63 @@ export class StandardMigratorView {
       Toast.warn("请先选择数据源");
       return;
     }
+    const title = this.activeTable
+      ? `智能预匹配 ${this.activeTable}`
+      : "智能预匹配数据标准";
     try {
-      const res = await migratorApi.autoMatchBindings({
-        connection_id: this.activeConnId,
-        schema_name: this.activeSchema,
-        table_name: this.activeTable,
-        format_profile: this.formatProfile,
-      });
+      const res = await this._runTracked(title, ({ taskId, signal }) =>
+        migratorApi.autoMatchBindings(
+          {
+            connection_id: this.activeConnId,
+            schema_name: this.activeSchema,
+            table_name: this.activeTable,
+            format_profile: this.formatProfile,
+          },
+          { taskId, signal }
+        )
+      );
+      if (this._destroyed) return;
       if (res.table_stats) this.tableStats = res.table_stats;
       if (res.columns && res.table) {
         this.tableCheck = { ...res, ok: true };
       } else if (this.activeTable) {
         await this.loadTableCompliance(false);
       }
-      Toast.success(res.message || "智能预匹配完成");
+      if (res.warning) Toast.warn(res.warning);
+      else Toast.success(res.message || "智能预匹配完成");
       this.tree.renderTreeBody();
       this.render();
       this.onStateUpdate?.();
     } catch (err) {
+      if (isAbortError(err)) return;
+      Toast.error(err.message);
+    }
+  }
+
+  async runSyncItems() {
+    try {
+      const res = await this._runTracked("实时核验目标库状态", ({ taskId, signal }) =>
+        migratorApi.sync({ taskId, signal })
+      );
+      if (this._destroyed) return;
+      this._applyStateResponse(res);
+    } catch (err) {
+      if (isAbortError(err)) return;
+      Toast.error(err.message);
+    }
+  }
+
+  async executeSingleItem(itemRow) {
+    if (!itemRow?.id) return;
+    const label = `${itemRow.schema_name}.${itemRow.table_name}.${itemRow.old_col_name || itemRow.new_col_name || itemRow.id}`;
+    try {
+      const res = await this._runTracked(`执行单字段贯标 · ${label}`, ({ taskId, signal }) =>
+        migratorApi.executeSingle(itemRow.id, { taskId, signal })
+      );
+      if (this._destroyed) return;
+      this._applyStateResponse(res);
+    } catch (err) {
+      if (isAbortError(err)) return;
       Toast.error(err.message);
     }
   }
@@ -613,13 +700,16 @@ export class StandardMigratorView {
           this._syncFormatFromConnection(cid);
           try {
             if (this.subMode === "queue") {
-              const res = await migratorApi.bindConnection(cid, true);
-              this._applyStateResponse(res);
+              const res = await this._runTracked("绑定并同步数据源", ({ taskId, signal }) =>
+                migratorApi.bindConnection(cid, true, { taskId, signal })
+              );
+              if (!this._destroyed) this._applyStateResponse(res);
             } else {
               await this.tree.setActiveConnection(cid, { expand: true });
               await this.loadBindingsOverview();
             }
           } catch (err) {
+            if (isAbortError(err)) return;
             Toast.error(err.message);
           }
         },
@@ -657,14 +747,7 @@ export class StandardMigratorView {
           type: "button",
           className: "mac-btn mac-btn-sm",
           text: "实时核验",
-          onClick: async () => {
-            try {
-              const res = await migratorApi.sync();
-              this._applyStateResponse(res);
-            } catch (err) {
-              Toast.error(err.message);
-            }
-          },
+          onClick: () => this.runSyncItems(),
         }),
         el("button", {
           type: "button",
@@ -721,14 +804,21 @@ export class StandardMigratorView {
     });
     if (!ok) return;
     try {
-      const res = await migratorApi.executeBatch({
-        item_ids: ids,
-        max_workers: this.maxWorkers,
-        keep_backup: this.keepBackup,
-      });
+      const res = await this._runTracked(`批量并发贯标 (${ids.length} 项)`, ({ taskId, signal }) =>
+        migratorApi.executeBatch(
+          {
+            item_ids: ids,
+            max_workers: this.maxWorkers,
+            keep_backup: this.keepBackup,
+          },
+          { taskId, signal }
+        )
+      );
+      if (this._destroyed) return;
       this.selectedIds.clear();
       this._applyStateResponse(res);
     } catch (err) {
+      if (isAbortError(err)) return;
       Toast.error(err.message);
     }
   }
@@ -767,15 +857,22 @@ export class StandardMigratorView {
       onClick: async () => {
         try {
           okBtn.disabled = true;
-          const res = await migratorApi.loadFromDb({
-            connection_id: this.ws?.active_connection_id || this.activeConnId || null,
-            schema_name: schemaInput.value.trim(),
-            table_name: tableInput.value.trim(),
-            max_tables: Number(maxInput.value) || 30,
-          });
+          const res = await this._runTracked("从数据库载入表结构", ({ taskId, signal }) =>
+            migratorApi.loadFromDb(
+              {
+                connection_id: this.ws?.active_connection_id || this.activeConnId || null,
+                schema_name: schemaInput.value.trim(),
+                table_name: tableInput.value.trim(),
+                max_tables: Number(maxInput.value) || 30,
+              },
+              { taskId, signal }
+            )
+          );
+          if (this._destroyed) return;
           Modal.close("ok");
           this._applyStateResponse(res);
         } catch (err) {
+          if (isAbortError(err)) return;
           Toast.error(err.message);
         } finally {
           okBtn.disabled = false;
@@ -840,14 +937,23 @@ export class StandardMigratorView {
         onClick: async () => {
           try {
             execBtn.disabled = true;
-            const res = await migratorApi.executeRebuild({
-              schema_name: schemaName,
-              table_name: tableName,
-              keep_backup: this.keepBackup,
-            });
+            const res = await this._runTracked(
+              `整表保序重建 · ${schemaName}.${tableName}`,
+              ({ taskId, signal }) =>
+                migratorApi.executeRebuild(
+                  {
+                    schema_name: schemaName,
+                    table_name: tableName,
+                    keep_backup: this.keepBackup,
+                  },
+                  { taskId, signal }
+                )
+            );
+            if (this._destroyed) return;
             Modal.close("done");
             this._applyStateResponse(res);
           } catch (err) {
+            if (isAbortError(err)) return;
             Toast.error(err.message);
           } finally {
             execBtn.disabled = false;
@@ -976,8 +1082,23 @@ export class StandardMigratorView {
       this._renderQueueView();
     }
 
-    clearEl(this.mainMount, this.tablistMount, this.subbarMount, this.gridMount);
-    clearEl(this.root, this.sidebarMount, this.mainMount);
+    const mainChildren = this.mainMount.children;
+    if (
+      mainChildren.length !== 4 ||
+      mainChildren[0] !== this.tablistMount ||
+      mainChildren[1] !== this.subbarMount ||
+      mainChildren[2] !== this.activityBar.el ||
+      mainChildren[3] !== this.gridMount
+    ) {
+      clearEl(this.mainMount, this.tablistMount, this.subbarMount, this.activityBar.el, this.gridMount);
+    }
+    if (
+      this.root.children.length !== 2 ||
+      this.root.children[0] !== this.sidebarMount ||
+      this.root.children[1] !== this.mainMount
+    ) {
+      clearEl(this.root, this.sidebarMount, this.mainMount);
+    }
   }
 
   _renderBindingsView() {
@@ -1377,12 +1498,7 @@ export class StandardMigratorView {
                     await this.openRebuildPreviewModal(r.schema_name, r.table_name);
                     return;
                   }
-                  try {
-                    const res = await migratorApi.executeSingle(r.id);
-                    this._applyStateResponse(res);
-                  } catch (err) {
-                    Toast.error(err.message);
-                  }
+                  await this.executeSingleItem(r);
                 },
               }),
               el("button", {

@@ -24,6 +24,7 @@ from core.platform.dialects import (
 )
 from core.platform.driver_manager import JdbcConnectionAdapter
 from core.platform.excel_io import export_tabular_csv_bytes, export_tabular_xlsx_bytes
+from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.inceptor_client import InceptorThriftClient
 from core.platform.models import ConnectionProfile, QueryColumn, QueryResult
 from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
@@ -116,6 +117,7 @@ class QueryEngine:
         *,
         limit: int = DEFAULT_QUERY_LIMIT,
         timeout_sec: int = 30,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> QueryResult:
         clean_sql = (sql or "").strip()
         if not clean_sql:
@@ -125,8 +127,22 @@ class QueryEngine:
         profile = self.connection_hub.require_profile(connection_id)
 
         t0 = time.perf_counter()
+        progress_cb(
+            18,
+            "连接数据源",
+            f"正在建立到 {profile.name} ({profile.db_type}) 的查询会话...",
+            0,
+            1,
+        )
         try:
             with self.connection_hub.session(connection_id, timeout_sec=min(15, safe_timeout)) as conn:
+                progress_cb(
+                    45,
+                    "执行 SQL 查询",
+                    f"正在执行 SQL（上限 {safe_limit} 行 / 超时 {safe_timeout}s）...",
+                    0,
+                    1,
+                )
                 if isinstance(conn, InceptorThriftClient):
                     cols_meta, raw_rows, truncated = conn.execute_query_with_meta(
                         clean_sql, max_rows=safe_limit
@@ -163,6 +179,13 @@ class QueryEngine:
             raise
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        progress_cb(
+            88,
+            "封装结果集",
+            f"已获取 {len(rows)} 行结果，正在整理返回...",
+            len(rows),
+            len(rows),
+        )
         if q_cols:
             msg = (
                 f"查询完成：返回 {len(rows)} 行"
@@ -198,6 +221,7 @@ class QueryEngine:
         table_name: str,
         *,
         limit: int = 200,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> QueryResult:
         profile = self.connection_hub.require_profile(connection_id)
         safe_limit = self.clamp_limit(limit)
@@ -223,7 +247,12 @@ class QueryEngine:
             display_sql = f"SELECT * FROM {target_ref} LIMIT {safe_limit}"
             probe_sql = f"SELECT * FROM {target_ref} LIMIT {safe_limit + 1}"
 
-        res = self.execute_sql(connection_id, probe_sql, limit=safe_limit)
+        res = self.execute_sql(
+            connection_id,
+            probe_sql,
+            limit=safe_limit,
+            progress_cb=progress_cb,
+        )
         res.sql = display_sql
         return res
 

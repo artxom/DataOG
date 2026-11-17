@@ -3045,3 +3045,358 @@ dialog::backdrop {
   color: var(--os-accent);
   background: var(--os-select);
 }
+
+/* =========================================================================
+   14. 全局轻量实时任务活动条 (TaskActivityBar)
+   ========================================================================= */
+
+.task-activity-bar {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: 9px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-drawer-bg);
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  overflow: visible;
+  z-index: 35;
+  transition: border-color 0.18s ease, background-color 0.18s ease;
+}
+
+.task-activity-bar [hidden] {
+  display: none !important;
+}
+
+.task-activity-bar.is-hidden {
+  display: none;
+}
+
+.task-activity-bar.is-compact {
+  border-radius: 7px;
+}
+
+.task-activity-bar.is-done {
+  border-color: color-mix(in srgb, var(--status-success) 42%, var(--os-border));
+}
+
+.task-activity-bar.is-warn {
+  border-color: color-mix(in srgb, var(--status-warn) 48%, var(--os-border));
+  background: color-mix(in srgb, var(--status-warn) 8%, var(--os-drawer-bg));
+}
+
+.task-activity-bar.is-error {
+  border-color: color-mix(in srgb, var(--status-danger) 52%, var(--os-border));
+  background: color-mix(in srgb, var(--status-danger) 7%, var(--os-drawer-bg));
+}
+
+.task-activity-track {
+  width: 100%;
+  height: 2px;
+  border-radius: 9px 9px 0 0;
+  background: color-mix(in srgb, var(--os-seg-track) 75%, transparent);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.task-activity-bar.is-compact .task-activity-track {
+  border-radius: 7px 7px 0 0;
+}
+
+.task-activity-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(
+    90deg,
+    var(--os-accent) 0%,
+    color-mix(in srgb, var(--os-accent) 72%, #ffffff) 50%,
+    var(--os-accent) 100%
+  );
+  background-size: 200% 100%;
+  transition: width 0.22s cubic-bezier(0.22, 1, 0.36, 1), background-color 0.18s ease;
+  animation: upload-bar-sheen 1.4s linear infinite;
+}
+
+.task-activity-bar.is-done .task-activity-fill {
+  background: var(--status-success);
+  animation: none;
+}
+
+.task-activity-bar.is-warn .task-activity-fill {
+  background: var(--status-warn);
+  animation: none;
+}
+
+.task-activity-bar.is-error .task-activity-fill {
+  background: var(--status-danger);
+  animation: none;
+}
+
+.task-activity-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  min-height: 31px;
+  min-width: 0;
+}
+
+.task-activity-bar.is-compact .task-activity-body {
+  padding: 4px 8px;
+  gap: 6px;
+  min-height: 26px;
+}
+
+.task-activity-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  flex-shrink: 0;
+  background: var(--os-accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--os-accent) 45%, transparent);
+  animation: taskPulse 1.5s ease-in-out infinite;
+}
+
+.task-activity-bar.is-done .task-activity-pulse {
+  background: var(--status-success);
+  box-shadow: none;
+  animation: none;
+}
+
+.task-activity-bar.is-warn .task-activity-pulse {
+  background: var(--status-warn);
+  box-shadow: none;
+  animation: none;
+}
+
+.task-activity-bar.is-error .task-activity-pulse {
+  background: var(--status-danger);
+  box-shadow: none;
+  animation: none;
+}
+
+.task-activity-stage {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--os-text);
+  white-space: nowrap;
+  flex-shrink: 0;
+  max-width: 34%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-activity-bar.is-compact .task-activity-stage {
+  font-size: 11px;
+}
+
+.task-activity-ticker {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11.5px;
+  color: var(--os-text-secondary);
+  display: flex;
+  align-items: center;
+}
+
+.task-activity-bar.is-compact .task-activity-ticker {
+  font-size: 11px;
+}
+
+.task-activity-bar.is-error .task-activity-ticker {
+  color: var(--status-danger);
+}
+
+.task-activity-bar.is-warn .task-activity-ticker {
+  color: color-mix(in srgb, var(--status-warn) 85%, var(--os-text));
+}
+
+.task-activity-ticker-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: taskTickerIn 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.task-activity-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.task-activity-timer {
+  display: inline-flex;
+  align-items: center;
+  height: 19px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  background: var(--os-seg-track);
+  color: var(--os-text-secondary);
+  white-space: nowrap;
+}
+
+.task-activity-bar.is-compact .task-activity-timer {
+  height: 17px;
+  padding: 0 5px;
+  font-size: 10px;
+}
+
+.task-activity-cancel-btn {
+  color: var(--status-danger);
+  border-color: color-mix(in srgb, var(--status-danger) 30%, var(--os-border));
+}
+
+.task-activity-cancel-btn:hover {
+  background: color-mix(in srgb, var(--status-danger) 10%, transparent);
+}
+
+.task-activity-dismiss-btn {
+  width: 20px;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--os-muted);
+}
+
+.task-activity-dismiss-btn:hover {
+  color: var(--os-text);
+}
+
+.task-activity-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: min(560px, 100%);
+  min-width: min(320px, 100%);
+  max-height: 260px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 10px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-drawer-bg);
+  backdrop-filter: blur(22px) saturate(185%);
+  -webkit-backdrop-filter: blur(22px) saturate(185%);
+  box-shadow: 0 14px 36px rgba(15, 23, 42, 0.18), 0 0 0 0.5px var(--os-border);
+  z-index: 65;
+  overflow: hidden;
+}
+
+.task-activity-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--os-border);
+  background: color-mix(in srgb, var(--os-toolbar-bg) 70%, transparent);
+  flex-shrink: 0;
+}
+
+.task-activity-popover-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--os-text-secondary);
+}
+
+.task-activity-log-list {
+  overflow-y: auto;
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-activity-log-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  min-width: 0;
+  transition: background 0.12s ease;
+}
+
+.task-activity-log-row:hover {
+  background: var(--os-hover);
+}
+
+.task-activity-log-dot {
+  flex-shrink: 0;
+}
+
+.task-activity-log-elapsed {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--os-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+  min-width: 40px;
+}
+
+.task-activity-log-stage {
+  flex-shrink: 0;
+  height: 17px;
+  font-size: 10px;
+  padding: 0 5px;
+}
+
+.task-activity-log-summary {
+  flex: 1;
+  min-width: 0;
+  color: var(--os-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-activity-log-empty {
+  padding: 12px 8px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--os-muted);
+}
+
+@keyframes taskPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--os-accent) 45%, transparent);
+  }
+  50% {
+    transform: scale(1.16);
+    opacity: 0.78;
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--os-accent) 0%, transparent);
+  }
+}
+
+@keyframes taskTickerIn {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .task-activity-pulse,
+  .task-activity-fill,
+  .task-activity-ticker-text {
+    animation: none;
+  }
+}

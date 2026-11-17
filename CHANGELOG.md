@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+### Added
+- **全平台实时任务进度条与间断缩略微日志底座 (`core/platform/import_progress.py`, `core/platform/router.py`, `static/js/ui/task_activity_bar.js`, `static/css/workbench.css`)**：
+  - 将 `ImportProgressHub` 升级为通用 `TaskProgressHub`（向下兼容 `/import-progress/*`），新增 `threading.Condition` 实时变更唤醒、单调 `seq` 增量追踪、凭据脱敏与 `<=64` 字截断的 `0.35s` 节流 `recent_logs`（最多保留 8 条）及 `cancel()`/`is_cancelled()` 协作取消支持；新增 `/api/platform/tasks/{task_id}`、`/api/platform/tasks/{task_id}/cancel` 与原生 `StreamingResponse` SSE 流 `/api/platform/tasks/{task_id}/stream`。
+  - 新增 macOS 毛玻璃内联活动条公共组件 `TaskActivityBar`（`180ms` 防闪烁静默宽限期、`2px` 顶部渐变进度条、`120ms` 渐进计时与平滑爬升、`EventSource` 主通道 + `250ms` 轮询自动兜底、单行翻页缩略微日志及可折叠 `步骤 (N) ▾` 气泡），覆盖跨环境比对切表/预览/保存/推送、左树刷新/表展开、第 2 步单表核验/批量检查/贯标执行、SQL 执行/预览、AI 多步只读探查与多邻国智能命名/方言翻译，并全面支持 `AbortController` 抢占取消防竞态。
+- **跨环境比对轻量切表、双库并发探查与后台预热 (`modules/cross_comparator/`, `static/js/views/cross_comparator_view.js`)**：
+  - 新增 `GET /api/modules/cross_comparator/compare-pair` 轻量单表对接口（剥离全库目录树与全量表结构扫描，配合 `count_cross_columns()`）与 `POST /api/modules/cross_comparator/prefetch-pairs` 后台单会话批量预热接口；`compare_single_table` 支持源/目标双库 `ThreadPoolExecutor` 并发探查。
+
+### Changed
+- **元数据探查 60 秒温连接池、120 秒负缓存与单连接四层视图穿透 (`core/platform/connection_hub.py`, `core/platform/metadata_hub.py`)**：
+  - 新增 `ConnectionHub.probe_session`（非 SQLite 数据源空闲 `60s` 温连接复用、退出自动 `rollback()`、异常自动剔除并销毁、`save_profile`/`delete_profile` 失效清理，严格隔离 `readonly_session` 零复用；SQLite 默认直连免锁文件句柄）。
+  - `MetadataHub` 新增 `120s` 不存在表内存负缓存（强制刷新时立即失效）与 `_shared_conn` 单连接四层递归视图血缘穿透复用，消除连续切表与多层视图的重复握手耗时。
+- 在 [app.py](file:///Users/artxom/code/DataOG/app.py) 访问日志过滤器中同步静默 `/api/platform/tasks/*` 正常 `200` 轮询；扩充聚焦单测至 **40 项**。
+
 ---
 
 ## [2.4.0] - 2026-11-17

@@ -12,13 +12,15 @@
 from __future__ import annotations
 
 import datetime
+import inspect
 import json
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.platform.context import PlatformContext
+from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.llm_hub import extract_json_payload
 from core.platform.models import ConnectionProfile, TableMeta
 from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
@@ -58,6 +60,33 @@ _SENSITIVE_KV_RE = re.compile(
 
 def _now_str() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _bind_progress_reporter(progress_cb: Optional[ProgressCallback]) -> ProgressCallback:
+    """兼容 3/4/5 参数进度回调签名，避免测试桩参数个数不一致抛出 TypeError."""
+    cb = progress_cb or noop_progress
+    if cb is noop_progress:
+        return noop_progress
+    try:
+        sig = inspect.signature(cb)
+        params = list(sig.parameters.values())
+        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        pos_count = sum(
+            1
+            for p in params
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        )
+    except (TypeError, ValueError):
+        has_varargs = True
+        pos_count = 5
+
+    if has_varargs or pos_count >= 5:
+        return cb
+    if pos_count == 4:
+        return lambda pct, stg, dtl="", proc=0, _tot=0: cb(pct, stg, dtl, proc)
+    if pos_count == 3:
+        return lambda pct, stg, dtl="", _proc=0, _tot=0: cb(pct, stg, dtl)
+    return cb
 
 
 def _sanitize_error_text(raw_err: Any, secret_values: Optional[List[str]] = None) -> str:
@@ -667,11 +696,20 @@ class DataExplorerService:
         model: str = "",
         max_steps: int = 5,
         sample_limit: int = 100,
+        progress_cb: ProgressCallback = noop_progress,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         clean_prompt = (prompt or "").strip()
         if not clean_prompt:
             raise ValueError("请输入要探查的目标或问题")
 
+        report = _bind_progress_reporter(progress_cb)
+
+        def _check_cancelled() -> None:
+            if cancel_check is not None and cancel_check():
+                raise RuntimeError("探查任务已取消")
+
+        _check_cancelled()
         profile = self.ctx.connection_hub.require_profile(connection_id)
         resolved = self.ctx.llm_hub.resolve_provider_and_model(
             provider_id=provider_id, model=model, require_ready=True
@@ -721,6 +759,14 @@ class DataExplorerService:
                 )
 
         # 2. 组装元数据上下文与历史轮次摘要
+        _check_cancelled()
+        report(
+            10.0,
+            "加载元数据",
+            f"正在收集焦点表结构与方言信息 ({len(clean_focus)} 张)...",
+            0,
+            safe_max_steps,
+        )
         meta_context = self._build_metadata_context(
             profile, eff_schema, clean_focus, clean_prompt
         )
@@ -759,8 +805,18 @@ class DataExplorerService:
         secrets_to_mask = [s for s in (profile.password, llm_prof.api_key) if s]
 
         for step_no in range(1, safe_max_steps + 1):
+            _check_cancelled()
             if (time.perf_counter() - t_start) > LOOP_WALLCLOCK_BUDGET_SEC:
                 break
+
+            pct = 15 + int((step_no - 1) / max(1, safe_max_steps) * 70)
+            report(
+                pct,
+                f"AI 规划 {step_no}/{safe_max_steps}",
+                "正在请求大模型规划只读探查 SQL...",
+                step_no - 1,
+                safe_max_steps,
+            )
 
             chat_res = self.ctx.llm_hub.chat_completion(
                 messages=llm_messages,
@@ -769,11 +825,19 @@ class DataExplorerService:
                 temperature=0.1,
                 timeout_sec=40.0,
             )
+            _check_cancelled()
             raw_reply = str(chat_res.get("content") or "")
             decision = self._parse_agent_decision(raw_reply)
             action = str(decision.get("action") or "").strip().lower()
 
             if action == "conclude" or (action != "query" and not decision.get("sql")):
+                report(
+                    92.0,
+                    "生成结论",
+                    "正在整理最终探查结论与复核 SQL...",
+                    len(executed_steps),
+                    safe_max_steps,
+                )
                 final_summary = str(
                     decision.get("summary") or decision.get("conclusion") or raw_reply
                 ).strip()
@@ -787,6 +851,13 @@ class DataExplorerService:
                             cand_rec, db_type=profile.db_type
                         )
                     except ReadOnlyViolationError:
+                        report(
+                            94.0,
+                            "只读拦截保护",
+                            "已剥离不合规推荐 SQL 并回退至安全只读语句",
+                            len(executed_steps),
+                            safe_max_steps,
+                        )
                         final_rec_sql = ""
                 concluded = True
                 break
@@ -818,6 +889,21 @@ class DataExplorerService:
                 continue
             seen_sqls.add(norm_sql_key)
 
+            _check_cancelled()
+            raw_purpose = str(decision.get("purpose") or "").strip()[:44]
+            sample_detail = (
+                f"执行只读采样 SQL · {raw_purpose}"
+                if raw_purpose
+                else "执行只读采样 SQL..."
+            )
+            report(
+                min(88, pct + 5),
+                f"只读采样 {step_no}/{safe_max_steps}",
+                sample_detail,
+                step_no - 1,
+                safe_max_steps,
+            )
+
             step_t0 = time.perf_counter()
             try:
                 q_res = self.ctx.query_engine.execute_readonly_sql(
@@ -839,6 +925,13 @@ class DataExplorerService:
                     "elapsed_ms": round(q_res.elapsed_ms, 1),
                     "error": "",
                 }
+                report(
+                    min(90, pct + 10),
+                    f"分析采样结果 {step_no}/{safe_max_steps}",
+                    f"采样完成 (返回 {q_res.row_count} 行)，汇总分析...",
+                    step_no,
+                    safe_max_steps,
+                )
             except ReadOnlyViolationError as vio_exc:
                 elapsed = round((time.perf_counter() - step_t0) * 1000.0, 1)
                 step_record = {
@@ -853,6 +946,13 @@ class DataExplorerService:
                     "elapsed_ms": elapsed,
                     "error": str(vio_exc),
                 }
+                report(
+                    min(90, pct + 10),
+                    "只读拦截保护",
+                    f"第 {step_no} 步非只读 SQL 已被沙箱阻断，要求 AI 修正...",
+                    step_no,
+                    safe_max_steps,
+                )
             except Exception as sql_exc:
                 elapsed = round((time.perf_counter() - step_t0) * 1000.0, 1)
                 step_record = {
@@ -867,6 +967,13 @@ class DataExplorerService:
                     "elapsed_ms": elapsed,
                     "error": _sanitize_error_text(sql_exc, secrets_to_mask),
                 }
+                report(
+                    min(90, pct + 10),
+                    f"分析采样结果 {step_no}/{safe_max_steps}",
+                    f"第 {step_no} 步采样 SQL 执行异常，通知 AI 自动修正...",
+                    step_no,
+                    safe_max_steps,
+                )
 
             executed_steps.append(step_record)
             obs_text = self._format_step_observation_for_llm(step_record)
@@ -874,6 +981,14 @@ class DataExplorerService:
 
         # 4. 若触达步数或墙钟熔断阈值仍未 conclude，发起一次强制收敛总结
         if not concluded:
+            _check_cancelled()
+            report(
+                92.0,
+                "生成结论",
+                "已达采样步数上限，正在汇总采样结果生成最终结论...",
+                len(executed_steps),
+                safe_max_steps,
+            )
             llm_messages.append(
                 {
                     "role": "user",
@@ -908,6 +1023,13 @@ class DataExplorerService:
                             cand_rec, db_type=profile.db_type
                         )
                     except ReadOnlyViolationError:
+                        report(
+                            95.0,
+                            "只读拦截保护",
+                            "已剥离不合规推荐 SQL 并回退至安全只读语句",
+                            len(executed_steps),
+                            safe_max_steps,
+                        )
                         final_rec_sql = ""
             except Exception as synth_exc:
                 ok_cnt = sum(1 for s in executed_steps if s["status"] == "ok")
@@ -931,6 +1053,7 @@ class DataExplorerService:
         now = _now_str()
 
         # 5. 原子持久化本轮用户提问与 AI 探查轨迹/结论
+        _check_cancelled()
         with self.ctx.store.module_db() as conn:
             conn.execute(
                 """
@@ -996,6 +1119,13 @@ class DataExplorerService:
             f"完成第 {next_turn_idx} 轮只读探查（共 {len(executed_steps)} 步采样，模型 {eff_model}，耗时 {total_elapsed_ms} ms）",
         )
 
+        report(
+            98.0,
+            "生成结论",
+            f"探查结论已生成并保存（共 {len(executed_steps)} 步只读采样）",
+            len(executed_steps),
+            safe_max_steps,
+        )
         detail = self.get_session_detail(eff_session_id)
         return {
             "session": detail,

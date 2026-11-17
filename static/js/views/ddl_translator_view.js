@@ -5,12 +5,13 @@
  * 2. 方言翻译 — 跨数据库建表 DDL 互译、四层递归视图血缘穿透与 AI 异构 SQL 语法深度适配
  */
 
-import { ddlApi } from "../core/api.js";
+import { ddlApi, isAbortError } from "../core/api.js";
 import { badge, clearEl, copyText, downloadBlob, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";
 import { Modal } from "../ui/modal.js";
 import { ObjectPicker } from "../ui/object_picker.js";
+import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
 
 const SAMPLE_NAMING_COLUMN = [
@@ -128,6 +129,10 @@ export class PolyglotView {
       },
     });
 
+    this.activityBar = new TaskActivityBar();
+    this.activityBar.el.style.margin = "6px 12px";
+    this.activityBar.el.style.flexShrink = "0";
+
     this.root = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
     });
@@ -144,6 +149,7 @@ export class PolyglotView {
   }
 
   destroy() {
+    this.activityBar?.destroy();
     this._unsub?.();
   }
 
@@ -362,22 +368,37 @@ export class PolyglotView {
     this.busy = true;
     this.refreshHeader?.();
     try {
-      const res = await ddlApi.smartNaming({
-        text: raw,
-        granularity: this.namingGranularity,
-        naming_style: this.namingStyle,
-        table_prefix: this.tablePrefix,
-        use_abbrev: this.useAbbrev,
-        target_dialect: this.namingDialect,
-        use_ai: useAi,
-        provider_id: providerId,
-        model,
-      });
+      const res = await this.activityBar.track(
+        "智能标准命名",
+        async ({ taskId, signal }) => {
+          const out = await ddlApi.smartNaming(
+            {
+              text: raw,
+              granularity: this.namingGranularity,
+              naming_style: this.namingStyle,
+              table_prefix: this.tablePrefix,
+              use_abbrev: this.useAbbrev,
+              target_dialect: this.namingDialect,
+              use_ai: useAi,
+              provider_id: providerId,
+              model,
+            },
+            { taskId, signal }
+          );
+          return {
+            ...out,
+            message: `已完成 ${(out?.items || []).length} 项标准命名`,
+          };
+        },
+        { prefix: "nmg" }
+      );
       this.namingResult = res;
       this.render();
       this.refreshHeader?.();
     } catch (err) {
-      Toast.error(err.message);
+      if (!isAbortError(err)) {
+        Toast.error(err.message);
+      }
     } finally {
       this.busy = false;
       this.refreshHeader?.();
@@ -407,30 +428,45 @@ export class PolyglotView {
     this.busy = true;
     this.refreshHeader?.();
     try {
-      const res = await ddlApi.translate({
-        source_mode: this.sourceMode,
-        connection_id: this.sourceMode === "connection" ? this.connectionId : "",
-        probe_connection_id: this.sourceMode === "sql_text" ? this.probeConnectionId : "",
-        source_schema: this.sourceSchema,
-        source_table: this.sourceTable,
-        source_dialect_hint: this.sourceDialectHint,
-        std_table_key: this.stdTableKey,
-        apply_standard_mapping: this.applyStandardMapping,
-        sql_text: this.sourceMode === "sql_text" ? this.sqlText : "",
-        view_sql: this.sourceMode === "sql_text" ? this.sqlText : "",
-        target_dialect: this.targetDialect,
-        storage_mode: this.storageMode,
-        target_schema: this.targetSchema,
-        target_table: this.targetTable,
-        ai_assist: effAiAssist,
-        provider_id: providerId,
-        model,
-      });
+      const res = await this.activityBar.track(
+        `跨方言翻译 → ${this.targetDialect}`,
+        async ({ taskId, signal }) => {
+          const out = await ddlApi.translate(
+            {
+              source_mode: this.sourceMode,
+              connection_id: this.sourceMode === "connection" ? this.connectionId : "",
+              probe_connection_id: this.sourceMode === "sql_text" ? this.probeConnectionId : "",
+              source_schema: this.sourceSchema,
+              source_table: this.sourceTable,
+              source_dialect_hint: this.sourceDialectHint,
+              std_table_key: this.stdTableKey,
+              apply_standard_mapping: this.applyStandardMapping,
+              sql_text: this.sourceMode === "sql_text" ? this.sqlText : "",
+              view_sql: this.sourceMode === "sql_text" ? this.sqlText : "",
+              target_dialect: this.targetDialect,
+              storage_mode: this.storageMode,
+              target_schema: this.targetSchema,
+              target_table: this.targetTable,
+              ai_assist: effAiAssist,
+              provider_id: providerId,
+              model,
+            },
+            { taskId, signal }
+          );
+          return {
+            ...out,
+            message: `已完成 ${out?.source_dialect || ""} → ${out?.target_dialect || this.targetDialect} 翻译`,
+          };
+        },
+        { prefix: "ddl" }
+      );
       this.translateResult = res;
       this.render();
       this.refreshHeader?.();
     } catch (err) {
-      Toast.error(err.message);
+      if (!isAbortError(err)) {
+        Toast.error(err.message);
+      }
     } finally {
       this.busy = false;
       this.refreshHeader?.();
@@ -1142,6 +1178,7 @@ export class PolyglotView {
       "div",
       { style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" } },
       subbar,
+      this.activityBar.el,
       dualSplit,
       footerBar,
       mappingGridNode
@@ -1149,7 +1186,11 @@ export class PolyglotView {
   }
 
   render() {
-    clearEl(this.root, this.mode === "naming" ? this._renderNamingView() : this._renderDialectView());
+    if (this.mode === "naming") {
+      clearEl(this.root, this.activityBar.el, this._renderNamingView());
+    } else {
+      clearEl(this.root, this._renderDialectView());
+    }
   }
 }
 

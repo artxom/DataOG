@@ -44,6 +44,7 @@ class PlatformContext:
         self.llm_hub = LLMHub(self.store)
         self.standard_catalog = StandardCatalog(self.store)
         self.import_progress = ImportProgressHub()
+        self.task_progress = self.import_progress
         self._registered_modules: List[Dict[str, str]] = []
 
     def register_module_manifest(

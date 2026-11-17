@@ -6,10 +6,17 @@
  * - multi  (AI 探查模式)：直接在树内 Schema / 表节点勾选焦点表，点击 ▸ 仍可展开查看字段结构
  */
 
-import { platformApi } from "../core/api.js";
+import { isAbortError, platformApi } from "../core/api.js";
 import { badge, clearEl, el, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
+import { TaskActivityBar } from "./task_activity_bar.js";
 import { Toast } from "./toast.js";
+
+function makeAbortError() {
+  const err = new Error("AbortError");
+  err.name = "AbortError";
+  return err;
+}
 
 export class DatabaseTree {
   constructor(
@@ -80,7 +87,12 @@ export class DatabaseTree {
       el("search", {}, this.filterInput)
     );
 
-    clearEl(this.mountEl, header, this.treeBody);
+    this.activityBar = new TaskActivityBar({ graceMs: 180, compact: true });
+    this.activityBar.el.style.margin = "6px 8px 0";
+    this.activityBar.el.style.flexShrink = "0";
+    this._destroyed = false;
+
+    clearEl(this.mountEl, header, this.activityBar.el, this.treeBody);
     this._unsub = store.subscribe((_state, reason) => {
       if (["bootstrap", "connections", "catalog"].includes(reason)) {
         if (!this.activeConnectionId && store.state.connections.length > 0) {
@@ -93,7 +105,9 @@ export class DatabaseTree {
   }
 
   destroy() {
+    this._destroyed = true;
     this._unsub?.();
+    this.activityBar?.destroy();
   }
 
   setSelectionMode(mode) {
@@ -202,11 +216,24 @@ export class DatabaseTree {
   async _refreshConnection(conn, ev) {
     ev.stopPropagation();
     try {
-      const res = await platformApi.refreshMetadata(conn.connection_id);
+      const res = await this.activityBar.track(
+        `刷新 ${conn.name} 目录`,
+        async ({ taskId, signal }) => {
+          const data = await platformApi.refreshMetadataTree(conn.connection_id, null, {
+            taskId,
+            signal,
+          });
+          if (signal?.aborted) throw makeAbortError();
+          return data;
+        },
+        { prefix: "tree_ref", cancellable: true, exclusive: false }
+      );
+      if (this._destroyed) return;
       this.expandedConns.add(conn.connection_id);
       store.updateCatalogTree(conn.connection_id, res);
-      Toast.success("元数据已刷新");
+      Toast.success(res.message || "元数据已刷新");
     } catch (err) {
+      if (isAbortError(err)) return;
       Toast.error(err.message);
     }
   }
@@ -222,7 +249,22 @@ export class DatabaseTree {
     this.expandedTables.add(key);
     if (!this.tableColumnsCache.has(key)) {
       try {
-        const res = await platformApi.getTableDetail(connId, schemaName, tableName, false);
+        const res = await this.activityBar.track(
+          `读取 ${tableName} 列结构`,
+          async ({ taskId, signal }) => {
+            const data = await platformApi.getTableDetail(
+              connId,
+              schemaName,
+              tableName,
+              false,
+              { taskId, signal }
+            );
+            if (signal?.aborted) throw makeAbortError();
+            return data;
+          },
+          { prefix: "tree_col", cancellable: true, exclusive: false }
+        );
+        if (this._destroyed) return;
         const distSet = new Set(
           (res.table?.distribute_keys || []).map((k) => String(k).toLowerCase())
         );
@@ -236,10 +278,15 @@ export class DatabaseTree {
         }));
         this.tableColumnsCache.set(key, cols);
       } catch (err) {
-        Toast.error(err.message);
+        this.expandedTables.delete(key);
+        if (!isAbortError(err)) {
+          Toast.error(err.message);
+        }
       }
     }
-    this.renderTreeBody();
+    if (!this._destroyed) {
+      this.renderTreeBody();
+    }
   }
 
   _toggleSingleTableFocus(connId, schemaName, tableName) {

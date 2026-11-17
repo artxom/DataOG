@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -32,6 +33,7 @@ from core.platform.dialects import (
     validate_identifier,
 )
 from core.platform.driver_manager import JdbcConnectionAdapter
+from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.inceptor_client import InceptorThriftClient
 from core.platform.models import ColumnMeta, ConnectionProfile, SchemaMeta, TableMeta
 from core.platform.storage import PlatformStateStore
@@ -45,6 +47,18 @@ class MetadataHub:
     def __init__(self, store: PlatformStateStore, connection_hub: ConnectionHub) -> None:
         self.store = store
         self.connection_hub = connection_hub
+        self._neg_lock = threading.Lock()
+        self._missing_table_cache: Dict[Tuple[str, str, str], float] = {}
+        self._neg_ttl_sec = 120.0
+
+    def invalidate_negative_cache(self, connection_id: Optional[str] = None) -> None:
+        with self._neg_lock:
+            if connection_id is None:
+                self._missing_table_cache.clear()
+                return
+            doomed = [k for k in self._missing_table_cache if k[0] == connection_id]
+            for k in doomed:
+                self._missing_table_cache.pop(k, None)
 
     @staticmethod
     def _finalize_table_meta(meta: TableMeta) -> TableMeta:
@@ -127,12 +141,30 @@ class MetadataHub:
         return cached
 
     def refresh_catalog(
-        self, connection_id: str, schema_name: Optional[str] = None
+        self,
+        connection_id: str,
+        schema_name: Optional[str] = None,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         profile = self.connection_hub.require_profile(connection_id)
         clean_schema = clean_identifier_input(schema_name or "") or None
+        self.invalidate_negative_cache(connection_id)
 
-        with self.connection_hub.session(connection_id, timeout_sec=15) as conn:
+        progress_cb(
+            18,
+            "连接数据源",
+            f"正在建立到 {profile.name} ({profile.db_type}) 的探查会话...",
+            0,
+            1,
+        )
+        with self.connection_hub.probe_session(connection_id, timeout_sec=15) as conn:
+            progress_cb(
+                45,
+                "扫描系统目录",
+                f"正在扫描 {clean_schema or '全部模式'} 表与视图清单...",
+                0,
+                1,
+            )
             if isinstance(conn, InceptorThriftClient):
                 schemas, tables = self._probe_inceptor_catalog(conn, profile, clean_schema)
             elif isinstance(conn, JdbcConnectionAdapter):
@@ -144,6 +176,13 @@ class MetadataHub:
             else:
                 schemas, tables = self._probe_pg_dws_catalog(conn, profile, clean_schema)
 
+        progress_cb(
+            82,
+            "写入本地缓存",
+            f"发现 {len(schemas)} 个模式、{len(tables)} 个对象，正在落盘缓存...",
+            len(tables),
+            len(tables),
+        )
         self.store.save_catalog_snapshot(
             connection_id,
             schemas=schemas,
@@ -165,6 +204,8 @@ class MetadataHub:
         *,
         force_refresh: bool = False,
         penetrate_views: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
+        _shared_conn: Any = None,
     ) -> TableMeta:
         profile = self.connection_hub.require_profile(connection_id)
         raw_t = (table_name or "").strip()
@@ -195,9 +236,17 @@ class MetadataHub:
         if not eff_table:
             return TableMeta(schema_name=eff_schema, table_name="", exists=False)
 
+        neg_key = (connection_id, eff_schema.lower(), eff_table.lower())
         if not force_refresh:
             cached = self.store.get_cached_table_meta(connection_id, eff_schema, eff_table)
             if cached is not None:
+                progress_cb(
+                    100,
+                    "命中缓存",
+                    f"已从本地缓存读取 {eff_schema}.{eff_table} ({len(cached.columns)} 列)",
+                    1,
+                    1,
+                )
                 return cached
             if not cleaned_s or cleaned_s.lower() in (default_sch.lower(), "public"):
                 fb_map = self.store.get_cached_tables_meta_batch(
@@ -207,33 +256,116 @@ class MetadataHub:
                 )
                 fb_hit = fb_map.get((eff_schema.lower(), eff_table.lower()))
                 if fb_hit is not None:
+                    progress_cb(
+                        100,
+                        "命中缓存",
+                        f"已从本地缓存读取 {fb_hit.schema_name}.{fb_hit.table_name} ({len(fb_hit.columns)} 列)",
+                        1,
+                        1,
+                    )
                     return fb_hit
 
-        with self.connection_hub.session(connection_id, timeout_sec=15) as conn:
+            now_mono = time.monotonic()
+            hit_missing = False
+            with self._neg_lock:
+                miss_ts = self._missing_table_cache.get(neg_key)
+                if miss_ts is not None:
+                    if (now_mono - miss_ts) <= self._neg_ttl_sec:
+                        hit_missing = True
+                    else:
+                        self._missing_table_cache.pop(neg_key, None)
+            if hit_missing:
+                progress_cb(
+                    100,
+                    "命中缓存",
+                    f"已知远端暂未建表 {eff_schema}.{eff_table}",
+                    1,
+                    1,
+                )
+                return TableMeta(schema_name=eff_schema, table_name=eff_table, exists=False)
+        else:
+            with self._neg_lock:
+                self._missing_table_cache.pop(neg_key, None)
+
+        def _probe_and_enrich(conn: Any) -> TableMeta:
+            if _shared_conn is None:
+                progress_cb(
+                    35,
+                    "扫描系统目录",
+                    f"正在读取 {eff_schema}.{eff_table} 字段与 DDL 结构...",
+                    0,
+                    1,
+                )
             meta = self._probe_single_table_on_conn(
                 conn, profile, eff_schema, eff_table
             )
+            if not meta.exists:
+                with self._neg_lock:
+                    self._missing_table_cache[neg_key] = time.monotonic()
+                if _shared_conn is None:
+                    progress_cb(
+                        100,
+                        "探查完成",
+                        f"远端不存在对象 {eff_schema}.{eff_table}",
+                        1,
+                        1,
+                    )
+                return meta
 
-        if not meta.exists:
-            return meta
+            with self._neg_lock:
+                self._missing_table_cache.pop(neg_key, None)
 
-        if penetrate_views and meta.object_type in ("VIEW", "MATVIEW") and (meta.view_definition or meta.raw_ddl):
-            def _fetch_upstream(up_sch: str, up_tbl: str) -> Optional[TableMeta]:
-                return self.get_table_metadata(
-                    connection_id,
-                    up_sch,
-                    up_tbl,
-                    force_refresh=False,
-                    penetrate_views=False,
+            if (
+                penetrate_views
+                and meta.object_type in ("VIEW", "MATVIEW")
+                and (meta.view_definition or meta.raw_ddl)
+            ):
+                def _fetch_upstream(up_sch: str, up_tbl: str) -> Optional[TableMeta]:
+                    progress_cb(
+                        62,
+                        "视图穿透",
+                        f"正在穿透上游依赖 {up_sch}.{up_tbl}...",
+                        0,
+                        1,
+                    )
+                    return self.get_table_metadata(
+                        connection_id,
+                        up_sch,
+                        up_tbl,
+                        force_refresh=False,
+                        penetrate_views=False,
+                        progress_cb=noop_progress,
+                        _shared_conn=conn,
+                    )
+
+                meta = enrich_view_columns_by_lineage(
+                    meta, fetch_object_fn=_fetch_upstream, max_depth=4
                 )
 
-            meta = enrich_view_columns_by_lineage(
-                meta, fetch_object_fn=_fetch_upstream, max_depth=4
-            )
+            meta = self._finalize_table_meta(meta)
+            if _shared_conn is None:
+                progress_cb(
+                    88,
+                    "写入本地缓存",
+                    f"正在保存 {meta.schema_name}.{meta.table_name} 元数据...",
+                    1,
+                    1,
+                )
+            self.store.save_table_meta(connection_id, meta)
+            return meta
 
-        meta = self._finalize_table_meta(meta)
-        self.store.save_table_meta(connection_id, meta)
-        return meta
+        if _shared_conn is not None:
+            return _probe_and_enrich(_shared_conn)
+
+        progress_cb(
+            18,
+            "连接数据源",
+            f"正在建立到 {profile.name} ({profile.db_type}) 的探查会话...",
+            0,
+            1,
+        )
+        with self.connection_hub.probe_session(connection_id, timeout_sec=15) as conn:
+            return _probe_and_enrich(conn)
 
     def get_tables_metadata_batch(
         self,
@@ -244,6 +376,7 @@ class MetadataHub:
         penetrate_views: bool = True,
         tolerate_errors: bool = False,
         on_progress: Optional[Callable[[int, int, str, str], None]] = None,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Tuple[Dict[Tuple[str, str], TableMeta], str, Set[Tuple[str, str]]]:
         """单会话批量获取多张库表/视图元数据（命中本地缓存零连库，未缓存表复用单条连接批量探查并单事务落库）."""
         profile = self.connection_hub.require_profile(connection_id)
@@ -306,6 +439,24 @@ class MetadataHub:
             for lk, c_meta in cached_map.items():
                 by_lookup[lk] = c_meta
 
+            now_mono = time.monotonic()
+            with self._neg_lock:
+                for s, t in norm_targets:
+                    lk = (s.lower(), t.lower())
+                    if lk in by_lookup:
+                        continue
+                    neg_key = (connection_id, lk[0], lk[1])
+                    miss_ts = self._missing_table_cache.get(neg_key)
+                    if miss_ts is not None:
+                        if (now_mono - miss_ts) <= self._neg_ttl_sec:
+                            by_lookup[lk] = TableMeta(schema_name=s, table_name=t, exists=False)
+                        else:
+                            self._missing_table_cache.pop(neg_key, None)
+        else:
+            with self._neg_lock:
+                for s, t in norm_targets:
+                    self._missing_table_cache.pop((connection_id, s.lower(), t.lower()), None)
+
         uncached = [
             (s, t) for s, t in norm_targets if (s.lower(), t.lower()) not in by_lookup
         ]
@@ -315,22 +466,49 @@ class MetadataHub:
             if on_progress:
                 last_s, last_t = norm_targets[-1]
                 on_progress(total_cnt, total_cnt, last_s, last_t)
+            progress_cb(
+                100,
+                "命中缓存",
+                f"已从本地缓存读取 {total_cnt} 张对象元数据",
+                total_cnt,
+                total_cnt,
+            )
             out_cached = {rk: by_lookup[lk] for rk, lk in req_to_lookup.items() if lk in by_lookup}
             for lk, m in by_lookup.items():
                 out_cached.setdefault(lk, m)
             return out_cached, "", set()
 
-        if on_progress:
-            on_progress(done_cached, total_cnt, uncached[0][0], uncached[0][1])
+        def _report_batch_progress(done_n: int, tot_n: int, cur_s: str, cur_t: str) -> None:
+            if on_progress:
+                on_progress(done_n, tot_n, cur_s, cur_t)
+            if progress_cb is not noop_progress:
+                ratio = (done_n / max(1, tot_n))
+                pct = min(85.0, 28.0 + ratio * 56.0)
+                progress_cb(
+                    pct,
+                    "扫描系统目录",
+                    f"正在读取 {cur_s}.{cur_t} ({done_n}/{tot_n})",
+                    done_n,
+                    tot_n,
+                )
+
+        progress_cb(
+            15,
+            "连接数据源",
+            f"正在建立到 {profile.name} ({profile.db_type}) 的探查会话...",
+            done_cached,
+            total_cnt,
+        )
+        _report_batch_progress(done_cached, total_cnt, uncached[0][0], uncached[0][1])
 
         newly_probed: List[TableMeta] = []
         probe_warning = ""
         skipped_lookup_keys: Set[Tuple[str, str]] = set()
+        probed_pairs: List[Tuple[Tuple[str, str], TableMeta]] = []
         conn_timeout = 6 if tolerate_errors else 15
 
         try:
-            with self.connection_hub.session(connection_id, timeout_sec=conn_timeout) as conn:
-                probed_pairs: List[Tuple[Tuple[str, str], TableMeta]] = []
+            with self.connection_hub.probe_session(connection_id, timeout_sec=conn_timeout) as conn:
                 used_native_batch = False
 
                 if (
@@ -353,7 +531,7 @@ class MetadataHub:
                             uncached,
                             done_offset=done_cached,
                             total_count=total_cnt,
-                            on_progress=on_progress,
+                            on_progress=_report_batch_progress,
                         )
                         used_native_batch = True
                     except Exception as batch_exc:
@@ -383,7 +561,7 @@ class MetadataHub:
                             uncached,
                             done_offset=done_cached,
                             total_count=total_cnt,
-                            on_progress=on_progress,
+                            on_progress=_report_batch_progress,
                         )
                         used_native_batch = True
                     except Exception as batch_exc:
@@ -395,8 +573,7 @@ class MetadataHub:
                     consecutive_failures = 0
                     max_consecutive_failures = 3
                     for idx_u, (u_sch, u_tbl) in enumerate(uncached, start=1):
-                        if on_progress:
-                            on_progress(done_cached + idx_u - 1, total_cnt, u_sch, u_tbl)
+                        _report_batch_progress(done_cached + idx_u - 1, total_cnt, u_sch, u_tbl)
                         try:
                             m = self._probe_single_table_on_conn(conn, profile, u_sch, u_tbl)
                             probed_pairs.append(((u_sch.lower(), u_tbl.lower()), m))
@@ -422,17 +599,15 @@ class MetadataHub:
                                     probe_warning,
                                     len(uncached) - idx_u,
                                 )
-                                if on_progress:
-                                    last_s, last_t = uncached[-1]
-                                    on_progress(
-                                        done_cached + len(uncached),
-                                        total_cnt,
-                                        last_s,
-                                        last_t,
-                                    )
+                                last_s, last_t = uncached[-1]
+                                _report_batch_progress(
+                                    done_cached + len(uncached),
+                                    total_cnt,
+                                    last_s,
+                                    last_t,
+                                )
                                 break
-                        if on_progress:
-                            on_progress(done_cached + idx_u, total_cnt, u_sch, u_tbl)
+                        _report_batch_progress(done_cached + idx_u, total_cnt, u_sch, u_tbl)
 
                 upstream_failures = 0
                 for lk, meta in probed_pairs:
@@ -489,7 +664,23 @@ class MetadataHub:
                 if lk not in by_lookup:
                     skipped_lookup_keys.add(lk)
 
+        now_done = time.monotonic()
+        with self._neg_lock:
+            for lk, meta in probed_pairs:
+                neg_k = (connection_id, lk[0], lk[1])
+                if not meta.exists and lk not in skipped_lookup_keys:
+                    self._missing_table_cache[neg_k] = now_done
+                elif meta.exists:
+                    self._missing_table_cache.pop(neg_k, None)
+
         if newly_probed:
+            progress_cb(
+                90,
+                "写入本地缓存",
+                f"正在保存 {len(newly_probed)} 张表元数据至本地缓存...",
+                total_cnt,
+                total_cnt,
+            )
             self.store.save_tables_meta_batch(connection_id, newly_probed)
 
         out_all: Dict[Tuple[str, str], TableMeta] = {}

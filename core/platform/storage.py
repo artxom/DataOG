@@ -2095,6 +2095,19 @@ class PlatformStateStore:
                 ).fetchall()
             return [dict(r) for r in rows]
 
+    def count_cross_columns(self, std_table_key: Optional[str] = None) -> int:
+        with self._lock, self._get_conn() as conn:
+            if std_table_key:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM cross_column_bindings WHERE std_table_key = ?",
+                    (std_table_key.strip().lower(),),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM cross_column_bindings"
+                ).fetchone()
+            return int(row[0]) if row else 0
+
     def batch_update_cross_column_bindings(
         self, updates: List[Dict[str, Any]]
     ) -> None:

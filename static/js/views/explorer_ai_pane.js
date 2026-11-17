@@ -6,11 +6,12 @@
  * - 焦点表直接从左侧 DataGrip 四级数据库清单勾选联动，右侧不堆叠方块胶囊
  */
 
-import { explorerApi, platformApi } from "../core/api.js";
+import { explorerApi, isAbortError, platformApi } from "../core/api.js";
 import { badge, clearEl, copyText, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";
 import { Modal } from "../ui/modal.js";
+import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
 
 const GOAL_STARTERS = [
@@ -63,6 +64,9 @@ export class ExplorerAiPane {
     this.openStepKeys = new Set(); // "${msgId}:${stepNo}"
 
     this._promptId = `exp-prompt-${Math.random().toString(36).slice(2, 8)}`;
+    this.activityBar = new TaskActivityBar({ graceMs: 120 });
+    this.activityBar.el.style.margin = "8px 14px 0";
+    this.activityBar.el.style.flexShrink = "0";
     this.root = el("div", { className: "explorer-ai-wrap" });
 
     this._unsub = store.subscribe((_st, reason) => {
@@ -75,6 +79,7 @@ export class ExplorerAiPane {
   }
 
   destroy() {
+    this.activityBar?.destroy();
     this._unsub?.();
   }
 
@@ -296,18 +301,32 @@ export class ExplorerAiPane {
     this.onHeaderStateChange?.();
 
     try {
-      const res = await explorerApi.explore({
-        session_id: this.currentSession?.session_id || "",
-        connection_id: this.connectionId,
-        schema_name: this.schemaName || "",
-        focus_tables: this.focusTables,
-        prompt: text,
-        goal_type: effGoal,
-        provider_id: providerId,
-        model,
-        max_steps: this.maxSteps,
-        sample_limit: this.sampleLimit,
-      });
+      const res = await this.activityBar.track(
+        "AI 只读智能探查",
+        async ({ taskId, signal }) => {
+          const out = await explorerApi.explore(
+            {
+              session_id: this.currentSession?.session_id || "",
+              connection_id: this.connectionId,
+              schema_name: this.schemaName || "",
+              focus_tables: this.focusTables,
+              prompt: text,
+              goal_type: effGoal,
+              provider_id: providerId,
+              model,
+              max_steps: this.maxSteps,
+              sample_limit: this.sampleLimit,
+            },
+            { taskId, signal }
+          );
+          const stepCnt = out?.assistant_message?.steps?.length ?? 0;
+          return {
+            ...out,
+            message: `已完成 AI 只读探查（共 ${stepCnt} 步采样）`,
+          };
+        },
+        { prefix: "exp" }
+      );
       this.currentSession = res.session || null;
       this.sessions = res.sessions || this.sessions;
       const newAsst = res.assistant_message;
@@ -317,7 +336,9 @@ export class ExplorerAiPane {
       this.activeGoalType = "general";
     } catch (err) {
       this.draftPrompt = text;
-      Toast.error(err.message);
+      if (!isAbortError(err)) {
+        Toast.error(err.message);
+      }
     } finally {
       this.loading = false;
       this._pendingUserPrompt = "";
@@ -777,6 +798,6 @@ export class ExplorerAiPane {
       )
     );
 
-    clearEl(this.root, scopeBar, streamNode, composerForm);
+    clearEl(this.root, scopeBar, this.activityBar.el, streamNode, composerForm);
   }
 }

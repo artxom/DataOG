@@ -5,11 +5,12 @@
  * 支持拖拽与点选双向绑标配对，两侧自动沿用各自数据库配置的落标标准格式。
  */
 
-import { crossApi, standardsApi } from "../core/api.js";
+import { crossApi, isAbortError, standardsApi } from "../core/api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
 import { openStandardPickerModal } from "../ui/standard_picker_modal.js";
+import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
 import { openUploadWizardModal } from "../ui/upload_wizard_modal.js";
 
@@ -86,6 +87,12 @@ export class CrossComparatorView {
     this.centerRows = [];
     this.stdItemCache = new Map();
     this._pendingLookupCodes = new Set();
+    this._prefetchedSignature = "";
+    this._destroyed = false;
+
+    this.activityBar = new TaskActivityBar();
+    this.activityBar.el.style.margin = "6px 14px 0";
+    this.activityBar.el.style.flexShrink = "0";
 
     this.root = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
@@ -99,6 +106,8 @@ export class CrossComparatorView {
   }
 
   destroy() {
+    this._destroyed = true;
+    this.activityBar?.destroy();
     this._unsubStore?.();
     this._unsubStore = null;
   }
@@ -135,16 +144,20 @@ export class CrossComparatorView {
     await this.loadOverview(this.activeTableKey, false);
   }
 
-  async _reloadCurrentComparison(extra = {}) {
+  async _reloadCurrentComparison(extra = {}, { pairOnly = false } = {}) {
+    const loader =
+      pairOnly && this.loadedOnce && this.overview
+        ? this.loadPairComparison.bind(this)
+        : this.loadOverview.bind(this);
     const savedTables = this.overview?.tables || [];
     const hasSavedActive = Boolean(
       this.activeTableKey && savedTables.some((t) => t.std_table_key === this.activeTableKey)
     );
     if (hasSavedActive) {
-      return this.loadOverview(this.activeTableKey, false, extra);
+      return loader(this.activeTableKey, false, extra);
     }
     if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
-      return this.loadOverview("", false, {
+      return loader("", false, {
         sourceSchema: this.draftTableBind.source_schema,
         sourceTable: this.draftTableBind.source_table,
         targetSchema: this.draftTableBind.target_schema,
@@ -152,7 +165,7 @@ export class CrossComparatorView {
         ...extra,
       });
     }
-    return this.loadOverview(this.activeTableKey, false, extra);
+    return loader(this.activeTableKey, false, extra);
   }
 
   async refreshOnActivate() {
@@ -449,28 +462,120 @@ export class CrossComparatorView {
     }
   }
 
+  _mergeRoleConnectionBrief(nextConn, prevConn) {
+    if (!nextConn) return prevConn || null;
+    if (
+      !Array.isArray(nextConn.tables) &&
+      prevConn &&
+      prevConn.connection_id === nextConn.connection_id
+    ) {
+      return {
+        ...prevConn,
+        ...nextConn,
+        schemas: prevConn.schemas || [],
+        tables: prevConn.tables || [],
+      };
+    }
+    return nextConn;
+  }
+
+  _applyComparisonResponse(res, { mergeBrief = false } = {}) {
+    const prevOv = this.overview || {};
+    this.loadedOnce = true;
+    if (mergeBrief) {
+      this.overview = {
+        ...prevOv,
+        ...res,
+        source_connection: this._mergeRoleConnectionBrief(
+          res.source_connection,
+          prevOv.source_connection
+        ),
+        target_connection: this._mergeRoleConnectionBrief(
+          res.target_connection,
+          prevOv.target_connection
+        ),
+      };
+    } else {
+      this.overview = res;
+    }
+    if (res.format_profiles?.length) this.formatProfiles = res.format_profiles;
+    this._syncSideFormatsFromOverview(this.overview);
+    if (res.active_table_key !== undefined) {
+      this.activeTableKey = res.active_table_key || "";
+    }
+    this._hydrateDraftFromComparison(res.active_comparison);
+    this.render();
+    this.onStateUpdate?.();
+  }
+
+  _maybePrefetchPairs() {
+    if (this._destroyed || !this.overview || (this.overview.tables?.length || 0) <= 1) return;
+    const srcCid = String(this.overview.source_connection?.connection_id || "");
+    const tgtCid = String(this.overview.target_connection?.connection_id || "");
+    if (!srcCid && !tgtCid) return;
+    const sig = `${srcCid}::${tgtCid}`;
+    if (this._prefetchedSignature === sig) return;
+    this._prefetchedSignature = sig;
+    setTimeout(() => {
+      if (this._destroyed) return;
+      crossApi.prefetchPairs({ max_pairs: 60 }).catch(() => {});
+    }, 80);
+  }
+
   async loadOverview(tableKey = "", forceRefresh = false, extra = {}) {
     try {
       const reqSourceFmt = extra.sourceFormatProfile ?? "AUTO";
       const reqTargetFmt = extra.targetFormatProfile ?? "AUTO";
-      const res = await crossApi.getOverview(tableKey, forceRefresh, {
-        formatProfile: this.formatProfile,
-        sourceFormatProfile: reqSourceFmt,
-        targetFormatProfile: reqTargetFmt,
-        ...extra,
-      });
-      this.loadedOnce = true;
-      this.overview = res;
-      if (res.format_profiles?.length) this.formatProfiles = res.format_profiles;
-      this._syncSideFormatsFromOverview(res);
-      if (res.active_table_key !== undefined) {
-        this.activeTableKey = res.active_table_key || "";
-      }
-      this._hydrateDraftFromComparison(res.active_comparison);
-      this.render();
-      this.onStateUpdate?.();
+      const res = await this.activityBar.track(
+        "加载跨环境比对",
+        async ({ taskId, signal }) =>
+          crossApi.getOverview(
+            tableKey,
+            forceRefresh,
+            {
+              formatProfile: this.formatProfile,
+              sourceFormatProfile: reqSourceFmt,
+              targetFormatProfile: reqTargetFmt,
+              ...extra,
+            },
+            { signal, taskId }
+          ),
+        { prefix: "cmp" }
+      );
+      this._applyComparisonResponse(res, { mergeBrief: false });
+      this._maybePrefetchPairs();
       return true;
     } catch (err) {
+      if (isAbortError(err)) return false;
+      Toast.error(err.message);
+      return false;
+    }
+  }
+
+  async loadPairComparison(tableKey = "", forceRefresh = false, extra = {}) {
+    try {
+      const reqSourceFmt = extra.sourceFormatProfile ?? "AUTO";
+      const reqTargetFmt = extra.targetFormatProfile ?? "AUTO";
+      const res = await this.activityBar.track(
+        "切换比对表对",
+        async ({ taskId, signal }) =>
+          crossApi.comparePair(
+            {
+              tableKey,
+              forceRefresh,
+              formatProfile: this.formatProfile,
+              sourceFormatProfile: reqSourceFmt,
+              targetFormatProfile: reqTargetFmt,
+              ...extra,
+            },
+            { signal, taskId }
+          ),
+        { prefix: "cmp" }
+      );
+      this._applyComparisonResponse(res, { mergeBrief: true });
+      return true;
+    } catch (err) {
+      if (isAbortError(err)) return false;
       Toast.error(err.message);
       return false;
     }
@@ -582,14 +687,20 @@ export class CrossComparatorView {
         });
     }
     this.activeTableKey = "";
-    await this.loadOverview(matched?.std_table_key || "", forceRefresh, {
+    const targetKey = matched?.std_table_key || "";
+    const extraOpts = {
       sourceSchema: source_schema,
       sourceTable: source_table,
       targetSchema: target_schema,
       targetTable: target_table,
       sourceFormatProfile: this.sourceFormatProfile,
       targetFormatProfile: this.targetFormatProfile,
-    });
+    };
+    if (this.loadedOnce && this.overview) {
+      await this.loadPairComparison(targetKey, forceRefresh, extraOpts);
+    } else {
+      await this.loadOverview(targetKey, forceRefresh, extraOpts);
+    }
   }
 
   async saveCurrentPairings(forceRefresh = false) {
@@ -619,28 +730,32 @@ export class CrossComparatorView {
           target_std_code: "",
         })),
       ];
-      const res = await crossApi.savePairings({
-        std_table_key: key,
-        source_schema: this.draftTableBind.source_schema,
-        source_table: this.draftTableBind.source_table,
-        target_schema: this.draftTableBind.target_schema,
-        target_table: this.draftTableBind.target_table,
-        format_profile: this.targetFormatProfile || this.formatProfile || "AUTO",
-        source_format_profile: this.sourceFormatProfile || "AUTO",
-        target_format_profile: this.targetFormatProfile || "AUTO",
-        pairings,
-        force_refresh: forceRefresh,
-        sync_to_field_bindings: true,
-      });
-      this.overview = res;
-      this._syncSideFormatsFromOverview(res);
-      this.activeTableKey = res.active_table_key || key;
-      this._hydrateDraftFromComparison(res.active_comparison);
+      const res = await this.activityBar.track(
+        "保存跨环境映射",
+        async ({ taskId, signal }) =>
+          crossApi.savePairings(
+            {
+              std_table_key: key,
+              source_schema: this.draftTableBind.source_schema,
+              source_table: this.draftTableBind.source_table,
+              target_schema: this.draftTableBind.target_schema,
+              target_table: this.draftTableBind.target_table,
+              format_profile: this.targetFormatProfile || this.formatProfile || "AUTO",
+              source_format_profile: this.sourceFormatProfile || "AUTO",
+              target_format_profile: this.targetFormatProfile || "AUTO",
+              pairings,
+              force_refresh: forceRefresh,
+              sync_to_field_bindings: true,
+            },
+            { signal, taskId }
+          ),
+        { prefix: "cmp", cancellable: false }
+      );
+      this._applyComparisonResponse(res, { mergeBrief: false });
       Toast.success(res.message || "映射关系与数标绑定已保存");
-      this.render();
-      this.onStateUpdate?.();
       return true;
     } catch (err) {
+      if (isAbortError(err)) return false;
       Toast.error(err.message);
       return false;
     }
@@ -1124,6 +1239,46 @@ export class CrossComparatorView {
     });
   }
 
+  async pushToMigrator() {
+    if (this.dirty || (!this.activeTableKey && this.centerRows.length > 0)) {
+      const saved = await this.saveCurrentPairings(false);
+      if (!saved) return false;
+    }
+    if (!this.activeTableKey) {
+      Toast.warn("请先选择并保存包含已绑标准字段的映射表对后再推送贯标");
+      return false;
+    }
+    const ok = await Modal.confirm({
+      title: "推送至第 2 步贯标执行",
+      message: "将当前目标库已绑标的待改造规则推送至「2. 落标绑定与贯标 → 贯标改造执行队列」，是否继续？",
+      confirmText: "推送并切换",
+    });
+    if (!ok) return false;
+    try {
+      const res = await this.activityBar.track(
+        "推送贯标规则",
+        async ({ taskId, signal }) =>
+          crossApi.pushToMigrator(
+            this.activeTableKey,
+            this.targetFormatProfile || this.formatProfile || "AUTO",
+            {
+              sourceFormatProfile: this.sourceFormatProfile,
+              targetFormatProfile: this.targetFormatProfile,
+            },
+            { signal, taskId }
+          ),
+        { prefix: "cmp", cancellable: false }
+      );
+      Toast.success(`已推送 ${res.pushed_count ?? 0} 条规则`);
+      this.onPushToMigrator?.();
+      return true;
+    } catch (err) {
+      if (isAbortError(err)) return false;
+      Toast.error(err.message);
+      return false;
+    }
+  }
+
   renderHeaderActions() {
     return el(
       "div",
@@ -1144,38 +1299,68 @@ export class CrossComparatorView {
         type: "button",
         className: "mac-btn mac-btn-sm mac-btn-primary",
         text: "推送贯标 →",
-        onClick: async () => {
-          if (this.dirty || (!this.activeTableKey && this.centerRows.length > 0)) {
-            const saved = await this.saveCurrentPairings(false);
-            if (!saved) return;
-          }
-          if (!this.activeTableKey) {
-            Toast.warn("请先选择并保存包含已绑标准字段的映射表对后再推送贯标");
-            return;
-          }
-          const ok = await Modal.confirm({
-            title: "推送至第 2 步贯标执行",
-            message: "将当前目标库已绑标的待改造规则推送至「2. 落标绑定与贯标 → 贯标改造执行队列」，是否继续？",
-            confirmText: "推送并切换",
-          });
-          if (!ok) return;
-          try {
-            const res = await crossApi.pushToMigrator(
-              this.activeTableKey,
-              this.targetFormatProfile || this.formatProfile || "AUTO",
-              {
-                sourceFormatProfile: this.sourceFormatProfile,
-                targetFormatProfile: this.targetFormatProfile,
-              }
-            );
-            Toast.success(`已推送 ${res.pushed_count ?? 0} 条规则`);
-            this.onPushToMigrator?.();
-          } catch (err) {
-            Toast.error(err.message);
-          }
-        },
+        onClick: () => this.pushToMigrator(),
       })
     );
+  }
+
+  async bindRoleConnection(role, connectionId) {
+    const sideLabel = role === "source" ? "来源库" : "目标库";
+    try {
+      const hasUnsavedDraft =
+        !this.activeTableKey &&
+        Boolean(this.draftTableBind.source_table || this.draftTableBind.target_table);
+      const res = await this.activityBar.track(
+        `绑定${sideLabel}连接`,
+        async ({ taskId, signal }) =>
+          crossApi.bindRole(
+            {
+              role,
+              connection_id: connectionId,
+              active_table_key: this.activeTableKey,
+              auto_refresh: true,
+            },
+            { signal, taskId }
+          ),
+        { prefix: "cmp" }
+      );
+      this.loadedOnce = true;
+      this.overview = res;
+      if (role === "source") {
+        this.sourceFormatProfile =
+          res.source_connection?.standard_format || res.source_format_profile || "AUTO";
+      } else {
+        this.targetFormatProfile =
+          res.target_connection?.standard_format || res.target_format_profile || "AUTO";
+      }
+      if (!hasUnsavedDraft && res.active_table_key !== undefined) {
+        this.activeTableKey = res.active_table_key || "";
+      }
+      if (
+        hasUnsavedDraft ||
+        res.source_format_profile !== this.sourceFormatProfile ||
+        res.target_format_profile !== this.targetFormatProfile
+      ) {
+        await this._reloadCurrentComparison(
+          {
+            sourceFormatProfile: this.sourceFormatProfile,
+            targetFormatProfile: this.targetFormatProfile,
+          },
+          { pairOnly: true }
+        );
+        this._maybePrefetchPairs();
+        return true;
+      }
+      this._hydrateDraftFromComparison(res.active_comparison);
+      this.render();
+      this.onStateUpdate?.();
+      this._maybePrefetchPairs();
+      return true;
+    } catch (err) {
+      if (isAbortError(err)) return false;
+      Toast.error(err.message);
+      return false;
+    }
   }
 
   _makeRoleConnSelect(role, currentId, placeholder) {
@@ -1189,46 +1374,7 @@ export class CrossComparatorView {
         className: "mac-input input-xs",
         style: { flex: "1", minWidth: "110px" },
         "aria-label": role === "source" ? "选择来源库" : "选择目标库",
-        onChange: async (e) => {
-          try {
-            const hasUnsavedDraft =
-              !this.activeTableKey &&
-              Boolean(this.draftTableBind.source_table || this.draftTableBind.target_table);
-            const res = await crossApi.bindRole({
-              role,
-              connection_id: e.target.value,
-              active_table_key: this.activeTableKey,
-              auto_refresh: true,
-            });
-            this.overview = res;
-            if (role === "source") {
-              this.sourceFormatProfile =
-                res.source_connection?.standard_format || res.source_format_profile || "AUTO";
-            } else {
-              this.targetFormatProfile =
-                res.target_connection?.standard_format || res.target_format_profile || "AUTO";
-            }
-            if (!hasUnsavedDraft && res.active_table_key !== undefined) {
-              this.activeTableKey = res.active_table_key || "";
-            }
-            if (
-              hasUnsavedDraft ||
-              res.source_format_profile !== this.sourceFormatProfile ||
-              res.target_format_profile !== this.targetFormatProfile
-            ) {
-              await this._reloadCurrentComparison({
-                sourceFormatProfile: this.sourceFormatProfile,
-                targetFormatProfile: this.targetFormatProfile,
-              });
-              return;
-            }
-            this._hydrateDraftFromComparison(res.active_comparison);
-            this.render();
-            this.onStateUpdate?.();
-          } catch (err) {
-            Toast.error(err.message);
-          }
-        },
+        onChange: (e) => this.bindRoleConnection(role, e.target.value),
       },
       [
         el("option", { value: "", text: placeholder }),
@@ -1295,10 +1441,13 @@ export class CrossComparatorView {
         onChange: (e) => {
           if (side === "source") this.sourceFormatProfile = e.target.value;
           else this.targetFormatProfile = e.target.value;
-          this._reloadCurrentComparison({
-            sourceFormatProfile: this.sourceFormatProfile,
-            targetFormatProfile: this.targetFormatProfile,
-          });
+          this._reloadCurrentComparison(
+            {
+              sourceFormatProfile: this.sourceFormatProfile,
+              targetFormatProfile: this.targetFormatProfile,
+            },
+            { pairOnly: true }
+          );
         },
       },
       this.formatProfiles.map((p) => {
@@ -1755,7 +1904,11 @@ export class CrossComparatorView {
         "aria-label": "已保存映射表对",
         onChange: (e) => {
           this.activeTableKey = e.target.value;
-          this.loadOverview(this.activeTableKey, false);
+          if (this.loadedOnce && this.overview) {
+            this.loadPairComparison(this.activeTableKey, false);
+          } else {
+            this.loadOverview(this.activeTableKey, false);
+          }
         },
       },
       [
@@ -1788,6 +1941,32 @@ export class CrossComparatorView {
       el(
         "div",
         { className: "mac-subbar-group" },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn btn-xs",
+            title: "强制重新从数据源读取当前表对结构",
+            onClick: () => {
+              if (this.loadedOnce && this.overview) {
+                if (this.activeTableKey) {
+                  this.loadPairComparison(this.activeTableKey, true, {
+                    sourceFormatProfile: this.sourceFormatProfile,
+                    targetFormatProfile: this.targetFormatProfile,
+                  });
+                } else if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
+                  this.previewSelectedTables(true);
+                } else {
+                  this.loadOverview("", true);
+                }
+              } else {
+                this.loadOverview(this.activeTableKey, true);
+              }
+            },
+          },
+          svgIcon("refresh", 12),
+          el("span", { text: "强制刷新" })
+        ),
         el(
           "button",
           {
@@ -2011,6 +2190,6 @@ export class CrossComparatorView {
           )
         );
 
-    clearEl(this.root, subbar, envStrip, mainBody);
+    clearEl(this.root, subbar, this.activityBar.el, envStrip, mainBody);
   }
 }

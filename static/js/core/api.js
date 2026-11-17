@@ -26,13 +26,39 @@ async function parseJsonOrThrow(resp) {
   return payload;
 }
 
-export async function requestJson(url, { method = "GET", body = undefined, cache = undefined } = {}) {
+function withRequestOpts(base = {}, opts = {}) {
+  const next = { ...base };
+  if (opts && typeof opts === "object") {
+    if (opts.signal !== undefined) next.signal = opts.signal;
+    if (opts.taskId) next.taskId = opts.taskId;
+    if (opts.cache !== undefined && next.cache === undefined) next.cache = opts.cache;
+  }
+  return next;
+}
+
+export function isAbortError(err) {
+  return Boolean(
+    err && (err.name === "AbortError" || String(err.message || "").includes("AbortError"))
+  );
+}
+
+export async function requestJson(
+  url,
+  { method = "GET", body = undefined, cache = undefined, signal = undefined, taskId = "" } = {}
+) {
   const opts = {
     method,
     headers: { Accept: "application/json" },
   };
   if (cache) {
     opts.cache = cache;
+  }
+  if (signal) {
+    opts.signal = signal;
+  }
+  const normalizedTaskId = taskId ? String(taskId).trim() : "";
+  if (normalizedTaskId) {
+    opts.headers["X-Task-Id"] = normalizedTaskId;
   }
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
@@ -125,6 +151,14 @@ export async function downloadApiFile(url, { method = "GET", body = undefined, f
   return filename;
 }
 
+export const tasksApi = {
+  get: (taskId) =>
+    requestJson(`/api/platform/tasks/${encodeURIComponent(taskId)}`, { cache: "no-store" }),
+  cancel: (taskId) =>
+    requestJson(`/api/platform/tasks/${encodeURIComponent(taskId)}/cancel`, { method: "POST" }),
+  streamUrl: (taskId) => `/api/platform/tasks/${encodeURIComponent(taskId)}/stream`,
+};
+
 export const platformApi = {
   bootstrap: () => requestJson("/api/platform/bootstrap"),
 
@@ -191,22 +225,31 @@ export const platformApi = {
     requestJson(`/api/platform/connections/${encodeURIComponent(connId)}/test`, { method: "POST" }),
 
   // 元数据中枢 (MetadataHub)
-  getMetadataTree: (connId, autoRefresh = false) =>
+  getMetadataTree: (connId, autoRefresh = false, opts = {}) =>
     requestJson(
-      `/api/platform/metadata/${encodeURIComponent(connId)}/tree?auto_refresh=${autoRefresh ? "true" : "false"}`
+      `/api/platform/metadata/${encodeURIComponent(connId)}/tree?auto_refresh=${autoRefresh ? "true" : "false"}`,
+      withRequestOpts({}, opts)
     ),
-  refreshMetadata: (connId, schemaName = null) =>
-    requestJson(`/api/platform/metadata/${encodeURIComponent(connId)}/refresh`, {
-      method: "POST",
-      body: { schema_name: schemaName || null },
-    }),
-  getTableDetail: (connId, schemaName, tableName, forceRefresh = false) => {
+  refreshMetadata: (connId, schemaName = null, opts = {}) =>
+    requestJson(
+      `/api/platform/metadata/${encodeURIComponent(connId)}/refresh`,
+      withRequestOpts({ method: "POST", body: { schema_name: schemaName || null } }, opts)
+    ),
+  refreshMetadataTree: (connectionId, schemaName = null, opts = {}) =>
+    requestJson(
+      `/api/platform/metadata/${encodeURIComponent(connectionId)}/refresh`,
+      withRequestOpts({ method: "POST", body: { schema_name: schemaName || null } }, opts)
+    ),
+  getTableDetail: (connId, schemaName, tableName, forceRefresh = false, opts = {}) => {
     const qs = new URLSearchParams({
       schema_name: schemaName || "",
       table_name: tableName || "",
       force_refresh: forceRefresh ? "true" : "false",
     });
-    return requestJson(`/api/platform/metadata/${encodeURIComponent(connId)}/table?${qs.toString()}`);
+    return requestJson(
+      `/api/platform/metadata/${encodeURIComponent(connId)}/table?${qs.toString()}`,
+      withRequestOpts({}, opts)
+    );
   },
   searchMetadata: (keyword, connectionId = "", limit = 100) => {
     const qs = new URLSearchParams({ keyword: keyword || "", limit: String(limit) });
@@ -215,18 +258,23 @@ export const platformApi = {
   },
 
   // 查询预览中心 (QueryEngine)
-  executeSql: (payload) =>
-    requestJson("/api/platform/query/execute", { method: "POST", body: payload }),
-  executeReadonlySql: (payload) =>
-    requestJson("/api/platform/query/execute-readonly", { method: "POST", body: payload }),
-  previewTable: (connectionId, schemaName, tableName, limit = 200) => {
+  executeSql: (payload, opts = {}) =>
+    requestJson("/api/platform/query/execute", withRequestOpts({ method: "POST", body: payload }, opts)),
+  executeQuery: (payload, opts = {}) =>
+    requestJson("/api/platform/query/execute", withRequestOpts({ method: "POST", body: payload }, opts)),
+  executeReadonlySql: (payload, opts = {}) =>
+    requestJson(
+      "/api/platform/query/execute-readonly",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  previewTable: (connectionId, schemaName, tableName, limit = 200, opts = {}) => {
     const qs = new URLSearchParams({
       connection_id: connectionId,
       schema_name: schemaName || "",
       table_name: tableName || "",
       limit: String(limit),
     });
-    return requestJson(`/api/platform/query/preview?${qs.toString()}`);
+    return requestJson(`/api/platform/query/preview?${qs.toString()}`, withRequestOpts({}, opts));
   },
   exportQuery: (payload, fallbackName = "query_result.csv") =>
     downloadApiFile("/api/platform/query/export", {
@@ -295,12 +343,15 @@ export const standardsApi = {
 
 export const migratorApi = {
   getState: () => requestJson("/api/modules/standard_migrator/state"),
-  bindConnection: (connectionId, autoSync = true) =>
-    requestJson("/api/modules/standard_migrator/bind-connection", {
-      method: "POST",
-      body: { connection_id: connectionId, auto_sync: autoSync },
-    }),
-  sync: () => requestJson("/api/modules/standard_migrator/sync", { method: "POST" }),
+  bindConnection: (connectionId, autoSync = true, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/bind-connection",
+      withRequestOpts({ method: "POST", body: { connection_id: connectionId, auto_sync: autoSync } }, opts)
+    ),
+  sync: (opts = {}) =>
+    requestJson("/api/modules/standard_migrator/sync", withRequestOpts({ method: "POST" }, opts)),
+  syncItems: (opts = {}) =>
+    requestJson("/api/modules/standard_migrator/sync", withRequestOpts({ method: "POST" }, opts)),
   uploadChecklist: (
     file,
     { defaultSchema = "", defaultTable = "" } = {},
@@ -313,11 +364,11 @@ export const migratorApi = {
     if (progressId) fd.append("progress_id", progressId);
     return uploadFormData("/api/modules/standard_migrator/checklist/upload", fd, { onUploadProgress });
   },
-  loadFromDb: (payload) =>
-    requestJson("/api/modules/standard_migrator/checklist/load-from-db", {
-      method: "POST",
-      body: payload,
-    }),
+  loadFromDb: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/checklist/load-from-db",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
   clearItems: () => requestJson("/api/modules/standard_migrator/checklist/clear", { method: "POST" }),
   downloadTemplate: () =>
     downloadApiFile("/api/modules/standard_migrator/checklist/template.xlsx", {
@@ -327,30 +378,44 @@ export const migratorApi = {
     downloadApiFile("/api/modules/standard_migrator/checklist/report.xlsx", {
       fallbackName: "Data.O.G_贯标报告.xlsx",
     }),
-  executeSingle: (itemId) =>
-    requestJson(`/api/modules/standard_migrator/execute/item/${encodeURIComponent(itemId)}`, {
-      method: "POST",
-    }),
-  executeBatch: (payload) =>
-    requestJson("/api/modules/standard_migrator/execute/batch", { method: "POST", body: payload }),
-  previewRebuild: (payload) =>
-    requestJson("/api/modules/standard_migrator/rebuild/preview", { method: "POST", body: payload }),
-  executeRebuild: (payload) =>
-    requestJson("/api/modules/standard_migrator/rebuild/execute", { method: "POST", body: payload }),
+  executeSingle: (itemId, opts = {}) =>
+    requestJson(
+      `/api/modules/standard_migrator/execute/item/${encodeURIComponent(itemId)}`,
+      withRequestOpts({ method: "POST" }, opts)
+    ),
+  executeBatch: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/execute/batch",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  previewRebuild: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/rebuild/preview",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  executeRebuild: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/rebuild/execute",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
 
   // 第 2 步：字段绑标 + 落标核验 + 对照模板
-  getBindingsOverview: (connectionId = "", formatProfile = "AUTO") => {
+  getBindingsOverview: (connectionId = "", formatProfile = "AUTO", opts = {}) => {
     const qs = new URLSearchParams();
     if (connectionId) qs.set("connection_id", connectionId);
     if (formatProfile) qs.set("format_profile", formatProfile);
-    return requestJson(`/api/modules/standard_migrator/bindings/overview?${qs.toString()}`);
+    return requestJson(
+      `/api/modules/standard_migrator/bindings/overview?${qs.toString()}`,
+      withRequestOpts({}, opts)
+    );
   },
   getTableBindings: (
     connectionId,
     schemaName,
     tableName,
     formatProfile = "AUTO",
-    forceRefresh = false
+    forceRefresh = false,
+    opts = {}
   ) => {
     const qs = new URLSearchParams({
       connection_id: connectionId,
@@ -359,17 +424,41 @@ export const migratorApi = {
       format_profile: formatProfile || "AUTO",
       force_refresh: forceRefresh ? "true" : "false",
     });
-    return requestJson(`/api/modules/standard_migrator/bindings/table?${qs.toString()}`);
+    return requestJson(
+      `/api/modules/standard_migrator/bindings/table?${qs.toString()}`,
+      withRequestOpts({}, opts)
+    );
   },
-  saveBindings: (payload) =>
-    requestJson("/api/modules/standard_migrator/bindings/save", { method: "POST", body: payload }),
-  autoMatchBindings: (payload) =>
-    requestJson("/api/modules/standard_migrator/bindings/auto-match", { method: "POST", body: payload }),
-  checkCompliance: (payload) =>
-    requestJson("/api/modules/standard_migrator/bindings/check-compliance", {
-      method: "POST",
-      body: payload,
-    }),
+  getTableCompliance: (params = {}, opts = {}) => {
+    const p = params || {};
+    const force = p.force_refresh ?? p.forceRefresh;
+    const qs = new URLSearchParams({
+      connection_id: p.connection_id ?? p.connectionId ?? "",
+      schema_name: p.schema_name ?? p.schemaName ?? "",
+      table_name: p.table_name ?? p.tableName ?? "",
+      format_profile: p.format_profile ?? p.formatProfile ?? "AUTO",
+      force_refresh: force ? "true" : "false",
+    });
+    return requestJson(
+      `/api/modules/standard_migrator/bindings/table?${qs.toString()}`,
+      withRequestOpts({}, opts)
+    );
+  },
+  saveBindings: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/bindings/save",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  autoMatchBindings: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/bindings/auto-match",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  checkCompliance: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/bindings/check-compliance",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
   downloadBindingTemplate: ({ connectionId = "", schemaName = "", tables = "" } = {}) => {
     const qs = new URLSearchParams();
     if (connectionId) qs.set("connection_id", connectionId);
@@ -403,15 +492,15 @@ export const migratorApi = {
       fallbackName: "DataOG_单库字段落标检查报告.xlsx",
     });
   },
-  stageMigration: (payload) =>
-    requestJson("/api/modules/standard_migrator/bindings/stage-migration", {
-      method: "POST",
-      body: payload,
-    }),
+  stageMigration: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/bindings/stage-migration",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
 };
 
 export const crossApi = {
-  getOverview: (tableKey = "", forceRefresh = false, extra = {}) => {
+  getOverview: (tableKey = "", forceRefresh = false, extra = {}, opts = {}) => {
     const qs = new URLSearchParams();
     if (tableKey) qs.set("table_key", tableKey);
     if (forceRefresh) qs.set("force_refresh", "true");
@@ -422,14 +511,62 @@ export const crossApi = {
     if (extra.formatProfile) qs.set("format_profile", extra.formatProfile);
     if (extra.sourceFormatProfile) qs.set("source_format_profile", extra.sourceFormatProfile);
     if (extra.targetFormatProfile) qs.set("target_format_profile", extra.targetFormatProfile);
-    return requestJson(`/api/modules/cross_comparator/overview?${qs.toString()}`);
+    return requestJson(
+      `/api/modules/cross_comparator/overview?${qs.toString()}`,
+      withRequestOpts({}, opts)
+    );
   },
-  bindRole: (payload) =>
-    requestJson("/api/modules/cross_comparator/bind-role", { method: "POST", body: payload }),
-  saveBindings: (payload) =>
-    requestJson("/api/modules/cross_comparator/bindings/save", { method: "POST", body: payload }),
-  savePairings: (payload) =>
-    requestJson("/api/modules/cross_comparator/pairings/save", { method: "POST", body: payload }),
+  comparePair: (params = {}, opts = {}) => {
+    const qs = new URLSearchParams();
+    const aliasMap = {
+      tableKey: "table_key",
+      stdTableKey: "std_table_key",
+      forceRefresh: "force_refresh",
+      sourceSchema: "source_schema",
+      sourceTable: "source_table",
+      targetSchema: "target_schema",
+      targetTable: "target_table",
+      formatProfile: "format_profile",
+      sourceFormatProfile: "source_format_profile",
+      targetFormatProfile: "target_format_profile",
+      sourceConnectionId: "source_connection_id",
+      targetConnectionId: "target_connection_id",
+    };
+    for (const [k, v] of Object.entries(params || {})) {
+      if (v === undefined || v === null || v === "") continue;
+      const targetKey = aliasMap[k] || k;
+      if (typeof v === "boolean") {
+        qs.set(targetKey, v ? "true" : "false");
+      } else {
+        qs.set(targetKey, String(v));
+      }
+    }
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return requestJson(
+      `/api/modules/cross_comparator/compare-pair${suffix}`,
+      withRequestOpts({}, opts)
+    );
+  },
+  prefetchPairs: (payload = {}, opts = {}) =>
+    requestJson(
+      "/api/modules/cross_comparator/prefetch-pairs",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  bindRole: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/cross_comparator/bind-role",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  saveBindings: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/cross_comparator/bindings/save",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  savePairings: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/cross_comparator/pairings/save",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
   downloadPairingTemplate: ({
     tableKey = "",
     sourceSchema = "",
@@ -481,24 +618,57 @@ export const crossApi = {
       fallbackName: "Data.O.G_三栏比对报告.xlsx",
     });
   },
-  pushToMigrator: (stdTableKey = "", formatProfile = "AUTO", { sourceFormatProfile = "", targetFormatProfile = "" } = {}) =>
-    requestJson("/api/modules/cross_comparator/push-to-migrator", {
-      method: "POST",
-      body: {
-        std_table_key: stdTableKey || null,
-        format_profile: formatProfile || "AUTO",
-        source_format_profile: sourceFormatProfile || "AUTO",
-        target_format_profile: targetFormatProfile || "AUTO",
-      },
-    }),
+  pushToMigrator: (
+    stdTableKeyOrPayload = "",
+    formatProfileOrOpts = "AUTO",
+    profiles = {},
+    opts = {}
+  ) => {
+    if (
+      stdTableKeyOrPayload &&
+      typeof stdTableKeyOrPayload === "object" &&
+      !Array.isArray(stdTableKeyOrPayload)
+    ) {
+      const reqOptions =
+        formatProfileOrOpts && typeof formatProfileOrOpts === "object" ? formatProfileOrOpts : opts;
+      return requestJson(
+        "/api/modules/cross_comparator/push-to-migrator",
+        withRequestOpts({ method: "POST", body: stdTableKeyOrPayload }, reqOptions)
+      );
+    }
+    const stdTableKey = stdTableKeyOrPayload || "";
+    const formatProfile = typeof formatProfileOrOpts === "string" ? formatProfileOrOpts : "AUTO";
+    const { sourceFormatProfile = "", targetFormatProfile = "" } = profiles || {};
+    return requestJson(
+      "/api/modules/cross_comparator/push-to-migrator",
+      withRequestOpts(
+        {
+          method: "POST",
+          body: {
+            std_table_key: stdTableKey || null,
+            format_profile: formatProfile || "AUTO",
+            source_format_profile: sourceFormatProfile || "AUTO",
+            target_format_profile: targetFormatProfile || "AUTO",
+          },
+        },
+        opts
+      )
+    );
+  },
 };
 
 export const ddlApi = {
   getOptions: () => requestJson("/api/modules/ddl_translator/options"),
-  smartNaming: (payload) =>
-    requestJson("/api/modules/ddl_translator/naming", { method: "POST", body: payload }),
-  translate: (payload) =>
-    requestJson("/api/modules/ddl_translator/translate", { method: "POST", body: payload }),
+  smartNaming: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/ddl_translator/naming",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  translate: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/ddl_translator/translate",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
 };
 
 export const polyglotApi = ddlApi;
@@ -524,6 +694,9 @@ export const explorerApi = {
       { method: "DELETE" }
     );
   },
-  explore: (payload) =>
-    requestJson("/api/modules/data_explorer/explore", { method: "POST", body: payload }),
+  explore: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/data_explorer/explore",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
 };

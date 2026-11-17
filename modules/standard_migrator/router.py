@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
+from core.platform.router import extract_task_id
 from modules.standard_migrator.schemas import (
     AutoMatchBindingsPayload,
     BindMigratorConnectionPayload,
@@ -29,30 +30,92 @@ def _err(msg: str, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"ok": False, "error": msg}, status_code=status_code)
 
 
+async def _run_tracked_task(
+    *,
+    request: Request,
+    task_id: str,
+    ctx: PlatformContext,
+    title: str,
+    start_detail: str,
+    fn: Callable[..., Dict[str, Any]],
+    args: Tuple[Any, ...] = (),
+    kwargs: Optional[Dict[str, Any]] = None,
+    default_detail: str = "处理完成",
+    detail_fn: Optional[Callable[[Dict[str, Any]], str]] = None,
+    count_fn: Optional[Callable[[Dict[str, Any]], Tuple[int, int]]] = None,
+) -> Any:
+    """统一包装支持 task_id 实时进度与取消生命周期的模块端点."""
+    tid = extract_task_id(request, task_id)
+    try:
+        if tid:
+            ctx.task_progress.start(tid, title, detail=start_detail)
+        reporter = ctx.task_progress.make_reporter(tid)
+        call_kwargs = dict(kwargs or {})
+        call_kwargs["progress_cb"] = reporter
+        res = await run_in_threadpool(fn, *args, **call_kwargs)
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            processed, total = count_fn(res) if count_fn else (0, 0)
+            detail = (
+                detail_fn(res)
+                if detail_fn
+                else str(res.get("message") or default_detail)
+            )
+            ctx.task_progress.finish(
+                tid,
+                stage="处理完成",
+                detail=detail,
+                warning=str(res.get("warning") or ""),
+                processed=processed,
+                total=total,
+            )
+        return res
+    except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
+        return _err(str(exc), 400)
+
+
 @router.get("/state")
 def api_migrator_state(ctx: PlatformContext = Depends(get_platform_context)):
     return StandardMigratorService(ctx).get_workspace_state()
 
 
 @router.post("/bind-connection")
-def api_migrator_bind_connection(
+async def api_migrator_bind_connection(
     payload: BindMigratorConnectionPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).bind_connection(
-            payload.connection_id, auto_sync=payload.auto_sync
-        )
-    except Exception as exc:
-        return _err(str(exc), 400)
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="绑定数据源",
+        start_detail=f"正在切换并同步数据源 [{payload.connection_id}]...",
+        fn=StandardMigratorService(ctx).bind_connection,
+        args=(payload.connection_id,),
+        kwargs={"auto_sync": payload.auto_sync},
+        default_detail="数据源绑定完成",
+    )
 
 
 @router.post("/sync")
-def api_migrator_sync(ctx: PlatformContext = Depends(get_platform_context)):
-    try:
-        return StandardMigratorService(ctx).sync_items()
-    except Exception as exc:
-        return _err(str(exc), 400)
+async def api_migrator_sync(
+    request: Request,
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="核验目标库状态",
+        start_detail="正在比对贯标队列与目标库最新字段结构...",
+        fn=StandardMigratorService(ctx).sync_items,
+        default_detail="实时核验完成",
+        count_fn=lambda r: (len(r.get("items") or []), len(r.get("items") or [])),
+    )
 
 
 @router.post("/checklist/upload")
@@ -83,19 +146,31 @@ async def api_migrator_upload_checklist(
 
 
 @router.post("/checklist/load-from-db")
-def api_migrator_load_from_db(
+async def api_migrator_load_from_db(
     payload: LoadDbTablesPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).load_tables_from_db(
-            connection_id=payload.connection_id,
-            schema_name=payload.schema_name,
-            table_name=payload.table_name,
-            max_tables=payload.max_tables,
-        )
-    except Exception as exc:
-        return _err(str(exc), 400)
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="从数据库载入表结构",
+        start_detail="正在读取目标数据源表与字段定义...",
+        fn=StandardMigratorService(ctx).load_tables_from_db,
+        kwargs={
+            "connection_id": payload.connection_id,
+            "schema_name": payload.schema_name,
+            "table_name": payload.table_name,
+            "max_tables": payload.max_tables,
+        },
+        default_detail="表结构载入完成",
+        count_fn=lambda r: (
+            int(r.get("loaded_count", 0) or 0),
+            int(r.get("loaded_count", 0) or 0),
+        ),
+    )
 
 
 @router.post("/checklist/clear")
@@ -130,28 +205,50 @@ def api_migrator_report(ctx: PlatformContext = Depends(get_platform_context)):
 
 
 @router.post("/execute/item/{item_id}")
-def api_migrator_execute_single(
-    item_id: int, ctx: PlatformContext = Depends(get_platform_context)
+async def api_migrator_execute_single(
+    item_id: int,
+    request: Request,
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).execute_single(item_id)
-    except Exception as exc:
-        return _err(str(exc), 400)
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="执行单字段贯标",
+        start_detail=f"正在准备执行字段贯标任务 #{item_id}...",
+        fn=StandardMigratorService(ctx).execute_single,
+        args=(item_id,),
+        default_detail="单字段贯标执行完成",
+        count_fn=lambda _r: (1, 1),
+    )
 
 
 @router.post("/execute/batch")
-def api_migrator_execute_batch(
+async def api_migrator_execute_batch(
     payload: ExecuteBatchPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).execute_batch(
-            payload.item_ids,
-            max_workers=payload.max_workers,
-            keep_backup=payload.keep_backup,
-        )
-    except Exception as exc:
-        return _err(str(exc), 400)
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="批量并发贯标",
+        start_detail=f"正在调度 {len(payload.item_ids)} 条字段规则并发执行...",
+        fn=StandardMigratorService(ctx).execute_batch,
+        args=(payload.item_ids,),
+        kwargs={
+            "max_workers": payload.max_workers,
+            "keep_backup": payload.keep_backup,
+        },
+        default_detail="批量贯标任务执行完毕",
+        count_fn=lambda r: (
+            int((r.get("batch_result") or {}).get("executed_count", len(payload.item_ids)) or 0),
+            int((r.get("batch_result") or {}).get("executed_count", len(payload.item_ids)) or 0),
+        ),
+    )
 
 
 @router.post("/rebuild/preview")
@@ -171,19 +268,30 @@ def api_migrator_rebuild_preview(
 
 
 @router.post("/rebuild/execute")
-def api_migrator_rebuild_execute(
+async def api_migrator_rebuild_execute(
     payload: TableRebuildPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).execute_rebuild(
-            payload.schema_name,
-            payload.table_name,
-            item_ids=payload.item_ids,
-            keep_backup=payload.keep_backup,
-        )
-    except Exception as exc:
-        return _err(str(exc), 400)
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="整表保序重建",
+        start_detail=f"正在准备对 {payload.schema_name}.{payload.table_name} 执行保序重建...",
+        fn=StandardMigratorService(ctx).execute_rebuild,
+        args=(payload.schema_name, payload.table_name),
+        kwargs={
+            "item_ids": payload.item_ids,
+            "keep_backup": payload.keep_backup,
+        },
+        default_detail="整表保序重建完成",
+        count_fn=lambda r: (
+            int((r.get("rebuild_result") or {}).get("valid_count", 0) or 0),
+            int((r.get("rebuild_result") or {}).get("valid_count", 0) or 0),
+        ),
+    )
 
 
 # =========================================================================
@@ -207,24 +315,40 @@ def api_bindings_overview(
 
 
 @router.get("/bindings/table")
-def api_bindings_table(
+async def api_bindings_table(
+    request: Request,
     connection_id: str = Query(...),
     schema_name: str = Query(default=""),
     table_name: str = Query(...),
     format_profile: str = Query(default="AUTO"),
     force_refresh: bool = Query(default=False),
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).get_table_compliance(
-            connection_id=connection_id,
-            schema_name=schema_name,
-            table_name=table_name,
-            format_profile=format_profile,
-            force_refresh=force_refresh,
-        )
-    except Exception as exc:
-        return _err(str(exc), 400)
+    target_label = f"{schema_name}.{table_name}" if schema_name else table_name
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="核验表字段落标",
+        start_detail=f"正在加载 {target_label} 结构与数标绑定...",
+        fn=StandardMigratorService(ctx).get_table_compliance,
+        kwargs={
+            "connection_id": connection_id,
+            "schema_name": schema_name,
+            "table_name": table_name,
+            "format_profile": format_profile,
+            "force_refresh": force_refresh,
+        },
+        detail_fn=lambda r: (
+            f"已完成 {(r.get('table') or {}).get('schema_name', schema_name)}.{(r.get('table') or {}).get('table_name', table_name)} "
+            f"落标核验（已落标 {(r.get('summary') or {}).get('compliant_cols', 0)}/{(r.get('summary') or {}).get('total_cols', 0)} 列）"
+        ),
+        count_fn=lambda r: (
+            int((r.get("summary") or {}).get("total_cols", len(r.get("columns") or [])) or 0),
+            int((r.get("summary") or {}).get("total_cols", len(r.get("columns") or [])) or 0),
+        ),
+    )
 
 
 @router.post("/bindings/save")
@@ -245,36 +369,60 @@ def api_bindings_save(
 
 
 @router.post("/bindings/auto-match")
-def api_bindings_auto_match(
+async def api_bindings_auto_match(
     payload: AutoMatchBindingsPayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).auto_match_bindings(
-            connection_id=payload.connection_id,
-            tables=payload.tables,
-            schema_name=payload.schema_name,
-            table_name=payload.table_name,
-            format_profile=payload.format_profile,
-        )
-    except Exception as exc:
-        return _err(str(exc), 400)
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="智能预匹配数据标准",
+        start_detail="正在读取未绑字段并匹配标准字典...",
+        fn=StandardMigratorService(ctx).auto_match_bindings,
+        kwargs={
+            "connection_id": payload.connection_id,
+            "tables": payload.tables,
+            "schema_name": payload.schema_name,
+            "table_name": payload.table_name,
+            "format_profile": payload.format_profile,
+        },
+        default_detail="智能预匹配完成",
+        count_fn=lambda r: (
+            int(r.get("checked_tables", 0) or 0),
+            int(r.get("checked_tables", 0) or 0),
+        ),
+    )
 
 
 @router.post("/bindings/check-compliance")
-def api_bindings_check_compliance(
+async def api_bindings_check_compliance(
     payload: CheckCompliancePayload,
+    request: Request,
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        return StandardMigratorService(ctx).check_compliance(
-            connection_id=payload.connection_id,
-            tables=payload.tables,
-            format_profile=payload.format_profile,
-            force_refresh=payload.force_refresh,
-        )
-    except Exception as exc:
-        return _err(str(exc), 400)
+    return await _run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="检查字段落标状态",
+        start_detail="正在检查目标库表字段绑标与落标合规性...",
+        fn=StandardMigratorService(ctx).check_compliance,
+        kwargs={
+            "connection_id": payload.connection_id,
+            "tables": payload.tables,
+            "format_profile": payload.format_profile,
+            "force_refresh": payload.force_refresh,
+        },
+        default_detail="落标检查完成",
+        count_fn=lambda r: (
+            int((r.get("aggregate") or {}).get("checked_tables", len(r.get("tables") or [])) or 0),
+            int((r.get("aggregate") or {}).get("checked_tables", len(r.get("tables") or [])) or 0),
+        ),
+    )
 
 
 @router.get("/bindings/template.xlsx")

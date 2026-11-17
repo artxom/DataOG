@@ -8,8 +8,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import inspect
 import io
 import json
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import openpyxl
@@ -32,6 +35,16 @@ from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.models import ColumnMeta, TableMeta
 
 
+def _supports_kwarg(fn: Any, kw: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    if kw in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 class CrossComparatorService:
     """跨环境三栏数标比对中心核心服务."""
 
@@ -44,7 +57,7 @@ class CrossComparatorService:
             raise ValueError("环境角色必须为 source (来源库) 或 target (目标库)")
         return f"cross_{r}_connection_id"
 
-    def get_role_connection_info(self, role: str) -> Dict[str, Any]:
+    def _resolve_role_profile(self, role: str):
         meta_key = self._meta_key_for_role(role)
         cid = str(self.ctx.store.get_meta(meta_key, "") or "")
         prof = self.ctx.connection_hub.get_profile(cid) if cid else None
@@ -55,6 +68,17 @@ class CrossComparatorService:
                 prof = self.ctx.connection_hub.get_profile(fallback_cid)
                 if prof:
                     self.ctx.store.save_meta(meta_key, prof.connection_id)
+        return prof
+
+    def get_role_connection_brief(
+        self, role: str, *, connection_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """读取角色连接轻量摘要（不扫描全库目录树）."""
+        if connection_id:
+            self._meta_key_for_role(role)
+            prof = self.ctx.connection_hub.get_profile(connection_id)
+        else:
+            prof = self._resolve_role_profile(role)
 
         if prof is None:
             return {
@@ -71,18 +95,34 @@ class CrossComparatorService:
                 "default_schema": "public",
                 "user": "",
                 "standard_format": "AUTO",
-                "schemas": [],
-                "tables": [],
             }
 
-        cat = self.ctx.metadata_hub.get_catalog_tree(prof.connection_id, auto_refresh=False)
         pub = prof.to_public_dict()
         return {
             **pub,
             "role": role,
             "configured": True,
             "schema_name": prof.default_schema,
-            "schemas": [s["schema_name"] if isinstance(s, dict) else str(s) for s in cat["schemas"]],
+        }
+
+    def get_role_connection_info(self, role: str) -> Dict[str, Any]:
+        brief = self.get_role_connection_brief(role)
+        if not brief.get("configured"):
+            return {
+                **brief,
+                "schemas": [],
+                "tables": [],
+            }
+
+        cat = self.ctx.metadata_hub.get_catalog_tree(
+            brief["connection_id"], auto_refresh=False
+        )
+        return {
+            **brief,
+            "schemas": [
+                s["schema_name"] if isinstance(s, dict) else str(s)
+                for s in cat["schemas"]
+            ],
             "tables": cat["tables"],
         }
 
@@ -110,25 +150,47 @@ class CrossComparatorService:
         *,
         active_table_key: str = "",
         auto_refresh: bool = False,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
         meta_key = self._meta_key_for_role(role)
+        side_label = "来源库 (左栏)" if (role or "").strip().lower() == "source" else "目标库 (右栏)"
         if not connection_id:
+            report(30.0, "解绑数据源", f"正在清除{side_label}连接绑定...", 0, 0)
             self.ctx.store.save_meta(meta_key, "")
-            return self.get_overview_state(selected_table_key=active_table_key)
+            return self.get_overview_state(
+                selected_table_key=active_table_key, progress_cb=report
+            )
 
+        report(18.0, "校验连接档案", f"正在绑定{side_label}连接...", 0, 0)
         prof = self.ctx.connection_hub.require_profile(connection_id)
         self.ctx.store.save_meta(meta_key, prof.connection_id)
         warning = ""
         if auto_refresh:
+            report(30.0, "刷新目录缓存", f"正在采集 [{prof.name}] 库表目录...", 0, 0)
+
+            def _cat_cb(
+                pct: float, stg: str, dtl: str = "", proc: int = 0, tot: int = 0
+            ) -> None:
+                mapped = 28.0 + 0.37 * max(0.0, min(100.0, float(pct or 0.0)))
+                report(mapped, stg or "刷新目录缓存", dtl, proc, tot)
+
             try:
-                self.ctx.metadata_hub.refresh_catalog(prof.connection_id)
+                refresh_fn = self.ctx.metadata_hub.refresh_catalog
+                if report is not noop_progress and _supports_kwarg(refresh_fn, "progress_cb"):
+                    refresh_fn(prof.connection_id, progress_cb=_cat_cb)
+                else:
+                    refresh_fn(prof.connection_id)
             except Exception as exc:
                 warning = f"已绑定连接 [{prof.name}]，但自动刷新目录缓存未完成: {exc}"
 
-        state = self.get_overview_state(selected_table_key=active_table_key)
+        report(70.0, "刷新比对视图", f"正在加载 [{prof.name}] 表对视图...", 0, 0)
+        state = self.get_overview_state(
+            selected_table_key=active_table_key, progress_cb=report
+        )
         if warning:
             state["warning"] = warning
-        state["message"] = f"已将 [{prof.name}] 绑定为{'来源库 (左栏)' if role == 'source' else '目标库 (右栏)'}"
+        state["message"] = f"已将 [{prof.name}] 绑定为{side_label}"
         return state
 
     @staticmethod
@@ -201,18 +263,15 @@ class CrossComparatorService:
                     return str(t["std_table_key"])
         return ""
 
-    def get_overview_state(
+    def _resolve_comparison_target(
         self,
+        *,
         selected_table_key: Optional[str] = None,
-        force_refresh: bool = False,
         source_schema: Optional[str] = None,
         source_table: Optional[str] = None,
         target_schema: Optional[str] = None,
         target_table: Optional[str] = None,
-        format_profile: str = "AUTO",
-        source_format_profile: str = "AUTO",
-        target_format_profile: str = "AUTO",
-    ) -> Dict[str, Any]:
+    ) -> Tuple[List[Dict[str, Any]], str, str, bool]:
         tables = self.ctx.store.list_cross_tables()
         if not tables and self.ctx.store.list_items():
             fn = self.ctx.store.get_meta("current_excel_name", "执行台同步清单.xlsx")
@@ -224,16 +283,8 @@ class CrossComparatorService:
         if not active_key and tables and not (source_table or target_table):
             active_key = tables[0]["std_table_key"]
 
-        src_conn = self.get_role_connection_info("source")
-        tgt_conn = self.get_role_connection_info("target")
-        eff_src_fmt = self._resolve_side_format_profile(
-            src_conn, source_format_profile, format_profile
-        )
-        eff_tgt_fmt = self._resolve_side_format_profile(
-            tgt_conn, target_format_profile, format_profile
-        )
-
-        comp = None
+        lookup_key = ""
+        load_saved_binding = False
         if active_key or source_table or target_table:
             lookup_key = active_key
             load_saved_binding = bool(active_key)
@@ -255,7 +306,42 @@ class CrossComparatorService:
                         raw_fb = raw_fb.split(".", 1)[1]
                     lookup_key = clean_identifier_input(raw_fb).lower()
                     load_saved_binding = False
+        return tables, active_key, lookup_key, load_saved_binding
 
+    def get_overview_state(
+        self,
+        selected_table_key: Optional[str] = None,
+        force_refresh: bool = False,
+        source_schema: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_schema: Optional[str] = None,
+        target_table: Optional[str] = None,
+        format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
+        report(10.0, "加载配置与连接", "正在读取跨环境连接与已保存表对...", 0, 0)
+        tables, active_key, lookup_key, load_saved_binding = self._resolve_comparison_target(
+            selected_table_key=selected_table_key,
+            source_schema=source_schema,
+            source_table=source_table,
+            target_schema=target_schema,
+            target_table=target_table,
+        )
+
+        src_conn = self.get_role_connection_info("source")
+        tgt_conn = self.get_role_connection_info("target")
+        eff_src_fmt = self._resolve_side_format_profile(
+            src_conn, source_format_profile, format_profile
+        )
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            tgt_conn, target_format_profile, format_profile
+        )
+
+        comp = None
+        if lookup_key:
             comp = self.compare_single_table(
                 lookup_key,
                 override_source_schema=source_schema,
@@ -268,7 +354,13 @@ class CrossComparatorService:
                 target_format_profile=eff_tgt_fmt,
                 persist_missing_binding=bool(active_key),
                 load_saved_binding=load_saved_binding,
+                src_conn=src_conn,
+                tgt_conn=tgt_conn,
+                progress_cb=report,
             )
+        else:
+            report(92.0, "构建比对视图", "跨环境配置加载完成", 0, 0)
+
         return {
             "ok": True,
             "connections": self.ctx.connection_hub.list_profiles(),
@@ -283,11 +375,218 @@ class CrossComparatorService:
                 "filename": self.ctx.store.get_meta("cross_standard_filename", "未导入"),
                 "imported_at": self.ctx.store.get_meta("cross_standard_imported_at", ""),
                 "table_count": len(tables),
-                "column_count": len(self.ctx.store.list_cross_columns()),
+                "column_count": self.ctx.store.count_cross_columns(),
             },
             "tables": tables,
             "active_table_key": active_key,
             "active_comparison": comp,
+        }
+
+    def compare_pair_lightweight(
+        self,
+        selected_table_key: Optional[str] = None,
+        force_refresh: bool = False,
+        source_schema: Optional[str] = None,
+        source_table: Optional[str] = None,
+        target_schema: Optional[str] = None,
+        target_table: Optional[str] = None,
+        format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
+        source_connection_id: Optional[str] = None,
+        target_connection_id: Optional[str] = None,
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        """表对切换轻量接口：零全库目录扫描与零全表字段扫描."""
+        report = progress_cb or noop_progress
+        report(10.0, "加载表对", "正在读取目标表对与连接摘要...", 0, 0)
+        tables, active_key, lookup_key, load_saved_binding = self._resolve_comparison_target(
+            selected_table_key=selected_table_key,
+            source_schema=source_schema,
+            source_table=source_table,
+            target_schema=target_schema,
+            target_table=target_table,
+        )
+
+        src_conn = self.get_role_connection_brief(
+            "source", connection_id=source_connection_id or None
+        )
+        tgt_conn = self.get_role_connection_brief(
+            "target", connection_id=target_connection_id or None
+        )
+        eff_src_fmt = self._resolve_side_format_profile(
+            src_conn, source_format_profile, format_profile
+        )
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            tgt_conn, target_format_profile, format_profile
+        )
+
+        comp = None
+        if lookup_key:
+            comp = self.compare_single_table(
+                lookup_key,
+                override_source_schema=source_schema,
+                override_source_table=source_table,
+                override_target_schema=target_schema,
+                override_target_table=target_table,
+                force_refresh=force_refresh,
+                format_profile=format_profile,
+                source_format_profile=eff_src_fmt,
+                target_format_profile=eff_tgt_fmt,
+                persist_missing_binding=bool(active_key),
+                load_saved_binding=load_saved_binding,
+                src_conn=src_conn,
+                tgt_conn=tgt_conn,
+                progress_cb=report,
+            )
+        else:
+            report(92.0, "构建比对视图", "表对切换视图就绪", 0, 0)
+
+        return {
+            "ok": True,
+            "tables": tables,
+            "active_table_key": active_key,
+            "active_comparison": comp,
+            "format_profile": format_profile or "AUTO",
+            "source_format_profile": eff_src_fmt,
+            "target_format_profile": eff_tgt_fmt,
+            "dict_summary": self.ctx.standard_catalog.get_summary(),
+            "source_connection": src_conn,
+            "target_connection": tgt_conn,
+        }
+
+    def prefetch_saved_pairs(
+        self,
+        *,
+        max_pairs: int = 60,
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        """后台并发预热已保存映射表对的源/目标端元数据缓存."""
+        report = progress_cb or noop_progress
+        limit = max(1, int(max_pairs or 60))
+        src_conn = self.get_role_connection_brief("source")
+        tgt_conn = self.get_role_connection_brief("target")
+        tables = self.ctx.store.list_cross_tables()[:limit]
+
+        src_cid = str(src_conn.get("connection_id") or "") if src_conn.get("configured") else ""
+        tgt_cid = str(tgt_conn.get("connection_id") or "") if tgt_conn.get("configured") else ""
+        src_def_sch = str(src_conn.get("default_schema") or "public")
+        tgt_def_sch = str(tgt_conn.get("default_schema") or "public")
+
+        def _collect_targets(sch_key: str, tbl_key: str, def_sch: str) -> List[Tuple[str, str]]:
+            out: List[Tuple[str, str]] = []
+            seen: set[Tuple[str, str]] = set()
+            for t in tables:
+                raw_t = str(t.get(tbl_key) or "").strip()
+                if not raw_t:
+                    continue
+                raw_s = str(t.get(sch_key) or def_sch).strip() or def_sch
+                if "." in raw_t and not str(t.get(sch_key) or "").strip():
+                    raw_s, raw_t = raw_t.split(".", 1)
+                k = (clean_identifier_input(raw_s).lower(), clean_identifier_input(raw_t).lower())
+                if k[1] and k not in seen:
+                    seen.add(k)
+                    out.append((raw_s, raw_t))
+            return out
+
+        src_targets = _collect_targets("source_schema", "source_table", src_def_sch) if src_cid else []
+        tgt_targets = _collect_targets("target_schema", "target_table", tgt_def_sch) if tgt_cid else []
+        total_targets = len(src_targets) + len(tgt_targets)
+
+        if total_targets == 0:
+            report(95.0, "预热完成", "暂无需要预热的已保存映射表对", 0, 0)
+            return {
+                "ok": True,
+                "prefetched_source": 0,
+                "prefetched_target": 0,
+                "warnings": [],
+            }
+
+        report(
+            15.0,
+            "预热元数据缓存",
+            f"正在并发预热来源端 {len(src_targets)} 表与目标端 {len(tgt_targets)} 表...",
+            0,
+            total_targets,
+        )
+        progress_lock = threading.Lock()
+        done_by_side: Dict[str, int] = {"source": 0, "target": 0}
+        warnings: List[str] = []
+
+        def _run_side(side: str, cid: str, targets: List[Tuple[str, str]]) -> int:
+            side_label = "来源端" if side == "source" else "目标端"
+
+            def _on_prog(done_n: int, tot_n: int, cur_s: str, cur_t: str) -> None:
+                with progress_lock:
+                    done_by_side[side] = min(len(targets), max(done_by_side[side], int(done_n)))
+                    proc = done_by_side["source"] + done_by_side["target"]
+                    pct = min(95.0, 18.0 + 77.0 * proc / max(1, total_targets))
+                    report(
+                        pct,
+                        "预热元数据缓存",
+                        f"正在预热{side_label} {cur_s}.{cur_t} ({done_n}/{tot_n})",
+                        proc,
+                        total_targets,
+                    )
+
+            try:
+                out_map, warn, skipped = self.ctx.metadata_hub.get_tables_metadata_batch(
+                    cid,
+                    targets,
+                    force_refresh=False,
+                    penetrate_views=False,
+                    tolerate_errors=True,
+                    on_progress=_on_prog,
+                )
+                if warn:
+                    with progress_lock:
+                        warnings.append(f"{side_label}: {warn}")
+                resolved_cnt = sum(
+                    1
+                    for s, t in targets
+                    if (
+                        clean_identifier_input(s).lower(),
+                        clean_identifier_input(t).lower(),
+                    )
+                    in out_map
+                )
+                return resolved_cnt if resolved_cnt > 0 else max(0, len(targets) - len(skipped))
+            except Exception as exc:
+                with progress_lock:
+                    warnings.append(f"{side_label}: {exc}")
+                return 0
+
+        jobs: Dict[str, Tuple[str, List[Tuple[str, str]]]] = {}
+        if src_cid and src_targets:
+            jobs["source"] = (src_cid, src_targets)
+        if tgt_cid and tgt_targets:
+            jobs["target"] = (tgt_cid, tgt_targets)
+
+        prefetched_source = 0
+        prefetched_target = 0
+        if len(jobs) > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                fut_map = {
+                    side: pool.submit(_run_side, side, cid, tgts)
+                    for side, (cid, tgts) in jobs.items()
+                }
+                if "source" in fut_map:
+                    prefetched_source = fut_map["source"].result()
+                if "target" in fut_map:
+                    prefetched_target = fut_map["target"].result()
+        else:
+            for side, (cid, tgts) in jobs.items():
+                cnt = _run_side(side, cid, tgts)
+                if side == "source":
+                    prefetched_source = cnt
+                else:
+                    prefetched_target = cnt
+
+        return {
+            "ok": True,
+            "prefetched_source": prefetched_source,
+            "prefetched_target": prefetched_target,
+            "warnings": warnings,
         }
 
     def compare_single_table(
@@ -304,7 +603,13 @@ class CrossComparatorService:
         target_format_profile: str = "AUTO",
         persist_missing_binding: bool = True,
         load_saved_binding: bool = True,
+        src_conn: Optional[Dict[str, Any]] = None,
+        tgt_conn: Optional[Dict[str, Any]] = None,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
+        report = progress_cb or noop_progress
+        report(18.0, "准备比对", "正在解析表对与标准格式...", 0, 0)
+
         def _split_override(
             raw_sch: Optional[str], raw_tbl: Optional[str]
         ) -> Tuple[Optional[str], Optional[str]]:
@@ -352,8 +657,8 @@ class CrossComparatorService:
                     "target_table": override_target_table or "",
                 }
 
-        src_conn = self.get_role_connection_info("source")
-        tgt_conn = self.get_role_connection_info("target")
+        src_conn = src_conn if src_conn is not None else self.get_role_connection_brief("source")
+        tgt_conn = tgt_conn if tgt_conn is not None else self.get_role_connection_brief("target")
         eff_src_fmt = self._resolve_side_format_profile(
             src_conn, source_format_profile, format_profile
         )
@@ -389,29 +694,127 @@ class CrossComparatorService:
         src_error = ""
         tgt_error = ""
 
-        if src_conn.get("configured") and src_conn.get("connection_id"):
-            try:
-                src_meta = self.ctx.metadata_hub.get_table_metadata(
+        has_src = bool(src_conn.get("configured") and src_conn.get("connection_id"))
+        has_tgt = bool(tgt_conn.get("configured") and tgt_conn.get("connection_id"))
+        probe_lock = threading.Lock()
+
+        def _make_side_probe_cb(side_label: str) -> ProgressCallback:
+            if report is noop_progress:
+                return noop_progress
+
+            def _side_cb(
+                pct: float,
+                stg: str,
+                dtl: str = "",
+                proc: int = 0,
+                tot: int = 0,
+            ) -> None:
+                mapped_pct = 22.0 + 0.46 * max(0.0, min(100.0, float(pct or 0.0)))
+                eff_stg = stg if "穿透" in str(stg) else "探查表结构"
+                eff_dtl = f"{side_label}: {dtl or stg}"
+                with probe_lock:
+                    report(mapped_pct, eff_stg, eff_dtl, proc, tot)
+
+            return _side_cb
+
+        def _probe_side(
+            conn_id: str,
+            schema_name: str,
+            table_name: str,
+            side_label: str,
+        ) -> TableMeta:
+            fn = self.ctx.metadata_hub.get_table_metadata
+            side_cb = _make_side_probe_cb(side_label)
+            if side_cb is not noop_progress and _supports_kwarg(fn, "progress_cb"):
+                return fn(
+                    conn_id,
+                    schema_name,
+                    table_name,
+                    force_refresh=force_refresh,
+                    penetrate_views=True,
+                    progress_cb=side_cb,
+                )
+            return fn(
+                conn_id,
+                schema_name,
+                table_name,
+                force_refresh=force_refresh,
+                penetrate_views=True,
+            )
+
+        if has_src and has_tgt:
+            report(
+                22.0,
+                "探查表结构",
+                f"并行探查来源表({src_schema}.{src_table})与目标表({tgt_schema}.{tgt_table})结构...",
+                0,
+                2,
+            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                src_fut = pool.submit(
+                    _probe_side,
                     src_conn["connection_id"],
                     src_schema,
                     src_table,
-                    force_refresh=force_refresh,
-                    penetrate_views=True,
+                    "来源表",
                 )
-            except Exception as exc:
-                src_error = str(exc)
-
-        if tgt_conn.get("configured") and tgt_conn.get("connection_id"):
-            try:
-                tgt_meta = self.ctx.metadata_hub.get_table_metadata(
+                tgt_fut = pool.submit(
+                    _probe_side,
                     tgt_conn["connection_id"],
                     tgt_schema,
                     tgt_table,
-                    force_refresh=force_refresh,
-                    penetrate_views=True,
+                    "目标表",
+                )
+                try:
+                    src_meta = src_fut.result()
+                except Exception as exc:
+                    src_error = str(exc)
+                try:
+                    tgt_meta = tgt_fut.result()
+                except Exception as exc:
+                    tgt_error = str(exc)
+        elif has_src:
+            report(
+                22.0,
+                "探查表结构",
+                f"正在探查来源表({src_schema}.{src_table})结构...",
+                0,
+                1,
+            )
+            try:
+                src_meta = _probe_side(
+                    src_conn["connection_id"],
+                    src_schema,
+                    src_table,
+                    "来源表",
+                )
+            except Exception as exc:
+                src_error = str(exc)
+        elif has_tgt:
+            report(
+                22.0,
+                "探查表结构",
+                f"正在探查目标表({tgt_schema}.{tgt_table})结构...",
+                0,
+                1,
+            )
+            try:
+                tgt_meta = _probe_side(
+                    tgt_conn["connection_id"],
+                    tgt_schema,
+                    tgt_table,
+                    "目标表",
                 )
             except Exception as exc:
                 tgt_error = str(exc)
+
+        report(
+            72.0,
+            "核验数标",
+            f"已获取源表({len(src_meta.columns)}列)/目标表({len(tgt_meta.columns)}列)，正在对齐数据标准...",
+            0,
+            0,
+        )
 
         src_col_map: Dict[str, ColumnMeta] = {}
         for c in src_meta.columns:
@@ -642,6 +1045,13 @@ class CrossComparatorService:
             for c in tgt_meta.columns
         ]
 
+        report(
+            92.0,
+            "构建比对视图",
+            "正在生成五虚拟列对照矩阵...",
+            0,
+            0,
+        )
         dual_rows, bookmark_summary = self._build_dual_bookmark_rows(
             src_conn=src_conn,
             tgt_conn=tgt_conn,
@@ -1108,8 +1518,17 @@ class CrossComparatorService:
         force_refresh: bool = False,
         sync_to_field_bindings: bool = True,
         return_overview: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         """保存双列拖拽调整后的字段映射关系与两侧数标，并可选双向回写第 2 步数据源绑定."""
+        report = progress_cb or noop_progress
+        report(
+            18.0,
+            "校验映射规则",
+            f"正在整理 {len(pairings)} 条字段映射与数据标准...",
+            0,
+            len(pairings),
+        )
         src_cid = str(self.ctx.store.get_meta("cross_source_connection_id", "") or "")
         tgt_cid = str(self.ctx.store.get_meta("cross_target_connection_id", "") or "")
         src_prof = self.ctx.connection_hub.get_profile(src_cid) if src_cid else None
@@ -1249,6 +1668,13 @@ class CrossComparatorService:
                         }
                     )
 
+        report(
+            42.0,
+            "保存映射关系",
+            f"正在写入 [{eff_key}] {len(col_rows_to_insert)} 行字段映射...",
+            len(col_rows_to_insert),
+            max(1, len(col_rows_to_insert)),
+        )
         with self.ctx.store.module_db() as conn:
             conn.execute("DELETE FROM cross_column_bindings WHERE std_table_key = ?", (eff_key,))
             if col_rows_to_insert:
@@ -1266,6 +1692,15 @@ class CrossComparatorService:
                 )
 
         if sync_to_field_bindings:
+            total_sync = len(src_sync_batch) + len(tgt_sync_batch)
+            if total_sync > 0:
+                report(
+                    60.0,
+                    "双向回写数标",
+                    f"正在同步 {total_sync} 条字段数标绑定至单库档案...",
+                    0,
+                    total_sync,
+                )
             if src_sync_batch:
                 self.ctx.standard_catalog.upsert_field_bindings(
                     src_cid, src_sync_batch, bind_source="CROSS_SYNC"
@@ -1286,12 +1721,20 @@ class CrossComparatorService:
                 "std_table_key": eff_key,
                 "saved_count": len(col_rows_to_insert),
             }
+        report(
+            74.0,
+            "刷新比对视图",
+            f"正在重新校验 [{eff_key}] 落标状态...",
+            0,
+            0,
+        )
         state = self.get_overview_state(
             selected_table_key=eff_key,
             force_refresh=force_refresh,
             format_profile=format_profile,
             source_format_profile=source_format_profile,
             target_format_profile=target_format_profile,
+            progress_cb=report,
         )
         state["message"] = "已保存双列映射与书签绑定"
         return state
@@ -1912,8 +2355,10 @@ class CrossComparatorService:
         format_profile: str = "AUTO",
         source_format_profile: str = "AUTO",
         target_format_profile: str = "AUTO",
+        progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         """经由 PlatformStateStore 数据契约将待贯标字段推送至单库贯标队列（零跨模块导入）."""
+        report = progress_cb or noop_progress
         tables = (
             [self.ctx.store.get_cross_table_binding(std_table_key)]
             if std_table_key
@@ -1923,7 +2368,15 @@ class CrossComparatorService:
         if not tables:
             raise ValueError("当前没有可推送的标准绑定表")
 
-        tgt_conn_info = self.get_role_connection_info("target")
+        report(
+            16.0,
+            "加载映射表对",
+            f"准备抽取 {len(tables)} 张表的待贯标规则...",
+            0,
+            len(tables),
+        )
+        src_conn_info = self.get_role_connection_brief("source")
+        tgt_conn_info = self.get_role_connection_brief("target")
         tgt_db_type = str(tgt_conn_info.get("db_type") or "DWS")
         eff_tgt_fmt = self._resolve_side_format_profile(
             tgt_conn_info, target_format_profile, format_profile
@@ -1931,13 +2384,39 @@ class CrossComparatorService:
         items_to_push: List[Dict[str, Any]] = []
         row_idx = 1
 
-        for t in tables:
+        total_tbls = len(tables)
+        for idx_t, t in enumerate(tables, start=1):
             t_key = t["std_table_key"]
+            low_p = 20.0 + 62.0 * (idx_t - 1) / max(1, total_tbls)
+            high_p = 20.0 + 62.0 * idx_t / max(1, total_tbls)
+            report(
+                low_p,
+                "解析贯标规则",
+                f"正在对齐 [{t_key}] 目标表与数据标准 ({idx_t}/{total_tbls})...",
+                idx_t - 1,
+                total_tbls,
+            )
+
+            def _tbl_cb(
+                pct: float,
+                stg: str,
+                dtl: str = "",
+                proc: int = 0,
+                tot: int = 0,
+                _low: float = low_p,
+                _high: float = high_p,
+            ) -> None:
+                mapped = _low + (_high - _low) * max(0.0, min(100.0, float(pct or 0.0))) / 100.0
+                report(mapped, stg, dtl, idx_t - 1, total_tbls)
+
             comp = self.compare_single_table(
                 t_key,
                 format_profile=format_profile,
                 source_format_profile=source_format_profile,
                 target_format_profile=eff_tgt_fmt,
+                src_conn=src_conn_info,
+                tgt_conn=tgt_conn_info,
+                progress_cb=_tbl_cb if report is not noop_progress else noop_progress,
             )
             tgt_panel = comp.get("target_panel") or {}
             tgt_schema = (
@@ -2047,6 +2526,13 @@ class CrossComparatorService:
         if not items_to_push:
             raise ValueError("当前标准表暂无可推送的字段改造规则，请先导入数标或连接来源/目标库加载字段")
 
+        report(
+            86.0,
+            "写入贯标队列",
+            f"正在推送 {len(items_to_push)} 条贯标规则至单库贯标执行台...",
+            len(items_to_push),
+            len(items_to_push),
+        )
         fn = self.ctx.store.get_meta("cross_standard_filename", "跨环境数标推送清单.xlsx")
         self.ctx.store.replace_all_items(items_to_push, fn, preserve_history=True)
 
@@ -2228,9 +2714,15 @@ class CrossComparatorService:
         )
         tables = [t for t in tables if t]
 
+        src_conn_brief = self.get_role_connection_brief("source")
+        tgt_conn_brief = self.get_role_connection_brief("target")
         row_num = 1
         for t in tables:
-            comp = self.compare_single_table(t["std_table_key"])
+            comp = self.compare_single_table(
+                t["std_table_key"],
+                src_conn=src_conn_brief,
+                tgt_conn=tgt_conn_brief,
+            )
             t_bind = comp["table_binding"]
             for sc in comp["standard_panel"]["columns"]:
                 src_m = sc.get("source_col_meta") or {}

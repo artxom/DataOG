@@ -63,38 +63,38 @@
 ## 5. 当前代码基线快照（供下次会话快速定位）
 - **当前主干里程碑版本**：`v2.4.0`（官方品牌名 `Data.O.G`，按数据库持久化落标标准 · macOS 五虚拟列跨环境图形化比对与顶栏防遮蔽重构版，`main` 分支与 `v2.4.0` 标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI `2.4.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度轮询 `200` 日志降噪过滤器、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
+  - `app.py`：FastAPI `2.4.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
   - `requirements.txt`：保持 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），零新增第三方依赖。
   - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（去除重复静态资源拷贝、排除非运行时重型包与测试子模块、自动剥离 `.pyi`/`.pxd`/`__pycache__` 冗余元数据，保障冻结态 `--test` 自检）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
-  - `context.py` (`PlatformContext`) / `router.py` / `schemas.py` / `models.py`
-  - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，暴露线程安全 `module_db()` 上下文与批量元数据缓存读写，核心与模块表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`standard_dictionary`、`field_standard_bindings`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_table_bindings`、`cross_column_bindings`、`explorer_sessions`、`explorer_messages`、`execution_logs`)
+  - `context.py` (`PlatformContext`，同时暴露 `task_progress = import_progress`) / `router.py` / `schemas.py` / `models.py`
+  - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，暴露线程安全 `module_db()` 上下文、`count_cross_columns()` 与批量元数据缓存读写，核心与模块表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`standard_dictionary`、`field_standard_bindings`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_table_bindings`、`cross_column_bindings`、`explorer_sessions`、`explorer_messages`、`execution_logs`)
   - `standard_catalog.py` (`StandardCatalog`，管理全局 46 列标准字典 Upsert/Replace 导入与导出、脱敏系统模板生成、多库物理格式智能解析、三级落标判定、`bulk_save_field_bindings` 单事务分块绑定持久化、B-Tree 半开区间精确清理与 `match_standard_candidates_batch` 批量候选匹配，挂载 `/standards*`)
-  - `import_progress.py` (`ImportProgressHub`，线程安全导入实时阶段/行级/表级进度追踪中枢与运行态延长 TTL 保护，挂载 `GET /import-progress/{progress_id}` 禁缓存响应)
+  - `import_progress.py` (`ImportProgressHub` / `TaskProgressHub`，线程安全任务进度与 `0.35s` 节流 `recent_logs` 缩略微日志环形缓冲、`Condition` 唤醒与取消控制，挂载 `/import-progress/{progress_id}`、`/tasks/{task_id}`、`/tasks/{task_id}/cancel` 与 SSE `/tasks/{task_id}/stream`)
   - `excel_io.py` & `core/excel_formula.py`（统一提供 Excel 缓存结果优先读取、纯 Python 跨表公式兜底求值及 `#N/A` 等全谱系公式错误值置空清洗）
   - `readonly_guard.py` (`validate_readonly_sql` / `ReadOnlyViolationError`，双模态 ANSI + 反斜杠转义词法分词器、单语句校验、`SELECT`/`WITH ... SELECT`/`SHOW`/`DESCRIBE`/非 `ANALYZE` `EXPLAIN` 顶层白名单、全语句写/DDL/锁/`INTO` 与跨方言危险系统函数黑名单)
   - `asset_store.py` (`AssetStore`，管理壁纸预设、本地上传壁纸、`Data.O.G` 主图标与四大模块自定义图标持久化至 `data/assets/`，挂载 `/appearance*` 与 `/assets/{asset_name}`)
   - `llm_hub.py` (`LLMHub`，基于 Python 标准库 `urllib.request` 零额外依赖统一接入 DeepSeek、Google Gemini 与自定义 OpenAI 兼容网关，挂载 `/llm/providers*`、`/llm/test`、`/llm/models`)
   - `driver_manager.py` & `inceptor_client.py` (`DriverManager`，双轨驱动：`NATIVE` + 按需懒加载 `JDBC`，支持 `open_connection(..., readonly=True)` 会话级硬件只读锁)
-  - `connection_hub.py`（含 `readonly_session` 退出无条件 `rollback()` 及按库持久化 `standard_format`：`PUT /connections/{connection_id}/standard-format`） / `metadata_hub.py`（含 `get_tables_metadata_batch` 单会话系统目录批量探查、DWS/PG `lock_timeout`/`lockwait_timeout`/`statement_timeout` 锁保护降级与逐表异常熔断） / `query_engine.py`（含 `execute_readonly_sql` 与 `POST /query/execute-readonly`） / `excel_io.py` / `dialects/`
+  - `connection_hub.py`（含 `readonly_session` 退出无条件 `rollback()`、`probe_session` 60 秒非 SQLite 温连接复用及按库持久化 `standard_format`：`PUT /connections/{connection_id}/standard-format`） / `metadata_hub.py`（含 `120s` 缺失表负缓存、单连接四层视图穿透、`get_tables_metadata_batch` 单会话系统目录批量探查、DWS/PG `lock_timeout`/`lockwait_timeout`/`statement_timeout` 锁保护降级与逐表异常熔断） / `query_engine.py`（含 `execute_readonly_sql` 与 `POST /query/execute-readonly`） / `excel_io.py` / `dialects/`
 - **独立业务插件模块 (`modules/`，严格零跨模块互引)**：
-  - `modules/standard_migrator/`（`/api/modules/standard_migrator`）：支撑「2. 落标绑定与贯标」，支持左侧按数据库粒度设定并持久化落标标准格式，覆盖字段数标绑定（`/bindings/*`）、批量对照导入与按表预填模板、三维分级落标核验、一键转贯标任务及单库保序迁移执行台（`DIRECT_ALTER` / `TABLE_REBUILD`、Kahn 拓扑改名、分区继承、并发作业池）。
-  - `modules/cross_comparator/`（`/api/modules/cross_comparator`）：支撑「3. 跨环境比对」，自动沿用第 2 步按库设定的标准格式与两侧字段绑定，输出五虚拟列图形化对比工作台模型（`UNIFIED` 一致单卡 / `SPLIT_DIFF` 异标双胶囊 / `SPLIT_PARTIAL` 单侧绑定）及 Schema 隔离表对解析，支持拖拽/点选配对保存（`/pairings/save` 双向回写）、铺底模板导入与一键推送至第 2 步贯标。
-  - `modules/ddl_translator/`（`/api/modules/ddl_translator`）：支撑「多邻国」模块，含 `POST /naming`（AI 大模型 + 内置 170+ 数仓标准词根双驱动智能命名与建表草稿生成）与 `POST /translate`（数据源库表/粘贴 `CREATE TABLE` 或 `VIEW`/自由异构 SQL 跨方言互译、四层递归视图穿透与 `AST+AI` 语法适配）。
-  - `modules/data_explorer/`（`/api/modules/data_explorer`）：支撑「数据探查 · AI 探查」多轮目标驱动只读探查会话，含 `/sessions*` 会话历史管理与 `POST /explore` 多步自动采样推理循环（单步采样上限 `200` 行、`12s` 超时、单轮最多 `8` 步熔断及 `recommended_sql` 二次只读清洗）。
+  - `modules/standard_migrator/`（`/api/modules/standard_migrator`）：支撑「2. 落标绑定与贯标」，支持左侧按数据库粒度设定并持久化落标标准格式，覆盖字段数标绑定（`/bindings/*`）、批量对照导入与按表预填模板、三维分级落标核验、一键转贯标任务及单库保序迁移执行台（`DIRECT_ALTER` / `TABLE_REBUILD`、Kahn 拓扑改名、分区继承、并发作业池），全链路接入 `X-Task-Id` 阶段微日志。
+  - `modules/cross_comparator/`（`/api/modules/cross_comparator`）：支撑「3. 跨环境比对」，自动沿用第 2 步按库设定的标准格式与两侧字段绑定，输出五虚拟列图形化对比工作台模型（`UNIFIED` 一致单卡 / `SPLIT_DIFF` 异标双胶囊 / `SPLIT_PARTIAL` 单侧绑定）及 Schema 隔离表对解析，提供轻量 `/compare-pair` 双库并发探查、`/prefetch-pairs` 批量预热、拖拽/点选配对保存（`/pairings/save` 双向回写）、铺底模板导入与一键推送至第 2 步贯标。
+  - `modules/ddl_translator/`（`/api/modules/ddl_translator`）：支撑「多邻国」模块，含 `POST /naming`（AI 大模型 + 内置 170+ 数仓标准词根双驱动智能命名与建表草稿生成）与 `POST /translate`（数据源库表/粘贴 `CREATE TABLE` 或 `VIEW`/自由异构 SQL 跨方言互译、四层递归视图穿透与 `AST+AI` 语法适配），接入 `X-Task-Id` 进度微日志。
+  - `modules/data_explorer/`（`/api/modules/data_explorer`）：支撑「数据探查 · AI 探查」多轮目标驱动只读探查会话，含 `/sessions*` 会话历史管理与 `POST /explore` 多步自动采样推理循环（单步采样上限 `200` 行、`12s` 超时、单轮最多 `8` 步熔断、`recommended_sql` 二次只读清洗与实时步骤微日志推送）。
 - **前端原生 ES Modules macOS 桌面工作台 (`static/`)**：
   - `index.html`、`css/tokens.css`（明暗双主题与内置壁纸变量）、`css/workbench.css`、`js/main.js`（纯净桌面画布、底部悬浮毛玻璃 macOS Dock 栏、最小化 Dock 右侧收纳、全屏 Dock 自动下沉贴底唤出、`⌘K` Spotlight、日志控制台）
-  - 核心层 `js/core/`：`api.js`、`dom.js`、`state.js`
-  - 公共组件 `js/ui/`：`database_tree.js`（DataGrip 风格四级数据库目录树，支持 `single`/`multi` 模式及表级自定义徽标渲染）、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`upload_wizard_modal.js`、`standard_picker_modal.js`、`modal.js`、`toast.js`
+  - 核心层 `js/core/`：`api.js`（含 `AbortSignal`、`X-Task-Id`、`tasksApi` 与 `comparePair`/`prefetchPairs`）、`dom.js`、`state.js`
+  - 公共组件 `js/ui/`：`task_activity_bar.js`（`TaskActivityBar`：`180ms` 防闪烁毛玻璃活动条 + SSE/轮询 + 缩略微日志气泡）、`database_tree.js`（DataGrip 风格四级数据库目录树，支持 `single`/`multi` 模式、紧凑刷新进度条及表级自定义徽标渲染）、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`upload_wizard_modal.js`、`standard_picker_modal.js`、`modal.js`、`toast.js`
   - 四大桌面应用视图 `js/views/`：
     - **系统配置**：`settings_view.js` + `connections_view.js`（外观与图标 / 数据库连接 / JDBC 驱动 / AI 模型）
-    - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单并支持探查 SQL 一键同步至主编辑器）
-    - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片） + `cross_comparator_view.js`（macOS 五虚拟列图形化工作台 + `.mac-subbar` 已保存映射表对防遮蔽布局）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
+    - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单、实时任务微日志并支持探查 SQL 一键同步至主编辑器）
+    - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片） + `cross_comparator_view.js`（macOS 五虚拟列图形化工作台 + `.mac-subbar` 已保存映射表对防遮蔽布局 + `TaskActivityBar` 秒切预热）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
     - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
-- **全量自动化测试套件 (`tests/`，当前共 38 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
+- **全量自动化测试套件 (`tests/`，当前共 40 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
   - `tests/test_core.py`（13 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、DDL 互译与四层视图穿透核心引擎。
-  - `tests/test_platform.py`（14 项）：验证旧版状态库无损迁移、数据源 `standard_format` 幂等迁移与持久化、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索与单会话多表批量探查（含 DWS/PG 会话级锁等待超时降级与逐表异常熔断）、`StandardCatalog` 46 列导入与多库格式解析及 B-Tree 区间绑定清理、Excel 公式最终结果求值与 `#N/A` 置空清洗、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
-  - `tests/test_modules_and_api.py`（11 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 按库设标与落标绑定核验 -> 跨环境五虚拟列拖拽配对、Schema 隔离与 `.mac-subbar` 顶栏防遮蔽闭环）、4631 行×160 表批量绑标压测与离线探查熔断保护、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
+  - `tests/test_platform.py`（15 项）：验证旧版状态库无损迁移、数据源 `standard_format` 幂等迁移与持久化、`TaskProgressHub` 缩略微日志与 SSE、`ConnectionHub.probe_session` 60s 温连接复用、`MetadataHub` 120s 负缓存与单连接视图穿透、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索与单会话多表批量探查（含 DWS/PG 会话级锁等待超时降级与逐表异常熔断）、`StandardCatalog` 46 列导入与多库格式解析及 B-Tree 区间绑定清理、Excel 公式最终结果求值与 `#N/A` 置空清洗、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
+  - `tests/test_modules_and_api.py`（12 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 按库设标与落标绑定核验 -> 跨环境五虚拟列拖拽配对、Schema 隔离与 `.mac-subbar` 顶栏防遮蔽闭环）、`/compare-pair` 轻量切表与 `/prefetch-pairs` 批量预热及跨模块 `X-Task-Id` 缩略微日志、4631 行×160 表批量绑标压测与离线探查熔断保护、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
 
 ## 6. AI 只读探查硬隔离铁律与后续演进守则
 - **绝对只读四道硬防线（后续任何涉及 AI 自动查询的功能均须严格复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束）**：

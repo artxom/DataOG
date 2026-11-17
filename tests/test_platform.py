@@ -2151,6 +2151,208 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             self.assertNotIn("password", p1)
             self.assertEqual(p2["standard_format"], "type_argodb")
 
+    def test_task_progress_stream_warm_probe_pool_and_negative_cache(self) -> None:
+        """验证 TaskProgressHub 缩略微日志与 SSE、probe_session 60s 温连接复用及 120s 负缓存/单连接视图穿透."""
+        import json
+        import logging
+        from unittest.mock import patch
+        from app import _QuietImportProgressAccessFilter, create_app
+        from core.platform.import_progress import ImportProgressHub, TaskProgressHub
+        from tests.test_modules_and_api import TestClient
+
+        self.assertIs(TaskProgressHub, ImportProgressHub)
+        hub = TaskProgressHub()
+        hub.start("tsk_demo_01", "探查任务")
+        for idx in range(12):
+            hub.update(
+                "tsk_demo_01",
+                percent=20 + idx * 5,
+                stage=f"阶段{idx}",
+                detail=f"处理 password=topsecret sk-1234567890abcdef 第{idx}步 " + ("x" * 80),
+            )
+        snap = hub.get("tsk_demo_01")
+        self.assertIsNotNone(snap)
+        assert snap is not None
+        self.assertLessEqual(len(snap["recent_logs"]), 8)
+        for entry in snap["recent_logs"]:
+            self.assertLessEqual(len(entry["summary"]), 64)
+            self.assertNotIn("topsecret", entry["summary"])
+            self.assertNotIn("sk-1234567890abcdef", entry["summary"])
+
+        self.assertTrue(hub.cancel("tsk_demo_01", "用户切换表对"))
+        self.assertTrue(hub.is_cancelled("tsk_demo_01"))
+        self.assertEqual(hub.get("tsk_demo_01")["status"], "cancelled")
+
+        flt = _QuietImportProgressAccessFilter()
+        rec_200 = logging.LogRecord(
+            "uvicorn.access", logging.INFO, "", 0, '127.0.0.1 - "GET /api/platform/tasks/tsk_1 HTTP/1.1" 200', (), None
+        )
+        rec_500 = logging.LogRecord(
+            "uvicorn.access", logging.INFO, "", 0, '127.0.0.1 - "GET /api/platform/tasks/tsk_1 HTTP/1.1" 500', (), None
+        )
+        self.assertFalse(flt.filter(rec_200))
+        self.assertTrue(flt.filter(rec_500))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            ctx = app.state.platform_ctx
+            ctx.task_progress.start("tsk_sse_1", "实时探查")
+            ctx.task_progress.update("tsk_sse_1", percent=60, stage="视图穿透", detail="穿透上游基表")
+            ctx.task_progress.finish("tsk_sse_1", stage="探查完成", detail="就绪")
+
+            client = TestClient(app)
+            st_res = client.get("/api/platform/tasks/tsk_sse_1")
+            self.assertEqual(st_res.status_code, 200)
+            st_body = st_res.json()
+            self.assertTrue(st_body["found"])
+            self.assertEqual(st_body["task"]["status"], "completed")
+            self.assertGreaterEqual(len(st_body["task"]["recent_logs"]), 2)
+
+            sse_res = client.get("/api/platform/tasks/tsk_sse_1/stream?max_wait_ms=0")
+            self.assertEqual(sse_res.status_code, 200)
+            self.assertIn("text/event-stream", sse_res.headers.get("content-type", ""))
+            sse_line = next(ln for ln in sse_res.text.splitlines() if ln.startswith("data: "))
+            sse_payload = json.loads(sse_line[6:])
+            self.assertEqual(sse_payload["task"]["status"], "completed")
+
+            cancel_res = client.post("/api/platform/tasks/tsk_cancel_x/cancel")
+            self.assertEqual(cancel_res.status_code, 200)
+            self.assertFalse(cancel_res.json()["cancelled"])
+
+            # 验证 probe_session: SQLite 默认不入池；非 SQLite 复用 60s 温连接；异常剔除；readonly_session 独立
+            sqlite_path = os.path.join(tmp, "probe_demo.db")
+            sc = sqlite3.connect(sqlite_path)
+            sc.execute("CREATE TABLE t_base (id INTEGER PRIMARY KEY, amt TEXT)")
+            sc.execute("CREATE VIEW v_l1 AS SELECT id, amt FROM t_base")
+            sc.commit()
+            sc.close()
+
+            sq_prof = ctx.connection_hub.save_profile(
+                {"connection_id": "conn_sq_unpooled", "name": "SQ", "db_type": "SQLITE", "sqlite_path": sqlite_path}
+            )
+            with ctx.connection_hub.probe_session(sq_prof.connection_id) as c1:
+                self.assertEqual(c1.execute("SELECT COUNT(*) FROM t_base").fetchone()[0], 0)
+            self.assertNotIn(sq_prof.connection_id, ctx.connection_hub._warm_pool)
+
+            probe_queries: List[str] = []
+
+            class _FakePgCursor:
+                def __init__(self) -> None:
+                    self.closed = False
+                    self._rows: List[Any] = []
+                    self.description: Any = None
+
+                def __enter__(self) -> "_FakePgCursor":
+                    return self
+
+                def __exit__(self, *_args: Any) -> None:
+                    self.close()
+
+                def execute(self, sql: str, params: Any = None) -> None:
+                    low = sql.lower()
+                    if "from pg_catalog.pg_class c" in low and "c.relkind" in low:
+                        tbl = str((params or [""])[0]).lower()
+                        probe_queries.append(tbl)
+                        if tbl == "v_four":
+                            self._rows = [(101, "public", "v_four", "视图", "", "v")]
+                        elif tbl == "t_real":
+                            self._rows = [(102, "public", "t_real", "基表", "", "r")]
+                        else:
+                            self._rows = []
+                    elif "pg_get_viewdef" in low:
+                        self._rows = [("SELECT a FROM public.t_real",)]
+                    elif "from pg_catalog.pg_class c" in low and "a.attname" in low:
+                        self._rows = [("a", "character varying(32)", True, None, "A列")]
+                    else:
+                        self._rows = []
+
+                def fetchall(self) -> List[Any]:
+                    return list(self._rows)
+
+                def fetchone(self) -> Any:
+                    return self._rows[0] if self._rows else None
+
+                def close(self) -> None:
+                    self.closed = True
+
+            class _FakePgConn:
+                def __init__(self) -> None:
+                    self.closed = False
+                    self.autocommit = False
+                    self.rollbacks = 0
+
+                def cursor(self) -> _FakePgCursor:
+                    return _FakePgCursor()
+
+                def rollback(self) -> None:
+                    self.rollbacks += 1
+
+                def close(self) -> None:
+                    self.closed = True
+
+            opened: List[_FakePgConn] = []
+
+            def _fake_open(profile, timeout_sec=15, readonly=False):
+                c = _FakePgConn()
+                opened.append(c)
+                return c
+
+            pg_prof = ctx.connection_hub.save_profile(
+                {"connection_id": "conn_pg_warm", "name": "PGWarm", "db_type": "PGSQL", "host": "127.0.0.1", "port": 5432, "dbname": "dw"}
+            )
+            with patch.object(ctx.driver_manager, "open_connection", side_effect=_fake_open):
+                with ctx.connection_hub.probe_session(pg_prof.connection_id) as p_c1:
+                    self.assertFalse(p_c1.closed)
+                with ctx.connection_hub.probe_session(pg_prof.connection_id) as p_c2:
+                    self.assertIs(p_c1, p_c2)
+                self.assertEqual(len(opened), 1)
+                self.assertGreaterEqual(opened[0].rollbacks, 2)
+
+                # readonly_session 绝不复用温连接池
+                with ctx.connection_hub.readonly_session(pg_prof.connection_id) as ro_c:
+                    self.assertIsNot(ro_c, opened[0])
+                self.assertTrue(ro_c.closed)
+                self.assertEqual(len(opened), 2)
+
+                # 异常时剔除并关闭温连接，下次重新建连
+                with self.assertRaises(RuntimeError):
+                    with ctx.connection_hub.probe_session(pg_prof.connection_id):
+                        raise RuntimeError("boom")
+                self.assertTrue(opened[0].closed)
+
+                # 120s 负缓存：不存在的表第二次探查零连库也零 SQL 查询；force_refresh=True 时绕过负缓存并复用温连接重查
+                before_neg = len(opened)
+                q_before = len(probe_queries)
+                m_miss1 = ctx.metadata_hub.get_table_metadata(pg_prof.connection_id, "public", "missing_tbl")
+                self.assertFalse(m_miss1.exists)
+                after_miss1 = len(opened)
+                self.assertEqual(after_miss1, before_neg + 1)
+                self.assertEqual(len(probe_queries), q_before + 1)
+                m_miss2 = ctx.metadata_hub.get_table_metadata(pg_prof.connection_id, "public", "missing_tbl")
+                self.assertFalse(m_miss2.exists)
+                self.assertEqual(len(opened), after_miss1)
+                self.assertEqual(len(probe_queries), q_before + 1)
+                ctx.metadata_hub.get_table_metadata(pg_prof.connection_id, "public", "missing_tbl", force_refresh=True)
+                self.assertEqual(len(opened), after_miss1)
+                self.assertEqual(len(probe_queries), q_before + 2)
+
+                # 单连接四层视图穿透：视图 + 上游基表复用同一连接（仅新建/复用 1 次连接）
+                v_stages: List[str] = []
+                before_view = len(opened)
+                ctx.connection_hub.close_warm_connections(pg_prof.connection_id)
+                v_meta = ctx.metadata_hub.get_table_metadata(
+                    pg_prof.connection_id,
+                    "public",
+                    "v_four",
+                    penetrate_views=True,
+                    progress_cb=lambda pct, st, det, *_a: v_stages.append(st),
+                )
+                self.assertTrue(v_meta.exists)
+                self.assertEqual(len(opened), before_view + 1)
+                self.assertIn("视图穿透", v_stages)
+
+            ctx.connection_hub.close_warm_connections()
+
 
 if __name__ == "__main__":
     unittest.main()
