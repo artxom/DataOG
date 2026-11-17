@@ -325,7 +325,7 @@ class StandardCatalog:
             ).fetchone()
             if not row:
                 row = conn.execute(
-                    "SELECT * FROM standard_dictionary WHERE LOWER(std_code) = LOWER(?)",
+                    "SELECT * FROM standard_dictionary WHERE std_code = ? COLLATE NOCASE",
                     (code,),
                 ).fetchone()
             return self._row_to_item(row) if row else None
@@ -348,6 +348,20 @@ class StandardCatalog:
                 for r in rows:
                     item = self._row_to_item(r)
                     result[item["std_code"]] = item
+            missing_codes = [c for c in unique_codes if c not in result]
+            for i in range(0, len(missing_codes), chunk_size):
+                sub = missing_codes[i : i + chunk_size]
+                placeholders = ",".join("?" for _ in sub)
+                rows = conn.execute(
+                    f"SELECT * FROM standard_dictionary WHERE std_code COLLATE NOCASE IN ({placeholders})",
+                    sub,
+                ).fetchall()
+                by_low = {str(r["std_code"]).lower(): self._row_to_item(r) for r in rows}
+                for orig_c in sub:
+                    hit = by_low.get(orig_c.lower())
+                    if hit:
+                        result[orig_c] = hit
+                        result[hit["std_code"]] = hit
         return result
 
     def search_standards(
@@ -1277,6 +1291,13 @@ class StandardCatalog:
         c = clean_identifier_input(column_name or "").lower()
         return f"{s}::{t}::{c}"
 
+    @staticmethod
+    def make_table_key_bounds(schema_name: str, table_name: str) -> Tuple[str, str]:
+        """构造精确命中 UNIQUE(connection_id, col_key) B-Tree 索引的半开区间 [lo, hi)，杜绝 LIKE '_' 通配符误伤与全表扫描."""
+        s = clean_identifier_input(schema_name or "public").lower() or "public"
+        t = clean_identifier_input(table_name or "").lower()
+        return f"{s}::{t}::", f"{s}::{t}:;"
+
     def get_table_field_bindings(
         self, connection_id: str, schema_name: str, table_name: str
     ) -> Dict[str, Dict[str, Any]]:
@@ -1285,15 +1306,15 @@ class StandardCatalog:
             return {}
         sch = clean_identifier_input(schema_name or "public").lower() or "public"
         tbl = clean_identifier_input(table_name).lower()
-        prefix = f"{sch}::{tbl}::"
+        lo, hi = self.make_table_key_bounds(sch, tbl)
         with self.store.module_db() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM field_standard_bindings
-                WHERE connection_id = ? AND col_key LIKE ?
+                WHERE connection_id = ? AND col_key >= ? AND col_key < ?
                 ORDER BY id ASC
                 """,
-                (connection_id, f"{prefix}%"),
+                (connection_id, lo, hi),
             ).fetchall()
             if not rows:
                 rows = conn.execute(
@@ -1314,6 +1335,73 @@ class StandardCatalog:
             ck = clean_identifier_input(d["column_name"]).lower()
             res[ck] = d
         return res
+
+    def get_tables_field_bindings_batch(
+        self, connection_id: str, targets: Iterable[Tuple[str, str]]
+    ) -> Dict[Tuple[str, str], Dict[str, Dict[str, Any]]]:
+        """单连接批量读取多张表的字段数标绑定映射，键为 (schema_lower, table_lower)."""
+        if not connection_id:
+            return {}
+        wanted: List[Tuple[str, str]] = []
+        wanted_set = set()
+        for raw_s, raw_t in targets:
+            t_low = clean_identifier_input(raw_t or "").lower()
+            if not t_low:
+                continue
+            s_low = clean_identifier_input(raw_s or "public").lower() or "public"
+            if (s_low, t_low) not in wanted_set:
+                wanted_set.add((s_low, t_low))
+                wanted.append((s_low, t_low))
+        if not wanted:
+            return {}
+
+        out: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        with self.store.module_db() as conn:
+            if len(wanted) <= 24:
+                raw_rows = []
+                for s_low, t_low in wanted:
+                    lo, hi = self.make_table_key_bounds(s_low, t_low)
+                    part = conn.execute(
+                        """
+                        SELECT * FROM field_standard_bindings
+                        WHERE connection_id = ? AND col_key >= ? AND col_key < ?
+                        ORDER BY id ASC
+                        """,
+                        (connection_id, lo, hi),
+                    ).fetchall()
+                    if not part:
+                        part = conn.execute(
+                            """
+                            SELECT * FROM field_standard_bindings
+                            WHERE connection_id = ? AND LOWER(table_name) = ? AND LOWER(schema_name) = ?
+                            ORDER BY id ASC
+                            """,
+                            (connection_id, t_low, s_low),
+                        ).fetchall()
+                    raw_rows.extend(part)
+            else:
+                raw_rows = conn.execute(
+                    """
+                    SELECT * FROM field_standard_bindings
+                    WHERE connection_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (connection_id,),
+                ).fetchall()
+
+        for r in raw_rows:
+            d = dict(r)
+            s_low = clean_identifier_input(d.get("schema_name") or "public").lower() or "public"
+            t_low = clean_identifier_input(d.get("table_name") or "").lower()
+            if (s_low, t_low) not in wanted_set:
+                continue
+            cleaned_code = _clean_cell(d.get("std_code"), treat_slash_empty=True)
+            if not cleaned_code:
+                continue
+            d["std_code"] = cleaned_code
+            ck = clean_identifier_input(d["column_name"]).lower()
+            out.setdefault((s_low, t_low), {})[ck] = d
+        return out
 
     def purge_invalid_error_bindings(self, connection_id: str = "") -> int:
         """清理历史残留的 Excel 错误值与空占位符绑定（如旧版误入库的 #N/A、'#N/A、全角 ＃N/A、#REF! 等）."""
@@ -1370,52 +1458,64 @@ class StandardCatalog:
                     )
         return deleted_total
 
-    def upsert_field_bindings(
+    def bulk_save_field_bindings(
         self,
         connection_id: str,
         bindings: List[Dict[str, Any]],
         *,
-        bind_source: str = "MANUAL",
+        mode: str = "merge",
+        replace_tables: Optional[Iterable[Tuple[str, str]]] = None,
+        bind_source: str = "EXCEL",
+        progress_cb: Optional[ProgressCallback] = None,
+        progress_start_pct: float = 60.0,
+        progress_end_pct: float = 70.0,
     ) -> int:
-        if not connection_id or not bindings:
+        """单事务分块批量持久化字段标准绑定（兼容增量合并与按表覆盖重建，消除多表逐次连接/提交风暴）."""
+        if not connection_id:
             return 0
+        report = progress_cb or noop_progress
+        eff_mode = (mode or "merge").strip().lower()
         now = self._now_str()
-        changed = 0
-        with self.store.module_db() as conn:
-            for item in bindings:
-                sch = clean_identifier_input(item.get("schema_name") or "public") or "public"
-                tbl = clean_identifier_input(item.get("table_name") or "")
-                col = clean_identifier_input(item.get("column_name") or "")
-                if not tbl or not col:
+        default_src = (bind_source or "MANUAL").strip() or "MANUAL"
+
+        del_table_ranges: List[Tuple[str, str, str]] = []
+        del_table_nocase: List[Tuple[str, str, str]] = []
+        seen_tbl_keys = set()
+        if eff_mode == "replace_table" and replace_tables:
+            for raw_s, raw_t in replace_tables:
+                t_low = clean_identifier_input(raw_t or "").lower()
+                if not t_low:
                     continue
-                col_key = self.make_col_key(sch, tbl, col)
-                std_code = _clean_cell(item.get("std_code"), treat_slash_empty=True)
-                if not std_code:
-                    cur = conn.execute(
-                        "DELETE FROM field_standard_bindings WHERE connection_id = ? AND col_key = ?",
-                        (connection_id, col_key),
-                    )
-                    changed += cur.rowcount
-                    continue
-                src = str(item.get("bind_source") or bind_source or "MANUAL").strip()
+                s_low = clean_identifier_input(raw_s or "public").lower() or "public"
+                if (s_low, t_low) not in seen_tbl_keys:
+                    seen_tbl_keys.add((s_low, t_low))
+                    lo, hi = self.make_table_key_bounds(s_low, t_low)
+                    del_table_ranges.append((connection_id, lo, hi))
+                    del_table_nocase.append((connection_id, s_low, t_low))
+
+        # 按 col_key 顺序去重（同行/同字段重复出现时以最后一条为准，与顺序执行语义严格一致）
+        deduped_ops: Dict[str, Tuple[str, str, Optional[Tuple[Any, ...]]]] = {}
+        touched_tbl_set = set(seen_tbl_keys)
+        for item in bindings or []:
+            sch = clean_identifier_input(item.get("schema_name") or "public") or "public"
+            tbl = clean_identifier_input(item.get("table_name") or "")
+            col = clean_identifier_input(item.get("column_name") or "")
+            if not tbl or not col:
+                continue
+            s_low = sch.lower()
+            t_low = tbl.lower()
+            touched_tbl_set.add((s_low, t_low))
+            col_key = self.make_col_key(sch, tbl, col)
+            std_code = _clean_cell(item.get("std_code"), treat_slash_empty=True)
+            if not std_code:
+                deduped_ops[col_key] = (s_low, t_low, None)
+            else:
+                src = str(item.get("bind_source") or default_src).strip() or default_src
                 c_status = str(item.get("compliance_status") or "UNCHECKED").strip()
                 c_detail = str(item.get("compliance_detail") or "").strip()
-                conn.execute(
-                    """
-                    INSERT INTO field_standard_bindings (
-                        connection_id, schema_name, table_name, column_name, col_key,
-                        std_code, bind_source, compliance_status, compliance_detail, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(connection_id, col_key) DO UPDATE SET
-                        schema_name = excluded.schema_name,
-                        table_name = excluded.table_name,
-                        column_name = excluded.column_name,
-                        std_code = excluded.std_code,
-                        bind_source = excluded.bind_source,
-                        compliance_status = excluded.compliance_status,
-                        compliance_detail = excluded.compliance_detail,
-                        updated_at = excluded.updated_at
-                    """,
+                deduped_ops[col_key] = (
+                    s_low,
+                    t_low,
                     (
                         connection_id,
                         sch,
@@ -1429,8 +1529,216 @@ class StandardCatalog:
                         now,
                     ),
                 )
-                changed += 1
+
+        if not del_table_ranges and not deduped_ops:
+            return 0
+
+        delete_col_params: List[Tuple[str, str]] = []
+        upsert_tuples: List[Tuple[Any, ...]] = []
+        for col_key, (s_low, t_low, tup) in deduped_ops.items():
+            if tup is None:
+                if eff_mode != "replace_table" or (s_low, t_low) not in seen_tbl_keys:
+                    delete_col_params.append((connection_id, col_key))
+            else:
+                upsert_tuples.append(tup)
+
+        upsert_sql = """
+            INSERT INTO field_standard_bindings (
+                connection_id, schema_name, table_name, column_name, col_key,
+                std_code, bind_source, compliance_status, compliance_detail, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id, col_key) DO UPDATE SET
+                schema_name = excluded.schema_name,
+                table_name = excluded.table_name,
+                column_name = excluded.column_name,
+                std_code = excluded.std_code,
+                bind_source = excluded.bind_source,
+                compliance_status = excluded.compliance_status,
+                compliance_detail = excluded.compliance_detail,
+                updated_at = excluded.updated_at
+        """
+
+        total_bind_ops = max(1, len(upsert_tuples) + len(delete_col_params))
+        tbl_count = max(1, len(touched_tbl_set))
+        changed = 0
+        chunk_size = 500
+        base_pct = (
+            progress_start_pct + (progress_end_pct - progress_start_pct) * 0.15
+            if del_table_ranges
+            else progress_start_pct
+        )
+
+        with self.store.module_db() as conn:
+            if del_table_ranges:
+                for i in range(0, len(del_table_ranges), chunk_size):
+                    batch_del = del_table_ranges[i : i + chunk_size]
+                    cur_dt = conn.executemany(
+                        "DELETE FROM field_standard_bindings WHERE connection_id = ? AND col_key >= ? AND col_key < ?",
+                        batch_del,
+                    )
+                    changed += max(0, int(cur_dt.rowcount or 0))
+                    batch_nc = del_table_nocase[i : i + chunk_size]
+                    cur_nc = conn.executemany(
+                        "DELETE FROM field_standard_bindings WHERE connection_id = ? AND schema_name = ? COLLATE NOCASE AND table_name = ? COLLATE NOCASE",
+                        batch_nc,
+                    )
+                    changed += max(0, int(cur_nc.rowcount or 0))
+                report(
+                    progress_end_pct
+                    if (not upsert_tuples and not delete_col_params)
+                    else base_pct,
+                    "保存对照关系",
+                    f"已完成 {len(del_table_ranges)} 张表的绑定清理"
+                    if (not upsert_tuples and not delete_col_params)
+                    else f"已清理 {len(del_table_ranges)} 张表的旧绑定，正在批量写入 {len(upsert_tuples)} 条新对照关系...",
+                    total_bind_ops if (not upsert_tuples and not delete_col_params) else 0,
+                    total_bind_ops,
+                )
+
+            done_ops = 0
+            for i in range(0, len(delete_col_params), chunk_size):
+                batch_dk = delete_col_params[i : i + chunk_size]
+                cur = conn.executemany(
+                    "DELETE FROM field_standard_bindings WHERE connection_id = ? AND col_key = ?",
+                    batch_dk,
+                )
+                changed += max(0, int(cur.rowcount or 0))
+                done_ops += len(batch_dk)
+                ratio = min(1.0, done_ops / total_bind_ops)
+                pct = base_pct + (progress_end_pct - base_pct) * ratio
+                report(
+                    pct,
+                    "保存对照关系",
+                    f"正在更新字段标准绑定 {min(done_ops, total_bind_ops)} / {total_bind_ops} 条（涉及 {tbl_count} 张表）...",
+                    min(done_ops, total_bind_ops),
+                    total_bind_ops,
+                )
+
+            for i in range(0, len(upsert_tuples), chunk_size):
+                batch_up = upsert_tuples[i : i + chunk_size]
+                conn.executemany(upsert_sql, batch_up)
+                changed += len(batch_up)
+                done_ops += len(batch_up)
+                ratio = min(1.0, done_ops / total_bind_ops)
+                pct = base_pct + (progress_end_pct - base_pct) * ratio
+                report(
+                    pct,
+                    "保存对照关系",
+                    f"正在写入字段标准绑定 {min(done_ops, total_bind_ops)} / {total_bind_ops} 条（涉及 {tbl_count} 张表）...",
+                    min(done_ops, total_bind_ops),
+                    total_bind_ops,
+                )
+
         return changed
+
+    def realign_table_bindings_schema(
+        self,
+        connection_id: str,
+        migrations: Iterable[Tuple[str, str, str]],
+        *,
+        replace_mode: bool = False,
+    ) -> int:
+        """当未填写模式名的表在探查后确认真实 Schema（如 public -> dwd/main/ods）时，单事务原子对齐绑定记录."""
+        if not connection_id:
+            return 0
+        dedup: List[Tuple[str, str, str]] = []
+        seen = set()
+        for old_s, new_s, tbl in migrations:
+            os_clean = clean_identifier_input(old_s or "")
+            ns_clean = clean_identifier_input(new_s or "")
+            t_clean = clean_identifier_input(tbl or "")
+            if not os_clean or not ns_clean or not t_clean or os_clean.lower() == ns_clean.lower():
+                continue
+            k = (os_clean.lower(), ns_clean.lower(), t_clean.lower())
+            if k not in seen:
+                seen.add(k)
+                dedup.append((os_clean, ns_clean, t_clean))
+        if not dedup:
+            return 0
+
+        now = self._now_str()
+        moved = 0
+        upsert_sql = """
+            INSERT INTO field_standard_bindings (
+                connection_id, schema_name, table_name, column_name, col_key,
+                std_code, bind_source, compliance_status, compliance_detail, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id, col_key) DO UPDATE SET
+                schema_name = excluded.schema_name,
+                table_name = excluded.table_name,
+                column_name = excluded.column_name,
+                std_code = excluded.std_code,
+                bind_source = excluded.bind_source,
+                compliance_status = excluded.compliance_status,
+                compliance_detail = excluded.compliance_detail,
+                updated_at = excluded.updated_at
+        """
+        with self.store.module_db() as conn:
+            for old_s, new_s, tbl in dedup:
+                lo_old, hi_old = self.make_table_key_bounds(old_s, tbl)
+                src_rows = conn.execute(
+                    """
+                    SELECT * FROM field_standard_bindings
+                    WHERE connection_id = ? AND col_key >= ? AND col_key < ?
+                    ORDER BY id ASC
+                    """,
+                    (connection_id, lo_old, hi_old),
+                ).fetchall()
+                if replace_mode:
+                    lo_new, hi_new = self.make_table_key_bounds(new_s, tbl)
+                    conn.execute(
+                        "DELETE FROM field_standard_bindings WHERE connection_id = ? AND col_key >= ? AND col_key < ?",
+                        (connection_id, lo_new, hi_new),
+                    )
+                    conn.execute(
+                        "DELETE FROM field_standard_bindings WHERE connection_id = ? AND schema_name = ? COLLATE NOCASE AND table_name = ? COLLATE NOCASE",
+                        (connection_id, new_s, tbl),
+                    )
+                if src_rows:
+                    up_batch = [
+                        (
+                            connection_id,
+                            new_s,
+                            tbl,
+                            r["column_name"],
+                            self.make_col_key(new_s, tbl, r["column_name"]),
+                            r["std_code"],
+                            r["bind_source"],
+                            r["compliance_status"],
+                            r["compliance_detail"],
+                            now,
+                        )
+                        for r in src_rows
+                    ]
+                    conn.executemany(upsert_sql, up_batch)
+                    moved += len(up_batch)
+                conn.execute(
+                    "DELETE FROM field_standard_bindings WHERE connection_id = ? AND col_key >= ? AND col_key < ?",
+                    (connection_id, lo_old, hi_old),
+                )
+                conn.execute(
+                    "DELETE FROM field_standard_bindings WHERE connection_id = ? AND schema_name = ? COLLATE NOCASE AND table_name = ? COLLATE NOCASE",
+                    (connection_id, old_s, tbl),
+                )
+        return moved
+
+    def upsert_field_bindings(
+        self,
+        connection_id: str,
+        bindings: List[Dict[str, Any]],
+        *,
+        bind_source: str = "MANUAL",
+        progress_cb: Optional[ProgressCallback] = None,
+    ) -> int:
+        if not connection_id or not bindings:
+            return 0
+        return self.bulk_save_field_bindings(
+            connection_id,
+            bindings,
+            mode="merge",
+            bind_source=bind_source,
+            progress_cb=progress_cb,
+        )
 
     def replace_table_field_bindings(
         self,
@@ -1440,18 +1748,18 @@ class StandardCatalog:
         bindings: List[Dict[str, Any]],
         *,
         bind_source: str = "EXCEL",
+        progress_cb: Optional[ProgressCallback] = None,
     ) -> int:
         if not connection_id or not table_name:
             return 0
-        sch = clean_identifier_input(schema_name or "public").lower() or "public"
-        tbl = clean_identifier_input(table_name).lower()
-        prefix = f"{sch}::{tbl}::"
-        with self.store.module_db() as conn:
-            conn.execute(
-                "DELETE FROM field_standard_bindings WHERE connection_id = ? AND col_key LIKE ?",
-                (connection_id, f"{prefix}%"),
-            )
-        return self.upsert_field_bindings(connection_id, bindings, bind_source=bind_source)
+        return self.bulk_save_field_bindings(
+            connection_id,
+            bindings,
+            mode="replace_table",
+            replace_tables=[(schema_name, table_name)],
+            bind_source=bind_source,
+            progress_cb=progress_cb,
+        )
 
     def update_binding_compliance_batch(
         self, connection_id: str, updates: List[Dict[str, Any]]
@@ -1522,6 +1830,70 @@ class StandardCatalog:
             ).fetchall()
         return [(r["schema_name"], r["table_name"]) for r in rows]
 
+    def _query_candidates_on_conn(
+        self,
+        conn: Any,
+        *,
+        col_name: str = "",
+        col_comment: str = "",
+        preferred_code: str = "",
+    ) -> List[Dict[str, Any]]:
+        code = _clean_cell(preferred_code, treat_slash_empty=True)
+        if code:
+            row = conn.execute(
+                "SELECT * FROM standard_dictionary WHERE std_code = ?",
+                (code,),
+            ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT * FROM standard_dictionary WHERE std_code = ? COLLATE NOCASE",
+                    (code,),
+                ).fetchone()
+            if row:
+                return [self._row_to_item(row)]
+
+        en = clean_identifier_input(col_name or "")
+        cn = _clean_cell(col_comment, treat_slash_empty=True)
+        if en and cn:
+            rows = conn.execute(
+                """
+                SELECT * FROM standard_dictionary
+                WHERE en_abbr = ? COLLATE NOCASE AND (cn_name = ? OR cn_name LIKE ?)
+                ORDER BY CASE WHEN is_standard_dict = '1' THEN 0 ELSE 1 END, std_code ASC
+                LIMIT 5
+                """,
+                (en, cn, f"%{cn}%"),
+            ).fetchall()
+            if rows:
+                return [self._row_to_item(r) for r in rows]
+
+        if en:
+            rows = conn.execute(
+                """
+                SELECT * FROM standard_dictionary
+                WHERE en_abbr = ? COLLATE NOCASE
+                ORDER BY CASE WHEN is_standard_dict = '1' THEN 0 ELSE 1 END, std_code ASC
+                LIMIT 5
+                """,
+                (en,),
+            ).fetchall()
+            if rows:
+                return [self._row_to_item(r) for r in rows]
+
+        if cn:
+            rows = conn.execute(
+                """
+                SELECT * FROM standard_dictionary
+                WHERE cn_name = ? OR cn_alias = ?
+                ORDER BY CASE WHEN is_standard_dict = '1' THEN 0 ELSE 1 END, std_code ASC
+                LIMIT 5
+                """,
+                (cn, cn),
+            ).fetchall()
+            if rows:
+                return [self._row_to_item(r) for r in rows]
+        return []
+
     def match_standard_candidates(
         self,
         *,
@@ -1530,51 +1902,38 @@ class StandardCatalog:
         preferred_code: str = "",
     ) -> List[Dict[str, Any]]:
         """按编号 > 英文简称+中文名 > 英文简称 > 中文名在标准字典中智能匹配候选标准."""
-        code = _clean_cell(preferred_code, treat_slash_empty=True)
-        if code:
-            exact = self.get_item(code)
-            if exact:
-                return [exact]
-
-        en = clean_identifier_input(col_name or "")
-        cn = _clean_cell(col_comment, treat_slash_empty=True)
         with self.store.module_db() as conn:
-            if en and cn:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM standard_dictionary
-                    WHERE LOWER(en_abbr) = LOWER(?) AND (cn_name = ? OR cn_name LIKE ?)
-                    ORDER BY CASE WHEN is_standard_dict = '1' THEN 0 ELSE 1 END, std_code ASC
-                    LIMIT 5
-                    """,
-                    (en, cn, f"%{cn}%"),
-                ).fetchall()
-                if rows:
-                    return [self._row_to_item(r) for r in rows]
+            return self._query_candidates_on_conn(
+                conn,
+                col_name=col_name,
+                col_comment=col_comment,
+                preferred_code=preferred_code,
+            )
 
-            if en:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM standard_dictionary
-                    WHERE LOWER(en_abbr) = LOWER(?)
-                    ORDER BY CASE WHEN is_standard_dict = '1' THEN 0 ELSE 1 END, std_code ASC
-                    LIMIT 5
-                    """,
-                    (en,),
-                ).fetchall()
-                if rows:
-                    return [self._row_to_item(r) for r in rows]
-
-            if cn:
-                rows = conn.execute(
-                    """
-                    SELECT * FROM standard_dictionary
-                    WHERE cn_name = ? OR cn_alias = ?
-                    ORDER BY CASE WHEN is_standard_dict = '1' THEN 0 ELSE 1 END, std_code ASC
-                    LIMIT 5
-                    """,
-                    (cn, cn),
-                ).fetchall()
-                if rows:
-                    return [self._row_to_item(r) for r in rows]
-        return []
+    def match_standard_candidates_batch(
+        self,
+        queries: Iterable[Tuple[str, str]],
+    ) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
+        """单连接批量执行候选数据标准匹配，消除大表无编号行逐次开闭 SQLite 连接开销."""
+        unique_q: List[Tuple[str, str]] = []
+        seen = set()
+        for raw_en, raw_cn in queries:
+            en = clean_identifier_input(raw_en or "")
+            cn = _clean_cell(raw_cn, treat_slash_empty=True)
+            if not en and not cn:
+                continue
+            k = (en.lower(), cn)
+            if k not in seen:
+                seen.add(k)
+                unique_q.append((en, cn))
+        if not unique_q:
+            return {}
+        out: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        with self.store.module_db() as conn:
+            for en, cn in unique_q:
+                out[(en.lower(), cn)] = self._query_candidates_on_conn(
+                    conn,
+                    col_name=en,
+                    col_comment=cn,
+                )
+        return out

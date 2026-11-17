@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from core.platform.connection_hub import ConnectionHub
 from core.platform.dialects import (
@@ -55,6 +56,61 @@ class MetadataHub:
                 col.is_primary_key = True
         return meta
 
+    @staticmethod
+    def _enable_pg_autocommit(conn: Any) -> None:
+        if not hasattr(conn, "autocommit") or getattr(conn, "autocommit", False):
+            return
+        try:
+            if hasattr(conn, "rollback"):
+                conn.rollback()
+        except Exception:
+            pass
+        try:
+            conn.autocommit = True
+        except Exception:
+            pass
+
+    @staticmethod
+    def _rollback_pg_if_needed(conn: Any) -> None:
+        try:
+            if hasattr(conn, "rollback"):
+                conn.rollback()
+        except Exception:
+            pass
+
+    @classmethod
+    def _apply_pg_probe_timeouts(
+        cls, conn: Any, cur: Any, profile: ConnectionProfile
+    ) -> None:
+        """尽力而为设置 PG / GaussDB(DWS) 会话级锁等待与语句超时，防止远端 ETL 排他锁导致元数据探查无限阻塞."""
+        try:
+            cur.execute("SET lock_timeout = 3000;")
+        except Exception:
+            cls._rollback_pg_if_needed(conn)
+            if profile.db_type == "DWS":
+                try:
+                    cur.execute("SET lockwait_timeout = 3000;")
+                except Exception:
+                    cls._rollback_pg_if_needed(conn)
+        else:
+            if profile.db_type == "DWS":
+                try:
+                    cur.execute("SET lockwait_timeout = 3000;")
+                except Exception:
+                    cls._rollback_pg_if_needed(conn)
+        try:
+            cur.execute("SET statement_timeout = 8000;")
+        except Exception:
+            cls._rollback_pg_if_needed(conn)
+
+    @classmethod
+    def _recover_pg_tx(
+        cls, conn: Any, cur: Any, profile: ConnectionProfile
+    ) -> None:
+        cls._rollback_pg_if_needed(conn)
+        if not getattr(conn, "autocommit", False):
+            cls._apply_pg_probe_timeouts(conn, cur, profile)
+
     # =========================================================================
     # 对外公共查询、增量刷新与全文检索 API
     # =========================================================================
@@ -66,7 +122,7 @@ class MetadataHub:
         if auto_refresh and not cached["schemas"] and not cached["tables"]:
             return self.refresh_catalog(connection_id)
         profile = self.connection_hub.get_profile(connection_id)
-        cached["default_schema"] = profile.default_schema if profile else "public"
+        cached["default_schema"] = profile.effective_default_schema() if profile else "public"
         cached["db_type"] = profile.db_type if profile else ""
         return cached
 
@@ -116,11 +172,25 @@ class MetadataHub:
         if "." in raw_t and not raw_s:
             raw_s, raw_t = raw_t.split(".", 1)
 
-        eff_schema = (
-            clean_identifier_input(raw_s)
-            or profile.default_schema
-            or ("default" if profile.db_type == "INCEPTOR" else ("main" if profile.db_type == "SQLITE" else "public"))
-        )
+        default_sch = profile.effective_default_schema()
+        cleaned_s = clean_identifier_input(raw_s)
+        if (
+            cleaned_s.lower() == "public"
+            and default_sch.lower() != "public"
+            and profile.db_type in (
+                "SQLITE",
+                "INCEPTOR",
+                "MYSQL",
+                "MARIADB",
+                "OCEANBASE",
+                "DORIS",
+                "STARROCKS",
+                "TIDB",
+            )
+        ):
+            eff_schema = default_sch
+        else:
+            eff_schema = cleaned_s or default_sch
         eff_table = clean_identifier_input(raw_t)
         if not eff_table:
             return TableMeta(schema_name=eff_schema, table_name="", exists=False)
@@ -129,6 +199,15 @@ class MetadataHub:
             cached = self.store.get_cached_table_meta(connection_id, eff_schema, eff_table)
             if cached is not None:
                 return cached
+            if not cleaned_s or cleaned_s.lower() in (default_sch.lower(), "public"):
+                fb_map = self.store.get_cached_tables_meta_batch(
+                    connection_id,
+                    [(eff_schema, eff_table)],
+                    fallback_default_schema=default_sch,
+                )
+                fb_hit = fb_map.get((eff_schema.lower(), eff_table.lower()))
+                if fb_hit is not None:
+                    return fb_hit
 
         with self.connection_hub.session(connection_id, timeout_sec=15) as conn:
             meta = self._probe_single_table_on_conn(
@@ -156,6 +235,274 @@ class MetadataHub:
         self.store.save_table_meta(connection_id, meta)
         return meta
 
+    def get_tables_metadata_batch(
+        self,
+        connection_id: str,
+        targets: Iterable[Tuple[str, str]],
+        *,
+        force_refresh: bool = False,
+        penetrate_views: bool = True,
+        tolerate_errors: bool = False,
+        on_progress: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> Tuple[Dict[Tuple[str, str], TableMeta], str, Set[Tuple[str, str]]]:
+        """单会话批量获取多张库表/视图元数据（命中本地缓存零连库，未缓存表复用单条连接批量探查并单事务落库）."""
+        profile = self.connection_hub.require_profile(connection_id)
+        default_sch = profile.effective_default_schema()
+
+        norm_targets: List[Tuple[str, str]] = []
+        req_to_lookup: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        seen_lookup = set()
+
+        for raw_s, raw_t in targets:
+            rt = (raw_t or "").strip()
+            rs = (raw_s or "").strip()
+            if "." in rt and not rs:
+                rs, rt = rt.split(".", 1)
+            eff_t = clean_identifier_input(rt)
+            if not eff_t:
+                continue
+            cleaned_s = clean_identifier_input(rs)
+            orig_s = cleaned_s or default_sch
+            if (
+                orig_s.lower() == "public"
+                and default_sch.lower() != "public"
+                and profile.db_type in (
+                    "SQLITE",
+                    "INCEPTOR",
+                    "MYSQL",
+                    "MARIADB",
+                    "OCEANBASE",
+                    "DORIS",
+                    "STARROCKS",
+                    "TIDB",
+                )
+            ):
+                eff_s = default_sch
+            elif profile.db_type == "SQLITE":
+                eff_s = "main"
+            else:
+                eff_s = orig_s
+            req_key = (orig_s.lower(), eff_t.lower())
+            lookup_key = (eff_s.lower(), eff_t.lower())
+            req_to_lookup[req_key] = lookup_key
+            if not cleaned_s:
+                req_to_lookup[("", eff_t.lower())] = lookup_key
+            if lookup_key not in seen_lookup:
+                seen_lookup.add(lookup_key)
+                norm_targets.append((eff_s, eff_t))
+
+        if not norm_targets:
+            return {}, "", set()
+
+        total_cnt = len(norm_targets)
+        by_lookup: Dict[Tuple[str, str], TableMeta] = {}
+
+        if not force_refresh:
+            cached_map = self.store.get_cached_tables_meta_batch(
+                connection_id,
+                norm_targets,
+                fallback_default_schema=default_sch,
+            )
+            for lk, c_meta in cached_map.items():
+                by_lookup[lk] = c_meta
+
+        uncached = [
+            (s, t) for s, t in norm_targets if (s.lower(), t.lower()) not in by_lookup
+        ]
+        done_cached = total_cnt - len(uncached)
+
+        if not uncached:
+            if on_progress:
+                last_s, last_t = norm_targets[-1]
+                on_progress(total_cnt, total_cnt, last_s, last_t)
+            out_cached = {rk: by_lookup[lk] for rk, lk in req_to_lookup.items() if lk in by_lookup}
+            for lk, m in by_lookup.items():
+                out_cached.setdefault(lk, m)
+            return out_cached, "", set()
+
+        if on_progress:
+            on_progress(done_cached, total_cnt, uncached[0][0], uncached[0][1])
+
+        newly_probed: List[TableMeta] = []
+        probe_warning = ""
+        skipped_lookup_keys: Set[Tuple[str, str]] = set()
+        conn_timeout = 6 if tolerate_errors else 15
+
+        try:
+            with self.connection_hub.session(connection_id, timeout_sec=conn_timeout) as conn:
+                probed_pairs: List[Tuple[Tuple[str, str], TableMeta]] = []
+                used_native_batch = False
+
+                if (
+                    len(uncached) > 1
+                    and not isinstance(conn, (InceptorThriftClient, JdbcConnectionAdapter))
+                    and profile.db_type not in (
+                        "SQLITE",
+                        "MYSQL",
+                        "MARIADB",
+                        "OCEANBASE",
+                        "DORIS",
+                        "STARROCKS",
+                        "TIDB",
+                    )
+                ):
+                    try:
+                        probed_pairs = self._probe_pg_dws_tables_batch(
+                            conn,
+                            profile,
+                            uncached,
+                            done_offset=done_cached,
+                            total_count=total_cnt,
+                            on_progress=on_progress,
+                        )
+                        used_native_batch = True
+                    except Exception as batch_exc:
+                        logger.debug("PG/DWS 批量目录探查回退单连接逐表模式: %s", batch_exc)
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        probed_pairs = []
+                        used_native_batch = False
+                elif (
+                    len(uncached) > 1
+                    and not isinstance(conn, (InceptorThriftClient, JdbcConnectionAdapter))
+                    and profile.db_type in (
+                        "MYSQL",
+                        "MARIADB",
+                        "OCEANBASE",
+                        "DORIS",
+                        "STARROCKS",
+                        "TIDB",
+                    )
+                ):
+                    try:
+                        probed_pairs = self._probe_mysql_tables_batch(
+                            conn,
+                            profile,
+                            uncached,
+                            done_offset=done_cached,
+                            total_count=total_cnt,
+                            on_progress=on_progress,
+                        )
+                        used_native_batch = True
+                    except Exception as batch_exc:
+                        logger.debug("MySQL 批量目录探查回退单连接逐表模式: %s", batch_exc)
+                        probed_pairs = []
+                        used_native_batch = False
+
+                if not used_native_batch:
+                    consecutive_failures = 0
+                    max_consecutive_failures = 3
+                    for idx_u, (u_sch, u_tbl) in enumerate(uncached, start=1):
+                        if on_progress:
+                            on_progress(done_cached + idx_u - 1, total_cnt, u_sch, u_tbl)
+                        try:
+                            m = self._probe_single_table_on_conn(conn, profile, u_sch, u_tbl)
+                            probed_pairs.append(((u_sch.lower(), u_tbl.lower()), m))
+                            consecutive_failures = 0
+                        except Exception as single_exc:
+                            if not tolerate_errors:
+                                raise
+                            consecutive_failures += 1
+                            if not probe_warning:
+                                probe_warning = str(single_exc)
+                            skipped_lookup_keys.add((u_sch.lower(), u_tbl.lower()))
+                            self._rollback_pg_if_needed(conn)
+                            if (
+                                consecutive_failures >= max_consecutive_failures
+                                and idx_u < len(uncached)
+                            ):
+                                for rem_sch, rem_tbl in uncached[idx_u:]:
+                                    skipped_lookup_keys.add((rem_sch.lower(), rem_tbl.lower()))
+                                logger.warning(
+                                    "数据源 [%s] 逐表探查连续 %d 次异常 (%s)，已触发熔断跳过剩余 %d 张未缓存表",
+                                    profile.name,
+                                    consecutive_failures,
+                                    probe_warning,
+                                    len(uncached) - idx_u,
+                                )
+                                if on_progress:
+                                    last_s, last_t = uncached[-1]
+                                    on_progress(
+                                        done_cached + len(uncached),
+                                        total_cnt,
+                                        last_s,
+                                        last_t,
+                                    )
+                                break
+                        if on_progress:
+                            on_progress(done_cached + idx_u, total_cnt, u_sch, u_tbl)
+
+                upstream_failures = 0
+                for lk, meta in probed_pairs:
+                    if not meta.exists:
+                        by_lookup[lk] = meta
+                        continue
+                    if (
+                        penetrate_views
+                        and meta.object_type in ("VIEW", "MATVIEW")
+                        and (meta.view_definition or meta.raw_ddl)
+                    ):
+                        def _fetch_up_on_same_conn(up_s: str, up_t: str) -> Optional[TableMeta]:
+                            nonlocal upstream_failures
+                            eff_us = "main" if profile.db_type == "SQLITE" else (clean_identifier_input(up_s) or default_sch)
+                            eff_ut = clean_identifier_input(up_t)
+                            if not eff_ut:
+                                return None
+                            uk = (eff_us.lower(), eff_ut.lower())
+                            if uk in by_lookup:
+                                return by_lookup[uk]
+                            c_up = self.store.get_cached_table_meta(connection_id, eff_us, eff_ut)
+                            if c_up is not None:
+                                by_lookup[uk] = c_up
+                                return c_up
+                            if tolerate_errors and upstream_failures >= 3:
+                                return None
+                            try:
+                                p_up = self._finalize_table_meta(
+                                    self._probe_single_table_on_conn(conn, profile, eff_us, eff_ut)
+                                )
+                                upstream_failures = 0
+                                by_lookup[uk] = p_up
+                                if p_up.exists:
+                                    newly_probed.append(p_up)
+                                return p_up
+                            except Exception:
+                                upstream_failures += 1
+                                self._rollback_pg_if_needed(conn)
+                                return None
+
+                        meta = enrich_view_columns_by_lineage(
+                            meta, fetch_object_fn=_fetch_up_on_same_conn, max_depth=4
+                        )
+
+                    meta = self._finalize_table_meta(meta)
+                    by_lookup[lk] = meta
+                    newly_probed.append(meta)
+        except Exception as conn_exc:
+            if not tolerate_errors:
+                raise
+            probe_warning = str(conn_exc)
+            for u_sch, u_tbl in uncached:
+                lk = (u_sch.lower(), u_tbl.lower())
+                if lk not in by_lookup:
+                    skipped_lookup_keys.add(lk)
+
+        if newly_probed:
+            self.store.save_tables_meta_batch(connection_id, newly_probed)
+
+        out_all: Dict[Tuple[str, str], TableMeta] = {}
+        skipped_req_keys: Set[Tuple[str, str]] = set(skipped_lookup_keys)
+        for rk, lk in req_to_lookup.items():
+            if lk in skipped_lookup_keys:
+                skipped_req_keys.add(rk)
+            elif lk in by_lookup:
+                out_all[rk] = by_lookup[lk]
+        for lk, m in by_lookup.items():
+            out_all.setdefault(lk, m)
+        return out_all, probe_warning, skipped_req_keys
+
     def search_objects(
         self, keyword: str, connection_id: Optional[str] = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
@@ -170,7 +517,7 @@ class MetadataHub:
     def _probe_pg_dws_catalog(
         self, conn: Any, profile: ConnectionProfile, target_schema: Optional[str]
     ) -> Tuple[List[SchemaMeta], List[Dict[str, Any]]]:
-        conn.autocommit = True
+        self._enable_pg_autocommit(conn)
         with conn.cursor() as cur:
             current_schema = profile.default_schema or "public"
             try:
@@ -179,7 +526,7 @@ class MetadataHub:
                 if r and r[0]:
                     current_schema = str(r[0])
             except Exception:
-                pass
+                self._rollback_pg_if_needed(conn)
 
             if target_schema:
                 schema_names = [target_schema]
@@ -271,29 +618,55 @@ class MetadataHub:
     def _probe_pg_dws_table(
         self, conn: Any, profile: ConnectionProfile, schema_name: str, table_name: str
     ) -> TableMeta:
-        conn.autocommit = True
+        self._enable_pg_autocommit(conn)
+        def_sch_low = profile.effective_default_schema().lower()
+        strict_schema = bool(schema_name and schema_name.lower() not in (def_sch_low, "public"))
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    c.oid,
-                    n.nspname,
-                    c.relname,
-                    COALESCE(obj_description(c.oid, 'pg_class'), ''),
-                    COALESCE(array_to_string(c.reloptions, ', '), ''),
-                    c.relkind
-                FROM pg_catalog.pg_class c
-                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
-                  AND LOWER(c.relname) = LOWER(%s)
-                  AND n.nspname NOT IN %s
-                  AND n.nspname NOT LIKE 'pg_toast%%'
-                  AND n.nspname NOT LIKE 'pg_temp%%'
-                ORDER BY CASE WHEN LOWER(n.nspname) = LOWER(%s) THEN 0 ELSE 1 END, n.nspname ASC
-                LIMIT 1;
-                """,
-                (table_name, SYSTEM_SCHEMAS, schema_name),
-            )
+            self._apply_pg_probe_timeouts(conn, cur, profile)
+            if strict_schema:
+                cur.execute(
+                    """
+                    SELECT
+                        c.oid,
+                        n.nspname,
+                        c.relname,
+                        COALESCE(obj_description(c.oid, 'pg_class'), ''),
+                        COALESCE(array_to_string(c.reloptions, ', '), ''),
+                        c.relkind
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                      AND LOWER(c.relname) = LOWER(%s)
+                      AND LOWER(n.nspname) = LOWER(%s)
+                      AND n.nspname NOT IN %s
+                      AND n.nspname NOT LIKE 'pg_toast%%'
+                      AND n.nspname NOT LIKE 'pg_temp%%'
+                    LIMIT 1;
+                    """,
+                    (table_name, schema_name, SYSTEM_SCHEMAS),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        c.oid,
+                        n.nspname,
+                        c.relname,
+                        COALESCE(obj_description(c.oid, 'pg_class'), ''),
+                        COALESCE(array_to_string(c.reloptions, ', '), ''),
+                        c.relkind
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                      AND LOWER(c.relname) = LOWER(%s)
+                      AND n.nspname NOT IN %s
+                      AND n.nspname NOT LIKE 'pg_toast%%'
+                      AND n.nspname NOT LIKE 'pg_temp%%'
+                    ORDER BY CASE WHEN LOWER(n.nspname) = LOWER(%s) THEN 0 ELSE 1 END, n.nspname ASC
+                    LIMIT 1;
+                    """,
+                    (table_name, SYSTEM_SCHEMAS, schema_name),
+                )
             row = cur.fetchone()
             if not row:
                 return TableMeta(schema_name=schema_name, table_name=table_name, exists=False)
@@ -324,6 +697,7 @@ class MetadataHub:
                 )
                 pk_cols = [str(r[0]) for r in cur.fetchall() if r and r[0]]
             except Exception:
+                self._rollback_pg_if_needed(conn)
                 pk_cols = []
 
             if obj_type in ("VIEW", "MATVIEW"):
@@ -338,7 +712,7 @@ class MetadataHub:
                             f"{view_def_sql}"
                         )
                 except Exception:
-                    pass
+                    self._rollback_pg_if_needed(conn)
             elif profile.db_type == "DWS":
                 try:
                     cur.execute("SELECT pg_catalog.pg_get_tabledef(%s);", (rel_oid,))
@@ -357,7 +731,7 @@ class MetadataHub:
                         if parsed_def["partition_keys"]:
                             part_keys = parsed_def["partition_keys"]
                 except Exception:
-                    pass
+                    self._rollback_pg_if_needed(conn)
 
                 if not dist_keys:
                     try:
@@ -370,7 +744,7 @@ class MetadataHub:
                                 if clean_identifier_input(x)
                             ]
                     except Exception:
-                        pass
+                        self._rollback_pg_if_needed(conn)
             else:
                 dist_keys = list(pk_cols)
                 try:
@@ -386,27 +760,47 @@ class MetadataHub:
                                 if clean_identifier_input(x)
                             ]
                 except Exception:
-                    pass
+                    self._rollback_pg_if_needed(conn)
 
-            cur.execute(
-                """
-                SELECT
-                    a.attname AS column_name,
-                    pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-                    a.attnotnull AS is_not_null,
-                    pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
-                    COALESCE(col_description(c.oid, a.attnum), '') AS column_comment
-                FROM pg_catalog.pg_class c
-                JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
-                LEFT JOIN pg_catalog.pg_attrdef ad
-                  ON ad.adrelid = c.oid AND ad.adnum = a.attnum
-                WHERE c.oid = %s
-                  AND a.attnum > 0
-                  AND NOT a.attisdropped
-                ORDER BY a.attnum ASC;
-                """,
-                (rel_oid,),
-            )
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        a.attname AS column_name,
+                        pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                        a.attnotnull AS is_not_null,
+                        pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+                        COALESCE(col_description(c.oid, a.attnum), '') AS column_comment
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                    LEFT JOIN pg_catalog.pg_attrdef ad
+                      ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+                    WHERE c.oid = %s
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                    ORDER BY a.attnum ASC;
+                    """,
+                    (rel_oid,),
+                )
+            except Exception:
+                self._recover_pg_tx(conn, cur, profile)
+                cur.execute(
+                    """
+                    SELECT
+                        a.attname AS column_name,
+                        pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                        a.attnotnull AS is_not_null,
+                        NULL AS column_default,
+                        COALESCE(col_description(c.oid, a.attnum), '') AS column_comment
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                    WHERE c.oid = %s
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                    ORDER BY a.attnum ASC;
+                    """,
+                    (rel_oid,),
+                )
             cols = [
                 ColumnMeta(
                     ordinal_position=idx,
@@ -444,7 +838,7 @@ class MetadataHub:
                             child_defs.append(f"PARTITION {quote_ident_str(str(p_nm))} VALUES LESS THAN ({fmt_b})")
                         part_clause = f"{part_clause.rstrip()} (\n    " + ",\n    ".join(child_defs) + "\n)"
                 except Exception:
-                    pass
+                    self._rollback_pg_if_needed(conn)
 
             return TableMeta(
                 schema_name=str(actual_schema),
@@ -463,6 +857,443 @@ class MetadataHub:
                 object_type=obj_type,
                 view_definition=view_def_sql,
             )
+
+    def _probe_pg_dws_tables_batch(
+        self,
+        conn: Any,
+        profile: ConnectionProfile,
+        targets: List[Tuple[str, str]],
+        *,
+        done_offset: int = 0,
+        total_count: int = 0,
+        on_progress: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> List[Tuple[Tuple[str, str], TableMeta]]:
+        """单连接分块批量探查 PG / GaussDB(DWS) 多表元数据，将 N*5 次查询压缩为极少数系统表批量查询."""
+        self._enable_pg_autocommit(conn)
+        def_sch_low = profile.effective_default_schema().lower()
+        out: List[Tuple[Tuple[str, str], TableMeta]] = []
+        tot = max(total_count, done_offset + len(targets))
+        chunk_size = 80
+
+        with conn.cursor() as cur:
+            self._apply_pg_probe_timeouts(conn, cur, profile)
+            for start_i in range(0, len(targets), chunk_size):
+                batch = targets[start_i : start_i + chunk_size]
+                high_water = done_offset + start_i
+
+                def _emit_chunk_progress(step_in_chunk: int, cur_s: str, cur_t: str) -> None:
+                    nonlocal high_water
+                    if not on_progress:
+                        return
+                    target_done = min(
+                        done_offset + start_i + len(batch),
+                        max(high_water, done_offset + start_i + step_in_chunk),
+                    )
+                    high_water = target_done
+                    on_progress(target_done, tot, cur_s, cur_t)
+
+                if on_progress and batch:
+                    _emit_chunk_progress(0, batch[0][0], batch[0][1])
+
+                lower_names = tuple({t.lower() for _, t in batch if t})
+                if not lower_names:
+                    continue
+
+                cur.execute(
+                    """
+                    SELECT
+                        c.oid,
+                        n.nspname,
+                        c.relname,
+                        COALESCE(obj_description(c.oid, 'pg_class'), ''),
+                        COALESCE(array_to_string(c.reloptions, ', '), ''),
+                        c.relkind
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                      AND LOWER(c.relname) IN %s
+                      AND n.nspname NOT IN %s
+                      AND n.nspname NOT LIKE 'pg_toast%%'
+                      AND n.nspname NOT LIKE 'pg_temp%%'
+                    ORDER BY n.nspname ASC;
+                    """,
+                    (lower_names, SYSTEM_SCHEMAS),
+                )
+                cands_by_rel: Dict[str, List[Tuple[Any, ...]]] = {}
+                for r in cur.fetchall():
+                    cands_by_rel.setdefault(str(r[2]).lower(), []).append(r)
+
+                matched_for_req: Dict[Tuple[str, str], Tuple[Any, ...]] = {}
+                oid_set: Dict[Any, Tuple[Any, ...]] = {}
+                for req_s, req_t in batch:
+                    cands = cands_by_rel.get(req_t.lower()) or []
+                    if not cands:
+                        continue
+                    picked = next(
+                        (c for c in cands if str(c[1]).lower() == req_s.lower()),
+                        None,
+                    )
+                    if picked is None and (not req_s or req_s.lower() in (def_sch_low, "public")):
+                        picked = cands[0]
+                    if picked is None:
+                        continue
+                    matched_for_req[(req_s.lower(), req_t.lower())] = picked
+                    oid_set[picked[0]] = picked
+
+                if not oid_set:
+                    for idx_b, (req_s, req_t) in enumerate(batch, start=1):
+                        out.append(
+                            (
+                                (req_s.lower(), req_t.lower()),
+                                TableMeta(schema_name=req_s, table_name=req_t, exists=False),
+                            )
+                        )
+                    if on_progress:
+                        last_s, last_t = batch[-1]
+                        _emit_chunk_progress(len(batch), last_s, last_t)
+                    continue
+
+                oid_tuple = tuple(oid_set.keys())
+                pk_by_oid: Dict[Any, List[str]] = {}
+                try:
+                    cur.execute(
+                        """
+                        SELECT con.conrelid, a.attname
+                        FROM pg_catalog.pg_constraint con
+                        JOIN pg_catalog.pg_attribute a
+                          ON a.attrelid = con.conrelid AND a.attnum = ANY(con.conkey)
+                        WHERE con.conrelid IN %s AND con.contype = 'p';
+                        """,
+                        (oid_tuple,),
+                    )
+                    for oid_v, att_nm in cur.fetchall():
+                        if att_nm:
+                            pk_by_oid.setdefault(oid_v, []).append(str(att_nm))
+                except Exception:
+                    self._recover_pg_tx(conn, cur, profile)
+                    pk_by_oid = {}
+
+                try:
+                    cur.execute(
+                        """
+                        SELECT
+                            c.oid,
+                            a.attname AS column_name,
+                            pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                            a.attnotnull AS is_not_null,
+                            pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+                            COALESCE(col_description(c.oid, a.attnum), '') AS column_comment
+                        FROM pg_catalog.pg_class c
+                        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                        LEFT JOIN pg_catalog.pg_attrdef ad
+                          ON ad.adrelid = c.oid AND ad.adnum = a.attnum
+                        WHERE c.oid IN %s
+                          AND a.attnum > 0
+                          AND NOT a.attisdropped
+                        ORDER BY c.oid ASC, a.attnum ASC;
+                        """,
+                        (oid_tuple,),
+                    )
+                except Exception:
+                    self._recover_pg_tx(conn, cur, profile)
+                    cur.execute(
+                        """
+                        SELECT
+                            c.oid,
+                            a.attname AS column_name,
+                            pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                            a.attnotnull AS is_not_null,
+                            NULL AS column_default,
+                            COALESCE(col_description(c.oid, a.attnum), '') AS column_comment
+                        FROM pg_catalog.pg_class c
+                        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                        WHERE c.oid IN %s
+                          AND a.attnum > 0
+                          AND NOT a.attisdropped
+                        ORDER BY c.oid ASC, a.attnum ASC;
+                        """,
+                        (oid_tuple,),
+                    )
+                cols_by_oid: Dict[Any, List[ColumnMeta]] = {}
+                for oid_v, c_nm, c_tp, not_null, c_def, c_comm in cur.fetchall():
+                    lst = cols_by_oid.setdefault(oid_v, [])
+                    lst.append(
+                        ColumnMeta(
+                            ordinal_position=len(lst) + 1,
+                            column_name=str(c_nm),
+                            data_type=str(c_tp),
+                            is_not_null=bool(not_null),
+                            column_default=c_def,
+                            column_comment=str(c_comm or ""),
+                        )
+                    )
+                if on_progress and len(batch) > 1:
+                    first_info = next(iter(oid_set.values()))
+                    _emit_chunk_progress(
+                        max(1, int(len(batch) * 0.2)),
+                        str(first_info[1]),
+                        str(first_info[2]),
+                    )
+
+                view_oids = tuple(
+                    oid_v for oid_v, info in oid_set.items() if str(info[5] or "r") in ("v", "m")
+                )
+                table_oids = tuple(
+                    oid_v for oid_v, info in oid_set.items() if str(info[5] or "r") not in ("v", "m")
+                )
+
+                view_def_by_oid: Dict[Any, str] = {}
+                if view_oids:
+                    try:
+                        cur.execute(
+                            "SELECT oid, pg_catalog.pg_get_viewdef(oid, true) FROM pg_catalog.pg_class WHERE oid IN %s;",
+                            (view_oids,),
+                        )
+                        for oid_v, v_sql in cur.fetchall():
+                            if v_sql:
+                                view_def_by_oid[oid_v] = str(v_sql).strip()
+                    except Exception:
+                        self._recover_pg_tx(conn, cur, profile)
+                        slow_vdef_failures = 0
+                        for oid_v in view_oids:
+                            t0_v = time.monotonic()
+                            try:
+                                cur.execute("SELECT pg_catalog.pg_get_viewdef(%s, true);", (oid_v,))
+                                vr = cur.fetchone()
+                                if vr and vr[0]:
+                                    view_def_by_oid[oid_v] = str(vr[0]).strip()
+                            except Exception as v_exc:
+                                self._recover_pg_tx(conn, cur, profile)
+                                if (
+                                    isinstance(v_exc, (TimeoutError, ConnectionError, OSError, EOFError))
+                                    or (time.monotonic() - t0_v) >= 0.8
+                                ):
+                                    slow_vdef_failures += 1
+                                    if slow_vdef_failures >= 3:
+                                        break
+
+                tdef_by_oid: Dict[Any, str] = {}
+                dkey_fallback_by_oid: Dict[Any, List[str]] = {}
+                partkey_pg_by_oid: Dict[Any, str] = {}
+
+                if table_oids and profile.db_type == "DWS":
+                    sub_chunk = 15
+                    slow_tdef_failures = 0
+                    for sub_i in range(0, len(table_oids), sub_chunk):
+                        sub_oids = table_oids[sub_i : sub_i + sub_chunk]
+                        if slow_tdef_failures >= 3:
+                            break
+                        if on_progress and sub_oids:
+                            head_info = oid_set[sub_oids[0]]
+                            _emit_chunk_progress(
+                                int(len(batch) * (0.2 + 0.7 * (sub_i / max(1, len(table_oids))))),
+                                str(head_info[1]),
+                                str(head_info[2]),
+                            )
+                        try:
+                            cur.execute(
+                                "SELECT oid, pg_catalog.pg_get_tabledef(oid) FROM pg_catalog.pg_class WHERE oid IN %s;",
+                                (sub_oids,),
+                            )
+                            for oid_v, td_sql in cur.fetchall():
+                                if td_sql:
+                                    tdef_by_oid[oid_v] = str(td_sql).strip()
+                        except Exception:
+                            self._recover_pg_tx(conn, cur, profile)
+                            for idx_so, oid_v in enumerate(sub_oids, start=1):
+                                t0_td = time.monotonic()
+                                try:
+                                    cur.execute("SELECT pg_catalog.pg_get_tabledef(%s);", (oid_v,))
+                                    tr = cur.fetchone()
+                                    if tr and tr[0]:
+                                        tdef_by_oid[oid_v] = str(tr[0]).strip()
+                                except Exception as td_exc:
+                                    self._recover_pg_tx(conn, cur, profile)
+                                    if (
+                                        isinstance(td_exc, (TimeoutError, ConnectionError, OSError, EOFError))
+                                        or (time.monotonic() - t0_td) >= 0.8
+                                    ):
+                                        slow_tdef_failures += 1
+                                        if slow_tdef_failures >= 3:
+                                            break
+                                if on_progress:
+                                    so_info = oid_set[oid_v]
+                                    done_so = min(len(table_oids), sub_i + idx_so)
+                                    _emit_chunk_progress(
+                                        int(len(batch) * (0.2 + 0.7 * (done_so / max(1, len(table_oids))))),
+                                        str(so_info[1]),
+                                        str(so_info[2]),
+                                    )
+                        else:
+                            if on_progress and sub_oids:
+                                tail_info = oid_set[sub_oids[-1]]
+                                done_so = min(len(table_oids), sub_i + len(sub_oids))
+                                _emit_chunk_progress(
+                                    int(len(batch) * (0.2 + 0.7 * (done_so / max(1, len(table_oids))))),
+                                    str(tail_info[1]),
+                                    str(tail_info[2]),
+                                )
+                    if slow_tdef_failures < 3:
+                        try:
+                            cur.execute(
+                                "SELECT oid, pg_catalog.getdistributekey(oid) FROM pg_catalog.pg_class WHERE oid IN %s;",
+                                (table_oids,),
+                            )
+                            for oid_v, dk_raw in cur.fetchall():
+                                if dk_raw:
+                                    dkey_fallback_by_oid[oid_v] = [
+                                        clean_identifier_input(x)
+                                        for x in str(dk_raw).split(",")
+                                        if clean_identifier_input(x)
+                                    ]
+                        except Exception:
+                            self._recover_pg_tx(conn, cur, profile)
+                elif table_oids:
+                    try:
+                        cur.execute(
+                            "SELECT oid, pg_catalog.pg_get_partkeydef(oid) FROM pg_catalog.pg_class WHERE oid IN %s;",
+                            (table_oids,),
+                        )
+                        for oid_v, pk_def in cur.fetchall():
+                            if pk_def:
+                                partkey_pg_by_oid[oid_v] = str(pk_def)
+                    except Exception:
+                        self._recover_pg_tx(conn, cur, profile)
+
+                meta_by_oid: Dict[Any, TableMeta] = {}
+                need_part_children_oids: List[Any] = []
+                for oid_v, row in oid_set.items():
+                    _, actual_schema, actual_table, tbl_comment, reloptions_str, relkind = row
+                    rk = str(relkind or "r")
+                    obj_type = "VIEW" if rk == "v" else ("MATVIEW" if rk == "m" else "TABLE")
+                    orientation = "COLUMN" if "orientation=column" in str(reloptions_str or "").lower() else "ROW"
+                    with_clause = format_reloptions_with_clause(reloptions_str)
+                    pk_cols = list(pk_by_oid.get(oid_v, []))
+                    cols = [
+                        ColumnMeta(
+                            ordinal_position=c.ordinal_position,
+                            column_name=c.column_name,
+                            data_type=c.data_type,
+                            is_not_null=c.is_not_null,
+                            column_default=c.column_default,
+                            column_comment=c.column_comment,
+                        )
+                        for c in cols_by_oid.get(oid_v, [])
+                    ]
+                    dist_clause = ""
+                    dist_keys: List[str] = []
+                    part_clause = ""
+                    part_keys: List[str] = []
+                    raw_ddl = ""
+                    view_def_sql = ""
+
+                    if obj_type in ("VIEW", "MATVIEW"):
+                        view_def_sql = view_def_by_oid.get(oid_v, "")
+                        if view_def_sql:
+                            raw_ddl = (
+                                f"-- [{profile.db_type} 视图原始定义 ({obj_type})]\n"
+                                f"CREATE OR REPLACE VIEW {quote_ident_str(str(actual_schema))}.{quote_ident_str(str(actual_table))} AS\n"
+                                f"{view_def_sql}"
+                            )
+                    elif profile.db_type == "DWS":
+                        raw_ddl = tdef_by_oid.get(oid_v, "")
+                        if raw_ddl:
+                            parsed_def = parse_dws_tabledef(raw_ddl)
+                            if parsed_def["with_clause"]:
+                                with_clause = parsed_def["with_clause"]
+                            if parsed_def["distribute_clause"]:
+                                dist_clause = parsed_def["distribute_clause"]
+                            if parsed_def["distribute_keys"]:
+                                dist_keys = parsed_def["distribute_keys"]
+                            if parsed_def["partition_clause"]:
+                                part_clause = parsed_def["partition_clause"]
+                            if parsed_def["partition_keys"]:
+                                part_keys = parsed_def["partition_keys"]
+                        if not dist_keys:
+                            dist_keys = list(dkey_fallback_by_oid.get(oid_v, []))
+                        if part_clause and not partition_clause_has_child_defs(part_clause):
+                            need_part_children_oids.append(oid_v)
+                    else:
+                        dist_keys = list(pk_cols)
+                        pk_def = partkey_pg_by_oid.get(oid_v, "")
+                        if pk_def:
+                            part_clause = f"PARTITION BY {pk_def}"
+                            m_pk = re.search(r"\(([^)]+)\)", pk_def)
+                            if m_pk:
+                                part_keys = [
+                                    clean_identifier_input(x)
+                                    for x in m_pk.group(1).split(",")
+                                    if clean_identifier_input(x)
+                                ]
+
+                    meta_by_oid[oid_v] = TableMeta(
+                        schema_name=str(actual_schema),
+                        table_name=str(actual_table),
+                        exists=True,
+                        table_comment=str(tbl_comment or ""),
+                        orientation=orientation,
+                        with_clause=with_clause,
+                        distribute_clause=dist_clause,
+                        distribute_keys=dist_keys,
+                        partition_clause=part_clause,
+                        partition_keys=part_keys,
+                        primary_keys=pk_cols,
+                        columns=cols,
+                        raw_ddl=raw_ddl,
+                        object_type=obj_type,
+                        view_definition=view_def_sql,
+                    )
+
+                if need_part_children_oids:
+                    try:
+                        cur.execute(
+                            """
+                            SELECT parentid, relname, COALESCE(array_to_string(boundaries, ','), '')
+                            FROM pg_catalog.pg_partition
+                            WHERE parentid IN %s AND parttype = 'p'
+                            ORDER BY parentid ASC, oid ASC;
+                            """,
+                            (tuple(need_part_children_oids),),
+                        )
+                        parts_by_parent: Dict[Any, List[Tuple[str, str]]] = {}
+                        for p_oid, p_nm, raw_b in cur.fetchall():
+                            parts_by_parent.setdefault(p_oid, []).append((str(p_nm), str(raw_b or "")))
+                        for p_oid, p_rows in parts_by_parent.items():
+                            m_obj = meta_by_oid.get(p_oid)
+                            if not m_obj or not p_rows:
+                                continue
+                            pkey_type = ""
+                            if m_obj.partition_keys:
+                                pk_col = next(
+                                    (c for c in m_obj.columns if c.column_name.lower() == m_obj.partition_keys[0].lower()),
+                                    None,
+                                )
+                                if pk_col:
+                                    pkey_type = pk_col.data_type
+                            child_defs = [
+                                f"PARTITION {quote_ident_str(p_nm)} VALUES LESS THAN ({format_partition_boundary_val(raw_b, pkey_type)})"
+                                for p_nm, raw_b in p_rows
+                            ]
+                            m_obj.partition_clause = (
+                                f"{m_obj.partition_clause.rstrip()} (\n    " + ",\n    ".join(child_defs) + "\n)"
+                            )
+                    except Exception:
+                        self._recover_pg_tx(conn, cur, profile)
+
+                for idx_b, (req_s, req_t) in enumerate(batch, start=1):
+                    rk = (req_s.lower(), req_t.lower())
+                    picked = matched_for_req.get(rk)
+                    if picked is None:
+                        out.append((rk, TableMeta(schema_name=req_s, table_name=req_t, exists=False)))
+                    else:
+                        out.append((rk, meta_by_oid[picked[0]]))
+                    if on_progress and (
+                        (idx_b % 10 == 0 and done_offset + start_i + idx_b >= high_water)
+                        or idx_b == len(batch)
+                    ):
+                        _emit_chunk_progress(idx_b, req_s, req_t)
+
+        return out
 
     # =========================================================================
     # 2. 星环 Transwarp Inceptor / Hive 定制探查器
@@ -543,9 +1374,13 @@ class MetadataHub:
         rows: List[List[Any]] = []
         try:
             rows = client.execute_query(f"DESCRIBE FORMATTED {safe_db}.{safe_tbl}")
+        except (TimeoutError, ConnectionError, OSError, EOFError):
+            raise
         except Exception:
             try:
                 rows = client.execute_query(f"DESCRIBE {safe_db}.{safe_tbl}")
+            except (TimeoutError, ConnectionError, OSError, EOFError):
+                raise
             except Exception:
                 return TableMeta(schema_name=safe_db, table_name=safe_tbl, exists=False)
 
@@ -750,7 +1585,8 @@ class MetadataHub:
     def _probe_mysql_table(
         self, conn: Any, profile: ConnectionProfile, schema_name: str, table_name: str
     ) -> TableMeta:
-        eff_schema = schema_name or profile.dbname or profile.default_schema
+        db_fallback = (profile.dbname or "").strip()
+        eff_schema = schema_name or db_fallback or profile.default_schema
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -762,6 +1598,23 @@ class MetadataHub:
                 (eff_schema, table_name),
             )
             t_row = cur.fetchone()
+            if (
+                not t_row
+                and eff_schema.lower() == "public"
+                and db_fallback
+                and db_fallback.lower() != "public"
+            ):
+                eff_schema = db_fallback
+                cur.execute(
+                    """
+                    SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COALESCE(TABLE_COMMENT, '')
+                    FROM information_schema.TABLES
+                    WHERE LOWER(TABLE_SCHEMA) = LOWER(%s) AND LOWER(TABLE_NAME) = LOWER(%s)
+                    LIMIT 1
+                    """,
+                    (eff_schema, table_name),
+                )
+                t_row = cur.fetchone()
             if not t_row:
                 return TableMeta(schema_name=eff_schema, table_name=table_name, exists=False)
             actual_sch, actual_tbl, t_type, tbl_comm = str(t_row[0]), str(t_row[1]), str(t_row[2] or ""), str(t_row[3] or "")
@@ -821,6 +1674,160 @@ class MetadataHub:
                 object_type=obj_type,
                 view_definition=view_def,
             )
+
+    def _probe_mysql_tables_batch(
+        self,
+        conn: Any,
+        profile: ConnectionProfile,
+        targets: List[Tuple[str, str]],
+        *,
+        done_offset: int = 0,
+        total_count: int = 0,
+        on_progress: Optional[Callable[[int, int, str, str], None]] = None,
+    ) -> List[Tuple[Tuple[str, str], TableMeta]]:
+        """单连接分块批量探查 MySQL / OceanBase / Doris / StarRocks / TiDB 多表元数据."""
+        out: List[Tuple[Tuple[str, str], TableMeta]] = []
+        tot = max(total_count, done_offset + len(targets))
+        default_sch = (profile.dbname or "").strip() or (profile.default_schema or "").strip()
+        if default_sch.lower() == "public" and (profile.dbname or "").strip():
+            default_sch = (profile.dbname or "").strip()
+        chunk_size = 100
+
+        with conn.cursor() as cur:
+            for start_i in range(0, len(targets), chunk_size):
+                batch = targets[start_i : start_i + chunk_size]
+                if on_progress and batch:
+                    on_progress(done_offset + start_i, tot, batch[0][0], batch[0][1])
+
+                norm_batch = [(s or default_sch, t) for s, t in batch]
+                lower_tbls = list({t.lower() for _, t in norm_batch if t})
+                sch_set = {s.lower() for s, _ in norm_batch if s}
+                if (
+                    "public" in sch_set
+                    and default_sch
+                    and default_sch.lower() != "public"
+                ):
+                    sch_set.add(default_sch.lower())
+                lower_schs = list(sch_set)
+                if not lower_tbls:
+                    continue
+
+                t_ph = ",".join(["%s"] * len(lower_tbls))
+                if lower_schs:
+                    s_ph = ",".join(["%s"] * len(lower_schs))
+                    cur.execute(
+                        f"""
+                        SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COALESCE(TABLE_COMMENT, '')
+                        FROM information_schema.TABLES
+                        WHERE LOWER(TABLE_SCHEMA) IN ({s_ph}) AND LOWER(TABLE_NAME) IN ({t_ph})
+                        """,
+                        tuple(lower_schs + lower_tbls),
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COALESCE(TABLE_COMMENT, '')
+                        FROM information_schema.TABLES
+                        WHERE LOWER(TABLE_NAME) IN ({t_ph})
+                        """,
+                        tuple(lower_tbls),
+                    )
+                tbl_info_map: Dict[Tuple[str, str], Tuple[str, str, str, str]] = {}
+                actual_schs = set()
+                actual_tbls = set()
+                for r in cur.fetchall():
+                    a_s, a_t, t_tp, t_cm = str(r[0]), str(r[1]), str(r[2] or ""), str(r[3] or "")
+                    tbl_info_map[(a_s.lower(), a_t.lower())] = (a_s, a_t, t_tp, t_cm)
+                    actual_schs.add(a_s)
+                    actual_tbls.add(a_t)
+
+                cols_map: Dict[Tuple[str, str], List[ColumnMeta]] = {}
+                pks_map: Dict[Tuple[str, str], List[str]] = {}
+                if actual_tbls and actual_schs:
+                    as_list = list(actual_schs)
+                    at_list = list(actual_tbls)
+                    as_ph = ",".join(["%s"] * len(as_list))
+                    at_ph = ",".join(["%s"] * len(at_list))
+                    cur.execute(
+                        f"""
+                        SELECT TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION, COLUMN_NAME,
+                               COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT,
+                               COALESCE(COLUMN_COMMENT, ''), COLUMN_KEY
+                        FROM information_schema.COLUMNS
+                        WHERE TABLE_SCHEMA IN ({as_ph}) AND TABLE_NAME IN ({at_ph})
+                        ORDER BY TABLE_SCHEMA ASC, TABLE_NAME ASC, ORDINAL_POSITION ASC
+                        """,
+                        tuple(as_list + at_list),
+                    )
+                    for r in cur.fetchall():
+                        mk = (str(r[0]).lower(), str(r[1]).lower())
+                        c_name = str(r[3])
+                        is_pk = str(r[8] or "").upper() == "PRI"
+                        if is_pk:
+                            pks_map.setdefault(mk, []).append(c_name)
+                        cols_map.setdefault(mk, []).append(
+                            ColumnMeta(
+                                ordinal_position=int(r[2]),
+                                column_name=c_name,
+                                data_type=str(r[4] or ""),
+                                is_not_null=str(r[5] or "").upper() == "NO",
+                                column_default=str(r[6]) if r[6] is not None else None,
+                                column_comment=str(r[7] or ""),
+                                is_primary_key=is_pk,
+                            )
+                        )
+
+                for idx_b, ((orig_s, orig_t), (eff_s, _)) in enumerate(zip(batch, norm_batch), start=1):
+                    rk = (orig_s.lower(), orig_t.lower())
+                    hit = tbl_info_map.get((eff_s.lower(), orig_t.lower()))
+                    if (
+                        not hit
+                        and eff_s.lower() == "public"
+                        and default_sch
+                        and default_sch.lower() != "public"
+                    ):
+                        hit = tbl_info_map.get((default_sch.lower(), orig_t.lower()))
+                    if not hit:
+                        miss_s = default_sch if (eff_s.lower() == "public" and default_sch) else eff_s
+                        out.append((rk, TableMeta(schema_name=miss_s, table_name=orig_t, exists=False)))
+                    else:
+                        a_s, a_t, t_tp, t_cm = hit
+                        mk = (a_s.lower(), a_t.lower())
+                        obj_type = "VIEW" if "VIEW" in t_tp.upper() else "TABLE"
+                        raw_ddl = ""
+                        view_def = ""
+                        if obj_type == "VIEW":
+                            try:
+                                q_full = f"{quote_backtick_str(a_s)}.{quote_backtick_str(a_t)}"
+                                cur.execute(f"SHOW CREATE VIEW {q_full}")
+                                ddl_r = cur.fetchone()
+                                if ddl_r and len(ddl_r) >= 2:
+                                    raw_ddl = str(ddl_r[1] or "")
+                                    view_def = raw_ddl
+                            except Exception:
+                                pass
+                        pk_cols = pks_map.get(mk, [])
+                        out.append(
+                            (
+                                rk,
+                                TableMeta(
+                                    schema_name=a_s,
+                                    table_name=a_t,
+                                    exists=True,
+                                    table_comment=t_cm,
+                                    distribute_keys=list(pk_cols),
+                                    primary_keys=pk_cols,
+                                    columns=cols_map.get(mk, []),
+                                    raw_ddl=raw_ddl,
+                                    object_type=obj_type,
+                                    view_definition=view_def,
+                                ),
+                            )
+                        )
+                    if on_progress and (idx_b % 10 == 0 or idx_b == len(batch)):
+                        on_progress(done_offset + start_i + idx_b, tot, orig_s, orig_t)
+
+        return out
 
     # =========================================================================
     # 4. SQLite 3 标准库探查器
