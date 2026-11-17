@@ -10,6 +10,7 @@ import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";
 import { DatabaseTree } from "../ui/database_tree.js";
 import { Modal } from "../ui/modal.js";
+import { openExportReportModal } from "../ui/export_report_modal.js";
 import { SqlCodeBox } from "../ui/sql_code_box.js";
 import { openStandardPickerModal } from "../ui/standard_picker_modal.js";
 import { TaskActivityBar } from "../ui/task_activity_bar.js";
@@ -342,7 +343,12 @@ export class StandardMigratorView {
       if (wsRes.logs) store.updateLogs(wsRes.logs);
       if (Array.isArray(ovRes.connections)) store.updateConnections(ovRes.connections);
 
-      this.activeConnId = ovRes.active_connection_id || wsRes.active_connection_id || store.state.connections[0]?.connection_id || "";
+      this.activeConnId =
+        (this.subMode === "queue" ? wsRes.active_connection_id : ovRes.active_connection_id) ||
+        ovRes.active_connection_id ||
+        wsRes.active_connection_id ||
+        store.state.connections[0]?.connection_id ||
+        "";
       this.formatProfile = ovRes.active_connection?.standard_format || ovRes.format_profile || this._syncFormatFromConnection(this.activeConnId);
       this.tableStats = ovRes.table_stats || {};
       if (ovRes.format_profiles?.length) this.formatProfiles = ovRes.format_profiles;
@@ -640,6 +646,139 @@ export class StandardMigratorView {
       if (isAbortError(err)) return;
       Toast.error(err.message);
     }
+  }
+
+  async _runExportReportTask(title, fn, { syncCatalog = true, connId = "" } = {}) {
+    try {
+      const filename = await this._runTracked(title, ({ taskId, signal }) => fn({ taskId, signal }), {
+        exclusive: false,
+      });
+      if (this._destroyed) return;
+      Toast.success(`已导出：${filename}`);
+      const targetCid = connId || this.activeConnId;
+      if (syncCatalog && targetCid) {
+        try {
+          const cat = await platformApi.getMetadataTree(targetCid, false);
+          if (!this._destroyed && cat) {
+            store.updateCatalogTree(targetCid, cat);
+            await this.loadBindingsOverview({ skipRender: false });
+          }
+        } catch (_ignore) {
+          // 忽略后置目录刷新非致命错误
+        }
+      }
+    } catch (err) {
+      if (isAbortError(err)) return;
+      Toast.error(err.message);
+    }
+  }
+
+  openExportDialog() {
+    const cid =
+      (this.subMode === "queue" ? this.ws?.active_connection_id : this.activeConnId) ||
+      this.activeConnId ||
+      this.ws?.active_connection_id ||
+      "";
+    if (!cid) {
+      if (this.subMode === "queue" && (this.ws?.items || []).length > 0) {
+        this._runExportReportTask(
+          "导出贯标队列 Excel (.xlsx)",
+          ({ taskId, signal }) => migratorApi.exportReport({ taskId, signal }),
+          { syncCatalog: false }
+        );
+        return;
+      }
+      Toast.warn("请先在左侧选择或绑定数据源连接");
+      return;
+    }
+    const conn = this._findConnection(cid);
+    const dbLabel = conn ? `${conn.name} (${conn.db_type || "DB"})` : cid;
+    const fmtProfile =
+      cid === this.activeConnId ? this.formatProfile : conn?.standard_format || "AUTO";
+
+    openExportReportModal({
+      title: "导出库级落标与贯标报告",
+      scopeBadge: `库级全量 · ${conn ? conn.name : cid}`,
+      scopeHint: `导出数据源 [${dbLabel}] 全库所有表的落标核验与贯标队列汇总；若库目录缓存为空，将先自动触发全库目录采集后再生成报告。`,
+      options: [
+        {
+          id: "html",
+          title: "离线交互网页报告 (.html)",
+          badge: "推荐",
+          badgeTone: "ok",
+          icon: "explorer",
+          shortExt: ".html",
+          ctaLabel: "导出离线网页报告 (.html)",
+          desc: "单个离线 HTML 文件，双击浏览器打开即可按库/表/状态交互筛选与查阅贯标 SQL，并内置「导出单 Sheet Excel (.xlsx)」按钮。",
+          onExport: () =>
+            this._runExportReportTask(
+              "导出离线网页报告 (.html)",
+              ({ taskId, signal }) =>
+                migratorApi.exportBindingReportHtml({
+                  connectionId: cid,
+                  formatProfile: fmtProfile,
+                  tables: "",
+                  taskId,
+                  signal,
+                }),
+              { syncCatalog: true, connId: cid }
+            ),
+        },
+        {
+          id: "xlsx",
+          title: "直接导出库级 Excel (.xlsx)",
+          badge: "单 Sheet 全库表",
+          badgeTone: "info",
+          icon: "table",
+          shortExt: ".xlsx",
+          ctaLabel: "导出库级 Excel (.xlsx)",
+          desc: "在一个 Sheet「全库落标与贯标报告」中汇集当前数据库所有表与字段的物理结构、数标匹配、落标状态与贯标队列进展。",
+          onExport: () =>
+            this._runExportReportTask(
+              "导出库级落标 Excel (.xlsx)",
+              ({ taskId, signal }) =>
+                migratorApi.exportBindingReport({
+                  connectionId: cid,
+                  formatProfile: fmtProfile,
+                  tables: "",
+                  taskId,
+                  signal,
+                }),
+              { syncCatalog: true, connId: cid }
+            ),
+        },
+      ],
+      secondaryActions: [
+        {
+          label: "全库预填对照模板 (.xlsx)",
+          icon: "download",
+          hint: "预填当前库所有表字段与已绑标准，补充数据项编号后可直接回传导入",
+          onClick: () =>
+            this._runExportReportTask(
+              "下载全库预填对照模板 (.xlsx)",
+              ({ taskId, signal }) =>
+                migratorApi.downloadBindingTemplate({
+                  connectionId: cid,
+                  scope: "all",
+                  taskId,
+                  signal,
+                }),
+              { syncCatalog: true, connId: cid }
+            ),
+        },
+        {
+          label: "仅导出贯标队列 (.xlsx)",
+          icon: "download",
+          hint: "仅导出当前贯标改造执行台中的任务清单",
+          onClick: () =>
+            this._runExportReportTask(
+              "导出贯标队列 Excel (.xlsx)",
+              ({ taskId, signal }) => migratorApi.exportReport({ taskId, signal }),
+              { syncCatalog: false }
+            ),
+        },
+      ],
+    });
   }
 
   async executeSingleItem(itemRow) {
@@ -1165,15 +1304,8 @@ export class StandardMigratorView {
         el("button", {
           type: "button",
           className: "btn btn-xs",
-          text: "导出落标报告",
-          onClick: () =>
-            migratorApi
-              .exportBindingReport({
-                connectionId: this.activeConnId,
-                formatProfile: this.formatProfile,
-                tables: this.activeTable ? `${this.activeSchema}.${this.activeTable}` : "",
-              })
-              .catch((e) => Toast.error(e.message)),
+          text: "导出报告",
+          onClick: () => this.openExportDialog(),
         })
       )
     );
@@ -1407,7 +1539,7 @@ export class StandardMigratorView {
           type: "button",
           className: "btn btn-xs",
           text: "导出报告",
-          onClick: () => migratorApi.exportReport().catch((e) => Toast.error(e.message)),
+          onClick: () => this.openExportDialog(),
         }),
         el("button", {
           type: "button",

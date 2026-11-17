@@ -127,8 +127,23 @@ export async function uploadFormData(url, formData, { onUploadProgress = null } 
   return parseJsonOrThrow(resp);
 }
 
-export async function downloadApiFile(url, { method = "GET", body = undefined, fallbackName = "export.bin" } = {}) {
+export async function downloadApiFile(
+  url,
+  {
+    method = "GET",
+    body = undefined,
+    fallbackName = "export.bin",
+    taskId = "",
+    signal = undefined,
+  } = {}
+) {
   const opts = { method, headers: {} };
+  if (taskId) {
+    opts.headers["X-Task-Id"] = taskId;
+  }
+  if (signal) {
+    opts.signal = signal;
+  }
   if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
@@ -374,9 +389,11 @@ export const migratorApi = {
     downloadApiFile("/api/modules/standard_migrator/checklist/template.xlsx", {
       fallbackName: "Data.O.G_字段贯标模板.xlsx",
     }),
-  exportReport: () =>
+  exportReport: ({ taskId = "", signal = undefined } = {}) =>
     downloadApiFile("/api/modules/standard_migrator/checklist/report.xlsx", {
       fallbackName: "Data.O.G_贯标报告.xlsx",
+      taskId,
+      signal,
     }),
   executeSingle: (itemId, opts = {}) =>
     requestJson(
@@ -459,14 +476,24 @@ export const migratorApi = {
       "/api/modules/standard_migrator/bindings/check-compliance",
       withRequestOpts({ method: "POST", body: payload }, opts)
     ),
-  downloadBindingTemplate: ({ connectionId = "", schemaName = "", tables = "" } = {}) => {
+  downloadBindingTemplate: ({
+    connectionId = "",
+    schemaName = "",
+    tables = "",
+    scope = "",
+    taskId = "",
+    signal = undefined,
+  } = {}) => {
     const qs = new URLSearchParams();
     if (connectionId) qs.set("connection_id", connectionId);
     if (schemaName) qs.set("schema_name", schemaName);
     if (tables) qs.set("tables", tables);
+    if (scope) qs.set("scope", scope);
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
     return downloadApiFile(`/api/modules/standard_migrator/bindings/template.xlsx${suffix}`, {
       fallbackName: "DataOG_字段与数据标准对照模板.xlsx",
+      taskId,
+      signal,
     });
   },
   uploadBindings: (
@@ -483,13 +510,38 @@ export const migratorApi = {
     if (progressId) fd.append("progress_id", progressId);
     return uploadFormData("/api/modules/standard_migrator/bindings/upload", fd, { onUploadProgress });
   },
-  exportBindingReport: ({ connectionId = "", formatProfile = "AUTO", tables = "" } = {}) => {
+  exportBindingReport: ({
+    connectionId = "",
+    formatProfile = "AUTO",
+    tables = "",
+    taskId = "",
+    signal = undefined,
+  } = {}) => {
     const qs = new URLSearchParams();
     if (connectionId) qs.set("connection_id", connectionId);
     if (formatProfile) qs.set("format_profile", formatProfile);
     if (tables) qs.set("tables", tables);
     return downloadApiFile(`/api/modules/standard_migrator/bindings/report.xlsx?${qs.toString()}`, {
-      fallbackName: "DataOG_单库字段落标检查报告.xlsx",
+      fallbackName: "DataOG_全库落标与贯标报告.xlsx",
+      taskId,
+      signal,
+    });
+  },
+  exportBindingReportHtml: ({
+    connectionId = "",
+    formatProfile = "AUTO",
+    tables = "",
+    taskId = "",
+    signal = undefined,
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    if (formatProfile) qs.set("format_profile", formatProfile);
+    if (tables) qs.set("tables", tables);
+    return downloadApiFile(`/api/modules/standard_migrator/bindings/report.html?${qs.toString()}`, {
+      fallbackName: "DataOG_全库落标与贯标离线报告.html",
+      taskId,
+      signal,
     });
   },
   stageMigration: (payload, opts = {}) =>
@@ -616,6 +668,40 @@ export const crossApi = {
     const qs = tableKey ? `?table_key=${encodeURIComponent(tableKey)}` : "";
     return downloadApiFile(`/api/modules/cross_comparator/bindings/export.xlsx${qs}`, {
       fallbackName: "Data.O.G_三栏比对报告.xlsx",
+    });
+  },
+  exportReportHtml: ({
+    formatProfile = "AUTO",
+    sourceFormatProfile = "AUTO",
+    targetFormatProfile = "AUTO",
+    taskId = "",
+    signal = undefined,
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (formatProfile) qs.set("format_profile", formatProfile);
+    if (sourceFormatProfile) qs.set("source_format_profile", sourceFormatProfile);
+    if (targetFormatProfile) qs.set("target_format_profile", targetFormatProfile);
+    return downloadApiFile(`/api/modules/cross_comparator/report.html?${qs.toString()}`, {
+      fallbackName: "DataOG_跨环境库级比对离线报告.html",
+      taskId,
+      signal,
+    });
+  },
+  exportReportExcel: ({
+    formatProfile = "AUTO",
+    sourceFormatProfile = "AUTO",
+    targetFormatProfile = "AUTO",
+    taskId = "",
+    signal = undefined,
+  } = {}) => {
+    const qs = new URLSearchParams();
+    if (formatProfile) qs.set("format_profile", formatProfile);
+    if (sourceFormatProfile) qs.set("source_format_profile", sourceFormatProfile);
+    if (targetFormatProfile) qs.set("target_format_profile", targetFormatProfile);
+    return downloadApiFile(`/api/modules/cross_comparator/report.xlsx?${qs.toString()}`, {
+      fallbackName: "DataOG_跨环境库级比对报告.xlsx",
+      taskId,
+      signal,
     });
   },
   pushToMigrator: (

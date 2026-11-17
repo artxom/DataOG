@@ -430,6 +430,7 @@ def api_bindings_template(
     connection_id: str = Query(default=""),
     schema_name: str = Query(default=""),
     tables: str = Query(default=""),
+    scope: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     try:
@@ -437,6 +438,7 @@ def api_bindings_template(
             connection_id=connection_id,
             schema_name=schema_name,
             tables=tables,
+            scope=scope,
         )
         fn = quote("DataOG_字段与数据标准对照模板.xlsx")
         return Response(
@@ -487,19 +489,37 @@ async def api_bindings_upload(
 
 
 @router.get("/bindings/report.xlsx")
-def api_bindings_report(
+async def api_bindings_report(
+    request: Request,
     connection_id: str = Query(default=""),
     format_profile: str = Query(default="AUTO"),
     tables: str = Query(default=""),
+    task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    tid = extract_task_id(request, task_id)
     try:
-        content = StandardMigratorService(ctx).export_binding_report_bytes(
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "导出全库落标与贯标报告 (.xlsx)",
+                detail="正在准备采集数据源目录并汇总全库落标与贯标数据...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        content = await run_in_threadpool(
+            StandardMigratorService(ctx).export_binding_report_bytes,
             connection_id=connection_id,
             format_profile=format_profile,
             tables=tables,
+            progress_cb=reporter,
         )
-        fn = quote("DataOG_单库字段落标检查报告.xlsx")
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="导出完成",
+                detail="单 Sheet 全库落标与贯标 Excel 报告已生成",
+            )
+        fn = quote("DataOG_全库落标与贯标报告.xlsx")
         return Response(
             content=content,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -508,6 +528,54 @@ def api_bindings_report(
             },
         )
     except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
+        return _err(str(exc), 400)
+
+
+@router.get("/bindings/report.html")
+async def api_bindings_report_html(
+    request: Request,
+    connection_id: str = Query(default=""),
+    format_profile: str = Query(default="AUTO"),
+    tables: str = Query(default=""),
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    tid = extract_task_id(request, task_id)
+    try:
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "导出离线交互网页报告 (.html)",
+                detail="正在准备采集数据源目录并构建离线可交互库级报告...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        content = await run_in_threadpool(
+            StandardMigratorService(ctx).export_binding_report_html_bytes,
+            connection_id=connection_id,
+            format_profile=format_profile,
+            tables=tables,
+            progress_cb=reporter,
+        )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="导出完成",
+                detail="离线交互库级网页报告 (.html) 已生成，支持直接双击打开并导出 Excel",
+            )
+        fn = quote("DataOG_全库落标与贯标离线报告.html")
+        return Response(
+            content=content,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Disposition": f"attachment; filename=binding_report.html; filename*=UTF-8''{fn}",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
         return _err(str(exc), 400)
 
 

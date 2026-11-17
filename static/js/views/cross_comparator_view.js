@@ -5,9 +5,10 @@
  * 支持拖拽与点选双向绑标配对，两侧自动沿用各自数据库配置的落标标准格式。
  */
 
-import { crossApi, isAbortError, standardsApi } from "../core/api.js";
+import { crossApi, isAbortError, platformApi, standardsApi } from "../core/api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
+import { openExportReportModal } from "../ui/export_report_modal.js";
 import { Modal } from "../ui/modal.js";
 import { openStandardPickerModal } from "../ui/standard_picker_modal.js";
 import { TaskActivityBar } from "../ui/task_activity_bar.js";
@@ -759,6 +760,141 @@ export class CrossComparatorView {
       Toast.error(err.message);
       return false;
     }
+  }
+
+  async _runExportReportTask(title, fn, { syncCatalogs = true } = {}) {
+    try {
+      const filename = await this.activityBar.track(
+        title,
+        async ({ taskId, signal }) => fn({ taskId, signal }),
+        { prefix: "cmp", cancellable: true, exclusive: false }
+      );
+      if (this._destroyed) return;
+      Toast.success(`已导出：${filename}`);
+      if (syncCatalogs) {
+        const ov = this.overview || {};
+        const sideEntries = [
+          ov.source_connection?.configured ? ["source_connection", ov.source_connection.connection_id] : null,
+          ov.target_connection?.configured ? ["target_connection", ov.target_connection.connection_id] : null,
+        ].filter(Boolean);
+        let updated = false;
+        await Promise.all(
+          sideEntries.map(async ([sideKey, cid]) => {
+            try {
+              const cat = await platformApi.getMetadataTree(cid, false);
+              if (!this._destroyed && cat) {
+                store.updateCatalogTree(cid, cat);
+                if (this.overview?.[sideKey]) {
+                  this.overview[sideKey].tables = cat.tables || [];
+                  this.overview[sideKey].schemas = (cat.schemas || []).map((s) =>
+                    typeof s === "string" ? s : s.schema_name
+                  );
+                  updated = true;
+                }
+              }
+            } catch (_ignore) {
+              // 忽略非致命目录同步异常
+            }
+          })
+        );
+        if (!this._destroyed && updated) {
+          this.render();
+        }
+      }
+    } catch (err) {
+      if (isAbortError(err)) return;
+      Toast.error(err.message);
+    }
+  }
+
+  openExportDialog() {
+    const ov = this.overview || {};
+    const srcConn = ov.source_connection || {};
+    const tgtConn = ov.target_connection || {};
+    if (!srcConn.configured && !tgtConn.configured && !(ov.tables || []).length) {
+      Toast.warn("请先配置跨环境来源库与目标库，或先保存/导入映射表对");
+      return;
+    }
+    const srcName = srcConn.configured ? srcConn.name || "来源库" : "未配来源库";
+    const tgtName = tgtConn.configured ? tgtConn.name || "目标库" : "未配目标库";
+
+    openExportReportModal({
+      title: "导出跨环境库级比对报告",
+      scopeBadge: `${srcName} ↔ ${tgtName}`,
+      scopeHint:
+        "汇集全部已保存映射表对的五虚拟列比对情况与双方落标标准，同时附上未配对同名表的推荐清单（不做自动字段预比对）；若库目录为空将先自动触发全库目录采集。",
+      options: [
+        {
+          id: "html",
+          title: "离线交互网页报告 (.html)",
+          badge: "推荐",
+          badgeTone: "ok",
+          icon: "explorer",
+          shortExt: ".html",
+          ctaLabel: "导出离线网页报告 (.html)",
+          desc: "独立离线 HTML 文件，双击即可离线还原「五虚拟列」图形化对标看板与「推荐同名表」清单，并支持随时一键导出单 Sheet Excel。",
+          onExport: () =>
+            this._runExportReportTask("导出跨环境离线网页报告 (.html)", ({ taskId, signal }) =>
+              crossApi.exportReportHtml({
+                formatProfile: this.formatProfile,
+                sourceFormatProfile: this.sourceFormatProfile,
+                targetFormatProfile: this.targetFormatProfile,
+                taskId,
+                signal,
+              })
+            ),
+        },
+        {
+          id: "xlsx",
+          title: "直接导出库级 Excel (.xlsx)",
+          badge: "单 Sheet 全库表",
+          badgeTone: "info",
+          icon: "table",
+          shortExt: ".xlsx",
+          ctaLabel: "导出库级 Excel (.xlsx)",
+          desc: "单个 Sheet「跨环境库级比对报告」同时包含所有已配对表五栏字段明细及未配对同名表推荐清单，附状态配色与自动筛选。",
+          onExport: () =>
+            this._runExportReportTask("导出跨环境库级 Excel (.xlsx)", ({ taskId, signal }) =>
+              crossApi.exportReportExcel({
+                formatProfile: this.formatProfile,
+                sourceFormatProfile: this.sourceFormatProfile,
+                targetFormatProfile: this.targetFormatProfile,
+                taskId,
+                signal,
+              })
+            ),
+        },
+      ],
+      secondaryActions: [
+        {
+          label: "导出三方绑定铺底表 (.xlsx)",
+          icon: "download",
+          hint: "保留旧版可回传重导入系统的数据标准铺底 Excel 格式",
+          onClick: () => {
+            if (!this.activeTableKey && !(ov.tables || []).length) {
+              Toast.warn("暂无可导出的已保存映射表对");
+              return;
+            }
+            this._runExportReportTask(
+              "导出三方绑定铺底表 (.xlsx)",
+              () => crossApi.exportExcel(this.activeTableKey),
+              { syncCatalogs: false }
+            );
+          },
+        },
+        {
+          label: "导出跨环境配置包 (.json)",
+          icon: "download",
+          hint: "导出已保存跨环境映射表对与字段绑定的 JSON 备份包",
+          onClick: () =>
+            this._runExportReportTask(
+              "导出跨环境配置包 (.json)",
+              () => crossApi.exportJson(),
+              { syncCatalogs: false }
+            ),
+        },
+      ],
+    });
   }
 
   _evaluateProvisionalTargetCompliance(colObj, tgtStdBrief) {
@@ -1980,26 +2116,8 @@ export class CrossComparatorView {
         el("button", {
           type: "button",
           className: "btn btn-xs",
-          text: "导出 Excel",
-          onClick: () => {
-            if (!this.activeTableKey) {
-              if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
-                Toast.warn("当前预览表对尚未保存，请先点击「保存」后再导出 Excel");
-                return;
-              }
-              if (!(ov.tables || []).length) {
-                Toast.warn("暂无可导出的已保存映射表对");
-                return;
-              }
-            }
-            crossApi.exportExcel(this.activeTableKey).catch((e) => Toast.error(e.message));
-          },
-        }),
-        el("button", {
-          type: "button",
-          className: "btn btn-xs",
-          text: "导出 JSON",
-          onClick: () => crossApi.exportJson().catch((e) => Toast.error(e.message)),
+          text: "导出报告",
+          onClick: () => this.openExportDialog(),
         }),
         el("button", {
           type: "button",

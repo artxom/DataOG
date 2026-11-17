@@ -321,6 +321,97 @@ def api_cross_export_xlsx(
     )
 
 
+@router.get("/report.xlsx")
+async def api_cross_report_xlsx(
+    request: Request,
+    format_profile: str = Query(default="AUTO"),
+    source_format_profile: str = Query(default="AUTO"),
+    target_format_profile: str = Query(default="AUTO"),
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    tid = extract_task_id(request, task_id)
+    try:
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "导出跨环境库级比对报告 (.xlsx)",
+                detail="正在汇总已保存映射表对与推荐同名表，构建单 Sheet Excel...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        content = await run_in_threadpool(
+            CrossComparatorService(ctx).export_cross_report_excel_bytes,
+            format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
+            progress_cb=reporter,
+        )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="导出完成",
+                detail="跨环境库级比对报告 (.xlsx) 已生成",
+            )
+        fn = quote("DataOG_跨环境库级比对报告.xlsx")
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename=cross_db_report.xlsx; filename*=UTF-8''{fn}"
+            },
+        )
+    except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
+        return _err(str(exc), 400)
+
+
+@router.get("/report.html")
+async def api_cross_report_html(
+    request: Request,
+    format_profile: str = Query(default="AUTO"),
+    source_format_profile: str = Query(default="AUTO"),
+    target_format_profile: str = Query(default="AUTO"),
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    tid = extract_task_id(request, task_id)
+    try:
+        if tid:
+            ctx.task_progress.start(
+                tid,
+                "导出跨环境离线网页报告 (.html)",
+                detail="正在构建跨环境五虚拟列离线交互网页与推荐同名清单...",
+            )
+        reporter = ctx.task_progress.make_reporter(tid)
+        content = await run_in_threadpool(
+            CrossComparatorService(ctx).export_cross_report_html_bytes,
+            format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
+            progress_cb=reporter,
+        )
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.finish(
+                tid,
+                stage="导出完成",
+                detail="跨环境离线交互网页报告 (.html) 已生成，支持离线查阅五栏视图与导出 Excel",
+            )
+        fn = quote("DataOG_跨环境库级比对离线报告.html")
+        return Response(
+            content=content,
+            media_type="text/html; charset=utf-8",
+            headers={
+                "Content-Disposition": f"attachment; filename=cross_db_report.html; filename*=UTF-8''{fn}",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except Exception as exc:
+        if tid and not ctx.task_progress.is_cancelled(tid):
+            ctx.task_progress.fail(tid, str(exc))
+        return _err(str(exc), 400)
+
+
 @router.post("/push-to-migrator")
 async def api_cross_push_to_migrator(
     payload: PushToMigratorPayload,

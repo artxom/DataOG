@@ -3400,3 +3400,121 @@ dialog::backdrop {
     animation: none;
   }
 }
+
+/* ---------- 报告导出弹窗 ---------- */
+.export-report-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.export-report-scope {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--os-accent) 7%, var(--os-panel-subtle));
+  border: 1px solid color-mix(in srgb, var(--os-accent) 20%, var(--os-border));
+}
+
+.export-report-scope-txt {
+  font-size: 11.5px;
+  color: var(--os-text-2);
+  line-height: 1.45;
+}
+
+.export-report-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.export-report-opt {
+  width: 100%;
+  text-align: left;
+  padding: 11px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--os-border-strong);
+  background: var(--os-panel);
+  color: var(--os-text);
+  font-family: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  transition: border-color 0.14s ease, background 0.14s ease, box-shadow 0.14s ease;
+}
+
+.export-report-opt:hover {
+  border-color: color-mix(in srgb, var(--os-accent) 55%, var(--os-border-strong));
+  background: var(--os-hover);
+}
+
+.export-report-opt.is-selected {
+  border-color: var(--os-accent);
+  background: color-mix(in srgb, var(--os-accent) 8%, var(--os-panel));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--os-accent) 18%, transparent);
+}
+
+.export-report-opt-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.export-report-opt-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.export-report-opt-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.export-report-radio {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1.5px solid var(--os-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.export-report-radio.is-checked {
+  border-color: var(--os-accent);
+  background: var(--os-accent);
+  box-shadow: inset 0 0 0 3px var(--os-panel);
+}
+
+.export-report-opt-desc {
+  padding-left: 21px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--os-text-2);
+}
+
+.export-report-secondary {
+  padding-top: 8px;
+  border-top: 1px dashed var(--os-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.export-report-secondary-label {
+  font-size: 11px;
+  color: var(--os-muted);
+}
+
+.export-report-secondary-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}

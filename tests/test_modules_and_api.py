@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
 import contextlib
 import dis
 import glob
@@ -14,7 +15,9 @@ import json
 import os
 import pkgutil
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
@@ -2847,6 +2850,413 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertEqual(t_exp["status"], "completed")
             stages = [x["stage"] for x in t_exp["recent_logs"]]
             self.assertTrue(any("加载元数据" in s or "AI 规划" in s or "只读采样" in s for s in stages))
+
+    def test_single_db_offline_html_and_single_sheet_excel_report(self):
+        """验证单库库级离线 HTML / 单 Sheet Excel 报告：空缓存先采目录再导出、全库范围、公式防注入与队列隔离."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, "single_rep.db")
+            conn_raw = sqlite3.connect(db_path)
+            conn_raw.execute("CREATE TABLE t_cust (cust_id TEXT, bal NUMERIC)")
+            conn_raw.execute("CREATE TABLE t_ord (ord_id TEXT, amt NUMERIC)")
+            conn_raw.execute("CREATE TABLE t_edge (safe_col TEXT)")
+            conn_raw.commit()
+            conn_raw.close()
+
+            other_db = os.path.join(tmp, "other.db")
+            sqlite3.connect(other_db).close()
+
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            ctx = app.state.platform_ctx
+            client = TestClient(app)
+
+            p1 = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "c_single",
+                    "name": "单库测试库",
+                    "db_type": "SQLITE",
+                    "sqlite_path": db_path,
+                    "standard_format": "type_mysql",
+                }
+            )
+            ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "c_other",
+                    "name": "其他库",
+                    "db_type": "SQLITE",
+                    "sqlite_path": other_db,
+                }
+            )
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "S_CUST_01",
+                    "cn_name": "客户号</script><img onerror=alert(1)>",
+                    "en_abbr": "cust_id",
+                    "data_format": "C32",
+                    "type_mysql": "=SUM(A1)",
+                }
+            )
+            ctx.standard_catalog.bulk_save_field_bindings(
+                "c_single",
+                [{"schema_name": "main", "table_name": "t_cust", "column_name": "cust_id", "std_code": "S_CUST_01"}],
+                mode="merge",
+            )
+            # 插入属于 c_other 的队列任务，确认不会串入 c_single 报告
+            ctx.store.save_meta("migrator_connection_id", "c_other")
+            ctx.store.replace_all_items(
+                [
+                    {
+                        "row_index": 1,
+                        "schema_name": "main",
+                        "table_name": "t_cust",
+                        "old_col_name": "cust_id",
+                        "old_col_type": "TEXT",
+                        "old_col_comment": "",
+                        "new_col_name": "cust_id",
+                        "new_col_type": "VARCHAR(32)",
+                        "new_col_comment": "客户号",
+                    }
+                ],
+                "other_queue.xlsx",
+                preserve_history=False,
+            )
+
+            # 清空 c_single 的目录与绑标缓存以触发 Q4「先触发采集目录，再生成报告」
+            with ctx.store.module_db() as mdb:
+                mdb.execute("DELETE FROM meta_tables WHERE connection_id = ?", ("c_single",))
+                mdb.execute("DELETE FROM meta_schemas WHERE connection_id = ?", ("c_single",))
+                mdb.execute("DELETE FROM field_standard_bindings WHERE connection_id = ?", ("c_single",))
+
+            self.assertEqual(ctx.metadata_hub.get_catalog_tree("c_single", auto_refresh=False)["tables"], [])
+
+            with mock.patch.object(
+                ctx.metadata_hub, "refresh_catalog", wraps=ctx.metadata_hub.refresh_catalog
+            ) as spy_refresh:
+                html_res = client.get(
+                    f"/api/modules/standard_migrator/bindings/report.html?connection_id={p1.connection_id}",
+                    headers={"X-Task-Id": "rep_html_1"},
+                )
+            self.assertEqual(html_res.status_code, 200, html_res.text)
+            self.assertEqual(spy_refresh.call_count, 1)
+            self.assertIn("text/html", html_res.headers.get("content-type", ""))
+            self.assertIn("attachment;", html_res.headers.get("content-disposition", ""))
+            self.assertGreaterEqual(
+                len(ctx.metadata_hub.get_catalog_tree("c_single", auto_refresh=False)["tables"]), 3
+            )
+
+            # 恢复绑定（含一条陈旧 schema 'public' 与一条库内缺表绑定），再清空目录但保留绑定以回归测试「有绑标无目录仍自触刷新」
+            ctx.standard_catalog.bulk_save_field_bindings(
+                "c_single",
+                [
+                    {"schema_name": "main", "table_name": "t_cust", "column_name": "cust_id", "std_code": "S_CUST_01"},
+                    {"schema_name": "public", "table_name": "t_cust", "column_name": "cust_id", "std_code": "S_CUST_01"},
+                    {"schema_name": "public", "table_name": "t_missing_only", "column_name": "ghost_col", "std_code": "S_CUST_01"},
+                ],
+                mode="merge",
+            )
+            with ctx.store.module_db() as mdb:
+                mdb.execute("DELETE FROM meta_tables WHERE connection_id = ?", ("c_single",))
+                mdb.execute("DELETE FROM meta_schemas WHERE connection_id = ?", ("c_single",))
+
+            with mock.patch.object(
+                ctx.metadata_hub, "refresh_catalog", wraps=ctx.metadata_hub.refresh_catalog
+            ) as spy_refresh2:
+                html_res2 = client.get(
+                    "/api/modules/standard_migrator/bindings/report.html?connection_id=c_single",
+                    headers={"X-Task-Id": "rep_html_2"},
+                )
+            self.assertEqual(html_res2.status_code, 200)
+            self.assertEqual(spy_refresh2.call_count, 1)
+            html_txt = html_res2.text
+            self.assertIn("t_cust", html_txt)
+            self.assertIn("t_ord", html_txt)
+            self.assertIn("t_edge", html_txt)
+            self.assertIn("t_missing_only", html_txt)
+            self.assertNotIn("</script><img", html_txt)
+            self.assertIn("\\u003c/script\\u003e", html_txt)
+            self.assertEqual(client.get("/api/platform/tasks/rep_html_2").json()["task"]["status"], "completed")
+
+            m_json = re.search(
+                r'<script id="report-data" type="application/json">(.*?)</script>',
+                html_txt,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(m_json)
+            payload = json.loads(m_json.group(1))
+            self.assertEqual(payload["migration_items"], [])
+            # public.t_cust 应与 main.t_cust 归并去重；外加 t_ord、t_edge、t_missing_only 共 4 张表
+            self.assertEqual([t["table"]["table_name"] for t in payload["tables"]].count("t_cust"), 1)
+            self.assertEqual(
+                {t["table"]["table_name"] for t in payload["tables"]},
+                {"t_cust", "t_ord", "t_edge", "t_missing_only"},
+            )
+
+            xlsx_res = client.get("/api/modules/standard_migrator/bindings/report.xlsx?connection_id=c_single")
+            self.assertEqual(xlsx_res.status_code, 200)
+            wb = openpyxl.load_workbook(io.BytesIO(xlsx_res.content))
+            self.assertEqual(wb.sheetnames, ["全库落标与贯标报告"])
+            ws = wb.active
+            self.assertEqual(ws.freeze_panes, "A2")
+            self.assertTrue(ws.auto_filter.ref)
+            rows_vals = list(ws.iter_rows(min_row=2, values_only=True))
+            table_names_in_sheet = {r[2] for r in rows_vals}
+            self.assertEqual(table_names_in_sheet, {"t_cust", "t_ord", "t_edge", "t_missing_only"})
+            # 单横杠占位符 '-' 不得被误前缀为 "'-"
+            self.assertFalse(any(v == "'-" for row in rows_vals for v in row))
+            missing_rows = [r for r in rows_vals if r[2] == "t_missing_only"]
+            self.assertEqual(len(missing_rows), 1)
+            self.assertEqual(missing_rows[0][14], "库内缺表")
+            cust_row = [r for r in rows_vals if r[2] == "t_cust" and r[6] == "cust_id"][0]
+            self.assertEqual(cust_row[13], "'=SUM(A1)")
+
+            # 若本机具备 node，验证单库离线 HTML 搜索框输入不重建节点（防失焦/断输入法）
+            node_bin = shutil.which("node")
+            if node_bin:
+                scripts = re.findall(r"<script[^>]*>(.*?)</script>", html_txt, re.DOTALL)
+                self.assertEqual(len(scripts), 2)
+                dom_probe = (
+                    "class Node{}\n"
+                    "function makeNode(tag){const n=new Node();Object.assign(n,{tagName:String(tag).toUpperCase(),children:[],style:{},dataset:{},_ev:{},className:'',type:'',placeholder:'',value:'',hidden:false,appendChild(c){this.children.push(c);return c;},removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);return c;},get firstChild(){return this.children[0]||null;},replaceChildren(...a){this.children=a;},addEventListener(e,f){(this._ev[e]||(this._ev[e]=[])).push(f);},dispatchEvent(ev){if(!ev.target)ev.target=this;(this._ev[ev.type]||[]).forEach(f=>f(ev));},setAttribute(k,v){this[k]=v;},getAttribute(k){return this[k];},querySelector(sel){const c=sel[0]==='.'?sel.slice(1):null;let f=null;const walk=x=>{if(f)return;if(c&&(x.className||'').split(/\\s+/).includes(c)){f=x;return;}(x.children||[]).forEach(walk);};walk(this);return f;},closest(){return null;},focus(){}});return n;}\n"
+                    "global.Node=Node;\n"
+                    "const _els={};const root=makeNode('div');root.id='app-root';_els['app-root']=root;\n"
+                    "const dataEl=makeNode('script');dataEl.id='report-data';dataEl.textContent=" + json.dumps(m_json.group(1)) + ";_els['report-data']=dataEl;\n"
+                    "global.window={matchMedia:()=>({matches:false})};\n"
+                    "global.document={documentElement:makeNode('html'),body:makeNode('body'),createElement:makeNode,createTextNode:t=>Object.assign(new Node(),{nodeType:3,textContent:t}),getElementById:id=>_els[id]||null};\n"
+                    "global.URL={createObjectURL:()=>'blob:0',revokeObjectURL(){}};global.Blob=class{constructor(p){this._b=Buffer.concat(p.map(x=>Buffer.from(x)));}};\n"
+                    + scripts[1]
+                    + "\nconst inputs=[];const findInputs=x=>{if(x.tagName==='INPUT')inputs.push(x);(x.children||[]).forEach(findInputs);};findInputs(root);\n"
+                    + "if(!inputs.length) throw new Error('missing search input');\n"
+                    + "const inp=inputs[0];inp.value='cust';inp.dispatchEvent({type:'input'});\n"
+                    + "const inputs2=[];const findInputs2=x=>{if(x.tagName==='INPUT')inputs2.push(x);(x.children||[]).forEach(findInputs2);};findInputs2(root);\n"
+                    + "if(inputs2[0]!==inp) throw new Error('input recreated on search');\n"
+                )
+                subprocess.run([node_bin, "-e", dom_probe], capture_output=True, text=True, check=True, timeout=10)
+
+            # 全库预填对照模板下载
+            tpl_res = client.get("/api/modules/standard_migrator/bindings/template.xlsx?connection_id=c_single&scope=all")
+            self.assertEqual(tpl_res.status_code, 200)
+            wb_tpl = openpyxl.load_workbook(io.BytesIO(tpl_res.content))
+            tpl_tbls = {r[1] for r in wb_tpl["字段与数据标准对照"].iter_rows(min_row=2, values_only=True)}
+            self.assertTrue({"t_cust", "t_ord", "t_edge"}.issubset(tpl_tbls))
+
+    def test_cross_env_offline_html_single_sheet_excel_and_node_xlsx_roundtrip(self):
+        """验证跨环境离线网页/单 Sheet Excel、推荐同名表不触发预比对及网页内嵌 JS 生成合法 .xlsx."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src_db = os.path.join(tmp, "src.db")
+            tgt_db = os.path.join(tmp, "tgt.db")
+            sc = sqlite3.connect(src_db)
+            sc.execute("CREATE TABLE t_saved_s (cust_no TEXT, extra_s TEXT)")
+            sc.execute("CREATE TABLE t_same_unpaired (x1 TEXT, x2 INTEGER)")
+            sc.execute("CREATE TABLE t_src_only (s_only TEXT)")
+            sc.commit()
+            sc.close()
+
+            tc = sqlite3.connect(tgt_db)
+            tc.execute("CREATE TABLE t_saved_t (cust_no TEXT, extra_t TEXT)")
+            tc.execute("CREATE TABLE t_same_unpaired (x1 TEXT, x2 INTEGER)")
+            tc.execute("CREATE TABLE t_tgt_only (t_only TEXT)")
+            tc.commit()
+            tc.close()
+
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            ctx = app.state.platform_ctx
+            client = TestClient(app)
+
+            ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "src_db",
+                    "name": "上游Oracle",
+                    "db_type": "SQLITE",
+                    "sqlite_path": src_db,
+                    "standard_format": "type_oracle",
+                }
+            )
+            ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "tgt_db",
+                    "name": "下游DWS",
+                    "db_type": "SQLITE",
+                    "sqlite_path": tgt_db,
+                    "standard_format": "type_dws",
+                }
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/bind-role",
+                    json={"role": "source", "connection_id": "src_db", "auto_refresh": False},
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/bind-role",
+                    json={"role": "target", "connection_id": "tgt_db", "auto_refresh": False},
+                ).status_code,
+                200,
+            )
+
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "STD_01",
+                    "cn_name": "客户编码",
+                    "en_abbr": "cust_no",
+                    "type_oracle": "VARCHAR2(32)",
+                    "type_dws": "VARCHAR(32)",
+                }
+            )
+            save_res = client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "t_saved",
+                    "source_schema": "main",
+                    "source_table": "t_saved_s",
+                    "target_schema": "main",
+                    "target_table": "t_saved_t",
+                    "pairings": [
+                        {
+                            "source_col": "cust_no",
+                            "target_col": "cust_no",
+                            "source_std_code": "STD_01",
+                            "target_std_code": "STD_01",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(save_res.status_code, 200)
+
+            # 仅清空目录缓存但保留已存绑标：仍应自动触发目录刷新发现全部表，且不触发未配对表字段探查
+            with ctx.store.module_db() as mdb:
+                mdb.execute("DELETE FROM meta_tables")
+                mdb.execute("DELETE FROM meta_schemas")
+
+            probed_tables_log: List[Tuple[str, str]] = []
+            orig_batch = ctx.metadata_hub.get_tables_metadata_batch
+            orig_single = ctx.metadata_hub.get_table_metadata
+
+            def _spy_batch(cid, targets, *args, **kwargs):
+                for _s, _t in targets:
+                    probed_tables_log.append((cid, str(_t).lower()))
+                return orig_batch(cid, targets, *args, **kwargs)
+
+            def _spy_single(cid, sch, tbl, *args, **kwargs):
+                probed_tables_log.append((cid, str(tbl).lower()))
+                return orig_single(cid, sch, tbl, *args, **kwargs)
+
+            with (
+                mock.patch.object(ctx.metadata_hub, "get_tables_metadata_batch", side_effect=_spy_batch),
+                mock.patch.object(ctx.metadata_hub, "get_table_metadata", side_effect=_spy_single),
+            ):
+                html_res = client.get(
+                    "/api/modules/cross_comparator/report.html",
+                    headers={"X-Task-Id": "cross_rep_1"},
+                )
+
+            self.assertEqual(html_res.status_code, 200, html_res.text)
+            self.assertEqual(client.get("/api/platform/tasks/cross_rep_1").json()["task"]["status"], "completed")
+            # Q2 核心约束：未配对的同名表与单侧表严禁触发字段探查 / 自动预比对
+            probed_names = {t_name for _c, t_name in probed_tables_log}
+            self.assertNotIn("t_same_unpaired", probed_names)
+            self.assertNotIn("t_src_only", probed_names)
+            self.assertNotIn("t_tgt_only", probed_names)
+
+            m_json = re.search(
+                r'<script id="report-data" type="application/json">(.*?)</script>',
+                html_res.text,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(m_json)
+            data_obj = json.loads(m_json.group(1))
+            self.assertEqual(data_obj["source_format_profile"], "type_oracle")
+            self.assertEqual(data_obj["target_format_profile"], "type_dws")
+            self.assertEqual(len(data_obj["pairs"]), 1)
+            rec_names = {r["table_name"] for r in data_obj["recommended_pairings"]}
+            self.assertEqual(rec_names, {"t_same_unpaired"})
+            self.assertEqual([t["table_name"] for t in data_obj["source_only_tables"]], ["t_src_only"])
+            self.assertEqual([t["table_name"] for t in data_obj["target_only_tables"]], ["t_tgt_only"])
+
+            xlsx_res = client.get("/api/modules/cross_comparator/report.xlsx")
+            self.assertEqual(xlsx_res.status_code, 200)
+            wb = openpyxl.load_workbook(io.BytesIO(xlsx_res.content))
+            self.assertEqual(wb.sheetnames, ["跨环境库级比对报告"])
+            ws = wb.active
+            self.assertEqual(ws.freeze_panes, "A2")
+            self.assertTrue(ws.auto_filter.ref)
+            sheet_rows = list(ws.iter_rows(min_row=2, values_only=True))
+            self.assertFalse(any(v == "'-" for row in sheet_rows for v in row))
+            self.assertTrue(any(r[1] == "推荐同名(未保存)" and r[4] == "t_same_unpaired" for r in sheet_rows))
+            self.assertTrue(any(r[1] == "已保存映射" and r[4] == "t_saved_s" for r in sheet_rows))
+            self.assertTrue(any(r[1] == "仅来源库存在" and r[4] == "t_src_only" for r in sheet_rows))
+            self.assertTrue(any(r[1] == "仅目标库存在" and r[12] == "t_tgt_only" for r in sheet_rows))
+
+            # 同库自比对（src_cid == tgt_cid）清空目录后仅应刷新一次，不得并发重复采集
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/bind-role",
+                    json={"role": "target", "connection_id": "src_db", "auto_refresh": False},
+                ).status_code,
+                200,
+            )
+            with ctx.store.module_db() as mdb:
+                mdb.execute("DELETE FROM meta_tables WHERE connection_id = ?", ("src_db",))
+                mdb.execute("DELETE FROM meta_schemas WHERE connection_id = ?", ("src_db",))
+            with mock.patch.object(
+                ctx.metadata_hub, "refresh_catalog", wraps=ctx.metadata_hub.refresh_catalog
+            ) as spy_self_ref:
+                self_rep = client.get("/api/modules/cross_comparator/report.xlsx")
+            self.assertEqual(self_rep.status_code, 200)
+            self.assertEqual(spy_self_ref.call_count, 1)
+
+            # 保留旧版可重导入绑定导出契约
+            legacy_res = client.get("/api/modules/cross_comparator/bindings/export.xlsx")
+            self.assertEqual(legacy_res.status_code, 200)
+            wb_legacy = openpyxl.load_workbook(io.BytesIO(legacy_res.content))
+            self.assertIn("数据标准字段名", list(wb_legacy.active.iter_rows(min_row=1, max_row=1, values_only=True))[0])
+
+            # 若本机具备 node，端到端执行离线 HTML 内嵌的零依赖 .xlsx ZIP/OOXML 生成器及 DOM 搜索态稳定性
+            node_bin = shutil.which("node")
+            if node_bin:
+                scripts = re.findall(r"<script[^>]*>(.*?)</script>", html_res.text, re.DOTALL)
+                self.assertEqual(len(scripts), 2)
+                app_js = scripts[1]
+                # 抽取 _PURE_JS_XLSX_RUNTIME（在 _OFFLINE_DOM_HELPERS_JS 之前）并喂入构造的 rows 测试
+                runtime_part = app_js.split("function el(", 1)[0]
+                harness = (
+                    "class Blob { constructor(parts) { this._buf = Buffer.concat(parts.map(p => Buffer.from(p))); } }\n"
+                    + runtime_part
+                    + "\nconst blob = buildSingleSheetXlsxBlob('跨环境库级比对报告', ['序号','模式','表名'], [{ tone: 'GREEN', values: [1, 'main', 't_saved_s'] }, { tone: 'LAVENDER', values: [2, 'main', 't_same_unpaired'] }]);\n"
+                    + "process.stdout.write(blob._buf.toString('base64'));\n"
+                )
+                proc = subprocess.run(
+                    [node_bin, "-e", harness],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=10,
+                )
+                js_xlsx_bytes = base64.b64decode(proc.stdout.strip())
+                wb_js = openpyxl.load_workbook(io.BytesIO(js_xlsx_bytes))
+                self.assertEqual(wb_js.sheetnames, ["跨环境库级比对报告"])
+                js_vals = list(wb_js.active.iter_rows(min_row=1, values_only=True))
+                self.assertEqual(js_vals[0], ("序号", "模式", "表名"))
+                self.assertEqual(js_vals[1], (1, "main", "t_saved_s"))
+                self.assertEqual(js_vals[2], (2, "main", "t_same_unpaired"))
+
+                cross_dom_probe = (
+                    "class Node{}\n"
+                    "function makeNode(tag){const n=new Node();Object.assign(n,{tagName:String(tag).toUpperCase(),children:[],style:{},dataset:{},_ev:{},className:'',type:'',placeholder:'',value:'',hidden:false,appendChild(c){this.children.push(c);return c;},removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);return c;},get firstChild(){return this.children[0]||null;},replaceChildren(...a){this.children=a;},addEventListener(e,f){(this._ev[e]||(this._ev[e]=[])).push(f);},dispatchEvent(ev){if(!ev.target)ev.target=this;(this._ev[ev.type]||[]).forEach(f=>f(ev));},setAttribute(k,v){this[k]=v;},getAttribute(k){return this[k];},querySelector(sel){const c=sel[0]==='.'?sel.slice(1):null;let f=null;const walk=x=>{if(f)return;if(c&&(x.className||'').split(/\\s+/).includes(c)){f=x;return;}(x.children||[]).forEach(walk);};walk(this);return f;},closest(){return null;},focus(){}});return n;}\n"
+                    "global.Node=Node;\n"
+                    "const _els={};const root=makeNode('div');root.id='app-root';_els['app-root']=root;\n"
+                    "const dataEl=makeNode('script');dataEl.id='report-data';dataEl.textContent=" + json.dumps(m_json.group(1)) + ";_els['report-data']=dataEl;\n"
+                    "global.window={matchMedia:()=>({matches:false})};\n"
+                    "global.document={documentElement:makeNode('html'),body:makeNode('body'),createElement:makeNode,createTextNode:t=>Object.assign(new Node(),{nodeType:3,textContent:t}),getElementById:id=>_els[id]||null};\n"
+                    "global.URL={createObjectURL:()=>'blob:0',revokeObjectURL(){}};global.Blob=class{constructor(p){this._b=Buffer.concat(p.map(x=>Buffer.from(x)));}};\n"
+                    + app_js
+                    + "\nconst inputs=[];const findInputs=x=>{if(x.tagName==='INPUT')inputs.push(x);(x.children||[]).forEach(findInputs);};findInputs(root);\n"
+                    + "if(!inputs.length) throw new Error('missing cross-env search input');\n"
+                    + "const inp=inputs[0];inp.value='saved';inp.dispatchEvent({type:'input'});\n"
+                    + "const inputs2=[];const findInputs2=x=>{if(x.tagName==='INPUT')inputs2.push(x);(x.children||[]).forEach(findInputs2);};findInputs2(root);\n"
+                    + "if(inputs2[0]!==inp) throw new Error('cross-env input recreated on search');\n"
+                )
+                subprocess.run([node_bin, "-e", cross_dom_probe], capture_output=True, text=True, check=True, timeout=10)
 
 
 if __name__ == "__main__":

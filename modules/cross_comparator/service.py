@@ -13,7 +13,7 @@ import inspect
 import io
 import json
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -33,6 +33,10 @@ from core.platform.excel_io import (
 )
 from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.models import ColumnMeta, TableMeta
+from core.platform.offline_report import (
+    build_cross_env_excel_bytes,
+    build_cross_env_html_bytes,
+)
 
 
 def _supports_kwarg(fn: Any, kw: str) -> bool:
@@ -93,6 +97,7 @@ class CrossComparatorService:
                 "dbname": "",
                 "schema_name": "public",
                 "default_schema": "public",
+                "effective_default_schema": "public",
                 "user": "",
                 "standard_format": "AUTO",
             }
@@ -103,6 +108,7 @@ class CrossComparatorService:
             "role": role,
             "configured": True,
             "schema_name": prof.default_schema,
+            "effective_default_schema": prof.effective_default_schema(),
         }
 
     def get_role_connection_info(self, role: str) -> Dict[str, Any]:
@@ -605,6 +611,12 @@ class CrossComparatorService:
         load_saved_binding: bool = True,
         src_conn: Optional[Dict[str, Any]] = None,
         tgt_conn: Optional[Dict[str, Any]] = None,
+        prefetched_src_metas: Optional[Dict[Tuple[str, str], TableMeta]] = None,
+        prefetched_tgt_metas: Optional[Dict[Tuple[str, str], TableMeta]] = None,
+        prefetched_src_skipped: Optional[Set[Tuple[str, str]]] = None,
+        prefetched_tgt_skipped: Optional[Set[Tuple[str, str]]] = None,
+        prefetched_src_warning: str = "",
+        prefetched_tgt_warning: str = "",
         progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
@@ -742,7 +754,58 @@ class CrossComparatorService:
                 penetrate_views=True,
             )
 
-        if has_src and has_tgt:
+        def _lookup_prefetched(
+            metas_dict: Optional[Dict[Tuple[str, str], TableMeta]],
+            skipped_set: Optional[Set[Tuple[str, str]]],
+            warning_txt: str,
+            schema_name: str,
+            table_name: str,
+        ) -> Tuple[bool, Optional[TableMeta], str]:
+            if metas_dict is None and skipped_set is None:
+                return False, None, ""
+            k = (schema_name.lower(), table_name.lower())
+            if metas_dict is not None and k in metas_dict:
+                return True, metas_dict[k], ""
+            if skipped_set is not None and k in skipped_set:
+                return True, TableMeta(schema_name=schema_name, table_name=table_name, exists=False), (
+                    warning_txt or f"表 {schema_name}.{table_name} 探查受限"
+                )
+            return False, None, ""
+
+        src_pref_hit, src_pref_meta, src_pref_err = (
+            _lookup_prefetched(
+                prefetched_src_metas,
+                prefetched_src_skipped,
+                prefetched_src_warning,
+                src_schema,
+                src_table,
+            )
+            if has_src
+            else (True, src_meta, "")
+        )
+        tgt_pref_hit, tgt_pref_meta, tgt_pref_err = (
+            _lookup_prefetched(
+                prefetched_tgt_metas,
+                prefetched_tgt_skipped,
+                prefetched_tgt_warning,
+                tgt_schema,
+                tgt_table,
+            )
+            if has_tgt
+            else (True, tgt_meta, "")
+        )
+
+        if has_src and src_pref_hit and src_pref_meta is not None:
+            src_meta = src_pref_meta
+            src_error = src_pref_err
+        if has_tgt and tgt_pref_hit and tgt_pref_meta is not None:
+            tgt_meta = tgt_pref_meta
+            tgt_error = tgt_pref_err
+
+        need_probe_src = has_src and not src_pref_hit
+        need_probe_tgt = has_tgt and not tgt_pref_hit
+
+        if need_probe_src and need_probe_tgt:
             report(
                 22.0,
                 "探查表结构",
@@ -773,7 +836,7 @@ class CrossComparatorService:
                     tgt_meta = tgt_fut.result()
                 except Exception as exc:
                     tgt_error = str(exc)
-        elif has_src:
+        elif need_probe_src:
             report(
                 22.0,
                 "探查表结构",
@@ -790,7 +853,7 @@ class CrossComparatorService:
                 )
             except Exception as exc:
                 src_error = str(exc)
-        elif has_tgt:
+        elif need_probe_tgt:
             report(
                 22.0,
                 "探查表结构",
@@ -2761,3 +2824,647 @@ class CrossComparatorService:
         buf = io.BytesIO()
         wb.save(buf)
         return buf.getvalue()
+
+    # =========================================================================
+    # 库级跨环境离线报告 (单 Sheet .xlsx + 离线交互 .html + 推荐同名表清单)
+    # =========================================================================
+
+    @staticmethod
+    def _hydrate_five_col_pair(comp: Dict[str, Any]) -> Dict[str, Any]:
+        """将单表比对结果整理为离线网页与 1-Sheet Excel 复用的五虚拟列数据契约（与前端五栏口径严格一致）."""
+        dual_rows = comp.get("dual_rows") or []
+        src_panel_raw = comp.get("source_panel") or {}
+        tgt_panel_raw = comp.get("target_panel") or {}
+
+        center_rows: List[Dict[str, Any]] = []
+        source_candidates: List[Dict[str, Any]] = []
+        target_candidates: List[Dict[str, Any]] = []
+        seen_src: Set[str] = set()
+        seen_tgt: Set[str] = set()
+
+        bk_summary = {
+            "total_rows": 0,
+            "paired_rows": 0,
+            "unified": 0,
+            "split_diff": 0,
+            "split_partial": 0,
+            "split_unbound": 0,
+            "target_needs_migration": 0,
+        }
+
+        for dr in dual_rows:
+            s_col = dr.get("source_col")
+            t_col = dr.get("target_col")
+            s_code = str(dr.get("source_std_code") or "").strip()
+            t_code = str(dr.get("target_std_code") or "").strip()
+
+            if s_col and s_col.get("column_name") and not s_code:
+                k = str(s_col["column_name"]).lower()
+                if k not in seen_src:
+                    seen_src.add(k)
+                    source_candidates.append(s_col)
+            if t_col and t_col.get("column_name") and not t_code:
+                k = str(t_col["column_name"]).lower()
+                if k not in seen_tgt:
+                    seen_tgt.add(k)
+                    target_candidates.append(t_col)
+
+            bound_src = s_col if (s_col and s_code) else None
+            bound_tgt = t_col if (t_col and t_code) else None
+            if bound_src and bound_src.get("column_name"):
+                seen_src.add(str(bound_src["column_name"]).lower())
+            if bound_tgt and bound_tgt.get("column_name"):
+                seen_tgt.add(str(bound_tgt["column_name"]).lower())
+
+            if not bound_src and not bound_tgt:
+                continue
+
+            paired = bool(bound_src and bound_tgt)
+            if paired and s_code == t_code:
+                bk_state = "UNIFIED"
+                bk_summary["unified"] += 1
+            elif s_code and t_code and s_code != t_code:
+                bk_state = "SPLIT_DIFF"
+                bk_summary["split_diff"] += 1
+            else:
+                bk_state = "SPLIT_PARTIAL"
+                bk_summary["split_partial"] += 1
+
+            if paired:
+                bk_summary["paired_rows"] += 1
+            bk_summary["total_rows"] += 1
+            t_needs_mig = bool(bound_tgt and dr.get("target_needs_migration"))
+            if t_needs_mig:
+                bk_summary["target_needs_migration"] += 1
+
+            center_rows.append(
+                {
+                    **dr,
+                    "paired": paired,
+                    "bookmark_state": bk_state,
+                    "source_col": bound_src,
+                    "target_col": bound_tgt,
+                    "source_std_code": s_code if bound_src else "",
+                    "target_std_code": t_code if bound_tgt else "",
+                    "source_std": dr.get("source_std") if bound_src else None,
+                    "target_std": dr.get("target_std") if bound_tgt else None,
+                    "target_compliance": dr.get("target_compliance") if bound_tgt else None,
+                    "target_needs_migration": t_needs_mig,
+                }
+            )
+
+        for c in src_panel_raw.get("columns") or []:
+            k = str(c.get("column_name") or "").lower()
+            if k and k not in seen_src:
+                seen_src.add(k)
+                source_candidates.append(c)
+        for c in tgt_panel_raw.get("columns") or []:
+            k = str(c.get("column_name") or "").lower()
+            if k and k not in seen_tgt:
+                seen_tgt.add(k)
+                target_candidates.append(c)
+
+        return {
+            "table_binding": comp.get("table_binding") or {},
+            "summary": comp.get("summary") or {},
+            "bookmark_summary": bk_summary,
+            "source_format_profile": comp.get("source_format_profile") or "AUTO",
+            "target_format_profile": comp.get("target_format_profile") or "AUTO",
+            "source_panel": {
+                "configured": bool(src_panel_raw.get("configured")),
+                "connection_id": src_panel_raw.get("connection_id", ""),
+                "connection_name": src_panel_raw.get("connection_name", ""),
+                "db_type": src_panel_raw.get("db_type", ""),
+                "standard_format": src_panel_raw.get("standard_format", "AUTO"),
+                "schema_name": src_panel_raw.get("schema_name", ""),
+                "table_name": src_panel_raw.get("table_name", ""),
+                "exists": bool(src_panel_raw.get("exists")),
+                "object_type": src_panel_raw.get("object_type", "TABLE"),
+                "table_comment": src_panel_raw.get("table_comment", ""),
+                "error": src_panel_raw.get("error", ""),
+            },
+            "target_panel": {
+                "configured": bool(tgt_panel_raw.get("configured")),
+                "connection_id": tgt_panel_raw.get("connection_id", ""),
+                "connection_name": tgt_panel_raw.get("connection_name", ""),
+                "db_type": tgt_panel_raw.get("db_type", ""),
+                "standard_format": tgt_panel_raw.get("standard_format", "AUTO"),
+                "schema_name": tgt_panel_raw.get("schema_name", ""),
+                "table_name": tgt_panel_raw.get("table_name", ""),
+                "exists": bool(tgt_panel_raw.get("exists")),
+                "object_type": tgt_panel_raw.get("object_type", "TABLE"),
+                "table_comment": tgt_panel_raw.get("table_comment", ""),
+                "error": tgt_panel_raw.get("error", ""),
+            },
+            "source_candidates": source_candidates,
+            "center_rows": center_rows,
+            "target_candidates": target_candidates,
+        }
+
+    @staticmethod
+    def _compute_recommended_pairings(
+        *,
+        saved_tables: List[Dict[str, Any]],
+        src_cat_tables: List[Dict[str, Any]],
+        tgt_cat_tables: List[Dict[str, Any]],
+        src_def_schema: str,
+        tgt_def_schema: str,
+        src_bind_stats: Dict[str, Dict[str, int]],
+        tgt_bind_stats: Dict[str, Dict[str, int]],
+        src_db_type: str = "",
+        tgt_db_type: str = "",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """仅基于目录表名与 SQLite 绑标统计计算推荐同名表与单侧独有表（严禁执行自动列预比对）."""
+        norm_sch_dialects = {
+            "SQLITE", "INCEPTOR", "MYSQL", "MARIADB", "OCEANBASE", "DORIS", "STARROCKS", "TIDB"
+        }
+
+        def _norm_saved_sch(raw_sch: str, def_sch: str, db_type: str) -> str:
+            cs = clean_identifier_input(raw_sch or "") or def_sch
+            if (
+                cs.lower() == "public"
+                and def_sch.lower() != "public"
+                and db_type.upper() in norm_sch_dialects
+            ):
+                return def_sch
+            if db_type.upper() == "SQLITE":
+                return "main"
+            return cs
+
+        saved_src_keys: Set[Tuple[str, str]] = set()
+        saved_tgt_keys: Set[Tuple[str, str]] = set()
+        for t in saved_tables:
+            s_s = _norm_saved_sch(str(t.get("source_schema") or ""), src_def_schema, src_db_type)
+            s_t = clean_identifier_input(str(t.get("source_table") or t.get("std_table_name") or ""))
+            if s_t:
+                saved_src_keys.add((s_s.lower(), s_t.lower()))
+            t_s = _norm_saved_sch(str(t.get("target_schema") or ""), tgt_def_schema, tgt_db_type)
+            t_t = clean_identifier_input(str(t.get("target_table") or t.get("std_table_name") or ""))
+            if t_t:
+                saved_tgt_keys.add((t_s.lower(), t_t.lower()))
+
+        def _extract_unpaired(
+            cat_list: List[Dict[str, Any]],
+            saved_keys: Set[Tuple[str, str]],
+            def_schema: str,
+            bind_stats: Dict[str, Dict[str, int]],
+        ) -> List[Dict[str, Any]]:
+            items: List[Dict[str, Any]] = []
+            seen: Set[Tuple[str, str]] = set()
+            for row in cat_list:
+                sch = clean_identifier_input(str(row.get("schema_name") or def_schema)) or def_schema
+                tbl = clean_identifier_input(str(row.get("table_name") or ""))
+                if not tbl:
+                    continue
+                k = (sch.lower(), tbl.lower())
+                if k in saved_keys or k in seen:
+                    continue
+                seen.add(k)
+                stat = bind_stats.get(f"{k[0]}.{k[1]}") or {}
+                items.append(
+                    {
+                        "schema_name": sch,
+                        "table_name": tbl,
+                        "object_type": str(row.get("object_type") or "TABLE"),
+                        "table_comment": str(row.get("table_comment") or ""),
+                        "bound_count": int(stat.get("bound_count") or 0),
+                    }
+                )
+            return items
+
+        src_unpaired = _extract_unpaired(
+            src_cat_tables, saved_src_keys, src_def_schema, src_bind_stats
+        )
+        tgt_unpaired = _extract_unpaired(
+            tgt_cat_tables, saved_tgt_keys, tgt_def_schema, tgt_bind_stats
+        )
+
+        tgt_by_exact: Dict[Tuple[str, str], List[int]] = {}
+        tgt_by_name: Dict[str, List[int]] = {}
+        for idx, t_item in enumerate(tgt_unpaired):
+            s_l = t_item["schema_name"].lower()
+            t_l = t_item["table_name"].lower()
+            tgt_by_exact.setdefault((s_l, t_l), []).append(idx)
+            tgt_by_name.setdefault(t_l, []).append(idx)
+
+        matched_src_idx: Set[int] = set()
+        matched_tgt_idx: Set[int] = set()
+        recommendations: List[Dict[str, Any]] = []
+
+        # Pass 1: 优先同模式同名精确推荐
+        for s_idx, s_item in enumerate(src_unpaired):
+            k_exact = (s_item["schema_name"].lower(), s_item["table_name"].lower())
+            for t_idx in tgt_by_exact.get(k_exact, ()):
+                if t_idx in matched_tgt_idx:
+                    continue
+                matched_src_idx.add(s_idx)
+                matched_tgt_idx.add(t_idx)
+                t_item = tgt_unpaired[t_idx]
+                recommendations.append(
+                    {
+                        "table_name": s_item["table_name"],
+                        "source_schema": s_item["schema_name"],
+                        "source_table": s_item["table_name"],
+                        "source_object_type": s_item["object_type"],
+                        "source_comment": s_item["table_comment"],
+                        "source_bound_count": s_item["bound_count"],
+                        "target_schema": t_item["schema_name"],
+                        "target_table": t_item["table_name"],
+                        "target_object_type": t_item["object_type"],
+                        "target_comment": t_item["table_comment"],
+                        "target_bound_count": t_item["bound_count"],
+                        "match_type": "同模式同名",
+                    }
+                )
+                break
+
+        # Pass 2: 跨模式同名推荐
+        for s_idx, s_item in enumerate(src_unpaired):
+            if s_idx in matched_src_idx:
+                continue
+            for t_idx in tgt_by_name.get(s_item["table_name"].lower(), ()):
+                if t_idx in matched_tgt_idx:
+                    continue
+                matched_src_idx.add(s_idx)
+                matched_tgt_idx.add(t_idx)
+                t_item = tgt_unpaired[t_idx]
+                recommendations.append(
+                    {
+                        "table_name": s_item["table_name"],
+                        "source_schema": s_item["schema_name"],
+                        "source_table": s_item["table_name"],
+                        "source_object_type": s_item["object_type"],
+                        "source_comment": s_item["table_comment"],
+                        "source_bound_count": s_item["bound_count"],
+                        "target_schema": t_item["schema_name"],
+                        "target_table": t_item["table_name"],
+                        "target_object_type": t_item["object_type"],
+                        "target_comment": t_item["table_comment"],
+                        "target_bound_count": t_item["bound_count"],
+                        "match_type": "跨模式同名",
+                    }
+                )
+                break
+
+        source_only = [it for idx, it in enumerate(src_unpaired) if idx not in matched_src_idx]
+        target_only = [it for idx, it in enumerate(tgt_unpaired) if idx not in matched_tgt_idx]
+        return recommendations, source_only, target_only
+
+    def build_database_cross_report_data(
+        self,
+        *,
+        format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        """构建跨环境库级比对报告数据（自动沿用按库落标格式，未刷新库先采集目录，未配对同名表仅推荐不预比对）."""
+        report = progress_cb or noop_progress
+        report(4.0, "加载配置与连接", "正在读取来源库、目标库及按库数据标准格式...", 0, 0)
+
+        src_conn = self.get_role_connection_info("source")
+        tgt_conn = self.get_role_connection_info("target")
+        eff_src_fmt = self._resolve_side_format_profile(
+            src_conn, source_format_profile, format_profile
+        )
+        eff_tgt_fmt = self._resolve_side_format_profile(
+            tgt_conn, target_format_profile, format_profile
+        )
+        fmt_map = {
+            p["value"]: p["label"]
+            for p in self.ctx.standard_catalog.list_format_profiles()
+        }
+
+        src_cid = str(src_conn.get("connection_id") or "") if src_conn.get("configured") else ""
+        tgt_cid = str(tgt_conn.get("connection_id") or "") if tgt_conn.get("configured") else ""
+        saved_tables, _, _, _ = self._resolve_comparison_target()
+
+        if not src_cid and not tgt_cid and not saved_tables:
+            raise ValueError("请先在跨环境比对中选择来源库或目标库，或先保存/导入映射表对")
+
+        src_cat = (
+            self.ctx.metadata_hub.get_catalog_tree(src_cid, auto_refresh=False)
+            if src_cid
+            else {"tables": []}
+        )
+        tgt_cat = (
+            src_cat
+            if (tgt_cid and tgt_cid == src_cid)
+            else (
+                self.ctx.metadata_hub.get_catalog_tree(tgt_cid, auto_refresh=False)
+                if tgt_cid
+                else {"tables": []}
+            )
+        )
+
+        same_cid = bool(src_cid and src_cid == tgt_cid)
+        need_src_refresh = bool(src_cid and not (src_cat.get("tables") or []))
+        need_tgt_refresh = bool(tgt_cid and not same_cid and not (tgt_cat.get("tables") or []))
+
+        warnings: List[str] = []
+        catalogs_auto_refreshed = False
+
+        if need_src_refresh or need_tgt_refresh:
+            catalogs_auto_refreshed = True
+            report(
+                8.0,
+                "采集全库目录",
+                "检测到未缓存目录的数据源，先自动触发全库表目录采集...",
+                0,
+                2 if (need_src_refresh and need_tgt_refresh) else 1,
+            )
+
+            def _do_refresh(cid: str, label: str) -> Tuple[Optional[Dict[str, Any]], str]:
+                try:
+                    cat = self.ctx.metadata_hub.refresh_catalog(cid)
+                    return cat, ""
+                except Exception as exc:
+                    return None, f"{label}自动采集目录失败: {exc}"
+
+            if need_src_refresh and need_tgt_refresh:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    src_rf_fut = pool.submit(
+                        _do_refresh, src_cid, f"来源库[{src_conn.get('name', src_cid)}]"
+                    )
+                    tgt_rf_fut = pool.submit(
+                        _do_refresh, tgt_cid, f"目标库[{tgt_conn.get('name', tgt_cid)}]"
+                    )
+                    res_src, err_src = src_rf_fut.result()
+                    if res_src is not None:
+                        src_cat = res_src
+                    if err_src:
+                        warnings.append(err_src)
+                    res_tgt, err_tgt = tgt_rf_fut.result()
+                    if res_tgt is not None:
+                        tgt_cat = res_tgt
+                    if err_tgt:
+                        warnings.append(err_tgt)
+            elif need_src_refresh:
+                res_src, err_src = _do_refresh(
+                    src_cid, f"来源库[{src_conn.get('name', src_cid)}]"
+                )
+                if res_src is not None:
+                    src_cat = res_src
+                    if same_cid:
+                        tgt_cat = res_src
+                if err_src:
+                    warnings.append(err_src)
+            elif need_tgt_refresh:
+                res_tgt, err_tgt = _do_refresh(
+                    tgt_cid, f"目标库[{tgt_conn.get('name', tgt_cid)}]"
+                )
+                if res_tgt is not None:
+                    tgt_cat = res_tgt
+                if err_tgt:
+                    warnings.append(err_tgt)
+
+        src_cat_tables = src_cat.get("tables") or []
+        tgt_cat_tables = tgt_cat.get("tables") or []
+
+        if not saved_tables and not src_cat_tables and not tgt_cat_tables:
+            if warnings:
+                raise ValueError("；".join(warnings))
+            raise ValueError("当前跨环境来源库与目标库均暂无可导出的映射表对或库表")
+
+        src_def_sch = str(
+            src_conn.get("effective_default_schema") or src_conn.get("default_schema") or "public"
+        )
+        tgt_def_sch = str(
+            tgt_conn.get("effective_default_schema") or tgt_conn.get("default_schema") or "public"
+        )
+
+        src_metas_map: Optional[Dict[Tuple[str, str], TableMeta]] = None
+        tgt_metas_map: Optional[Dict[Tuple[str, str], TableMeta]] = None
+        src_skipped: Optional[Set[Tuple[str, str]]] = None
+        tgt_skipped: Optional[Set[Tuple[str, str]]] = None
+        src_probe_warn = ""
+        tgt_probe_warn = ""
+
+        if saved_tables:
+            src_targets: List[Tuple[str, str]] = []
+            tgt_targets: List[Tuple[str, str]] = []
+            seen_s_t: Set[Tuple[str, str]] = set()
+            seen_t_t: Set[Tuple[str, str]] = set()
+            for tb in saved_tables:
+                ss = clean_identifier_input(str(tb.get("source_schema") or src_def_sch)) or src_def_sch
+                st = clean_identifier_input(str(tb.get("source_table") or tb.get("std_table_name") or ""))
+                if st and (ss.lower(), st.lower()) not in seen_s_t:
+                    seen_s_t.add((ss.lower(), st.lower()))
+                    src_targets.append((ss, st))
+                ts = clean_identifier_input(str(tb.get("target_schema") or tgt_def_sch)) or tgt_def_sch
+                tt = clean_identifier_input(str(tb.get("target_table") or tb.get("std_table_name") or ""))
+                if tt and (ts.lower(), tt.lower()) not in seen_t_t:
+                    seen_t_t.add((ts.lower(), tt.lower()))
+                    tgt_targets.append((ts, tt))
+
+            report(
+                20.0,
+                "批量加载已保存表对结构",
+                f"正在批量探查 {len(saved_tables)} 组已保存表对结构（未配对表不自动预比对）...",
+                0,
+                len(saved_tables),
+            )
+            if same_cid and (src_targets or tgt_targets):
+                merged_targets: List[Tuple[str, str]] = []
+                seen_merged: Set[Tuple[str, str]] = set()
+                for pair_item in src_targets + tgt_targets:
+                    mk = (pair_item[0].lower(), pair_item[1].lower())
+                    if mk not in seen_merged:
+                        seen_merged.add(mk)
+                        merged_targets.append(pair_item)
+                shared_map, shared_warn, shared_skip = (
+                    self.ctx.metadata_hub.get_tables_metadata_batch(
+                        src_cid,
+                        merged_targets,
+                        force_refresh=False,
+                        penetrate_views=True,
+                        tolerate_errors=True,
+                    )
+                )
+                src_metas_map = shared_map
+                tgt_metas_map = shared_map
+                src_skipped = shared_skip
+                tgt_skipped = shared_skip
+                src_probe_warn = shared_warn
+                tgt_probe_warn = shared_warn
+                if shared_warn:
+                    warnings.append(f"数据源探查受限: {shared_warn}")
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                    src_meta_fut = (
+                        pool.submit(
+                            self.ctx.metadata_hub.get_tables_metadata_batch,
+                            src_cid,
+                            src_targets,
+                            force_refresh=False,
+                            penetrate_views=True,
+                            tolerate_errors=True,
+                        )
+                        if src_cid and src_targets
+                        else None
+                    )
+                    tgt_meta_fut = (
+                        pool.submit(
+                            self.ctx.metadata_hub.get_tables_metadata_batch,
+                            tgt_cid,
+                            tgt_targets,
+                            force_refresh=False,
+                            penetrate_views=True,
+                            tolerate_errors=True,
+                        )
+                        if tgt_cid and tgt_targets
+                        else None
+                    )
+                    if src_meta_fut is not None:
+                        src_metas_map, src_probe_warn, src_skipped = src_meta_fut.result()
+                        if src_probe_warn:
+                            warnings.append(f"来源库探查受限: {src_probe_warn}")
+                    if tgt_meta_fut is not None:
+                        tgt_metas_map, tgt_probe_warn, tgt_skipped = tgt_meta_fut.result()
+                        if tgt_probe_warn:
+                            warnings.append(f"目标库探查受限: {tgt_probe_warn}")
+
+        pairs: List[Dict[str, Any]] = []
+        tot_pairs = len(saved_tables)
+        p_step = 1 if tot_pairs <= 25 else 5
+        agg = {
+            "saved_pairs_count": tot_pairs,
+            "recommended_pairs_count": 0,
+            "source_total_tables": len(src_cat_tables),
+            "target_total_tables": len(tgt_cat_tables),
+            "unified_cols": 0,
+            "split_diff_cols": 0,
+            "split_partial_cols": 0,
+            "total_center_rows": 0,
+            "target_needs_migration_cols": 0,
+            "unbound_src_cols": 0,
+            "unbound_tgt_cols": 0,
+        }
+
+        for idx, t in enumerate(saved_tables, start=1):
+            if idx == 1 or idx % p_step == 0 or idx == tot_pairs:
+                pct = 48.0 + 38.0 * (idx / max(1, tot_pairs))
+                report(
+                    pct,
+                    "逐对计算五虚拟列比对",
+                    f"[{idx}/{tot_pairs}] 对标比对 {t.get('std_table_key')}...",
+                    idx,
+                    tot_pairs,
+                )
+            comp = self.compare_single_table(
+                t["std_table_key"],
+                force_refresh=False,
+                format_profile=format_profile,
+                source_format_profile=eff_src_fmt,
+                target_format_profile=eff_tgt_fmt,
+                persist_missing_binding=False,
+                load_saved_binding=True,
+                src_conn=src_conn,
+                tgt_conn=tgt_conn,
+                prefetched_src_metas=src_metas_map,
+                prefetched_tgt_metas=tgt_metas_map,
+                prefetched_src_skipped=src_skipped,
+                prefetched_tgt_skipped=tgt_skipped,
+                prefetched_src_warning=src_probe_warn,
+                prefetched_tgt_warning=tgt_probe_warn,
+            )
+            hydrated = self._hydrate_five_col_pair(comp)
+            pairs.append(hydrated)
+
+            bk_s = hydrated["bookmark_summary"]
+            agg["unified_cols"] += int(bk_s.get("unified") or 0)
+            agg["split_diff_cols"] += int(bk_s.get("split_diff") or 0)
+            agg["split_partial_cols"] += int(bk_s.get("split_partial") or 0)
+            agg["total_center_rows"] += len(hydrated["center_rows"])
+            agg["target_needs_migration_cols"] += int(bk_s.get("target_needs_migration") or 0)
+            agg["unbound_src_cols"] += len(hydrated["source_candidates"])
+            agg["unbound_tgt_cols"] += len(hydrated["target_candidates"])
+
+        report(90.0, "生成推荐同名表清单", "正在扫描未配对同名表（仅推荐不预比对）...", 0, 0)
+        src_bind_stats = (
+            self.ctx.standard_catalog.get_connection_binding_stats(src_cid) if src_cid else {}
+        )
+        tgt_bind_stats = (
+            self.ctx.standard_catalog.get_connection_binding_stats(tgt_cid) if tgt_cid else {}
+        )
+        recommendations, source_only, target_only = self._compute_recommended_pairings(
+            saved_tables=saved_tables,
+            src_cat_tables=src_cat_tables,
+            tgt_cat_tables=tgt_cat_tables,
+            src_def_schema=src_def_sch,
+            tgt_def_schema=tgt_def_sch,
+            src_bind_stats=src_bind_stats,
+            tgt_bind_stats=tgt_bind_stats,
+            src_db_type=str(src_conn.get("db_type") or ""),
+            tgt_db_type=str(tgt_conn.get("db_type") or ""),
+        )
+        agg["recommended_pairs_count"] = len(recommendations)
+
+        report(
+            98.0,
+            "装配报告文件",
+            f"已汇集 {len(pairs)} 组已配对表与 {len(recommendations)} 组推荐同名表，正在生成报告文件...",
+            len(pairs),
+            max(1, len(pairs)),
+        )
+
+        return {
+            "report_type": "cross_env",
+            "catalogs_auto_refreshed": catalogs_auto_refreshed,
+            "source_connection": {
+                "configured": bool(src_conn.get("configured")),
+                "connection_id": src_cid,
+                "name": src_conn.get("name", ""),
+                "db_type": src_conn.get("db_type", ""),
+                "default_schema": src_def_sch,
+            },
+            "target_connection": {
+                "configured": bool(tgt_conn.get("configured")),
+                "connection_id": tgt_cid,
+                "name": tgt_conn.get("name", ""),
+                "db_type": tgt_conn.get("db_type", ""),
+                "default_schema": tgt_def_sch,
+            },
+            "source_format_profile": eff_src_fmt,
+            "source_format_profile_label": fmt_map.get(eff_src_fmt, eff_src_fmt),
+            "target_format_profile": eff_tgt_fmt,
+            "target_format_profile_label": fmt_map.get(eff_tgt_fmt, eff_tgt_fmt),
+            "aggregate": agg,
+            "pairs": pairs,
+            "recommended_pairings": recommendations,
+            "source_only_tables": source_only,
+            "target_only_tables": target_only,
+            "warnings": warnings,
+        }
+
+    def export_cross_report_excel_bytes(
+        self,
+        *,
+        format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> bytes:
+        report_data = self.build_database_cross_report_data(
+            format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
+            progress_cb=progress_cb,
+        )
+        return build_cross_env_excel_bytes(report_data)
+
+    def export_cross_report_html_bytes(
+        self,
+        *,
+        format_profile: str = "AUTO",
+        source_format_profile: str = "AUTO",
+        target_format_profile: str = "AUTO",
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> bytes:
+        report_data = self.build_database_cross_report_data(
+            format_profile=format_profile,
+            source_format_profile=source_format_profile,
+            target_format_profile=target_format_profile,
+            progress_cb=progress_cb,
+        )
+        return build_cross_env_html_bytes(report_data)
