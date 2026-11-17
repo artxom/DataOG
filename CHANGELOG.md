@@ -8,6 +8,18 @@
 
 ---
 
+## [2.3.3] - 2026-11-17
+
+### Fixed
+- **彻底消除数千行字段对照关系导入在「正在持久化字段标准绑定」与批量核验阶段的卡死风暴 (`core/platform/standard_catalog.py`, `core/platform/metadata_hub.py`, `core/platform/storage.py`, `modules/standard_migrator/service.py`, `modules/cross_comparator/service.py`)**：
+  - 新增 `bulk_save_field_bindings` 单事务分块（`500` 行/批）`executemany` 持久化与 `make_table_key_bounds` B-Tree 半开区间精确删除（防 `LIKE '_'` 通配符误伤，辅以 `COLLATE NOCASE` 大小写无关索引清理），彻底消除 `replace_table` / `merge` 多表逐次开闭 SQLite 连接与磁盘 `commit` 风暴，实时推进持久化进度（`60% -> 70%`）并在事务落盘后即刻切换至核验阶段；跨环境批量铺底（`upload_pairings_excel`）同步升级为单事务分块写入。
+  - 新增 `MetadataHub.get_tables_metadata_batch` 单会话多表批量探查与单事务批量缓存落库（支持 PG/DWS 与 MySQL 家族系统目录分块批量查询、显式非默认 Schema 防跨库误匹配、非 `autocommit` 事务异常自动回滚重配及 `match_standard_candidates_batch` 单连接 `COLLATE NOCASE` 索引候选匹配），消除多表核验与无编号候选匹配时的 $O(N)$ 数据库连接风暴。
+  - 为 PG / GaussDB(DWS) 元数据探查注入会话级 `lock_timeout` / `lockwait_timeout`（`3s`）与 `statement_timeout`（`8s`）保护、`pg_get_expr` 锁等待 MVCC 无锁列查询自动降级、`pg_get_tabledef` `15`-OID 子分批单调进度上报与慢超时熔断，并在 JDBC / Inceptor 等单连接逐表回退路径（含 Inceptor 套接字超时透传）引入连续 `3` 次异常自动熔断跳过剩余未缓存表，防止远端 ETL 排他锁或断连导致百张表无限期阻塞。
+  - 修复未填「模式名」工作簿在 DWS/MySQL/SQLite/Inceptor 下的默认 Schema 解析与真实 Schema 自动回写对齐（确保导入后左树徽标、点击预览及二次热缓存零重连一致生效），拦截无标准列的纯表结构工作簿在 `replace_table` 下误删既有绑定，修复跨环境铺底表首行为单侧目标字段时来源表名覆盖错位问题。
+- **优化导入进度轮询日志降噪、禁缓存与终态停轮询 (`app.py`, `core/platform/import_progress.py`, `core/platform/router.py`, `static/js/core/api.js`, `static/js/ui/upload_wizard_modal.js`)**：过滤正常 `200` `/api/platform/import-progress/*` 控制台访问日志刷屏（保留非 `200` 异常日志），补充 `Cache-Control: no-store` 防缓存头与运行态导入任务延长 TTL 保护，并在前端检测到服务端终态（`completed`/`failed`）时立即停止轮询且保留错误态样式。
+
+---
+
 ## [2.3.2] - 2026-11-16
 
 ### Added

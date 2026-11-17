@@ -1,4 +1,4 @@
-# Data.O.G v2.3.2 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.3.3 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -44,17 +44,17 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.3.2 微内核入口（安全响应头、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.3.3 微内核入口（安全响应头、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
-│   │   ├── standard_catalog.py   # 全局 46 列标准字典中枢、多库物理格式解析、字段绑标与分级落标核验
+│   │   ├── standard_catalog.py   # 全局 46 列标准字典中枢、多库物理格式解析、单事务批量绑标与分级落标核验
 │   │   ├── import_progress.py    # 线程安全 Excel 导入实时阶段/行级/表级进度追踪中枢
 │   │   ├── llm_hub.py            # 零额外依赖标准库 DeepSeek / Gemini / OpenAI 兼容协议大模型中枢
 │   │   ├── readonly_guard.py     # 双模态词法/语法级只读 SQL 白名单沙箱校验器
 │   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载 + 硬件只读模式）
 │   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文（含 readonly_session 无条件回滚）
-│   │   ├── metadata_hub.py       # 双层元数据探查器与本地 SQLite 缓存检索中枢
+│   │   ├── metadata_hub.py       # 双层单会话批量元数据探查器（含锁超时熔断）与本地 SQLite 缓存检索中枢
 │   │   ├── query_engine.py       # 跨驱动安全截断查询、硬件级只读执行通道与 CSV/Excel 导出引擎
 │   │   ├── storage.py            # data/dataog_state.db WAL 状态库、旧版无损迁移与幂等列演进
 │   │   └── dialects/             # 标识符清洗、类型映射矩阵、DDL 生成与四层视图血缘穿透
@@ -69,7 +69,7 @@ DataOG/
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（底部 Dock 与窗口管理器）、core/、ui/、views/（四大模块视图）
-├── tests/                        # 34 项全量自动化测试（核心算法 / 平台底座 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
+├── tests/                        # 35 项全量自动化测试（核心算法 / 平台底座 / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -88,7 +88,8 @@ DataOG/
 | **`v2.2.0`** | `feat/data-explorer-ai` → `main` | **数据探查 · AI 只读智能探查会话**：保留 DataGrip 四级数据库清单与自由 SQL 查询，新增目标驱动的多轮大模型自动采样探查、结论溯源与会话历史持久化，落地四道引擎级绝对只读硬隔离防线 |
 | **`v2.3.0`** | `feat/standard-governance-dock` → `main` | **三步式数据标准治理闭环与原生 macOS Dock**：重构为「1. 标准字典 → 2. 落标绑定与贯标 → 3. 跨环境比对」，落地双列拟物书签桥与字段拖拽配对、全流程两步模板导入向导及 macOS 底部居中悬浮毛玻璃 Dock 栏 |
 | **`v2.3.1`** | `feat/excel-progress-formula-na` → `main` | **Excel 导入实时进度条、公式最终值求值与 `#N/A` 置空清洗**：新增 `ImportProgressHub` 与向导双阶段实时进度条，支持缓存优先 + 纯 Python 跨表公式兜底求值、全谱系 `#N/A` 错误值置空与历史脏绑定自愈 |
-| **`v2.3.2`**（当前正式版） | `fix/excel-eval-progress-modal-races` → `main` | **导入向导竞态加固、经典多条件公式扩展求值与流式大表平滑进度**：补齐 `LOOKUP` / `CHOOSE({1,2},...)` / `INDIRECT` / `OFFSET` 与整行引用求值，保护共享公式结构化表引用列名，准确还原流式 `<dimension ref="A1:A1"/>` 行数，消除跨环境多表铺底冗余探查与 `<dialog>` / 重试轮询异步竞态 |
+| **`v2.3.2`** | `fix/excel-eval-progress-modal-races` → `main` | **导入向导竞态加固、经典多条件公式扩展求值与流式大表平滑进度**：补齐 `LOOKUP` / `CHOOSE({1,2},...)` / `INDIRECT` / `OFFSET` 与整行引用求值，保护共享公式结构化表引用列名，准确还原流式 `<dimension ref="A1:A1"/>` 行数，消除跨环境多表铺底冗余探查与 `<dialog>` / 重试轮询异步竞态 |
+| **`v2.3.3`**（当前正式版） | `fix/bulk-binding-persistence-batch-probe` → `main` | **大规模字段对照单事务批量持久化、单会话批量探查与锁超时熔断降噪**：落地 `bulk_save_field_bindings` 单事务分块写入与 B-Tree 区间删除、`get_tables_metadata_batch` 系统目录批量探查与缓存读写、DWS/PG 会话级锁等待超时降级与逐表异常熔断，并静默高频进度轮询 `200` 刷屏日志 |
 
 ---
 
@@ -99,7 +100,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（34 项核心引擎、平台底座、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（35 项核心引擎、平台底座、大规模批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检
