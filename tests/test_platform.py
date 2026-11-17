@@ -1516,6 +1516,544 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
         with ResolvedWorkbook(buf_st_fixed_dim.getvalue()) as rwb_st:
             self.assertEqual(rwb_st.estimate_sheet_rows("EasySheet"), 210)
 
+    def test_bulk_binding_btree_bounds_batch_metadata_probe_and_running_progress_ttl(self) -> None:
+        """验证字段绑定 B-Tree 精确前缀隔离（防 '_' 通配符误伤）、PG/DWS/MySQL 单会话批量元数据探查及运行态进度 TTL 保护."""
+        import logging
+        from app import _QuietImportProgressAccessFilter
+        from core.platform.import_progress import ImportProgressHub
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(db_path=os.path.join(tmpdir, "dataog_state.db"))
+            cat = ctx.standard_catalog
+            cat.upsert_item(
+                {
+                    "std_code": "STD_W1",
+                    "cn_name": "客户号",
+                    "en_abbr": "CUST_ID",
+                    "type_dws": "VARCHAR(32)",
+                }
+            )
+            cat.upsert_item(
+                {
+                    "std_code": "STD_W2",
+                    "cn_name": "账户号",
+                    "en_abbr": "ACCT_ID",
+                    "type_dws": "VARCHAR(32)",
+                }
+            )
+
+            # 1. 验证下划线表名 dwd_a_1 在按表覆盖或单表查询时绝不误伤 dwdxa_1，且重复字段以最后一行准
+            cat.bulk_save_field_bindings(
+                "conn_wild",
+                [
+                    {"schema_name": "public", "table_name": "dwdxa_1", "column_name": "c1", "std_code": "STD_W2"},
+                    {"schema_name": "public", "table_name": "dwd_a_1", "column_name": "c1", "std_code": "STD_W1"},
+                    {"schema_name": "public", "table_name": "dwd_a_1", "column_name": "c1", "std_code": "STD_W2"},
+                ],
+                mode="merge",
+            )
+            self.assertEqual(cat.get_table_field_bindings("conn_wild", "public", "dwd_a_1")["c1"]["std_code"], "STD_W2")
+            self.assertEqual(cat.get_table_field_bindings("conn_wild", "public", "dwdxa_1")["c1"]["std_code"], "STD_W2")
+
+            cat.replace_table_field_bindings(
+                "conn_wild",
+                "public",
+                "dwd_a_1",
+                [{"schema_name": "public", "table_name": "dwd_a_1", "column_name": "c_new", "std_code": "STD_W1"}],
+            )
+            self.assertEqual(set(cat.get_table_field_bindings("conn_wild", "public", "dwd_a_1").keys()), {"c_new"})
+            self.assertEqual(cat.get_table_field_bindings("conn_wild", "public", "dwdxa_1")["c1"]["std_code"], "STD_W2")
+
+            # 按表覆盖传入空绑定列表时应清空目标表旧绑定而不影响其他表
+            cat.bulk_save_field_bindings(
+                "conn_wild",
+                [],
+                mode="replace_table",
+                replace_tables=[("public", "dwd_a_1")],
+            )
+            self.assertEqual(cat.get_table_field_bindings("conn_wild", "public", "dwd_a_1"), {})
+            self.assertEqual(cat.get_table_field_bindings("conn_wild", "public", "dwdxa_1")["c1"]["std_code"], "STD_W2")
+            self.assertEqual(cat.bulk_save_field_bindings("", []), 0)
+            self.assertEqual(cat.get_tables_field_bindings_batch("", [("public", "dwdxa_1")]), {})
+
+            # 大小写不一致的标准编号批量查询回退验证
+            ci_items = cat.get_items_by_codes(["std_w1", "NO_SUCH_CODE"])
+            self.assertIn("std_w1", ci_items)
+            self.assertEqual(ci_items["std_w1"]["std_code"], "STD_W1")
+
+            # 2. 验证模拟 DWS 与 MySQL 单连接批量探查路径（含同名跨 Schema 表、不存在表及缓存落盘）
+            dws_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "mock_dws",
+                    "driver_track": "NATIVE",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 8000,
+                    "dbname": "dw",
+                    "user": "u",
+                    "password": "p",
+                }
+            )
+            mysql_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "mock_mysql",
+                    "driver_track": "NATIVE",
+                    "db_type": "MYSQL",
+                    "host": "127.0.0.1",
+                    "port": 3306,
+                    "dbname": "ods",
+                    "user": "u",
+                    "password": "p",
+                }
+            )
+
+            class _FakeDwsCursor:
+                def __init__(self) -> None:
+                    self._rows: list = []
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def execute(self, sql: str, params=None) -> None:
+                    s = " ".join(sql.split())
+                    if "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n" in s:
+                        self._rows = [
+                            (101, "ods", "cust_info", "ODS客户表", "orientation=column", "r"),
+                            (202, "dwd", "cust_info", "DWD客户表", "orientation=row", "r"),
+                        ]
+                    elif "FROM pg_catalog.pg_constraint con" in s:
+                        self._rows = [(101, "ods_id"), (202, "cust_id")]
+                    elif "JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid" in s:
+                        self._rows = [
+                            (101, "ods_id", "character varying(32)", True, None, "源客户号"),
+                            (202, "cust_id", "character varying(32)", True, None, "统一客户号"),
+                        ]
+                    elif "pg_get_tabledef" in s:
+                        self._rows = [
+                            (101, "CREATE TABLE ods.cust_info (ods_id varchar(32)) WITH (orientation=column) DISTRIBUTE BY HASH(ods_id);"),
+                            (202, "CREATE TABLE dwd.cust_info (cust_id varchar(32)) DISTRIBUTE BY HASH(cust_id);"),
+                        ]
+                    else:
+                        self._rows = []
+
+                def fetchall(self):
+                    return list(self._rows)
+
+                def fetchone(self):
+                    return self._rows[0] if self._rows else None
+
+            class _FakeDwsConn:
+                autocommit = False
+
+                def cursor(self):
+                    return _FakeDwsCursor()
+
+                def close(self):
+                    pass
+
+            class _FakeMysqlCursor:
+                def __init__(self) -> None:
+                    self._rows: list = []
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def execute(self, sql: str, params=None) -> None:
+                    s = " ".join(sql.split())
+                    p_list = [str(x).lower() for x in (params or ())]
+                    if "FROM information_schema.TABLES" in s:
+                        if "ods" in p_list:
+                            self._rows = [("ods", "t_order", "BASE TABLE", "订单表")]
+                        else:
+                            self._rows = []
+                    elif "FROM information_schema.COLUMNS" in s:
+                        if "SELECT TABLE_SCHEMA," in s:
+                            self._rows = [(
+                                "ods", "t_order", 1, "order_id", "varchar(40)", "NO", None, "订单号", "PRI"
+                            )]
+                        else:
+                            self._rows = [(
+                                1, "order_id", "varchar(40)", "NO", None, "订单号", "PRI"
+                            )]
+                    else:
+                        self._rows = []
+
+                def fetchall(self):
+                    return list(self._rows)
+
+                def fetchone(self):
+                    return self._rows[0] if self._rows else None
+
+            class _FakeMysqlConn:
+                def cursor(self):
+                    return _FakeMysqlCursor()
+
+                def close(self):
+                    pass
+
+            self.assertEqual(mysql_prof.default_schema, "ods")
+
+            open_calls = {"dws": 0, "mysql": 0}
+            orig_open = ctx.driver_manager.open_connection
+
+            def _mock_open(profile, timeout_sec=10, **kw):
+                if profile.connection_id == dws_prof.connection_id:
+                    open_calls["dws"] += 1
+                    return _FakeDwsConn()
+                if profile.connection_id == mysql_prof.connection_id:
+                    open_calls["mysql"] += 1
+                    return _FakeMysqlConn()
+                return orig_open(profile, timeout_sec=timeout_sec, **kw)
+
+            ctx.driver_manager.open_connection = _mock_open
+            try:
+                dws_metas, dws_warn, dws_skip = ctx.metadata_hub.get_tables_metadata_batch(
+                    dws_prof.connection_id,
+                    [
+                        ("ods", "cust_info"),
+                        ("dwd", "cust_info"),
+                        ("ads", "cust_info"),
+                        ("dwd", "missing_tbl"),
+                    ],
+                    force_refresh=True,
+                )
+                self.assertEqual(open_calls["dws"], 1)
+                self.assertEqual(dws_warn, "")
+                self.assertEqual(len(dws_skip), 0)
+                self.assertEqual(dws_metas[("ods", "cust_info")].columns[0].column_name, "ods_id")
+                self.assertEqual(dws_metas[("ods", "cust_info")].orientation, "COLUMN")
+                self.assertEqual(dws_metas[("dwd", "cust_info")].columns[0].column_name, "cust_id")
+                # 显式指定不存在的非默认 Schema (ads.cust_info) 绝不可跨 Schema 误匹配到 ods/dwd
+                self.assertFalse(dws_metas[("ads", "cust_info")].exists)
+                self.assertFalse(dws_metas[("dwd", "missing_tbl")].exists)
+
+                # 二次非强制刷新（含默认 public 回退匹配已缓存异构 Schema 表）均零远程连库
+                dws_cached, _, _ = ctx.metadata_hub.get_tables_metadata_batch(
+                    dws_prof.connection_id,
+                    [("ods", "cust_info"), ("dwd", "cust_info"), ("public", "cust_info")],
+                    force_refresh=False,
+                )
+                self.assertEqual(open_calls["dws"], 1)
+                self.assertEqual(dws_cached[("dwd", "cust_info")].columns[0].column_name, "cust_id")
+                self.assertTrue(dws_cached[("public", "cust_info")].exists)
+
+                # MySQL 传入空白模式名或历史遗留 'public' 均自动解析至 dbname ('ods')
+                my_metas, _, _ = ctx.metadata_hub.get_tables_metadata_batch(
+                    mysql_prof.connection_id,
+                    [("", "t_order"), ("public", "t_absent")],
+                    force_refresh=True,
+                )
+                self.assertEqual(open_calls["mysql"], 1)
+                self.assertTrue(my_metas[("", "t_order")].exists)
+                self.assertEqual(my_metas[("", "t_order")].primary_keys, ["order_id"])
+                self.assertFalse(my_metas[("public", "t_absent")].exists)
+            finally:
+                ctx.driver_manager.open_connection = orig_open
+
+            # 2b. 验证 DWS 批量探查在非 autocommit 包装器且单表 pg_get_tabledef 报错时的事务回滚隔离恢复
+            class _StrictTxDwsConn:
+                def __init__(self) -> None:
+                    self._in_tx = True
+                    self._aborted = False
+
+                @property
+                def autocommit(self) -> bool:
+                    return False
+
+                @autocommit.setter
+                def autocommit(self, _v: bool) -> None:
+                    if self._in_tx:
+                        raise RuntimeError("set_session cannot be used inside a transaction")
+
+                def rollback(self) -> None:
+                    self._in_tx = False
+                    self._aborted = False
+
+                def close(self) -> None:
+                    pass
+
+                def cursor(self):
+                    conn = self
+
+                    class _Cur:
+                        def __enter__(s):
+                            return s
+
+                        def __exit__(s, *a):
+                            return False
+
+                        def execute(s, sql: str, params=None) -> None:
+                            if conn._aborted:
+                                raise RuntimeError("current transaction is aborted")
+                            conn._in_tx = True
+                            q = " ".join(sql.split())
+                            if "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n" in q:
+                                s.rows = [
+                                    (2, "public", "t_ext", "", "", "f"),
+                                    (1, "public", "t_hash", "", "", "r"),
+                                ]
+                            elif "JOIN pg_catalog.pg_attribute" in q and "c.oid," in q:
+                                s.rows = [
+                                    (2, "fid", "varchar(32)", False, None, ""),
+                                    (1, "id", "varchar(32)", True, None, ""),
+                                ]
+                            elif "pg_get_tabledef(oid) FROM" in q:
+                                conn._aborted = True
+                                raise RuntimeError("foreign table unsupported")
+                            elif "pg_get_tabledef(" in q:
+                                if params and params[0] == 2:
+                                    conn._aborted = True
+                                    raise RuntimeError("foreign table unsupported on oid 2")
+                                s.rows = [
+                                    ("CREATE TABLE public.t_hash (id varchar(32)) DISTRIBUTE BY HASH(id);",)
+                                ]
+                            else:
+                                s.rows = []
+
+                        def fetchall(s):
+                            return list(s.rows)
+
+                        def fetchone(s):
+                            return s.rows[0] if s.rows else None
+
+                    return _Cur()
+
+            ctx.driver_manager.open_connection = lambda p, **kw: _StrictTxDwsConn()
+            try:
+                tx_metas, _, _ = ctx.metadata_hub.get_tables_metadata_batch(
+                    dws_prof.connection_id,
+                    [("public", "t_ext"), ("public", "t_hash")],
+                    force_refresh=True,
+                )
+                self.assertEqual(tx_metas[("public", "t_hash")].distribute_keys, ["id"])
+            finally:
+                ctx.driver_manager.open_connection = orig_open
+
+            # 2c. 验证历史手工大写 col_key 在 replace_table 模式下完整清除，且候选匹配命中 COLLATE NOCASE 索引
+            with ctx.store.module_db() as sconn:
+                sconn.execute(
+                    "INSERT INTO field_standard_bindings (connection_id, schema_name, table_name, column_name, col_key, std_code) "
+                    "VALUES ('conn_wild', 'PUBLIC', 'DWD_UPPER', 'OLD_C', 'PUBLIC::DWD_UPPER::OLD_C', 'STD_W1')"
+                )
+                plan_en = sconn.execute(
+                    "EXPLAIN QUERY PLAN SELECT * FROM standard_dictionary WHERE en_abbr = ? COLLATE NOCASE",
+                    ("cust_id",),
+                ).fetchall()
+                plan_code = sconn.execute(
+                    "EXPLAIN QUERY PLAN SELECT * FROM standard_dictionary WHERE std_code = ? COLLATE NOCASE",
+                    ("std_w1",),
+                ).fetchall()
+            self.assertTrue(any("USING INDEX" in str(tuple(r)) for r in plan_en))
+            self.assertTrue(any("USING INDEX" in str(tuple(r)) for r in plan_code))
+            cat.replace_table_field_bindings(
+                "conn_wild",
+                "public",
+                "dwd_upper",
+                [{"schema_name": "public", "table_name": "dwd_upper", "column_name": "new_c", "std_code": "STD_W2"}],
+            )
+            self.assertEqual(set(cat.get_table_field_bindings("conn_wild", "public", "dwd_upper").keys()), {"new_c"})
+            batch_cands = cat.match_standard_candidates_batch([("cust_id", "客户号"), ("acct_id", "")])
+            self.assertEqual(batch_cands[("cust_id", "客户号")][0]["std_code"], "STD_W1")
+            self.assertEqual(batch_cands[("acct_id", "")][0]["std_code"], "STD_W2")
+
+            # 2d. 验证 DWS 批量探查会话级 lock_timeout/lockwait_timeout/statement_timeout、pg_get_expr 锁等待回退、15-OID 子分批单调进度及慢超时熔断
+            executed_dws_sqls: List[str] = []
+            tdef_sub_batches: List[int] = []
+            per_oid_tdef_calls = {"cnt": 0}
+
+            class _LockedEtlDwsConn:
+                autocommit = True
+
+                def rollback(self) -> None:
+                    pass
+
+                def close(self) -> None:
+                    pass
+
+                def cursor(self):
+                    class _Cur:
+                        def __enter__(s):
+                            return s
+
+                        def __exit__(s, *a):
+                            return False
+
+                        def execute(s, sql: str, params=None) -> None:
+                            q = " ".join(sql.split())
+                            executed_dws_sqls.append(q)
+                            if q == "SET lock_timeout = 3000;":
+                                raise RuntimeError('unrecognized configuration parameter "lock_timeout"')
+                            if "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n" in q:
+                                s.rows = [
+                                    (1000 + i, "dwd", f"etl_tbl_{i:02d}", f"表{i}", "orientation=row", "r")
+                                    for i in range(1, 36)
+                                ]
+                            elif "pg_get_expr(" in q and "JOIN pg_catalog.pg_attribute" in q:
+                                raise RuntimeError("canceling statement due to lock timeout")
+                            elif "NULL AS column_default" in q and "JOIN pg_catalog.pg_attribute" in q:
+                                s.rows = [
+                                    (1000 + i, "cust_id", "character varying(32)", True, None, "客户号")
+                                    for i in range(1, 36)
+                                ]
+                            elif "pg_get_tabledef(oid) FROM" in q:
+                                sub_oids = params[0]
+                                tdef_sub_batches.append(len(sub_oids))
+                                if 1016 in sub_oids:
+                                    raise TimeoutError("lockwait_timeout on second 15-OID sub-batch")
+                                s.rows = [
+                                    (oid_x, f"CREATE TABLE dwd.etl_tbl_{oid_x - 1000:02d} (cust_id varchar(32)) DISTRIBUTE BY HASH(cust_id);")
+                                    for oid_x in sub_oids
+                                ]
+                            elif "pg_get_tabledef(" in q:
+                                per_oid_tdef_calls["cnt"] += 1
+                                raise TimeoutError("ETL exclusive lock timeout on table")
+                            else:
+                                s.rows = []
+
+                        def fetchall(s):
+                            return list(s.rows)
+
+                        def fetchone(s):
+                            return s.rows[0] if s.rows else None
+
+                    return _Cur()
+
+            dws_lock_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "mock_dws_etl_lock",
+                    "driver_track": "NATIVE",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 8000,
+                    "dbname": "dw",
+                    "user": "u",
+                    "password": "p",
+                }
+            )
+            etl_progress: List[int] = []
+            ctx.driver_manager.open_connection = lambda p, **kw: _LockedEtlDwsConn()
+            try:
+                etl_metas, _, _ = ctx.metadata_hub.get_tables_metadata_batch(
+                    dws_lock_prof.connection_id,
+                    [("dwd", f"etl_tbl_{i:02d}") for i in range(1, 36)],
+                    force_refresh=True,
+                    on_progress=lambda d_c, _t_c, _cs, _ct: etl_progress.append(d_c),
+                )
+            finally:
+                ctx.driver_manager.open_connection = orig_open
+
+            self.assertIn("SET lock_timeout = 3000;", executed_dws_sqls)
+            self.assertIn("SET lockwait_timeout = 3000;", executed_dws_sqls)
+            self.assertIn("SET statement_timeout = 8000;", executed_dws_sqls)
+            # 第一批 15 个 OID 成功，第二批 15 个 OID 触发逐表回退并在连续 3 次 TimeoutError 后熔断跳过第 3 批与 getdistributekey
+            self.assertEqual(tdef_sub_batches, [15, 15])
+            self.assertEqual(per_oid_tdef_calls["cnt"], 3)
+            self.assertEqual(etl_progress, sorted(etl_progress))
+            self.assertEqual(etl_progress[-1], 35)
+            self.assertGreaterEqual(len(set(etl_progress)), 4)
+            # 即使存在 ETL 排他锁，全部 35 张表依然通过 MVCC 系统表降级拿到完整字段与注释
+            self.assertEqual(len(etl_metas), 35)
+            self.assertEqual(etl_metas[("dwd", "etl_tbl_01")].distribute_keys, ["cust_id"])
+            self.assertEqual(etl_metas[("dwd", "etl_tbl_25")].columns[0].column_name, "cust_id")
+            self.assertEqual(etl_metas[("dwd", "etl_tbl_35")].columns[0].column_comment, "客户号")
+
+            # 2e. 验证逐表回退分支（如 Inceptor / JDBC）连续 3 次超时/断连自动触发熔断，避免百张表逐一超时卡死
+            from core.platform.inceptor_client import InceptorThriftClient
+
+            inc_prof = ctx.connection_hub.save_profile(
+                {
+                    "name": "mock_inceptor_flaky",
+                    "driver_track": "NATIVE",
+                    "db_type": "INCEPTOR",
+                    "host": "127.0.0.1",
+                    "port": 10000,
+                    "dbname": "ods",
+                    "user": "hive",
+                }
+            )
+            inc_query_calls = {"cnt": 0}
+
+            class _FakeFlakyInceptor(InceptorThriftClient):
+                def __init__(self) -> None:
+                    pass
+
+                def execute_query(self, sql: str, max_rows: int = 1000):
+                    inc_query_calls["cnt"] += 1
+                    if "inc_tbl_01" in sql:
+                        if sql.startswith("DESCRIBE FORMATTED"):
+                            return [["cust_id", "varchar(32)", "客户号"]]
+                        return [["CREATE TABLE ods.inc_tbl_01 (cust_id varchar(32))"]]
+                    raise TimeoutError("Inceptor Thrift socket timed out")
+
+                def close(self) -> None:
+                    pass
+
+            inc_progress: List[int] = []
+            ctx.driver_manager.open_connection = lambda p, **kw: _FakeFlakyInceptor()
+            try:
+                inc_targets = [("ods", f"inc_tbl_{i:02d}") for i in range(1, 51)]
+                inc_metas, inc_warn, inc_skipped = ctx.metadata_hub.get_tables_metadata_batch(
+                    inc_prof.connection_id,
+                    inc_targets,
+                    force_refresh=True,
+                    tolerate_errors=True,
+                    on_progress=lambda d_c, _t_c, _cs, _ct: inc_progress.append(d_c),
+                )
+                self.assertTrue(inc_metas[("ods", "inc_tbl_01")].exists)
+                self.assertIn("timed out", inc_warn)
+                # 第 1 张表成功 (2 次查询)，第 2/3/4 张表各触发 1 次 TimeoutError 后立即熔断跳过剩余 46 张表
+                self.assertEqual(inc_query_calls["cnt"], 5)
+                self.assertEqual(len([k for k in inc_targets if (k[0], k[1]) in inc_skipped]), 49)
+                self.assertEqual(inc_progress, sorted(inc_progress))
+                self.assertEqual(inc_progress[-1], 50)
+
+                # 当 tolerate_errors=False 时必须原样抛出 TimeoutError 绝不静默吞没
+                with self.assertRaises(TimeoutError):
+                    ctx.metadata_hub.get_tables_metadata_batch(
+                        inc_prof.connection_id,
+                        [("ods", "inc_tbl_02")],
+                        force_refresh=True,
+                        tolerate_errors=False,
+                    )
+            finally:
+                ctx.driver_manager.open_connection = orig_open
+
+            # 3. 验证运行态进度条目延长 TTL 保护与轮询 200 访问日志降噪过滤器
+            hub = ImportProgressHub(max_entries=4, ttl_seconds=60.0)
+            hub.start("imp_running_long", "长耗时探查")
+            hub.start("imp_done_short", "短耗时完成")
+            hub.finish("imp_done_short", detail="ok")
+            hub._items["imp_running_long"]["updated_ts"] -= 120.0
+            hub._items["imp_done_short"]["updated_ts"] -= 120.0
+            self.assertIsNone(hub.get("imp_done_short"))
+            self.assertIsNotNone(hub.get("imp_running_long"))
+
+            flt = _QuietImportProgressAccessFilter()
+            rec_poll_200 = logging.LogRecord(
+                "uvicorn.access", logging.INFO, "", 1,
+                '127.0.0.1:51234 - "GET /api/platform/import-progress/imp_abc123 HTTP/1.1" 200',
+                None, None,
+            )
+            rec_poll_500 = logging.LogRecord(
+                "uvicorn.access", logging.INFO, "", 1,
+                '127.0.0.1:51234 - "GET /api/platform/import-progress/imp_abc123 HTTP/1.1" 500',
+                None, None,
+            )
+            rec_other = logging.LogRecord(
+                "uvicorn.access", logging.INFO, "", 1,
+                '127.0.0.1:51234 - "POST /api/modules/standard_migrator/bindings/upload HTTP/1.1" 200',
+                None, None,
+            )
+            self.assertFalse(flt.filter(rec_poll_200))
+            self.assertTrue(flt.filter(rec_poll_500))
+            self.assertTrue(flt.filter(rec_other))
+
 
 if __name__ == "__main__":
     unittest.main()

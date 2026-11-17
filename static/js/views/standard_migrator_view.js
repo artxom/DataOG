@@ -312,9 +312,21 @@ export class StandardMigratorView {
           this.activeSchema = res.active_table.table?.schema_name || this.activeSchema;
           this.activeTable = res.active_table.table?.table_name || this.activeTable;
         } else if (res.tables?.length) {
-          this.tableCheck = res.tables[0];
-          this.activeSchema = res.tables[0].table?.schema_name || this.activeSchema;
-          this.activeTable = res.tables[0].table?.table_name || this.activeTable;
+          const picked =
+            (this.activeTable &&
+              res.tables.find(
+                (t) =>
+                  String(t.table?.table_name || "").toLowerCase() ===
+                    String(this.activeTable).toLowerCase() &&
+                  (!this.activeSchema ||
+                    String(t.table?.schema_name || "").toLowerCase() ===
+                      String(this.activeSchema).toLowerCase())
+              )) ||
+            res.tables.find((t) => t.table?.exists) ||
+            res.tables[0];
+          this.tableCheck = picked;
+          this.activeSchema = picked.table?.schema_name || this.activeSchema;
+          this.activeTable = picked.table?.table_name || this.activeTable;
         }
         Toast.success(res.message || "对照关系导入完成");
         if (res.warning) Toast.warn(res.warning);

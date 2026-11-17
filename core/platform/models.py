@@ -107,6 +107,23 @@ class ConnectionProfile:
     created_at: str = ""
     updated_at: str = ""
 
+    def effective_default_schema(self) -> str:
+        """解析当前数据库方言下的真实默认 Schema（兼容 SQLite main、MySQL dbname 与 Inceptor default）."""
+        dt = (self.db_type or "").strip().upper()
+        raw = (self.default_schema or "").strip()
+        dbn = (self.dbname or "").strip()
+        if dt == "SQLITE":
+            return "main" if raw.lower() in ("", "public") else raw
+        if dt in ("MYSQL", "MARIADB", "OCEANBASE", "DORIS", "STARROCKS", "TIDB"):
+            if raw and (raw.lower() != "public" or not dbn):
+                return raw
+            return dbn or raw or "public"
+        if dt == "INCEPTOR":
+            if raw and raw.lower() != "public":
+                return raw
+            return dbn or "default"
+        return raw or "public"
+
     def to_public_dict(self) -> Dict[str, Any]:
         """输出脱敏后的前端安全字典（绝不直接暴露明文密码）."""
         return {

@@ -1291,20 +1291,24 @@ class CrossComparatorService:
                         return ""
                     return clean_excel_cell_str(row[ci], treat_placeholder_empty=True)
 
-                s_sch = clean_identifier_input(_cell("source_schema")) or "public"
+                raw_s_sch = clean_identifier_input(_cell("source_schema"))
                 s_tbl = clean_identifier_input(_cell("source_table"))
                 s_col = clean_identifier_input(_cell("source_col"))
                 s_std = _cell("source_std")
 
-                t_sch = clean_identifier_input(_cell("target_schema")) or "public"
+                raw_t_sch = clean_identifier_input(_cell("target_schema"))
                 t_tbl = clean_identifier_input(_cell("target_table"))
                 t_col = clean_identifier_input(_cell("target_col"))
                 t_std = _cell("target_std")
 
-                if "." in s_tbl and not _cell("source_schema"):
-                    s_sch, s_tbl = s_tbl.split(".", 1)
-                if "." in t_tbl and not _cell("target_schema"):
-                    t_sch, t_tbl = t_tbl.split(".", 1)
+                if "." in s_tbl and not raw_s_sch:
+                    ps, pt = s_tbl.split(".", 1)
+                    raw_s_sch = clean_identifier_input(ps)
+                    s_tbl = clean_identifier_input(pt)
+                if "." in t_tbl and not raw_t_sch:
+                    ps, pt = t_tbl.split(".", 1)
+                    raw_t_sch = clean_identifier_input(ps)
+                    t_tbl = clean_identifier_input(pt)
 
                 t_key = clean_identifier_input(t_tbl or s_tbl).lower()
                 if not t_key or (not s_col and not t_col):
@@ -1314,13 +1318,24 @@ class CrossComparatorService:
                     t_key,
                     {
                         "std_table_key": t_key,
-                        "source_schema": s_sch,
-                        "source_table": s_tbl or t_tbl,
-                        "target_schema": t_sch,
-                        "target_table": t_tbl or s_tbl,
+                        "source_schema": raw_s_sch if s_tbl else "",
+                        "source_table": s_tbl,
+                        "target_schema": raw_t_sch if t_tbl else "",
+                        "target_table": t_tbl,
                         "pairings": [],
                     },
                 )
+                if s_tbl and not grp["source_table"]:
+                    grp["source_table"] = s_tbl
+                if raw_s_sch and (s_tbl or not grp["source_schema"]):
+                    if not grp["source_schema"]:
+                        grp["source_schema"] = raw_s_sch
+                if t_tbl and not grp["target_table"]:
+                    grp["target_table"] = t_tbl
+                if raw_t_sch and (t_tbl or not grp["target_schema"]):
+                    if not grp["target_schema"]:
+                        grp["target_schema"] = raw_t_sch
+
                 p_item: Dict[str, Any] = {
                     "source_col": s_col,
                     "target_col": t_col,
@@ -1335,31 +1350,202 @@ class CrossComparatorService:
         if not grouped:
             raise ValueError("未能从上传表中解析出有效映射关系行")
 
+        src_cid = str(self.ctx.store.get_meta("cross_source_connection_id", "") or "")
+        tgt_cid = str(self.ctx.store.get_meta("cross_target_connection_id", "") or "")
+        src_prof = self.ctx.connection_hub.get_profile(src_cid) if src_cid else None
+        tgt_prof = self.ctx.connection_hub.get_profile(tgt_cid) if tgt_cid else None
+        src_def_sch = src_prof.effective_default_schema() if src_prof else "public"
+        tgt_def_sch = tgt_prof.effective_default_schema() if tgt_prof else "public"
+        tgt_db_type = tgt_prof.db_type if tgt_prof else "DWS"
+        all_codes: List[str] = []
+        for grp in grouped.values():
+            for p in grp["pairings"]:
+                sc_c = clean_excel_cell_str(p.get("source_std_code"), treat_placeholder_empty=True)
+                tc_c = clean_excel_cell_str(p.get("target_std_code"), treat_placeholder_empty=True)
+                if sc_c:
+                    all_codes.append(sc_c)
+                if tc_c:
+                    all_codes.append(tc_c)
+        std_map = self.ctx.standard_catalog.get_items_by_codes(all_codes)
+
+        now = self.ctx.store._now_str()
+        tbl_upsert_rows: List[Tuple[Any, ...]] = []
+        del_tbl_keys: List[Tuple[str]] = []
+        col_rows_all: List[Tuple[Any, ...]] = []
+        src_sync_batch: List[Dict[str, Any]] = []
+        tgt_sync_batch: List[Dict[str, Any]] = []
         last_key = ""
-        grp_items = list(grouped.items())
-        for idx_g, (t_key, grp) in enumerate(grp_items, start=1):
+
+        for t_key, grp in grouped.items():
             last_key = t_key
-            pct = 62.0 + (34.0 * idx_g / max(1, len(grp_items)))
-            report(
-                pct,
-                "保存双列映射与同步标准绑定",
-                f"正在保存表对 ({idx_g}/{len(grp_items)}): {grp['source_table']} ↔ {grp['target_table']}",
-                idx_g,
-                len(grp_items),
+            s_sch = (grp["source_schema"] or "").strip() or src_def_sch
+            s_tbl = (grp["source_table"] or "").strip() or (grp["target_table"] or "").strip() or t_key
+            t_sch = (grp["target_schema"] or "").strip() or tgt_def_sch
+            t_tbl = (grp["target_table"] or "").strip() or (grp["source_table"] or "").strip() or t_key
+            std_tbl_name = clean_identifier_input(t_tbl or s_tbl or t_key) or t_key
+
+            tbl_upsert_rows.append(
+                (
+                    t_key,
+                    t_sch or s_sch,
+                    std_tbl_name,
+                    "",
+                    s_sch,
+                    s_tbl,
+                    t_sch,
+                    t_tbl,
+                    now,
+                )
             )
-            self.save_pairings(
-                std_table_key=t_key,
-                source_schema=grp["source_schema"],
-                source_table=grp["source_table"],
-                target_schema=grp["target_schema"],
-                target_table=grp["target_table"],
-                pairings=grp["pairings"],
-                format_profile=format_profile,
-                force_refresh=False,
-                sync_to_field_bindings=True,
-                return_overview=False,
+            del_tbl_keys.append((t_key,))
+
+            for idx, p in enumerate(grp["pairings"], start=1):
+                s_col = clean_identifier_input(
+                    clean_excel_cell_str(p.get("source_col"), treat_placeholder_empty=True)
+                )
+                t_col = clean_identifier_input(
+                    clean_excel_cell_str(p.get("target_col"), treat_placeholder_empty=True)
+                )
+                s_code = clean_excel_cell_str(p.get("source_std_code"), treat_placeholder_empty=True)
+                t_code = clean_excel_cell_str(p.get("target_std_code"), treat_placeholder_empty=True)
+                if not s_col and not t_col:
+                    continue
+
+                if s_col and t_col:
+                    rep_item = std_map.get(t_code) or std_map.get(s_code)
+                    std_col_name = (rep_item.get("en_abbr") if rep_item else "") or t_col or s_col
+                    std_col_type = (
+                        self.ctx.standard_catalog.resolve_physical_type(
+                            rep_item, db_type=tgt_db_type, format_profile=format_profile
+                        )
+                        if rep_item
+                        else ""
+                    )
+                    std_col_comm = rep_item.get("cn_name", "") if rep_item else ""
+                    orig_col_name = s_col
+                elif s_col:
+                    std_col_name = f"__unpaired_src__::{s_col}"
+                    std_col_type = ""
+                    std_col_comm = ""
+                    orig_col_name = s_col
+                else:
+                    std_col_name = f"__unpaired_tgt__::{t_col}"
+                    std_col_type = ""
+                    std_col_comm = ""
+                    orig_col_name = t_col
+
+                col_rows_all.append(
+                    (
+                        t_key,
+                        idx,
+                        orig_col_name,
+                        "",
+                        "",
+                        std_col_name,
+                        std_col_type,
+                        std_col_comm,
+                        s_col,
+                        t_col,
+                        s_code,
+                        t_code,
+                        now,
+                    )
+                )
+                if src_cid and s_col and s_tbl and "source_std_code" in p:
+                    src_sync_batch.append(
+                        {
+                            "schema_name": s_sch,
+                            "table_name": s_tbl,
+                            "column_name": s_col,
+                            "std_code": s_code,
+                        }
+                    )
+                if tgt_cid and t_col and t_tbl and "target_std_code" in p:
+                    tgt_sync_batch.append(
+                        {
+                            "schema_name": t_sch,
+                            "table_name": t_tbl,
+                            "column_name": t_col,
+                            "std_code": t_code,
+                        }
+                    )
+
+        report(
+            62.0,
+            "保存双列映射与同步标准绑定",
+            f"正在批量持久化 {len(grouped)} 张表共 {len(col_rows_all)} 条字段映射...",
+            0,
+            max(1, len(col_rows_all)),
+        )
+        chunk_size = 500
+        with self.ctx.store.module_db() as conn:
+            conn.executemany(
+                """
+                INSERT INTO cross_table_bindings (
+                    std_table_key, std_schema_name, std_table_name, std_table_comment,
+                    source_schema, source_table, target_schema, target_table, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(std_table_key) DO UPDATE SET
+                    source_schema = excluded.source_schema,
+                    source_table = excluded.source_table,
+                    target_schema = excluded.target_schema,
+                    target_table = excluded.target_table,
+                    updated_at = excluded.updated_at
+                """,
+                tbl_upsert_rows,
+            )
+            conn.executemany("DELETE FROM cross_column_bindings WHERE std_table_key = ?", del_tbl_keys)
+            for start_i in range(0, len(col_rows_all), chunk_size):
+                batch_c = col_rows_all[start_i : start_i + chunk_size]
+                conn.executemany(
+                    """
+                    INSERT INTO cross_column_bindings (
+                        std_table_key, row_index,
+                        orig_col_name, orig_col_type, orig_col_comment,
+                        std_col_name, std_col_type, std_col_comment,
+                        bound_source_col, bound_target_col,
+                        source_std_code, target_std_code, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    batch_c,
+                )
+                done_c = min(len(col_rows_all), start_i + len(batch_c))
+                pct = 62.0 + 20.0 * (done_c / max(1, len(col_rows_all)))
+                report(
+                    pct,
+                    "保存双列映射与同步标准绑定",
+                    f"已写入跨环境映射 {done_c} / {len(col_rows_all)} 条（共 {len(grouped)} 张表）...",
+                    done_c,
+                    len(col_rows_all),
+                )
+
+        if src_sync_batch:
+            self.ctx.standard_catalog.bulk_save_field_bindings(
+                src_cid,
+                src_sync_batch,
+                mode="merge",
+                bind_source="CROSS_SYNC",
+                progress_cb=report,
+                progress_start_pct=82.0,
+                progress_end_pct=88.0,
+            )
+        if tgt_sync_batch:
+            self.ctx.standard_catalog.bulk_save_field_bindings(
+                tgt_cid,
+                tgt_sync_batch,
+                mode="merge",
+                bind_source="CROSS_SYNC",
+                progress_cb=report,
+                progress_start_pct=88.0,
+                progress_end_pct=94.0,
             )
 
+        self.ctx.store.add_log(
+            "INFO",
+            "跨环境映射批量铺底",
+            f"已从 [{filename}] 批量保存 {len(grouped)} 张表共 {len(col_rows_all)} 行双列映射与数标绑定",
+        )
+        report(96.0, "加载当前对比视图", f"正在读取表 [{last_key}] 对照预览...", total_rows, total_rows)
         state = self.get_overview_state(selected_table_key=last_key, format_profile=format_profile)
         state["imported_count"] = total_rows
         state["message"] = f"已从 [{filename}] 铺底导入 {len(grouped)} 张表共 {total_rows} 条字段映射关系"

@@ -156,6 +156,19 @@ class SafeConsoleStreamHandler(logging.StreamHandler):
             pass
 
 
+class _QuietImportProgressAccessFilter(logging.Filter):
+    """过滤高频导入进度轮询的正常 200 访问日志，防止控制台与日志文件刷屏，保留非 200 异常记录."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if "/api/platform/import-progress/" in msg and '" 200' in msg:
+                return False
+        except Exception:
+            pass
+        return True
+
+
 def setup_console_logging() -> logging.Logger:
     """配置控制台与文件双通道日志输出."""
     formatter = logging.Formatter(
@@ -185,6 +198,10 @@ def setup_console_logging() -> logging.Logger:
         uv_log.handlers = log.handlers
         uv_log.setLevel(logging.INFO)
         uv_log.propagate = False
+        if uv_name == "uvicorn.access" and not any(
+            isinstance(f, _QuietImportProgressAccessFilter) for f in uv_log.filters
+        ):
+            uv_log.addFilter(_QuietImportProgressAccessFilter())
 
     return log
 
@@ -272,7 +289,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.3.2",
+        version="2.3.3",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -395,7 +412,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.3.2 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.3.3 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")

@@ -1732,6 +1732,363 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertEqual(res_many["imported_count"], 12)
             self.assertLessEqual(meta_probe_calls, 2)
 
+            # 9. 回归验证 4631 行 × 160 张表大规模对照关系导入：
+            #    - 「保存对照关系」阶段单事务分块上报实时进度（绝不卡死在 62%）；
+            #    - replace_table 模式下同名大小写混合表（TBL_001 / tbl_001）不互相覆盖丢失；
+            #    - 模式名留空 + SQLite 默认 public 连接仍自动对齐 main 表并完成落标核验；
+            #    - 冷缓存仅打开 <= 1 次目标库连接，热缓存 0 次目标库连接，本地状态库连接数 <= 25；
+            #    - 跨环境 4631 行铺底导入同样走单事务批量写入。
+            prog_resp_hdr = client.get("/api/platform/import-progress/imp_bind_002")
+            self.assertIn("no-store", prog_resp_hdr.headers.get("cache-control", ""))
+
+            big_sq_path = os.path.join(tmpdir, "big_160_tables.db")
+            with sqlite3.connect(big_sq_path) as bconn:
+                for t_i in range(1, 161):
+                    col_defs = ", ".join(f"c_{c_i} VARCHAR(32)" for c_i in range(1, 30))
+                    bconn.execute(f"CREATE TABLE tbl_{t_i:03d} ({col_defs})")
+                bconn.commit()
+
+            big_cid = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "大规模4631行压测库",
+                    "driver_track": "NATIVE",
+                    "db_type": "SQLITE",
+                    "sqlite_path": big_sq_path,
+                    "auto_refresh_metadata": False,
+                },
+            ).json()["connection"]["connection_id"]
+
+            wb_4631 = openpyxl.Workbook(write_only=True)
+            ws_4631 = wb_4631.create_sheet("字段对照")
+            ws_4631.append(["模式名", "表名", "物理字段名", "数据项编号"])
+            written_4631 = 0
+            # 前 2 行测试同表大小写混合（TBL_001 与 tbl_001）在 replace_table 下不互相抹除
+            ws_4631.append(["", "TBL_001", "c_1", "CUST000101"])
+            ws_4631.append(["", "tbl_001", "c_2", "cust000101"])
+            # 第 3 行测试带引号 schema.table 拆分清洗
+            ws_4631.append(["", '"main"."tbl_002"', "c_1", "ACCT000205"])
+            written_4631 += 3
+
+            for t_i in range(1, 161):
+                start_c = 3 if t_i == 1 else (2 if t_i == 2 else 1)
+                for c_i in range(start_c, 30):
+                    if written_4631 >= 4631:
+                        break
+                    if written_4631 % 500 == 0:
+                        code_val = "#N/A"
+                    elif written_4631 % 333 == 0:
+                        code_val = "MISSING_STD_999"
+                    else:
+                        code_val = "CUST000101"
+                    ws_4631.append(["", f"tbl_{t_i:03d}", f"c_{c_i}", code_val])
+                    written_4631 += 1
+                if written_4631 >= 4631:
+                    break
+            self.assertEqual(written_4631, 4631)
+
+            buf_4631 = io.BytesIO()
+            wb_4631.save(buf_4631)
+
+            orig_store_conn = ctx.store._get_conn
+            orig_drv_open = ctx.driver_manager.open_connection
+            conn_counters = {"state_db": 0, "target_db": 0}
+
+            def _count_state_conn():
+                conn_counters["state_db"] += 1
+                return orig_store_conn()
+
+            def _count_target_open(*a, **kw):
+                conn_counters["target_db"] += 1
+                return orig_drv_open(*a, **kw)
+
+            persist_progress: List[Tuple[float, int, int]] = []
+            all_pcts_4631: List[float] = []
+
+            def _track_4631(pct: float, stg: str, _dtl: str, proc: int, tot: int) -> None:
+                all_pcts_4631.append(round(pct, 2))
+                if stg == "保存对照关系":
+                    persist_progress.append((round(pct, 2), proc, tot))
+
+            ctx.store._get_conn = _count_state_conn
+            ctx.driver_manager.open_connection = _count_target_open
+            try:
+                res_4631 = StandardMigratorService(ctx).upload_field_bindings_excel(
+                    filename="bindings_4631.xlsx",
+                    content=buf_4631.getvalue(),
+                    connection_id=big_cid,
+                    mode="replace_table",
+                    format_profile="type_mysql",
+                    progress_cb=_track_4631,
+                )
+                cold_state_conns = conn_counters["state_db"]
+                cold_target_conns = conn_counters["target_db"]
+
+                conn_counters["state_db"] = 0
+                conn_counters["target_db"] = 0
+                res_4631_warm = StandardMigratorService(ctx).upload_field_bindings_excel(
+                    filename="bindings_4631.xlsx",
+                    content=buf_4631.getvalue(),
+                    connection_id=big_cid,
+                    mode="merge",
+                    format_profile="type_mysql",
+                )
+                warm_state_conns = conn_counters["state_db"]
+                warm_target_conns = conn_counters["target_db"]
+            finally:
+                ctx.store._get_conn = orig_store_conn
+                ctx.driver_manager.open_connection = orig_drv_open
+
+            self.assertTrue(res_4631["ok"])
+            self.assertEqual(res_4631["imported_count"] + res_4631["unresolved_count"], 4631)
+            self.assertEqual(res_4631["aggregate"]["checked_tables"], 160)
+            self.assertEqual(res_4631["aggregate"]["bound_cols"], res_4631["imported_count"])
+            self.assertGreaterEqual(len(persist_progress), 8)
+            self.assertEqual(all_pcts_4631, sorted(all_pcts_4631))
+            self.assertLessEqual(cold_target_conns, 1)
+            self.assertLessEqual(cold_state_conns, 25)
+            self.assertEqual(warm_target_conns, 0)
+            self.assertLessEqual(warm_state_conns, 25)
+            self.assertEqual(res_4631_warm["imported_count"], res_4631["imported_count"])
+
+            # 验证 TBL_001 与 tbl_001 在 replace_table 下均完整保留，且带引号拆分的 tbl_002 正常入库
+            t1_binds = ctx.standard_catalog.get_table_field_bindings(big_cid, "main", "tbl_001")
+            self.assertIn("c_1", t1_binds)
+            self.assertIn("c_2", t1_binds)
+            t2_binds = ctx.standard_catalog.get_table_field_bindings(big_cid, "main", "tbl_002")
+            self.assertEqual(t2_binds["c_1"]["std_code"], "ACCT000205")
+
+            # 验证跨环境 4631 行铺底导入同样使用单事务批量写入
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "source", "connection_id": big_cid})
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "target", "connection_id": big_cid})
+            wb_p4631 = openpyxl.Workbook(write_only=True)
+            ws_p4631 = wb_p4631.create_sheet("跨环境映射")
+            ws_p4631.append(["来源模式名", "来源表名", "来源字段名", "来源数据项编号", "目标模式名", "目标表名", "目标字段名", "目标数据项编号"])
+            p_cnt = 0
+            for t_i in range(1, 161):
+                for c_i in range(1, 30):
+                    if p_cnt >= 4631:
+                        break
+                    ws_p4631.append(["main", f"tbl_{t_i:03d}", f"c_{c_i}", "CUST000101", "main", f"tbl_{t_i:03d}", f"c_{c_i}", "CUST000101"])
+                    p_cnt += 1
+                if p_cnt >= 4631:
+                    break
+            buf_p4631 = io.BytesIO()
+            wb_p4631.save(buf_p4631)
+
+            conn_counters["state_db"] = 0
+            pair_pcts: List[float] = []
+            ctx.store._get_conn = _count_state_conn
+            try:
+                res_p4631 = CrossComparatorService(ctx).upload_pairings_excel(
+                    filename="pairings_4631.xlsx",
+                    content=buf_p4631.getvalue(),
+                    format_profile="type_mysql",
+                    progress_cb=lambda pct, _s, _d, _pr, _tot: pair_pcts.append(round(pct, 2)),
+                )
+                pair_state_conns = conn_counters["state_db"]
+            finally:
+                ctx.store._get_conn = orig_store_conn
+
+            self.assertEqual(res_p4631["imported_count"], 4631)
+            self.assertEqual(pair_pcts, sorted(pair_pcts))
+            # 160 张表批量写入 + 1 次末尾概览渲染，状态库总连接数恒定 O(1)（旧版逐表循环高达 1400+ 次）
+            self.assertLessEqual(pair_state_conns, 50)
+
+            # 10. 深度回归验证：
+            #     a) 未填模式名的 DWS 对照表上传自动对齐真实 Schema (dwd)，左树徽标、点击预览与热缓存零重连全通；
+            #     b) 误传纯字段清单（无数据项编号/标准列）在 replace_table 模式下拒绝导入，绝不误删既有绑定；
+            #     c) 大批量无编号行依赖英文简称/中文名称匹配保持单连接 O(1) 索引查询；
+            #     d) 跨环境铺底表首行为仅目标单侧字段时，后续配对行的真实来源表名不被覆盖错绑；
+            #     e) 单库贯标清单多表上传核验同样复用单连接批量元数据探查。
+            dws_unqual_cid = client.post(
+                "/api/platform/connections",
+                json={
+                    "name": "模拟DWS无模式名上传库",
+                    "driver_track": "NATIVE",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 8000,
+                    "dbname": "dw",
+                    "user": "u",
+                    "password": "p",
+                    "auto_refresh_metadata": False,
+                },
+            ).json()["connection"]["connection_id"]
+
+            dws_unqual_opens = {"cnt": 0}
+
+            cust_std = ctx.standard_catalog.get_item("CUST000101") or {}
+            cust_dws_type = cust_std.get("type_dws") or "VARCHAR(32)"
+            cust_cn_name = cust_std.get("cn_name") or "客户统一编号"
+
+            class _MockDwsUnqualCur:
+                def __enter__(s):
+                    return s
+
+                def __exit__(s, *a):
+                    return False
+
+                def execute(s, sql: str, params=None) -> None:
+                    q = " ".join(sql.split())
+                    if "FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n" in q:
+                        s.rows = [
+                            (301, "dwd", "cust_info", "客户表", "orientation=row", "r"),
+                            (302, "dwd", "acct_info", "账户表", "orientation=row", "r"),
+                        ]
+                    elif "JOIN pg_catalog.pg_attribute" in q:
+                        s.rows = (
+                            [
+                                (301, "cust_id", cust_dws_type, True, None, cust_cn_name),
+                                (302, "open_dt", "date", False, None, "账户开立日期"),
+                            ]
+                            if "c.oid," in q
+                            else [("cust_id", cust_dws_type, True, None, cust_cn_name)]
+                        )
+                    else:
+                        s.rows = []
+
+                def fetchall(s):
+                    return list(s.rows)
+
+                def fetchone(s):
+                    return s.rows[0] if s.rows else None
+
+            class _MockDwsUnqualConn:
+                autocommit = False
+
+                def cursor(s):
+                    return _MockDwsUnqualCur()
+
+                def close(s):
+                    pass
+
+            def _open_dws_unqual(prof_obj, *a, **kw):
+                if prof_obj.connection_id == dws_unqual_cid:
+                    dws_unqual_opens["cnt"] += 1
+                    return _MockDwsUnqualConn()
+                return orig_drv_open(prof_obj, *a, **kw)
+
+            wb_unqual = openpyxl.Workbook()
+            ws_uq = wb_unqual.active
+            ws_uq.append(["表名", "物理字段名", "数据项编号"])
+            ws_uq.append(["cust_info", "cust_id", "CUST000101"])
+            ws_uq.append(["acct_info", "open_dt", "ACCT000205"])
+            buf_uq = io.BytesIO()
+            wb_unqual.save(buf_uq)
+
+            ctx.driver_manager.open_connection = _open_dws_unqual
+            try:
+                r_uq1 = StandardMigratorService(ctx).upload_field_bindings_excel(
+                    filename="unqual_dws.xlsx",
+                    content=buf_uq.getvalue(),
+                    connection_id=dws_unqual_cid,
+                )
+                self.assertIn("dwd.cust_info", r_uq1["table_stats"])
+                self.assertIn("dwd.acct_info", r_uq1["table_stats"])
+                tc_dwd = StandardMigratorService(ctx).get_table_compliance(
+                    dws_unqual_cid, "dwd", "cust_info"
+                )
+                self.assertEqual(tc_dwd["columns"][0]["std_code"], "CUST000101")
+                self.assertEqual(tc_dwd["columns"][0]["compliance_status"], "COMPLIANT")
+
+                dws_unqual_opens["cnt"] = 0
+                StandardMigratorService(ctx).upload_field_bindings_excel(
+                    filename="unqual_dws.xlsx",
+                    content=buf_uq.getvalue(),
+                    connection_id=dws_unqual_cid,
+                )
+                self.assertEqual(dws_unqual_opens["cnt"], 0)
+            finally:
+                ctx.driver_manager.open_connection = orig_drv_open
+
+            # 10b) 误传无标准列的普通表结构工作簿在 replace_table 下抛出明确错误且原绑定零丢失
+            wb_no_std = openpyxl.Workbook()
+            ws_ns = wb_no_std.active
+            ws_ns.append(["模式名", "表名", "物理字段名", "数据类型"])
+            ws_ns.append(["dwd", "cust_info", "cust_id", "varchar(32)"])
+            buf_ns = io.BytesIO()
+            wb_no_std.save(buf_ns)
+            with self.assertRaises(ValueError):
+                StandardMigratorService(ctx).upload_field_bindings_excel(
+                    filename="no_std_cols.xlsx",
+                    content=buf_ns.getvalue(),
+                    connection_id=dws_unqual_cid,
+                    mode="replace_table",
+                )
+            self.assertEqual(
+                ctx.standard_catalog.get_table_field_bindings(dws_unqual_cid, "dwd", "cust_info")["cust_id"]["std_code"],
+                "CUST000101",
+            )
+
+            # 10c) 600 行无编号不同候选标准名称匹配保持单连接 O(1)
+            with ctx.store.module_db() as sconn:
+                sconn.executemany(
+                    "INSERT OR REPLACE INTO standard_dictionary (std_code, cn_name, en_abbr, is_standard_dict, updated_at) VALUES (?, ?, ?, '1', '2026-01-01')",
+                    [(f"FZ_{i:04d}", f"候选中文_{i}", f"FZ_COL_{i}") for i in range(600)],
+                )
+            wb_fz = openpyxl.Workbook(write_only=True)
+            ws_fz = wb_fz.create_sheet("候选匹配")
+            ws_fz.append(["表名", "物理字段名", "数据项编号", "标准英文简称(选填)", "标准中文名称(选填)"])
+            for i in range(600):
+                ws_fz.append([f"tbl_{(i // 20) + 1:03d}", f"c_{(i % 20) + 1}", "#N/A", f"FZ_COL_{i}", f"候选中文_{i}"])
+            buf_fz = io.BytesIO()
+            wb_fz.save(buf_fz)
+
+            conn_counters["state_db"] = 0
+            ctx.store._get_conn = _count_state_conn
+            try:
+                res_fz = StandardMigratorService(ctx).upload_field_bindings_excel(
+                    filename="fuzzy_600.xlsx",
+                    content=buf_fz.getvalue(),
+                    connection_id=big_cid,
+                )
+                fz_conns = conn_counters["state_db"]
+            finally:
+                ctx.store._get_conn = orig_store_conn
+            self.assertEqual(res_fz["imported_count"], 600)
+            self.assertLessEqual(fz_conns, 25)
+
+            # 10d) 跨环境铺底表首行为单侧目标字段时，后续配对行的真实来源表名正确同步
+            wb_unp = openpyxl.Workbook()
+            ws_unp = wb_unp.active
+            ws_unp.append(["来源模式名", "来源表名", "来源字段名", "来源数据项编号", "目标模式名", "目标表名", "目标字段名", "目标数据项编号"])
+            ws_unp.append(["", "", "", "", "dwd", "dwd_unp_test", "etl_ts", ""])
+            ws_unp.append(["ods", "ods_unp_real", "src_cust", "CUST000101", "dwd", "dwd_unp_test", "cust_id", "CUST000101"])
+            buf_unp = io.BytesIO()
+            wb_unp.save(buf_unp)
+            ctx.store.save_meta("cross_source_connection_id", dws_unqual_cid)
+            CrossComparatorService(ctx).upload_pairings_excel(
+                filename="unp.xlsx",
+                content=buf_unp.getvalue(),
+            )
+            self.assertEqual(
+                ctx.standard_catalog.get_table_field_bindings(dws_unqual_cid, "ods", "ods_unp_real")["src_cust"]["std_code"],
+                "CUST000101",
+            )
+
+            # 10e) 单库贯标清单多表上传核验同样保持单次目标库连接
+            StandardMigratorService(ctx).bind_connection(big_cid, auto_sync=False)
+            wb_chk = openpyxl.Workbook()
+            ws_chk = wb_chk.active
+            ws_chk.append(["模式名", "表名", "修改前字段名", "修改后字段名", "修改后类型", "修改后注释"])
+            for t_i in range(1, 21):
+                ws_chk.append(["main", f"tbl_{t_i:03d}", "c_1", "cust_id", "VARCHAR(32)", "客户号"])
+            buf_chk = io.BytesIO()
+            wb_chk.save(buf_chk)
+            conn_counters["target_db"] = 0
+            ctx.driver_manager.open_connection = _count_target_open
+            try:
+                res_chk = StandardMigratorService(ctx).upload_excel_checklist(
+                    "multi_chk.xlsx",
+                    buf_chk.getvalue(),
+                )
+                chk_target_conns = conn_counters["target_db"]
+            finally:
+                ctx.driver_manager.open_connection = orig_drv_open
+            self.assertTrue(res_chk["ok"])
+            self.assertLessEqual(chk_target_conns, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

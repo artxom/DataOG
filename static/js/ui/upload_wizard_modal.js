@@ -383,6 +383,7 @@ export function openUploadWizardModal(opts) {
     const progressId = makeProgressId();
     let serverReported = false;
     let pollInFlight = false;
+    let progressState = "active";
 
     updateProgressView({
       percent: 3,
@@ -407,12 +408,17 @@ export function openUploadWizardModal(opts) {
               : p.status === "completed"
               ? "success"
               : "active";
+          progressState = pState;
           updateProgressView({
             percent: srvPct,
             stage: p.stage || "正在解析导入",
             detail: p.detail || "正在处理工作簿数据...",
             state: pState,
           });
+          if ((p.status === "completed" || p.status === "failed") && pollTimer) {
+            clearInterval(pollTimer);
+            pollTimer = null;
+          }
         }
       } catch (_e) {
         // 忽略偶发轮询抖动，以主请求最终结果为准
@@ -427,10 +433,10 @@ export function openUploadWizardModal(opts) {
       if (!serverReported && currentPercent >= 14 && currentPercent < 22) {
         currentPercent = Math.min(22, currentPercent + 0.35);
       }
-      updateProgressView({ state: "active" });
+      updateProgressView({ state: progressState });
     }, 100);
 
-    pollTimer = setInterval(pollServerProgress, 220);
+    pollTimer = setInterval(pollServerProgress, 320);
 
     const onUploadProgress = (ratio, loaded, total) => {
       if (!uploading || !modalOpen || myAttempt !== attemptSeq || serverReported) return;

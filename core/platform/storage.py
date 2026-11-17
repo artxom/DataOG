@@ -38,7 +38,7 @@ class PlatformStateStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = os.path.abspath(db_path)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._init_db()
         self._migrate_legacy_db_file_if_needed()
         self._migrate_legacy_connections_if_needed()
@@ -223,6 +223,8 @@ class PlatformStateStore:
                     target_std_code TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_cross_col_tbl_key
+                    ON cross_column_bindings (std_table_key, row_index);
 
                 CREATE TABLE IF NOT EXISTS standard_dictionary (
                     std_code TEXT PRIMARY KEY,
@@ -268,10 +270,14 @@ class PlatformStateStore:
                     extra_attrs_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL DEFAULT ''
                 );
+                CREATE INDEX IF NOT EXISTS idx_std_dict_code_nocase
+                    ON standard_dictionary (std_code COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_std_dict_en_abbr
                     ON standard_dictionary (en_abbr COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_std_dict_cn_name
                     ON standard_dictionary (cn_name);
+                CREATE INDEX IF NOT EXISTS idx_std_dict_cn_alias
+                    ON standard_dictionary (cn_alias);
                 CREATE INDEX IF NOT EXISTS idx_std_dict_reg
                     ON standard_dictionary (reg_category);
                 CREATE INDEX IF NOT EXISTS idx_std_dict_data_cat
@@ -293,6 +299,8 @@ class PlatformStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_fsb_conn_table
                     ON field_standard_bindings (connection_id, schema_name, table_name);
+                CREATE INDEX IF NOT EXISTS idx_fsb_conn_table_nocase
+                    ON field_standard_bindings (connection_id, schema_name COLLATE NOCASE, table_name COLLATE NOCASE);
                 CREATE INDEX IF NOT EXISTS idx_fsb_std_code
                     ON field_standard_bindings (std_code);
 
@@ -1212,6 +1220,223 @@ class PlatformStateStore:
                 object_type=t_row["object_type"] or "TABLE",
                 view_definition=t_row["view_definition"] or "",
             )
+
+    def get_cached_tables_meta_batch(
+        self,
+        connection_id: str,
+        targets: List[Tuple[str, str]],
+        *,
+        fallback_default_schema: str = "",
+    ) -> Dict[Tuple[str, str], TableMeta]:
+        """单连接批量读取多张已缓存列结构的表元数据，避免批量核验时产生 N 次 SQLite 连接开销."""
+        if not connection_id or not targets:
+            return {}
+        wanted_keys = {
+            (str(s or "").strip().lower(), str(t or "").strip().lower())
+            for s, t in targets
+            if str(t or "").strip()
+        }
+        if not wanted_keys:
+            return {}
+        fb_low = str(fallback_default_schema or "").strip().lower()
+        fb_candidates = {x for x in (fb_low, "public") if x} if fb_low else set()
+        lower_tbls = list({t for _, t in wanted_keys})
+        matched_t_rows: Dict[Tuple[str, str], sqlite3.Row] = {}
+        rows_by_tbl: Dict[str, List[sqlite3.Row]] = {}
+
+        with self._lock, self._get_conn() as conn:
+            chunk_size = 400
+            for i in range(0, len(lower_tbls), chunk_size):
+                chunk = lower_tbls[i : i + chunk_size]
+                ph = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM meta_tables
+                    WHERE connection_id = ?
+                      AND columns_cached != 0
+                      AND LOWER(table_name) IN ({ph})
+                    ORDER BY schema_name ASC
+                    """,
+                    [connection_id, *chunk],
+                ).fetchall()
+                for r in rows:
+                    s_l = str(r["schema_name"]).lower()
+                    t_l = str(r["table_name"]).lower()
+                    rows_by_tbl.setdefault(t_l, []).append(r)
+                    k = (s_l, t_l)
+                    if k in wanted_keys and k not in matched_t_rows:
+                        matched_t_rows[k] = r
+
+            if fb_candidates:
+                for req_s, req_t in wanted_keys:
+                    if (req_s, req_t) not in matched_t_rows and req_s in fb_candidates:
+                        cands = rows_by_tbl.get(req_t)
+                        if cands:
+                            matched_t_rows[(req_s, req_t)] = cands[0]
+
+            if not matched_t_rows:
+                return {}
+
+            actual_tbls = list({r["table_name"] for r in matched_t_rows.values()})
+            cols_by_exact: Dict[Tuple[str, str], List[ColumnMeta]] = {}
+            for i in range(0, len(actual_tbls), chunk_size):
+                chunk = actual_tbls[i : i + chunk_size]
+                ph = ",".join("?" for _ in chunk)
+                c_rows = conn.execute(
+                    f"""
+                    SELECT * FROM meta_columns
+                    WHERE connection_id = ? AND table_name IN ({ph})
+                    ORDER BY schema_name ASC, table_name ASC, ordinal_position ASC
+                    """,
+                    [connection_id, *chunk],
+                ).fetchall()
+                for cr in c_rows:
+                    ek = (cr["schema_name"], cr["table_name"])
+                    cols_by_exact.setdefault(ek, []).append(
+                        ColumnMeta(
+                            ordinal_position=int(cr["ordinal_position"]),
+                            column_name=cr["column_name"],
+                            data_type=cr["data_type"],
+                            normalized_type=cr["normalized_type"] or "",
+                            is_not_null=bool(cr["is_not_null"]),
+                            column_default=cr["column_default"],
+                            column_comment=cr["column_comment"] or "",
+                            is_primary_key=bool(cr["is_primary_key"]),
+                            index_names=json.loads(cr["index_names_json"] or "[]"),
+                            lineage_source=cr["lineage_source"] or "",
+                        )
+                    )
+
+        out: Dict[Tuple[str, str], TableMeta] = {}
+        for k, t_row in matched_t_rows.items():
+            cols = cols_by_exact.get((t_row["schema_name"], t_row["table_name"]), [])
+            out[k] = TableMeta(
+                schema_name=t_row["schema_name"],
+                table_name=t_row["table_name"],
+                exists=True,
+                table_comment=t_row["table_comment"] or "",
+                orientation=t_row["orientation"] or "ROW",
+                with_clause=t_row["with_clause"] or "",
+                distribute_clause=t_row["distribute_clause"] or "",
+                distribute_keys=json.loads(t_row["distribute_keys_json"] or "[]"),
+                partition_clause=t_row["partition_clause"] or "",
+                partition_keys=json.loads(t_row["partition_keys_json"] or "[]"),
+                primary_keys=json.loads(t_row["primary_keys_json"] or "[]"),
+                penetrated_base_tables=json.loads(
+                    t_row["penetrated_base_tables_json"] or "[]"
+                ),
+                columns=cols,
+                row_count=int(t_row["row_count"] or 0),
+                raw_ddl=t_row["raw_ddl"] or "",
+                object_type=t_row["object_type"] or "TABLE",
+                view_definition=t_row["view_definition"] or "",
+            )
+        return out
+
+    def save_tables_meta_batch(self, connection_id: str, metas: List[TableMeta]) -> None:
+        """单事务批量写入多张表/视图完整元数据缓存，消除逐表 commit 磁盘同步风暴."""
+        valid = [m for m in (metas or []) if m and m.exists and m.table_name]
+        if not connection_id or not valid:
+            return
+        now = self._now_str()
+        dedup: Dict[Tuple[str, str], TableMeta] = {}
+        for m in valid:
+            dedup[(m.schema_name, m.table_name)] = m
+        unique_metas = list(dedup.values())
+        unique_schemas = list(dict.fromkeys(m.schema_name for m in unique_metas))
+
+        schema_params = [
+            (connection_id, sch, connection_id, sch, connection_id, sch, now)
+            for sch in unique_schemas
+        ]
+        table_params = [
+            (
+                connection_id,
+                m.schema_name,
+                m.table_name,
+                m.object_type or "TABLE",
+                m.table_comment or "",
+                m.orientation or "ROW",
+                m.with_clause or "",
+                m.distribute_clause or "",
+                json.dumps(m.distribute_keys or [], ensure_ascii=False),
+                m.partition_clause or "",
+                json.dumps(m.partition_keys or [], ensure_ascii=False),
+                json.dumps(m.primary_keys or [], ensure_ascii=False),
+                json.dumps(m.penetrated_base_tables or [], ensure_ascii=False),
+                int(m.row_count or 0),
+                m.raw_ddl or "",
+                m.view_definition or "",
+                1,
+                now,
+            )
+            for m in unique_metas
+        ]
+        del_col_params = [(connection_id, m.schema_name, m.table_name) for m in unique_metas]
+        col_params = [
+            (
+                connection_id,
+                m.schema_name,
+                m.table_name,
+                int(c.ordinal_position),
+                c.column_name,
+                c.data_type or "",
+                c.normalized_type or "",
+                1 if c.is_not_null else 0,
+                c.column_default,
+                c.column_comment or "",
+                1 if c.is_primary_key else 0,
+                json.dumps(c.index_names or [], ensure_ascii=False),
+                c.lineage_source or "",
+                now,
+            )
+            for m in unique_metas
+            for c in (m.columns or [])
+        ]
+
+        with self._lock, self._get_conn() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO meta_schemas (
+                    connection_id, schema_name, table_count, view_count, refreshed_at
+                ) VALUES (
+                    ?, ?,
+                    COALESCE((SELECT table_count FROM meta_schemas WHERE connection_id = ? AND schema_name = ?), 0),
+                    COALESCE((SELECT view_count FROM meta_schemas WHERE connection_id = ? AND schema_name = ?), 0),
+                    ?
+                )
+                """,
+                schema_params,
+            )
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO meta_tables (
+                    connection_id, schema_name, table_name, object_type, table_comment,
+                    orientation, with_clause, distribute_clause, distribute_keys_json,
+                    partition_clause, partition_keys_json, primary_keys_json,
+                    penetrated_base_tables_json, row_count, raw_ddl, view_definition,
+                    columns_cached, refreshed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                table_params,
+            )
+            conn.executemany(
+                "DELETE FROM meta_columns WHERE connection_id = ? AND schema_name = ? AND table_name = ?",
+                del_col_params,
+            )
+            if col_params:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO meta_columns (
+                        connection_id, schema_name, table_name, ordinal_position,
+                        column_name, data_type, normalized_type, is_not_null,
+                        column_default, column_comment, is_primary_key,
+                        index_names_json, lineage_source, refreshed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    col_params,
+                )
+            conn.commit()
 
     def search_cached_metadata(
         self, keyword: str, connection_id: Optional[str] = None, limit: int = 100

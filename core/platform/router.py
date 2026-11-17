@@ -395,11 +395,14 @@ async def api_platform_import_progress(
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     prog = ctx.import_progress.get(progress_id)
-    return {
-        "ok": True,
-        "found": prog is not None,
-        "progress": prog,
-    }
+    return JSONResponse(
+        content={
+            "ok": True,
+            "found": prog is not None,
+            "progress": prog,
+        },
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 # =========================================================================

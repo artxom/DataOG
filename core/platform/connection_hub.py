@@ -59,12 +59,25 @@ class ConnectionHub:
         dbname = str(
             payload.get("dbname") if "dbname" in payload else (existing.dbname if existing else "")
         ).strip()
+        fallback_schema = (
+            (dbname or "default")
+            if db_type == "INCEPTOR"
+            else (
+                "main"
+                if db_type == "SQLITE"
+                else (
+                    dbname
+                    if db_type in ("MYSQL", "MARIADB", "OCEANBASE", "DORIS", "STARROCKS", "TIDB")
+                    else "public"
+                )
+            )
+        )
         default_schema = str(
             payload.get("default_schema")
             or payload.get("schema_name")
             or (existing.default_schema if existing else "")
             or tpl.get("default_schema")
-            or ("default" if db_type == "INCEPTOR" else ("main" if db_type == "SQLITE" else "public"))
+            or fallback_schema
         ).strip()
         user = str(
             payload.get("user") if "user" in payload else (existing.user if existing else "")
