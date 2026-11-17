@@ -222,6 +222,7 @@ class CrossComparatorService:
         comp = None
         if active_key or source_table or target_table:
             lookup_key = active_key
+            load_saved_binding = bool(active_key)
             if not lookup_key:
                 matched_key = self._find_matching_table_key(
                     tables,
@@ -233,11 +234,13 @@ class CrossComparatorService:
                 if matched_key:
                     active_key = matched_key
                     lookup_key = matched_key
+                    load_saved_binding = True
                 else:
                     raw_fb = (target_table or source_table or "").strip()
                     if "." in raw_fb:
                         raw_fb = raw_fb.split(".", 1)[1]
                     lookup_key = clean_identifier_input(raw_fb).lower()
+                    load_saved_binding = False
 
             comp = self.compare_single_table(
                 lookup_key,
@@ -250,6 +253,7 @@ class CrossComparatorService:
                 source_format_profile=eff_src_fmt,
                 target_format_profile=eff_tgt_fmt,
                 persist_missing_binding=bool(active_key),
+                load_saved_binding=load_saved_binding,
             )
         return {
             "ok": True,
@@ -285,8 +289,13 @@ class CrossComparatorService:
         source_format_profile: str = "AUTO",
         target_format_profile: str = "AUTO",
         persist_missing_binding: bool = True,
+        load_saved_binding: bool = True,
     ) -> Dict[str, Any]:
-        t_bind = self.ctx.store.get_cross_table_binding(std_table_key)
+        t_bind = (
+            self.ctx.store.get_cross_table_binding(std_table_key)
+            if load_saved_binding
+            else None
+        )
         if not t_bind:
             if persist_missing_binding:
                 t_bind = self.ctx.store.upsert_cross_table_binding(
@@ -380,7 +389,11 @@ class CrossComparatorService:
             tgt_col_map[clean_identifier_input(c.column_name).lower()] = c
             tgt_col_map[c.column_name.lower()] = c
 
-        all_saved_std_cols = self.ctx.store.list_cross_columns(t_bind["std_table_key"])
+        all_saved_std_cols = (
+            self.ctx.store.list_cross_columns(t_bind["std_table_key"])
+            if load_saved_binding and t_bind.get("std_table_key")
+            else []
+        )
         std_cols = [
             sc
             for sc in all_saved_std_cols
@@ -1909,7 +1922,25 @@ class CrossComparatorService:
             if dict_pushed_for_table:
                 continue
 
-            cols = (comp.get("standard_panel") or {}).get("columns") or self.ctx.store.list_cross_columns(t_key)
+            saved_cross_cols = self.ctx.store.list_cross_columns(t_key)
+            has_dict_paired_rows = any(
+                (c.get("source_std_code") or "").strip()
+                or (c.get("target_std_code") or "").strip()
+                for c in saved_cross_cols
+            )
+            has_legacy_checklist_rows = any(
+                not str(c.get("std_col_name") or "").startswith("__unpaired_")
+                and (
+                    (c.get("std_col_type") or "").strip()
+                    or (c.get("orig_col_type") or "").strip()
+                    or (c.get("std_col_comment") or "").strip()
+                )
+                for c in saved_cross_cols
+            )
+            if has_dict_paired_rows or not has_legacy_checklist_rows:
+                continue
+
+            cols = (comp.get("standard_panel") or {}).get("columns") or saved_cross_cols
             for c in cols:
                 t_col_meta = c.get("target_col_meta")
                 if isinstance(t_col_meta, dict) and t_col_meta.get("column_name"):

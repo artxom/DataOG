@@ -2100,6 +2100,9 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 sc.execute(
                     "CREATE TABLE ods_cust (cust_id TEXT, raw_extra TEXT)"
                 )
+                sc.execute(
+                    "CREATE TABLE ods_cust_v2 (new_col_a TEXT, new_col_b TEXT)"
+                )
                 sc.commit()
             with contextlib.closing(sqlite3.connect(tgt_db)) as tc:
                 tc.execute(
@@ -2385,6 +2388,72 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 if (r.get("target_col") or {}).get("column_name") == "cust_no"
             )
             self.assertEqual(tgt_cust_row["target_std_code"], "")
+
+            # 8) Step 2 全量解绑后推送贯标不得从旧 cross_column_bindings 复活未绑定字段
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/push-to-migrator",
+                    json={"std_table_key": "dwd_cust"},
+                ).status_code,
+                400,
+            )
+            client.post(
+                "/api/modules/cross_comparator/pairings/save",
+                json={
+                    "std_table_key": "dwd_cust",
+                    "source_schema": "main",
+                    "source_table": "ods_cust",
+                    "target_schema": "main",
+                    "target_table": "dwd_cust",
+                    "sync_to_field_bindings": True,
+                    "pairings": [
+                        {
+                            "source_col": "cust_id",
+                            "target_col": "cust_no",
+                            "source_std_code": "STD001",
+                            "target_std_code": "STD001",
+                        }
+                    ],
+                },
+            )
+            client.post(
+                "/api/modules/standard_migrator/bindings/save",
+                json={
+                    "connection_id": tgt_cid,
+                    "active_schema": "main",
+                    "active_table": "dwd_cust",
+                    "bindings": [
+                        {
+                            "schema_name": "main",
+                            "table_name": "dwd_cust",
+                            "column_name": "cust_no",
+                            "std_code": "",
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/push-to-migrator",
+                    json={"std_table_key": "dwd_cust"},
+                ).status_code,
+                400,
+            )
+
+            # 9) 用新的来源表 ods_cust_v2 预览已保存过的目标表 dwd_cust（不传 table_key）不得混入旧表幽灵字段
+            ov_new_src = client.get(
+                "/api/modules/cross_comparator/overview"
+                "?source_schema=main&source_table=ods_cust_v2&target_schema=main&target_table=dwd_cust"
+            )
+            self.assertEqual(ov_new_src.status_code, 200)
+            ov_new_data = ov_new_src.json()
+            self.assertEqual(ov_new_data["active_table_key"], "")
+            new_src_cols = {
+                (r.get("source_col") or {}).get("column_name")
+                for r in ov_new_data["active_comparison"]["dual_rows"]
+                if r.get("source_col")
+            }
+            self.assertEqual(new_src_cols, {"new_col_a", "new_col_b"})
 
     def test_cross_comparator_five_col_and_header_non_overlap_structure(self) -> None:
         """静态校验 R1 五虚拟列、R2 顶部防遮蔽与 R3 侧边栏标准选择器结构."""
