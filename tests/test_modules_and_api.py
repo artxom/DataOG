@@ -1742,7 +1742,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertIn("no-store", prog_resp_hdr.headers.get("cache-control", ""))
 
             big_sq_path = os.path.join(tmpdir, "big_160_tables.db")
-            with sqlite3.connect(big_sq_path) as bconn:
+            with contextlib.closing(sqlite3.connect(big_sq_path)) as bconn:
                 for t_i in range(1, 161):
                     col_defs = ", ".join(f"c_{c_i} VARCHAR(32)" for c_i in range(1, 30))
                     bconn.execute(f"CREATE TABLE tbl_{t_i:03d} ({col_defs})")
