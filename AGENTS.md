@@ -61,11 +61,11 @@
    - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
 
 ## 5. 当前代码基线快照（供下次会话快速定位）
-- **当前主干里程碑版本**：`v2.5.0`（官方品牌名 `Data.O.G`，全平台实时任务进度微日志 · 60s 温连接跨环境秒切 · 库级离线交互网页与单 Sheet Excel 报告版，`main` 分支与 `v2.5.0` 标签同步至 `origin`）。
+- **当前主干里程碑版本**：`v2.5.1`（官方品牌名 `Data.O.G`，Windows `DataOG.exe` 定制多尺寸品牌图标版，`main` 分支与 `v2.5.1` 标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI `2.5.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
+  - `app.py`：FastAPI `2.5.1` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
   - `requirements.txt`：保持 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），零新增第三方依赖。
-  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（去除重复静态资源拷贝、排除非运行时重型包与测试子模块、自动剥离 `.pyi`/`.pxd`/`__pycache__` 冗余元数据，保障冻结态 `--test` 自检）。
+  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（内置 `--icon=static/dataog.ico` 多尺寸 `.exe` 品牌图标、去除重复静态资源拷贝、排除非运行时重型包与测试子模块、自动剥离 `.pyi`/`.pxd`/`__pycache__` 冗余元数据，保障冻结态 `--test` 自检）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
   - `context.py` (`PlatformContext`，同时暴露 `task_progress = import_progress`) / `router.py` / `schemas.py` / `models.py`
   - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，暴露线程安全 `module_db()` 上下文、`count_cross_columns()` 与批量元数据缓存读写，核心与模块表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`standard_dictionary`、`field_standard_bindings`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_table_bindings`、`cross_column_bindings`、`explorer_sessions`、`explorer_messages`、`execution_logs`)
@@ -84,7 +84,7 @@
   - `modules/ddl_translator/`（`/api/modules/ddl_translator`）：支撑「多邻国」模块，含 `POST /naming`（AI 大模型 + 内置 170+ 数仓标准词根双驱动智能命名与建表草稿生成）与 `POST /translate`（数据源库表/粘贴 `CREATE TABLE` 或 `VIEW`/自由异构 SQL 跨方言互译、四层递归视图穿透与 `AST+AI` 语法适配），接入 `X-Task-Id` 进度微日志。
   - `modules/data_explorer/`（`/api/modules/data_explorer`）：支撑「数据探查 · AI 探查」多轮目标驱动只读探查会话，含 `/sessions*` 会话历史管理与 `POST /explore` 多步自动采样推理循环（单步采样上限 `200` 行、`12s` 超时、单轮最多 `8` 步熔断、`recommended_sql` 二次只读清洗与实时步骤微日志推送）。
 - **前端原生 ES Modules macOS 桌面工作台 (`static/`)**：
-  - `index.html`、`css/tokens.css`（明暗双主题与内置壁纸变量）、`css/workbench.css`、`js/main.js`（纯净桌面画布、底部悬浮毛玻璃 macOS Dock 栏、最小化 Dock 右侧收纳、全屏 Dock 自动下沉贴底唤出、`⌘K` Spotlight、日志控制台）
+  - `dataog.ico`、`index.html`、`css/tokens.css`（明暗双主题与内置壁纸变量）、`css/workbench.css`、`js/main.js`（纯净桌面画布、底部悬浮毛玻璃 macOS Dock 栏、最小化 Dock 右侧收纳、全屏 Dock 自动下沉贴底唤出、`⌘K` Spotlight、日志控制台）
   - 核心层 `js/core/`：`api.js`（含 `AbortSignal`、`X-Task-Id`、`downloadApiFile` 取消与任务追踪、`tasksApi`、`comparePair`/`prefetchPairs` 与库级报告/全库模板下载接口）、`dom.js`、`state.js`
   - 公共组件 `js/ui/`：`task_activity_bar.js`（`TaskActivityBar`：`180ms` 防闪烁毛玻璃活动条 + SSE/轮询 + 缩略微日志气泡）、`export_report_modal.js`（`openExportReportModal`：统一离线网页 `.html` 与单 Sheet `.xlsx` 导出弹窗）、`database_tree.js`（DataGrip 风格四级数据库目录树，支持 `single`/`multi` 模式、紧凑刷新进度条及表级自定义徽标渲染）、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`upload_wizard_modal.js`、`standard_picker_modal.js`、`modal.js`、`toast.js`
   - 四大桌面应用视图 `js/views/`：

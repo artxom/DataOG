@@ -1,4 +1,4 @@
-# Data.O.G v2.5.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.5.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -44,7 +44,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.5.0 微内核入口（安全响应头、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.5.1 微内核入口（安全响应头、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
@@ -71,7 +71,7 @@ DataOG/
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（底部 Dock 与窗口管理器）、core/、ui/（含 TaskActivityBar / ExportReportModal）、views/（四大模块视图）
 ├── tests/                        # 42 项全量自动化测试（核心算法 / 平台底座与进度流 / 按库标准与五虚拟列比对 / 库级离线 HTML 与单 Sheet Excel 报告 / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
-├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本
+├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
 ```
@@ -92,7 +92,8 @@ DataOG/
 | **`v2.3.2`** | `fix/excel-eval-progress-modal-races` → `main` | **导入向导竞态加固、经典多条件公式扩展求值与流式大表平滑进度**：补齐 `LOOKUP` / `CHOOSE({1,2},...)` / `INDIRECT` / `OFFSET` 与整行引用求值，保护共享公式结构化表引用列名，准确还原流式 `<dimension ref="A1:A1"/>` 行数，消除跨环境多表铺底冗余探查与 `<dialog>` / 重试轮询异步竞态 |
 | **`v2.3.3`** | `fix/bulk-binding-persistence-batch-probe` → `main` | **大规模字段对照单事务批量持久化、单会话批量探查与锁超时熔断降噪**：落地 `bulk_save_field_bindings` 单事务分块写入与 B-Tree 区间删除、`get_tables_metadata_batch` 系统目录批量探查与缓存读写、DWS/PG 会话级锁等待超时降级与逐表异常熔断，并静默高频进度轮询 `200` 刷屏日志 |
 | **`v2.4.0`** | `feat/standard-compare-ux` → `main` | **按库持久化落标标准、macOS 五虚拟列跨环境比对与顶栏防遮蔽重构**：支持在「2. 落标绑定与贯标」左侧按数据库独立设定并持久化落标标准格式且同步沿用至第 3 步；将「3. 跨环境比对」重构为 macOS 风格五虚拟列拖拽/点选图形化工作台，并将「已保存映射表对」迁入 `.mac-subbar` 彻底消除顶部遮挡 |
-| **`v2.5.0`**（当前正式版） | `feat/task-progress-smooth-ux` & `feat/offline-db-report` → `main` | **全平台实时任务进度微日志、60s 温连接秒切与库级离线交互网页 / 单 Sheet Excel 报告**：新增 `TaskProgressHub`（SSE + 节流缩略微日志 + 取消控制）与 `TaskActivityBar` 毛玻璃活动条；落地 `probe_session` 60 秒温连接池、120 秒负缓存与 `/compare-pair` 双库并发秒切预热；单库与跨环境统一升级免勾表库级离线交互网页报告（`.html`，内嵌纯 JS 单 Sheet `.xlsx` 导出器）与单 Sheet 库级 Excel（`.xlsx`，空目录先采再出、跨环境附带未配对同名推荐表清单） |
+| **`v2.5.0`** | `feat/task-progress-smooth-ux` & `feat/offline-db-report` → `main` | **全平台实时任务进度微日志、60s 温连接秒切与库级离线交互网页 / 单 Sheet Excel 报告**：新增 `TaskProgressHub`（SSE + 节流缩略微日志 + 取消控制）与 `TaskActivityBar` 毛玻璃活动条；落地 `probe_session` 60 秒温连接池、120 秒负缓存与 `/compare-pair` 双库并发秒切预热；单库与跨环境统一升级免勾表库级离线交互网页报告（`.html`，内嵌纯 JS 单 Sheet `.xlsx` 导出器）与单 Sheet 库级 Excel（`.xlsx`，空目录先采再出、跨环境附带未配对同名推荐表清单） |
+| **`v2.5.1`**（当前正式版） | `chore/exe-icon-v2.5.1` → `main` | **Windows 独立程序 (`DataOG.exe`) 多尺寸品牌图标定制**：新增 7 档分辨率（`16px~256px`）标准 `.ico` 品牌图标 `static/dataog.ico` 并接入 `build_exe.py` PyInstaller `--icon` 打包参数 |
 
 ---
 
