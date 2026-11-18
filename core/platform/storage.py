@@ -1992,7 +1992,19 @@ class PlatformStateStore:
                 """
                 SELECT
                     t.*,
-                    COUNT(c.id) AS column_count
+                    COUNT(c.id) AS column_count,
+                    COALESCE(GROUP_CONCAT(DISTINCT NULLIF(c.bound_source_col, '')), '') AS source_cols_text,
+                    COALESCE(GROUP_CONCAT(DISTINCT NULLIF(c.bound_target_col, '')), '') AS target_cols_text,
+                    COALESCE(
+                        GROUP_CONCAT(
+                            DISTINCT CASE
+                                WHEN SUBSTR(COALESCE(c.std_col_name, ''), 1, 11) = '__unpaired_' THEN NULL
+                                ELSE NULLIF(c.std_col_name, '')
+                            END
+                        ),
+                        ''
+                    ) AS std_cols_text,
+                    COALESCE(GROUP_CONCAT(DISTINCT NULLIF(c.std_col_comment, '')), '') AS std_comments_text
                 FROM cross_table_bindings t
                 LEFT JOIN cross_column_bindings c ON c.std_table_key = t.std_table_key
                 GROUP BY t.id
