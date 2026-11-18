@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+---
+
+## [2.5.0] - 2026-11-18
+
 ### Added
 - **库级离线交互网页报告 (`.html`) 与单 Sheet 库级 Excel (`.xlsx`) 导出引擎 (`core/platform/offline_report.py`, `static/js/ui/export_report_modal.js`, `static/css/workbench.css`, `static/js/core/api.js`)**：
   - 平台底座新增 `core/platform/offline_report.py`，统一生成单 Sheet 库级 Excel（`build_single_db_excel_bytes` / `build_cross_env_excel_bytes`，单 Sheet 汇总全库表及字段明细、首行冻结与自动筛选、公式注入转义与 `-` 占位符豁免）以及零外部网络依赖的离线交互网页（`build_single_db_html_bytes` / `build_cross_env_html_bytes`，安全转义嵌入 `<script type="application/json">`、内置纯 JS 单 Sheet OOXML `.xlsx` 构建器 `buildSingleSheetXlsxBlob` 支持网页内一键导出全库或当前筛选明细、明暗自适应与安全 DOM 渲染）。
@@ -24,7 +28,7 @@
 - **元数据探查 60 秒温连接池、120 秒负缓存与单连接四层视图穿透 (`core/platform/connection_hub.py`, `core/platform/metadata_hub.py`)**：
   - 新增 `ConnectionHub.probe_session`（非 SQLite 数据源空闲 `60s` 温连接复用、退出自动 `rollback()`、异常自动剔除并销毁、`save_profile`/`delete_profile` 失效清理，严格隔离 `readonly_session` 零复用；SQLite 默认直连免锁文件句柄）。
   - `MetadataHub` 新增 `120s` 不存在表内存负缓存（强制刷新时立即失效）与 `_shared_conn` 单连接四层递归视图血缘穿透复用，消除连续切表与多层视图的重复握手耗时。
-- 在 [app.py](file:///Users/artxom/code/DataOG/app.py) 访问日志过滤器中同步静默 `/api/platform/tasks/*` 正常 `200` 轮询；扩充单库/跨环境库级离线报告与 Node.js 内嵌 `.xlsx` 构建端到端测试至 **42 项**。
+- 升级 `app.py` 与 `PlatformContext` 版本号至 `2.5.0`，在 `app.py` 访问日志过滤器中同步静默 `/api/platform/tasks/*` 正常 `200` 轮询，并扩充单库/跨环境库级离线报告与 Node.js 内嵌 `.xlsx` 构建端到端测试至 **42 项**。
 
 ### Fixed
 - **修复 `ExportReportModal` 弹窗主题令牌缺失与离线报告页签筛选导出错位 (`static/css/workbench.css`, `static/js/ui/export_report_modal.js`, `core/platform/offline_report.py`, `modules/standard_migrator/`)**：
