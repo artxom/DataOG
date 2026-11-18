@@ -280,6 +280,16 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertEqual(r_js.status_code, 200)
             self.assertIn("bootstrapWorkbench", r_js.text)
 
+            r_ico = client.get("/dataog.ico")
+            self.assertEqual(r_ico.status_code, 200)
+            self.assertEqual(r_ico.content[:6], b"\x00\x00\x01\x00\x07\x00")
+            if not getattr(sys, "frozen", False):
+                build_script_path = os.path.join(os.path.dirname(resolve_static_dir()), "build_exe.py")
+                with open(build_script_path, encoding="utf-8") as bf:
+                    build_src = bf.read()
+                self.assertIn("dataog.ico", build_src)
+                self.assertIn("--icon=", build_src)
+
             # 模拟恶意跨站页面发起 POST 调用：必须返回 403 阻断
             r_csrf = client.post(
                 "/api/platform/logs/clear",

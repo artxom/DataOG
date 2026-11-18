@@ -8,6 +8,15 @@
 
 ---
 
+## [2.5.1] - 2026-11-18
+
+### Changed
+- **更换 Windows 独立可执行程序 (`DataOG.exe`) 品牌图标 (`static/dataog.ico`, `build_exe.py`)**：
+  - 新增包含 `256/128/64/48/32/24/16` 七档标准尺寸的多分辨率图标资源 `static/dataog.ico`（`256px` 高清 PNG 帧 + `16~128px` 32-bit BGRA DIB 与 1-bit AND 掩码帧），并在 `build_exe.py` 中接入 PyInstaller `--icon` 参数写入 `DataOG.exe` PE 图标资源（Windows 构建免额外第三方图像库依赖）。
+  - 升级 `app.py` 与 `PlatformContext` 版本号至 `2.5.1`，并在自动化测试中补充 `.ico` 魔数头与打包脚本 `--icon` 契约校验。
+
+---
+
 ## [2.5.0] - 2026-11-18
 
 ### Added

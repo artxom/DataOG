@@ -117,8 +117,12 @@ def build_executable() -> None:
 
     static_src = os.path.join(project_dir, "static")
     tests_src = os.path.join(project_dir, "tests")
+    icon_src = os.path.join(static_src, "dataog.ico")
     if not os.path.isdir(static_src):
         print(f"[错误] 找不到前端静态资源目录: {static_src}")
+        sys.exit(1)
+    if not os.path.isfile(icon_src):
+        print(f"[错误] 找不到可执行程序图标文件: {icon_src}")
         sys.exit(1)
 
     add_static_arg = f"{static_src}{os.pathsep}static"
@@ -234,6 +238,9 @@ def build_executable() -> None:
     ]
     if importlib.util.find_spec("jpype") is not None:
         pyinstaller_args.append("--collect-all=jpype")
+
+    if os.name == "nt" or importlib.util.find_spec("PIL") is not None:
+        pyinstaller_args.append(f"--icon={icon_src}")
 
     for mod in excluded_modules:
         pyinstaller_args.append(f"--exclude-module={mod}")
