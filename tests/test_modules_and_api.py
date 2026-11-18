@@ -2876,6 +2876,22 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             stages = [x["stage"] for x in t_exp["recent_logs"]]
             self.assertTrue(any("加载元数据" in s or "AI 规划" in s or "只读采样" in s for s in stages))
 
+    @staticmethod
+    def _run_node_probe(node_bin: str, tmp_dir: str, filename: str, js_code: str) -> str:
+        script_path = os.path.join(tmp_dir, filename)
+        with open(script_path, "w", encoding="utf-8") as sf:
+            sf.write(js_code)
+        proc = subprocess.run(
+            [node_bin, script_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"Node probe {filename} failed (rc={proc.returncode}):\n{proc.stderr}")
+        return proc.stdout
+
     def test_single_db_offline_html_and_single_sheet_excel_report(self):
         """验证单库库级离线 HTML / 单 Sheet Excel 报告：空缓存先采目录再导出、全库范围、公式防注入与队列隔离."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -3061,7 +3077,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                     + "qTabBtn.click();\n"
                     + "if(!filterBtn.hidden) throw new Error('stale overview filter leaked onto queue tab');\n"
                 )
-                subprocess.run([node_bin, "-e", dom_probe], capture_output=True, text=True, check=True, timeout=10)
+                self._run_node_probe(node_bin, tmp, "single_dom_probe.cjs", dom_probe)
 
             # 全库预填对照模板下载（含 X-Task-Id 进度追踪与 public->main 陈旧绑定回退预填）
             tpl_res = client.get(
@@ -3265,14 +3281,8 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                     + "\nconst blob = buildSingleSheetXlsxBlob('跨环境库级比对报告', ['序号','模式','表名'], [{ tone: 'GREEN', values: [1, 'main', 't_saved_s'] }, { tone: 'LAVENDER', values: [2, 'main', 't_same_unpaired'] }]);\n"
                     + "process.stdout.write(blob._buf.toString('base64'));\n"
                 )
-                proc = subprocess.run(
-                    [node_bin, "-e", harness],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                    timeout=10,
-                )
-                js_xlsx_bytes = base64.b64decode(proc.stdout.strip())
+                xlsx_b64 = self._run_node_probe(node_bin, tmp, "xlsx_harness.cjs", harness)
+                js_xlsx_bytes = base64.b64decode(xlsx_b64.strip())
                 with zipfile.ZipFile(io.BytesIO(js_xlsx_bytes), "r") as zf_js:
                     self.assertIsNone(zf_js.testzip())
                 wb_js = openpyxl.load_workbook(io.BytesIO(js_xlsx_bytes))
@@ -3317,7 +3327,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                     + "const fBtn2=findAll(root2,n=>n.tagName==='BUTTON'&&txtOf(n).includes('导出当前筛选'))[0];\n"
                     + "if(!fBtn2.hidden) throw new Error('filter btn should be hidden on warnings tab');\n"
                 )
-                subprocess.run([node_bin, "-e", cross_dom_probe], capture_output=True, text=True, check=True, timeout=10)
+                self._run_node_probe(node_bin, tmp, "cross_dom_probe.cjs", cross_dom_probe)
 
 
 if __name__ == "__main__":

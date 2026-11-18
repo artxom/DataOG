@@ -15,6 +15,9 @@
   - 新增包含 `256/128/64/48/32/24/16` 七档标准尺寸的多分辨率图标资源 `static/dataog.ico`（`256px` 高清 PNG 帧 + `16~128px` 32-bit BGRA DIB 与 1-bit AND 掩码帧），并在 `build_exe.py` 中接入 PyInstaller `--icon` 参数写入 `DataOG.exe` PE 图标资源（Windows 构建免额外第三方图像库依赖）。
   - 升级 `app.py` 与 `PlatformContext` 版本号至 `2.5.1`，并在自动化测试中补充 `.ico` 魔数头与打包脚本 `--icon` 契约校验。
 
+### Fixed
+- **修复 Windows 打包前单测 `node -e` 命令行长度超限导致 Release 构建中断 (`tests/test_modules_and_api.py`)**：将离线报告内嵌 JS 与 `.xlsx` 往返校验探针改为写入临时 `.cjs` UTF-8 脚本文件执行，规避 Windows `CreateProcessW` `32,767` 字符命令行硬上限（`WinError 206`）。
+
 ---
 
 ## [2.5.0] - 2026-11-18
