@@ -104,6 +104,8 @@ _CROSS_ENV_HEADERS: List[str] = [
     "目标标准目标类型",
     "对标状态",
     "目标库落标状态",
+    "目标长度/精度包络",
+    "是否涉及类型转换",
     "差异与诊断详情",
 ]
 
@@ -305,9 +307,15 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
             s_std = cr.get("source_std") or {}
             t_std = cr.get("target_std") or {}
             t_comp = cr.get("target_compliance") or {}
+            cc = cr.get("cross_compat") or {}
             bk_state = str(cr.get("bookmark_state") or "SPLIT_PARTIAL")
             t_comp_status = str(t_comp.get("status") or ("UNBOUND" if tc else ""))
             t_comp_label = str(t_comp.get("label") or ("未绑标" if tc else "-"))
+            cap_status = str(cc.get("capacity_status") or "N/A")
+            cap_label = str(cc.get("capacity_label") or "-")
+            conv_status = str(cc.get("type_conv_status") or "N/A")
+            conv_label = str(cc.get("type_conv_label") or "-")
+            has_type_conv = bool(cc.get("has_type_conversion"))
 
             diffs: List[str] = []
             if bk_state == "SPLIT_DIFF":
@@ -321,6 +329,10 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     diffs.append("仅来源端已绑标，缺少目标字段配对")
             if t_comp.get("detail") and t_comp_status != "COMPLIANT":
                 diffs.append(f"目标端: {t_comp['detail']}")
+            if cap_status in ("INSUFFICIENT", "RISK"):
+                diffs.append(f"长度/精度: {cc.get('capacity_detail') or cap_label}")
+            if has_type_conv:
+                diffs.append(f"类型转换: {cc.get('type_conv_detail') or conv_label}")
             if not diffs:
                 if bk_state == "UNIFIED" and t_comp_status == "COMPLIANT":
                     diffs.append("双侧标准一致且目标端已落标")
@@ -351,6 +363,11 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "bookmark_label": _BOOKMARK_LABELS.get(bk_state, bk_state),
                     "target_compliance_status": t_comp_status,
                     "target_compliance_label": t_comp_label,
+                    "capacity_status": cap_status,
+                    "capacity_label": cap_label,
+                    "type_conv_status": conv_status,
+                    "type_conv_label": conv_label,
+                    "has_type_conversion": has_type_conv,
                     "detail": "；".join(diffs),
                 }
             )
@@ -380,6 +397,11 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "bookmark_label": "待配对候选",
                     "target_compliance_status": "",
                     "target_compliance_label": "-",
+                    "capacity_status": "N/A",
+                    "capacity_label": "-",
+                    "type_conv_status": "N/A",
+                    "type_conv_label": "-",
+                    "has_type_conversion": False,
                     "detail": "来源表未绑标待选字段",
                 }
             )
@@ -409,6 +431,11 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                     "bookmark_label": "待配对候选",
                     "target_compliance_status": "UNBOUND",
                     "target_compliance_label": "未绑标",
+                    "capacity_status": "N/A",
+                    "capacity_label": "-",
+                    "type_conv_status": "N/A",
+                    "type_conv_label": "-",
+                    "has_type_conversion": False,
                     "detail": "目标表未绑标待选字段",
                 }
             )
@@ -441,6 +468,11 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "bookmark_label": "推荐同名未配对",
                 "target_compliance_status": "",
                 "target_compliance_label": "-",
+                "capacity_status": "N/A",
+                "capacity_label": "-",
+                "type_conv_status": "N/A",
+                "type_conv_label": "-",
+                "has_type_conversion": False,
                 "detail": f"{m_type}（尚未保存跨环境配对，未自动执行字段预比对）",
             }
         )
@@ -471,6 +503,11 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "bookmark_label": "仅来源库存在",
                 "target_compliance_status": "",
                 "target_compliance_label": "-",
+                "capacity_status": "N/A",
+                "capacity_label": "-",
+                "type_conv_status": "N/A",
+                "type_conv_label": "-",
+                "has_type_conversion": False,
                 "detail": "仅来源库存在该表（目标库无已保存配对或同名表）",
             }
         )
@@ -501,6 +538,11 @@ def _iter_cross_flat_rows(report_data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "bookmark_label": "仅目标库存在",
                 "target_compliance_status": "",
                 "target_compliance_label": "-",
+                "capacity_status": "N/A",
+                "capacity_label": "-",
+                "type_conv_status": "N/A",
+                "type_conv_label": "-",
+                "has_type_conversion": False,
                 "detail": "仅目标库存在该表（来源库无已保存配对或同名表）",
             }
         )
@@ -541,17 +583,20 @@ def build_cross_env_excel_bytes(report_data: Dict[str, Any]) -> bytes:
                 _safe_excel_cell(r["target_std_type"]),
                 _safe_excel_cell(r["bookmark_label"]),
                 _safe_excel_cell(r["target_compliance_label"]),
+                _safe_excel_cell(r["capacity_label"]),
+                _safe_excel_cell(r["type_conv_label"]),
                 _safe_excel_cell(r["detail"]),
             ]
         )
         bk = r["bookmark_state"]
         t_comp = r["target_compliance_status"]
+        cap_st = r["capacity_status"]
         if bk == "RECOMMENDED":
             row_tags.append("LAVENDER")
         elif bk == "SPLIT_DIFF":
             row_tags.append("RED")
         elif bk == "UNIFIED":
-            if t_comp == "NON_COMPLIANT":
+            if t_comp == "NON_COMPLIANT" or cap_st == "INSUFFICIENT":
                 row_tags.append("YELLOW")
             else:
                 row_tags.append("GREEN")
@@ -560,7 +605,7 @@ def build_cross_env_excel_bytes(report_data: Dict[str, Any]) -> bytes:
         else:
             row_tags.append("GRAY")
 
-    widths = [7, 15, 20, 13, 22, 20, 16, 22, 15, 20, 16, 13, 22, 20, 16, 22, 15, 20, 16, 14, 13, 38]
+    widths = [7, 15, 20, 13, 22, 20, 16, 22, 15, 20, 16, 13, 22, 20, 16, 22, 15, 20, 16, 14, 13, 24, 22, 42]
     _apply_single_sheet_style(ws, _CROSS_ENV_HEADERS, widths, row_tags)
 
     buf = io.BytesIO()
@@ -1913,6 +1958,20 @@ _CROSS_ENV_APP_JS = r"""
     return "";
   }
 
+  function capTone(st) {
+    if (st === "CONTAINED") return "ok";
+    if (st === "INSUFFICIENT") return "bad";
+    if (st === "RISK") return "warn";
+    return "";
+  }
+
+  function convTone(st) {
+    if (st === "CAST_REQUIRED") return "warn";
+    if (st === "SAFE_CAST") return "info";
+    if (st === "NONE") return "ok";
+    return "";
+  }
+
   function buildPairFlatRows(pair) {
     const tb = pair.table_binding || {};
     const tKey = String(tb.std_table_key || pair.std_table_key || "");
@@ -1928,18 +1987,31 @@ _CROSS_ENV_APP_JS = r"""
       const sStd = cr.source_std || {};
       const tStd = cr.target_std || {};
       const tcComp = cr.target_compliance || {};
+      const cc = cr.cross_compat || {};
       const bk = String(cr.bookmark_state || "SPLIT_PARTIAL");
       const tcStatus = String(tcComp.status || (tc.column_name ? "UNBOUND" : ""));
       const tcLabel = String(tcComp.label || (tc.column_name ? "未绑标" : "-"));
+      const capStatus = String(cc.capacity_status || "N/A");
+      const capLabel = String(cc.capacity_label || "-");
+      const capShort = String(cc.capacity_short || capLabel);
+      const capDetail = String(cc.capacity_detail || "");
+      const convStatus = String(cc.type_conv_status || "N/A");
+      const convLabel = String(cc.type_conv_label || "-");
+      const convShort = String(cc.type_conv_short || convLabel);
+      const convDetail = String(cc.type_conv_detail || "");
+      const hasTypeConv = Boolean(cc.has_type_conversion);
+
       const diffs = [];
       if (bk === "SPLIT_DIFF") diffs.push("两侧绑标不一致 (" + (cr.source_std_code || "") + " ≠ " + (cr.target_std_code || "") + ")");
       else if (bk === "SPLIT_PARTIAL") diffs.push(!sc.column_name ? "仅目标端已绑标，缺少来源字段配对" : "仅来源端已绑标，缺少目标字段配对");
       if (tcComp.detail && tcStatus !== "COMPLIANT") diffs.push("目标端: " + tcComp.detail);
+      if (capStatus === "INSUFFICIENT" || capStatus === "RISK") diffs.push("长度/精度: " + (capDetail || capLabel));
+      if (hasTypeConv) diffs.push("类型转换: " + (convDetail || convLabel));
       if (!diffs.length) diffs.push(tcStatus === "COMPLIANT" ? "双侧标准一致且目标端已落标" : "双侧标准一致");
 
       let excelTone = "BLUE";
       if (bk === "SPLIT_DIFF") excelTone = "RED";
-      else if (bk === "UNIFIED") excelTone = tcStatus === "NON_COMPLIANT" ? "YELLOW" : "GREEN";
+      else if (bk === "UNIFIED") excelTone = (tcStatus === "NON_COMPLIANT" || capStatus === "INSUFFICIENT") ? "YELLOW" : "GREEN";
 
       out.push({
         tone: excelTone,
@@ -1956,6 +2028,15 @@ _CROSS_ENV_APP_JS = r"""
         bookmark_label: BK_LABELS[bk] || bk,
         target_compliance_status: tcStatus,
         target_compliance_label: tcLabel,
+        capacity_status: capStatus,
+        capacity_label: capLabel,
+        capacity_short: capShort,
+        capacity_detail: capDetail,
+        type_conv_status: convStatus,
+        type_conv_label: convLabel,
+        type_conv_short: convShort,
+        type_conv_detail: convDetail,
+        has_type_conversion: hasTypeConv,
         detail: diffs.join("；"),
       });
     }
@@ -1969,6 +2050,8 @@ _CROSS_ENV_APP_JS = r"""
         target_col_name: "", target_col_type: "", target_col_comment: "",
         target_std_code: "", target_std_cn: "", target_std_type: "",
         bookmark_label: "待配对候选", target_compliance_status: "", target_compliance_label: "-",
+        capacity_status: "N/A", capacity_label: "-", capacity_short: "-", capacity_detail: "",
+        type_conv_status: "N/A", type_conv_label: "-", type_conv_short: "-", type_conv_detail: "", has_type_conversion: false,
         detail: "来源表未绑标待选字段",
       });
     }
@@ -1982,6 +2065,8 @@ _CROSS_ENV_APP_JS = r"""
         target_col_name: tc.column_name || "", target_col_type: tc.data_type || "", target_col_comment: tc.column_comment || "",
         target_std_code: "", target_std_cn: "", target_std_type: "",
         bookmark_label: "待配对候选", target_compliance_status: "UNBOUND", target_compliance_label: "未绑标",
+        capacity_status: "N/A", capacity_label: "-", capacity_short: "-", capacity_detail: "",
+        type_conv_status: "N/A", type_conv_label: "-", type_conv_short: "-", type_conv_detail: "", has_type_conversion: false,
         detail: "目标表未绑标待选字段",
       });
     }
@@ -2003,7 +2088,7 @@ _CROSS_ENV_APP_JS = r"""
           rec.target_schema || "", rec.target_table || "", "(整表推荐 · 未预比对)",
           rec.target_object_type || "TABLE", rec.target_comment || "",
           tCnt ? "已绑 " + tCnt + " 列" : "", "", "",
-          "推荐同名未配对", "-",
+          "推荐同名未配对", "-", "-", "-",
           (rec.match_type || "同名表") + "（尚未保存跨环境配对，未自动执行字段预比对）",
         ],
       };
@@ -2021,7 +2106,7 @@ _CROSS_ENV_APP_JS = r"""
           st.schema_name || "", st.table_name || "", "(整表仅来源库存在)",
           st.object_type || "TABLE", st.table_comment || "", cnt ? "已绑 " + cnt + " 列" : "", "", "",
           "", "", "", "", "", "", "", "",
-          "仅来源库存在", "-", "仅来源库存在该表（目标库无已保存配对或同名表）",
+          "仅来源库存在", "-", "-", "-", "仅来源库存在该表（目标库无已保存配对或同名表）",
         ],
       });
     }
@@ -2034,7 +2119,7 @@ _CROSS_ENV_APP_JS = r"""
           "", "", "", "", "", "", "", "",
           tt.schema_name || "", tt.table_name || "", "(整表仅目标库存在)",
           tt.object_type || "TABLE", tt.table_comment || "", cnt ? "已绑 " + cnt + " 列" : "", "", "",
-          "仅目标库存在", "-", "仅目标库存在该表（来源库无已保存配对或同名表）",
+          "仅目标库存在", "-", "-", "-", "仅目标库存在该表（来源库无已保存配对或同名表）",
         ],
       });
     }
@@ -2050,7 +2135,7 @@ _CROSS_ENV_APP_JS = r"""
         r.source_std_code, r.source_std_cn, r.source_std_type,
         r.target_schema, r.target_table, r.target_col_name, r.target_col_type, r.target_col_comment,
         r.target_std_code, r.target_std_cn, r.target_std_type,
-        r.bookmark_label, r.target_compliance_label, r.detail,
+        r.bookmark_label, r.target_compliance_label, r.capacity_label, r.type_conv_label, r.detail,
       ],
     };
   }
@@ -2058,6 +2143,10 @@ _CROSS_ENV_APP_JS = r"""
   function matchFlatRow(r) {
     if (state.rowFilter === "MIGRATE") {
       if (!r.needsMigration) return false;
+    } else if (state.rowFilter === "CAP_ISSUE") {
+      if (r.capacity_status !== "INSUFFICIENT" && r.capacity_status !== "RISK") return false;
+    } else if (state.rowFilter === "TYPE_CONV") {
+      if (!r.has_type_conversion) return false;
     } else if (state.rowFilter !== "ALL" && r.bookmark_state !== state.rowFilter) {
       return false;
     }
@@ -2065,7 +2154,8 @@ _CROSS_ENV_APP_JS = r"""
     if (!kw) return true;
     return [
       r.std_table_key, r.source_table, r.target_table, r.source_col_name, r.target_col_name,
-      r.source_std_code, r.target_std_code, r.source_std_cn, r.target_std_cn, r.detail
+      r.source_std_code, r.target_std_code, r.source_std_cn, r.target_std_cn,
+      r.capacity_label, r.type_conv_label, r.detail
     ].some((v) => String(v || "").toLowerCase().includes(kw));
   }
 
@@ -2076,10 +2166,22 @@ _CROSS_ENV_APP_JS = r"""
       const bk = p.bookmark_summary || {};
       if (state.pairListFilter === "HAS_DIFF" && (bk.split_diff || 0) === 0) return false;
       if (state.pairListFilter === "HAS_MIG" && (bk.target_needs_migration || 0) === 0) return false;
+      if (state.pairListFilter === "HAS_CAP_ISSUE" && (bk.capacity_insufficient || 0) === 0 && (bk.capacity_risk || 0) === 0) return false;
+      if (state.pairListFilter === "HAS_TYPE_CONV" && (bk.type_conversion || 0) === 0) return false;
       if (state.pairListFilter === "UNIFIED_ONLY" && ((bk.split_diff || 0) > 0 || (bk.unified || 0) === 0)) return false;
       if (!kw) return true;
-      return [tb.std_table_key, tb.source_schema, tb.source_table, tb.target_schema, tb.target_table]
-        .some((v) => String(v || "").toLowerCase().includes(kw));
+      if ([tb.std_table_key, tb.source_schema, tb.source_table, tb.target_schema, tb.target_table]
+        .some((v) => String(v || "").toLowerCase().includes(kw))) {
+        return true;
+      }
+      if ((p.center_rows || []).some((cr) => [
+        (cr.source_col || {}).column_name, (cr.target_col || {}).column_name,
+        (cr.source_std || {}).cn_name, (cr.target_std || {}).cn_name
+      ].some((v) => String(v || "").toLowerCase().includes(kw)))) {
+        return true;
+      }
+      return (p.source_candidates || []).some((c) => String(c.column_name || "").toLowerCase().includes(kw))
+        || (p.target_candidates || []).some((c) => String(c.column_name || "").toLowerCase().includes(kw));
     });
   }
 
@@ -2179,7 +2281,7 @@ _CROSS_ENV_APP_JS = r"""
   }
 
   const pairSearchInput = el("input", {
-    className: "input", type: "search", placeholder: "搜索映射表对...",
+    className: "input", type: "search", placeholder: "搜索表对 / 来源或目标字段...",
     value: state.pairKeyword,
     onInput: (e) => {
       state.pairKeyword = e.target.value;
@@ -2263,7 +2365,8 @@ _CROSS_ENV_APP_JS = r"""
       { label: "推荐同名未配对表", val: String(AGG.recommended_pairs_count ?? REC_PAIRS.length), sub: "仅推荐清单（未自动预比对）" },
       { label: "标准一致组 (UNIFIED)", val: String(AGG.unified_cols ?? 0), sub: "共已映射 " + (AGG.total_center_rows ?? 0) + " 组" },
       { label: "标准异标 (SPLIT_DIFF)", val: String(AGG.split_diff_cols ?? 0), sub: "单侧绑标 " + (AGG.split_partial_cols ?? 0) + " 组" },
-      { label: "目标库待贯标", val: String(AGG.target_needs_migration_cols ?? 0), sub: "未配对候选 源" + (AGG.unbound_src_cols ?? 0) + " / 目标" + (AGG.unbound_tgt_cols ?? 0) },
+      { label: "长度/精度风险", val: String(AGG.capacity_insufficient_cols ?? 0), sub: "无法包住 " + (AGG.capacity_insufficient_cols ?? 0) + " · 需核验 " + (AGG.capacity_risk_cols ?? 0) },
+      { label: "涉及类型转换", val: String(AGG.type_conversion_cols ?? 0), sub: "目标库待贯标 " + (AGG.target_needs_migration_cols ?? 0) + " 组" },
     ];
     return el("section", { className: "kpi-strip" },
       cards.map((c) => el("div", { className: "kpi-card" },
@@ -2281,7 +2384,7 @@ _CROSS_ENV_APP_JS = r"""
     const slice = rows.slice(startIdx, endIdx);
     const ths = [];
     if (showPairCols) ths.push("表对 (来源 ↔ 目标)");
-    ths.push("来源字段", "来源类型", "来源标准", "中缝对标状态", "目标标准", "目标字段", "目标类型", "目标落标", "差异说明");
+    ths.push("来源字段", "来源类型", "来源标准", "中缝对标状态", "目标标准", "目标字段", "目标类型", "目标落标", "长度/精度包络", "类型转换", "差异说明");
 
     const trs = slice.map((r) => {
       const cells = [];
@@ -2296,6 +2399,12 @@ _CROSS_ENV_APP_JS = r"""
         el("td", { className: "mono", text: r.target_col_type || "-" }),
         el("td", {}, r.target_compliance_status
           ? badge(r.target_compliance_label, r.target_compliance_status === "COMPLIANT" ? "ok" : (r.target_compliance_status === "NON_COMPLIANT" ? "bad" : (r.target_compliance_status === "COMMENT_ONLY" ? "info" : "")))
+          : el("span", { style: { color: "var(--muted)" }, text: "-" })),
+        el("td", { title: r.capacity_detail || "" }, r.capacity_status && r.capacity_status !== "N/A"
+          ? badge(r.capacity_label || "-", capTone(r.capacity_status))
+          : el("span", { style: { color: "var(--muted)" }, text: "-" })),
+        el("td", { title: r.type_conv_detail || "" }, r.type_conv_status && r.type_conv_status !== "N/A"
+          ? badge(r.type_conv_label || "-", convTone(r.type_conv_status))
           : el("span", { style: { color: "var(--muted)" }, text: "-" })),
         el("td", { style: { maxWidth: "260px" }, text: r.detail || "-" })
       );
@@ -2327,14 +2436,18 @@ _CROSS_ENV_APP_JS = r"""
     const srcCands = pair.source_candidates || [];
     const tgtCands = pair.target_candidates || [];
     const cRows = (pair.center_rows || []).filter((r) => {
+      const cc = r.cross_compat || {};
       if (state.rowFilter === "MIGRATE" && !r.target_needs_migration) return false;
+      if (state.rowFilter === "CAP_ISSUE" && cc.capacity_status !== "INSUFFICIENT" && cc.capacity_status !== "RISK") return false;
+      if (state.rowFilter === "TYPE_CONV" && !cc.has_type_conversion) return false;
       if (["UNIFIED", "SPLIT_DIFF", "SPLIT_PARTIAL"].includes(state.rowFilter) && r.bookmark_state !== state.rowFilter) return false;
       const kw = state.rowKeyword.trim().toLowerCase();
       if (!kw) return true;
       return [
         (r.source_col || {}).column_name, (r.target_col || {}).column_name,
         r.source_std_code, r.target_std_code,
-        (r.source_std || {}).cn_name, (r.target_std || {}).cn_name
+        (r.source_std || {}).cn_name, (r.target_std || {}).cn_name,
+        cc.capacity_label, cc.type_conv_label
       ].some((v) => String(v || "").toLowerCase().includes(kw));
     });
 
@@ -2348,6 +2461,8 @@ _CROSS_ENV_APP_JS = r"""
 
     const renderBoundChip = (col, isTgt, row) => {
       if (!col) return el("div", { className: "slot-empty", text: "空槽（未配对）" });
+      const cc = row.cross_compat || {};
+      const showCompat = isTgt && row.paired && cc.applicable;
       return el("div", { className: "cand-card", style: { borderColor: row.bookmark_state === "UNIFIED" ? "var(--ok-bd)" : "" } },
         el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "4px" } },
           el("span", { className: "mono", style: { fontWeight: "600" }, text: col.column_name || "" }),
@@ -2358,7 +2473,11 @@ _CROSS_ENV_APP_JS = r"""
         el("div", { style: { display: "flex", justifyContent: "space-between", gap: "6px", fontSize: "11px", color: "var(--muted)" } },
           el("span", { className: "mono", text: col.data_type || "-" }),
           col.column_comment ? el("span", { text: col.column_comment }) : null
-        )
+        ),
+        showCompat ? el("div", { style: { display: "flex", flexWrap: "wrap", gap: "4px", marginTop: "3px" }, title: [cc.capacity_detail, cc.type_conv_detail].filter(Boolean).join("；") },
+          badge(cc.capacity_short || cc.capacity_label, capTone(cc.capacity_status)),
+          badge(cc.type_conv_short || cc.type_conv_label, convTone(cc.type_conv_status))
+        ) : null
       );
     };
 
@@ -2434,7 +2553,9 @@ _CROSS_ENV_APP_JS = r"""
       const tb = p.table_binding || {};
       const bk = p.bookmark_summary || {};
       const tKey = tb.std_table_key || "";
-      const tone = (bk.split_diff || 0) > 0 ? "bad" : ((bk.target_needs_migration || 0) > 0 ? "warn" : "ok");
+      const tone = ((bk.split_diff || 0) > 0 || (bk.capacity_insufficient || 0) > 0)
+        ? "bad"
+        : (((bk.target_needs_migration || 0) > 0 || (bk.capacity_risk || 0) > 0) ? "warn" : "ok");
       sidebarNodes.push(el("button", {
         type: "button",
         className: "nav-item " + (state.selectedPairKey === tKey ? "is-active" : ""),
@@ -2494,7 +2615,8 @@ _CROSS_ENV_APP_JS = r"""
                 [
                   { k: "ALL", l: "全部" }, { k: "UNIFIED", l: "标准一致" },
                   { k: "SPLIT_DIFF", l: "标准异标" }, { k: "SPLIT_PARTIAL", l: "单侧绑标" },
-                  { k: "MIGRATE", l: "待贯标" }, { k: "CANDIDATE", l: "待配对候选" },
+                  { k: "MIGRATE", l: "待贯标" }, { k: "CAP_ISSUE", l: "容量不足" },
+                  { k: "TYPE_CONV", l: "类型转换" }, { k: "CANDIDATE", l: "待配对候选" },
                 ].map((fp) => el("button", {
                   type: "button", className: "pill " + (state.rowFilter === fp.k ? "is-active" : ""),
                   text: fp.l,
@@ -2519,6 +2641,7 @@ _CROSS_ENV_APP_JS = r"""
     }
     const tb = activePair.table_binding || {};
     const bk = activePair.bookmark_summary || {};
+    const capWarnCnt = (bk.capacity_insufficient || 0) + (bk.capacity_risk || 0);
     clearEl(
       pairSubbarMount,
       el("div", { className: "subbar-group" },
@@ -2526,6 +2649,8 @@ _CROSS_ENV_APP_JS = r"""
         badge("一致 " + (bk.unified || 0), "ok"),
         badge("异标 " + (bk.split_diff || 0), (bk.split_diff || 0) > 0 ? "bad" : ""),
         badge("单侧 " + (bk.split_partial || 0), (bk.split_partial || 0) > 0 ? "info" : ""),
+        capWarnCnt > 0 ? badge("容量风险 " + capWarnCnt, (bk.capacity_insufficient || 0) > 0 ? "bad" : "warn") : null,
+        (bk.type_conversion || 0) > 0 ? badge("类型转换 " + (bk.type_conversion || 0), "info") : null,
         el("div", { className: "pills" },
           [
             { m: "five", l: "五栏对标视图" },
@@ -2550,6 +2675,7 @@ _CROSS_ENV_APP_JS = r"""
           [
             { k: "ALL", l: "全部" }, { k: "UNIFIED", l: "一致" }, { k: "SPLIT_DIFF", l: "异标" },
             { k: "SPLIT_PARTIAL", l: "单侧" }, { k: "MIGRATE", l: "待贯标" },
+            { k: "CAP_ISSUE", l: "容量不足" }, { k: "TYPE_CONV", l: "类型转换" },
             ...(state.pairViewMode === "flat" ? [{ k: "CANDIDATE", l: "待配对" }] : []),
           ].map((fp) => el("button", {
             type: "button", className: "pill " + (state.rowFilter === fp.k ? "is-active" : ""),
@@ -2582,12 +2708,14 @@ _CROSS_ENV_APP_JS = r"""
             ? el("div", { className: "table-wrap" },
                 el("table", { className: "grid" },
                   el("thead", {}, el("tr", {},
-                    ["映射表键", "来源表", "目标表", "已映射组", "标准一致", "标准异标", "单侧绑标", "目标待贯标", "源待选", "目标待选"].map((h) => el("th", { text: h }))
+                    ["映射表键", "来源表", "目标表", "已映射组", "标准一致", "标准异标", "单侧绑标", "容量不足", "类型转换", "目标待贯标", "源待选", "目标待选"].map((h) => el("th", { text: h }))
                   )),
                   el("tbody", {}, pList.map((p) => {
                     const tb = p.table_binding || {};
                     const bk = p.bookmark_summary || {};
                     const k = tb.std_table_key || "";
+                    const capIns = bk.capacity_insufficient || 0;
+                    const capRisk = bk.capacity_risk || 0;
                     return el("tr", {
                       className: "is-clickable",
                       onClick: () => {
@@ -2605,6 +2733,8 @@ _CROSS_ENV_APP_JS = r"""
                       el("td", {}, badge(String(bk.unified || 0), (bk.unified || 0) > 0 ? "ok" : "")),
                       el("td", {}, badge(String(bk.split_diff || 0), (bk.split_diff || 0) > 0 ? "bad" : "")),
                       el("td", {}, badge(String(bk.split_partial || 0), (bk.split_partial || 0) > 0 ? "info" : "")),
+                      el("td", {}, badge(String(capIns + capRisk), capIns > 0 ? "bad" : (capRisk > 0 ? "warn" : ""))),
+                      el("td", {}, badge(String(bk.type_conversion || 0), (bk.type_conversion || 0) > 0 ? "info" : "")),
                       el("td", {}, badge(String(bk.target_needs_migration || 0), (bk.target_needs_migration || 0) > 0 ? "warn" : "")),
                       el("td", { className: "mono", text: String((p.source_candidates || []).length) }),
                       el("td", { className: "mono", text: String((p.target_candidates || []).length) })
@@ -2660,6 +2790,8 @@ _CROSS_ENV_APP_JS = r"""
       [
         { v: "ALL", t: "全部已保存表对 (" + PAIRS.length + ")" },
         { v: "HAS_DIFF", t: "含标准异标" },
+        { v: "HAS_CAP_ISSUE", t: "含长度/精度不足" },
+        { v: "HAS_TYPE_CONV", t: "含类型转换" },
         { v: "HAS_MIG", t: "目标库待贯标" },
         { v: "UNIFIED_ONLY", t: "完全一致" },
       ].map((o) => {

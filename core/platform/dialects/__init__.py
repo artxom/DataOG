@@ -25,11 +25,13 @@ from core.platform.dialects.identifiers import (
 )
 from core.platform.dialects.types import (
     SUPPORTED_DIALECTS,
+    analyze_cross_column_compatibility,
     clean_sql_type_input,
     is_cross_type_compatible,
     is_generic_or_unbounded_type,
     normalize_cross_type,
     normalize_dws_type,
+    parse_sql_type_spec,
     translate_column_type,
     validate_sql_type,
 )
@@ -45,6 +47,7 @@ __all__ = [
     "BACKTICK_DIALECTS",
     "SUPPORTED_DIALECTS",
     "SYSTEM_SCHEMAS",
+    "analyze_cross_column_compatibility",
     "build_dialect_ddl",
     "clean_identifier_input",
     "clean_sql_type_input",
@@ -60,6 +63,7 @@ __all__ = [
     "normalize_cross_type",
     "normalize_dws_type",
     "parse_dws_tabledef",
+    "parse_sql_type_spec",
     "parse_view_sql_lineage",
     "partition_clause_has_child_defs",
     "quote_backtick_str",

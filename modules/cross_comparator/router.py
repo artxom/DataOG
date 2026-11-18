@@ -152,6 +152,18 @@ async def api_cross_compare_pair(
         return _err(str(exc), 400)
 
 
+@router.get("/pairs/search")
+def api_cross_search_pairs(
+    keyword: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=500),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return CrossComparatorService(ctx).search_saved_pairs(keyword=keyword, limit=limit)
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
 @router.post("/prefetch-pairs")
 async def api_cross_prefetch_pairs(
     request: Request,

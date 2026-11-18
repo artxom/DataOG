@@ -21,6 +21,7 @@ from openpyxl.utils import get_column_letter
 
 from core.platform.context import PlatformContext
 from core.platform.dialects import (
+    analyze_cross_column_compatibility,
     clean_identifier_input,
     is_cross_type_compatible,
     normalize_cross_type,
@@ -459,6 +460,243 @@ class CrossComparatorService:
             "dict_summary": self.ctx.standard_catalog.get_summary(),
             "source_connection": src_conn,
             "target_connection": tgt_conn,
+        }
+
+    def search_saved_pairs(self, keyword: str = "", limit: int = 200) -> Dict[str, Any]:
+        """按表名、映射字段名或缓存库表物理字段/注释检索已保存映射表对."""
+        kw = (keyword or "").strip()
+        kw_low = kw.lower()
+        max_limit = max(1, min(500, int(limit or 200)))
+
+        src_prof = self._resolve_role_profile("source")
+        tgt_prof = self._resolve_role_profile("target")
+        src_cid = src_prof.connection_id if src_prof else ""
+        tgt_cid = tgt_prof.connection_id if tgt_prof else ""
+        src_def_sch = src_prof.effective_default_schema() if src_prof else "public"
+        tgt_def_sch = tgt_prof.effective_default_schema() if tgt_prof else "public"
+
+        with self.ctx.store.module_db() as conn:
+            t_rows = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM cross_table_bindings ORDER BY id ASC"
+                ).fetchall()
+            ]
+            if not t_rows:
+                return {"ok": True, "keyword": kw, "total": 0, "items": []}
+
+            col_counts: Dict[str, int] = {}
+            saved_cols_by_key: Dict[str, List[Dict[str, str]]] = {}
+            for r in conn.execute(
+                """
+                SELECT std_table_key, orig_col_name, std_col_name, std_col_comment,
+                       bound_source_col, bound_target_col
+                FROM cross_column_bindings
+                ORDER BY row_index ASC, id ASC
+                """
+            ).fetchall():
+                t_key = str(r["std_table_key"] or "").strip().lower()
+                if not t_key:
+                    continue
+                col_counts[t_key] = col_counts.get(t_key, 0) + 1
+                if kw_low:
+                    saved_cols_by_key.setdefault(t_key, []).append(
+                        {
+                            "bound_source_col": str(r["bound_source_col"] or ""),
+                            "bound_target_col": str(r["bound_target_col"] or ""),
+                            "orig_col_name": str(r["orig_col_name"] or ""),
+                            "std_col_name": str(r["std_col_name"] or ""),
+                            "std_col_comment": str(r["std_col_comment"] or ""),
+                        }
+                    )
+
+            meta_hits: Dict[Tuple[str, str, str], List[str]] = {}
+            fsb_hits: Dict[Tuple[str, str, str], List[str]] = {}
+            if kw_low and (src_cid or tgt_cid):
+                like_pat = f"%{kw_low}%"
+                cid_list = list(dict.fromkeys(c for c in (src_cid, tgt_cid) if c))
+                ph = ",".join("?" for _ in cid_list)
+                for mr in conn.execute(
+                    f"""
+                    SELECT connection_id, schema_name, table_name, column_name, column_comment
+                    FROM meta_columns
+                    WHERE connection_id IN ({ph})
+                      AND (LOWER(column_name) LIKE ? OR LOWER(column_comment) LIKE ?)
+                    ORDER BY ordinal_position ASC
+                    """,
+                    [*cid_list, like_pat, like_pat],
+                ).fetchall():
+                    mk = (
+                        str(mr["connection_id"] or ""),
+                        clean_identifier_input(str(mr["schema_name"] or "")).lower(),
+                        clean_identifier_input(str(mr["table_name"] or "")).lower(),
+                    )
+                    cname = str(mr["column_name"] or "").strip()
+                    if cname:
+                        meta_hits.setdefault(mk, []).append(cname)
+
+                for fr in conn.execute(
+                    f"""
+                    SELECT connection_id, schema_name, table_name, column_name, std_code
+                    FROM field_standard_bindings
+                    WHERE connection_id IN ({ph})
+                      AND (LOWER(column_name) LIKE ? OR LOWER(std_code) LIKE ?)
+                    ORDER BY id ASC
+                    """,
+                    [*cid_list, like_pat, like_pat],
+                ).fetchall():
+                    fk = (
+                        str(fr["connection_id"] or ""),
+                        clean_identifier_input(str(fr["schema_name"] or "")).lower(),
+                        clean_identifier_input(str(fr["table_name"] or "")).lower(),
+                    )
+                    cname = str(fr["column_name"] or "").strip()
+                    if cname:
+                        fsb_hits.setdefault(fk, []).append(cname)
+
+        def _append_unique(dst: List[str], seen_set: Set[str], val: str) -> None:
+            v = clean_identifier_input(val) or val.strip()
+            if not v:
+                return
+            vl = v.lower()
+            if vl not in seen_set:
+                seen_set.add(vl)
+                dst.append(v)
+
+        def _lookup_side_hits(
+            cid: str, raw_sch: str, raw_tbl: str, def_sch: str, is_sqlite: bool
+        ) -> List[str]:
+            if not cid or not raw_tbl:
+                return []
+            tbl_low = clean_identifier_input(raw_tbl).lower()
+            sch_low = clean_identifier_input(raw_sch).lower()
+            sch_candidates: List[str] = []
+            if is_sqlite:
+                sch_candidates = ["main"] if not sch_low or sch_low == "public" else [sch_low, "main"]
+            else:
+                if sch_low:
+                    sch_candidates.append(sch_low)
+                if (not sch_low or sch_low == "public") and def_sch.lower() not in sch_candidates:
+                    sch_candidates.append(def_sch.lower())
+            hits: List[str] = []
+            for sl in sch_candidates:
+                hits.extend(meta_hits.get((cid, sl, tbl_low), ()))
+                hits.extend(fsb_hits.get((cid, sl, tbl_low), ()))
+            return hits
+
+        matched_table_first: List[Dict[str, Any]] = []
+        matched_col_only: List[Dict[str, Any]] = []
+
+        for t in t_rows:
+            t_key = str(t.get("std_table_key") or "").strip().lower()
+            s_sch = str(t.get("source_schema") or "").strip()
+            s_tbl = str(t.get("source_table") or t.get("std_table_name") or "").strip()
+            t_sch = str(t.get("target_schema") or "").strip()
+            t_tbl = str(t.get("target_table") or t.get("std_table_name") or "").strip()
+            col_cnt = col_counts.get(t_key, 0)
+
+            if not kw_low:
+                matched_table_first.append(
+                    {
+                        "std_table_key": t_key,
+                        "source_schema": s_sch,
+                        "source_table": s_tbl,
+                        "target_schema": t_sch,
+                        "target_table": t_tbl,
+                        "std_table_name": str(t.get("std_table_name") or ""),
+                        "column_count": col_cnt,
+                        "match_scope": "all",
+                        "matched_source_cols": [],
+                        "matched_target_cols": [],
+                        "matched_source_count": 0,
+                        "matched_target_count": 0,
+                    }
+                )
+                continue
+
+            tbl_fields = (
+                t_key,
+                s_sch.lower(),
+                s_tbl.lower(),
+                t_sch.lower(),
+                t_tbl.lower(),
+                str(t.get("std_table_name") or "").lower(),
+                f"{s_sch}.{s_tbl}".lower(),
+                f"{t_sch}.{t_tbl}".lower(),
+                f"{s_tbl} ↔ {t_tbl}".lower(),
+            )
+            tbl_hit = any(kw_low in f for f in tbl_fields if f)
+
+            m_src: List[str] = []
+            m_tgt: List[str] = []
+            seen_src_l: Set[str] = set()
+            seen_tgt_l: Set[str] = set()
+
+            for c in saved_cols_by_key.get(t_key, ()):
+                sc_nm = c["bound_source_col"]
+                tc_nm = c["bound_target_col"]
+                orig_nm = c["orig_col_name"]
+                std_nm = "" if c["std_col_name"].startswith("__unpaired_") else c["std_col_name"]
+                std_cm = c["std_col_comment"]
+                if sc_nm and (kw_low in sc_nm.lower() or (std_cm and kw_low in std_cm.lower())):
+                    _append_unique(m_src, seen_src_l, sc_nm)
+                elif not sc_nm and orig_nm and kw_low in orig_nm.lower() and not tc_nm:
+                    _append_unique(m_src, seen_src_l, orig_nm)
+
+                if tc_nm and (
+                    kw_low in tc_nm.lower()
+                    or (std_nm and kw_low in std_nm.lower())
+                    or (std_cm and kw_low in std_cm.lower())
+                ):
+                    _append_unique(m_tgt, seen_tgt_l, tc_nm)
+
+            for hit_c in _lookup_side_hits(
+                src_cid,
+                s_sch or src_def_sch,
+                s_tbl,
+                src_def_sch,
+                bool(src_prof and src_prof.db_type == "SQLITE"),
+            ):
+                _append_unique(m_src, seen_src_l, hit_c)
+
+            for hit_c in _lookup_side_hits(
+                tgt_cid,
+                t_sch or tgt_def_sch,
+                t_tbl,
+                tgt_def_sch,
+                bool(tgt_prof and tgt_prof.db_type == "SQLITE"),
+            ):
+                _append_unique(m_tgt, seen_tgt_l, hit_c)
+
+            col_hit = bool(m_src or m_tgt)
+            if not tbl_hit and not col_hit:
+                continue
+
+            item = {
+                "std_table_key": t_key,
+                "source_schema": s_sch,
+                "source_table": s_tbl,
+                "target_schema": t_sch,
+                "target_table": t_tbl,
+                "std_table_name": str(t.get("std_table_name") or ""),
+                "column_count": col_cnt,
+                "match_scope": "both" if (tbl_hit and col_hit) else ("table" if tbl_hit else "column"),
+                "matched_source_cols": m_src[:4],
+                "matched_target_cols": m_tgt[:4],
+                "matched_source_count": len(m_src),
+                "matched_target_count": len(m_tgt),
+            }
+            if tbl_hit:
+                matched_table_first.append(item)
+            else:
+                matched_col_only.append(item)
+
+        combined = matched_table_first + matched_col_only
+        return {
+            "ok": True,
+            "keyword": kw,
+            "total": len(combined),
+            "items": combined[:max_limit],
         }
 
     def prefetch_saved_pairs(
@@ -1033,6 +1271,13 @@ class CrossComparatorService:
                     env_diff_text = f"两库差异: {src_col.column_name}({src_col.data_type}) ↔ {tgt_col.column_name}({tgt_col.data_type})"
                     summary["source_diff"] += 1
 
+            cross_compat = analyze_cross_column_compatibility(
+                src_col.data_type if src_col else "",
+                tgt_col.data_type if tgt_col else "",
+                source_db_type=str(src_conn.get("db_type") or ""),
+                target_db_type=str(tgt_conn.get("db_type") or ""),
+            )
+
             enriched_std_cols.append(
                 {
                     **sc,
@@ -1063,6 +1308,7 @@ class CrossComparatorService:
                     "target_status": tgt_status,
                     "target_detail": tgt_detail,
                     "env_diff_text": env_diff_text,
+                    "cross_compat": cross_compat,
                 }
             )
 
@@ -1474,6 +1720,9 @@ class CrossComparatorService:
             "split_partial": 0,
             "split_unbound": 0,
             "target_needs_migration": 0,
+            "capacity_insufficient": 0,
+            "capacity_risk": 0,
+            "type_conversion": 0,
         }
 
         for idx, rp in enumerate(raw_pairs, start=1):
@@ -1527,6 +1776,24 @@ class CrossComparatorService:
             src_std_brief = _std_brief(s_code, src_db_type, eff_src_fmt)
             tgt_std_brief = _std_brief(t_code, tgt_db_type, eff_tgt_fmt)
 
+            if paired and src_col_info and tgt_col_info:
+                cross_compat = analyze_cross_column_compatibility(
+                    str(src_col_info.get("data_type") or ""),
+                    str(tgt_col_info.get("data_type") or ""),
+                    source_db_type=src_db_type,
+                    target_db_type=tgt_db_type,
+                )
+            else:
+                cross_compat = analyze_cross_column_compatibility("", "")
+
+            if cross_compat.get("applicable"):
+                if cross_compat["capacity_status"] == "INSUFFICIENT":
+                    bk_summary["capacity_insufficient"] += 1
+                elif cross_compat["capacity_status"] == "RISK":
+                    bk_summary["capacity_risk"] += 1
+                if cross_compat.get("has_type_conversion"):
+                    bk_summary["type_conversion"] += 1
+
             # 判定目标库字段相对绑定标准的物理合规度（供淡绿书签附「待贯标」轻角标）
             target_compliance = None
             target_needs_migration = False
@@ -1558,6 +1825,7 @@ class CrossComparatorService:
                     "target_std": tgt_std_brief,
                     "target_compliance": target_compliance,
                     "target_needs_migration": target_needs_migration,
+                    "cross_compat": cross_compat,
                     "fallback_std_name": rp["fallback_std_name"],
                     "fallback_std_type": rp["fallback_std_type"],
                     "fallback_std_comment": rp["fallback_std_comment"],
@@ -2752,6 +3020,8 @@ class CrossComparatorService:
             "目标库当前注释",
             "目标库落标状态",
             "三方比对诊断详情",
+            "目标长度/精度包络",
+            "是否涉及类型转换",
         ]
         ws.append(headers)
 
@@ -2790,6 +3060,7 @@ class CrossComparatorService:
             for sc in comp["standard_panel"]["columns"]:
                 src_m = sc.get("source_col_meta") or {}
                 tgt_m = sc.get("target_col_meta") or {}
+                cc = sc.get("cross_compat") or {}
                 ws.append(
                     [
                         row_num,
@@ -2813,11 +3084,13 @@ class CrossComparatorService:
                         tgt_m.get("column_comment", ""),
                         sc.get("target_status", ""),
                         sc.get("target_detail", ""),
+                        cc.get("capacity_label") or "-",
+                        cc.get("type_conv_label") or "-",
                     ]
                 )
                 row_num += 1
 
-        widths = [6, 14, 22, 14, 22, 20, 18, 22, 20, 16, 20, 22, 18, 24, 14, 22, 20, 18, 22, 16, 36]
+        widths = [6, 14, 22, 14, 22, 20, 18, 22, 20, 16, 20, 22, 18, 24, 14, 22, 20, 18, 22, 16, 36, 22, 22]
         for idx, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = w
 
@@ -2850,7 +3123,12 @@ class CrossComparatorService:
             "split_partial": 0,
             "split_unbound": 0,
             "target_needs_migration": 0,
+            "capacity_insufficient": 0,
+            "capacity_risk": 0,
+            "type_conversion": 0,
         }
+        src_db_type = str(src_panel_raw.get("db_type") or "")
+        tgt_db_type = str(tgt_panel_raw.get("db_type") or "")
 
         for dr in dual_rows:
             s_col = dr.get("source_col")
@@ -2897,6 +3175,28 @@ class CrossComparatorService:
             if t_needs_mig:
                 bk_summary["target_needs_migration"] += 1
 
+            if paired:
+                raw_cc = dr.get("cross_compat")
+                if isinstance(raw_cc, dict) and "capacity_status" in raw_cc:
+                    cc = dict(raw_cc)
+                else:
+                    cc = analyze_cross_column_compatibility(
+                        str((bound_src or {}).get("data_type") or ""),
+                        str((bound_tgt or {}).get("data_type") or ""),
+                        source_db_type=src_db_type,
+                        target_db_type=tgt_db_type,
+                    )
+            else:
+                cc = analyze_cross_column_compatibility("", "")
+
+            if cc.get("applicable"):
+                if cc.get("capacity_status") == "INSUFFICIENT":
+                    bk_summary["capacity_insufficient"] += 1
+                elif cc.get("capacity_status") == "RISK":
+                    bk_summary["capacity_risk"] += 1
+                if cc.get("has_type_conversion"):
+                    bk_summary["type_conversion"] += 1
+
             center_rows.append(
                 {
                     **dr,
@@ -2910,6 +3210,7 @@ class CrossComparatorService:
                     "target_std": dr.get("target_std") if bound_tgt else None,
                     "target_compliance": dr.get("target_compliance") if bound_tgt else None,
                     "target_needs_migration": t_needs_mig,
+                    "cross_compat": cc,
                 }
             )
 
@@ -3337,6 +3638,9 @@ class CrossComparatorService:
             "split_partial_cols": 0,
             "total_center_rows": 0,
             "target_needs_migration_cols": 0,
+            "capacity_insufficient_cols": 0,
+            "capacity_risk_cols": 0,
+            "type_conversion_cols": 0,
             "unbound_src_cols": 0,
             "unbound_tgt_cols": 0,
         }
@@ -3377,6 +3681,9 @@ class CrossComparatorService:
             agg["split_partial_cols"] += int(bk_s.get("split_partial") or 0)
             agg["total_center_rows"] += len(hydrated["center_rows"])
             agg["target_needs_migration_cols"] += int(bk_s.get("target_needs_migration") or 0)
+            agg["capacity_insufficient_cols"] += int(bk_s.get("capacity_insufficient") or 0)
+            agg["capacity_risk_cols"] += int(bk_s.get("capacity_risk") or 0)
+            agg["type_conversion_cols"] += int(bk_s.get("type_conversion") or 0)
             agg["unbound_src_cols"] += len(hydrated["source_candidates"])
             agg["unbound_tgt_cols"] += len(hydrated["target_candidates"])
 

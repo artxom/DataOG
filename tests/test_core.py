@@ -1127,6 +1127,109 @@ ENABLE ROW MOVEMENT;"""
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0]["new_col_name"], "new_c")
 
+    def test_cross_column_capacity_and_type_conversion_matrix(self) -> None:
+        """验证跨库字段长度/精度包络与类型转换双维判定全矩阵."""
+        from core.platform.dialects import analyze_cross_column_compatibility
+
+        # 1. 空类型兜底
+        na = analyze_cross_column_compatibility("", "VARCHAR(32)")
+        self.assertFalse(na["applicable"])
+        self.assertEqual(na["capacity_status"], "N/A")
+        self.assertEqual(na["capacity_label"], "-")
+        self.assertEqual(na["type_conv_status"], "N/A")
+        self.assertEqual(na["type_conv_label"], "-")
+
+        # 2. 字符长度扩展 / 缩窄 / 无界文本 / CHAR vs BYTE
+        s_ok = analyze_cross_column_compatibility("VARCHAR2(32)", "VARCHAR(64)")
+        self.assertEqual(s_ok["capacity_status"], "CONTAINED")
+        self.assertEqual(s_ok["type_conv_status"], "NONE")
+        self.assertFalse(s_ok["has_type_conversion"])
+
+        s_short = analyze_cross_column_compatibility("VARCHAR(100)", "VARCHAR(50)")
+        self.assertEqual(s_short["capacity_status"], "INSUFFICIENT")
+        self.assertIn("100→50", s_short["capacity_label"])
+        self.assertFalse(s_short["has_type_conversion"])
+
+        s_unbounded = analyze_cross_column_compatibility("TEXT", "VARCHAR(255)")
+        self.assertEqual(s_unbounded["capacity_status"], "INSUFFICIENT")
+        self.assertFalse(s_unbounded["has_type_conversion"])
+
+        s_char_byte = analyze_cross_column_compatibility("VARCHAR2(32 CHAR)", "VARCHAR2(64 BYTE)")
+        self.assertEqual(s_char_byte["capacity_status"], "RISK")
+        self.assertIn("CHAR", s_char_byte["capacity_label"])
+
+        # 3. 定点数值整数位与小数位双维校验（含总长相同但整数位缩窄陷阱）
+        d_int_short = analyze_cross_column_compatibility("DECIMAL(18,2)", "DECIMAL(10,2)")
+        self.assertEqual(d_int_short["capacity_status"], "INSUFFICIENT")
+        self.assertIn("整数位", d_int_short["capacity_label"])
+        self.assertEqual(d_int_short["type_conv_status"], "NONE")
+
+        d_scale_short = analyze_cross_column_compatibility("DECIMAL(18,4)", "DECIMAL(18,2)")
+        self.assertEqual(d_scale_short["capacity_status"], "INSUFFICIENT")
+        self.assertIn("小数精度", d_scale_short["capacity_label"])
+
+        d_same_prec_trap = analyze_cross_column_compatibility("DECIMAL(18,2)", "DECIMAL(18,4)")
+        self.assertEqual(d_same_prec_trap["capacity_status"], "INSUFFICIENT")
+        self.assertIn("16→14", d_same_prec_trap["capacity_label"])
+
+        d_ok = analyze_cross_column_compatibility("NUMBER(18,2)", "DECIMAL(20,4)")
+        self.assertEqual(d_ok["capacity_status"], "CONTAINED")
+        self.assertFalse(d_ok["has_type_conversion"])
+
+        # 4. 整型位宽与 MySQL 显示宽度豁免
+        i_mysql_disp = analyze_cross_column_compatibility("INT(11)", "INTEGER(4)", "MYSQL", "DWS")
+        self.assertEqual(i_mysql_disp["capacity_status"], "CONTAINED")
+        self.assertEqual(i_mysql_disp["type_conv_status"], "NONE")
+
+        i_narrow = analyze_cross_column_compatibility("BIGINT", "INT")
+        self.assertEqual(i_narrow["capacity_status"], "INSUFFICIENT")
+        self.assertIn("64位→32位", i_narrow["capacity_label"])
+
+        # 5. 整型与定点互转
+        i_to_dec_ok = analyze_cross_column_compatibility("INT", "DECIMAL(18,2)")
+        self.assertEqual(i_to_dec_ok["capacity_status"], "CONTAINED")
+        self.assertEqual(i_to_dec_ok["type_conv_status"], "SAFE_CAST")
+        self.assertTrue(i_to_dec_ok["has_type_conversion"])
+
+        i_to_dec_short = analyze_cross_column_compatibility("INT", "DECIMAL(8,2)")
+        self.assertEqual(i_to_dec_short["capacity_status"], "INSUFFICIENT")
+        self.assertEqual(i_to_dec_short["type_conv_status"], "SAFE_CAST")
+
+        dec_to_int_loss = analyze_cross_column_compatibility("DECIMAL(18,2)", "BIGINT")
+        self.assertEqual(dec_to_int_loss["capacity_status"], "INSUFFICIENT")
+        self.assertEqual(dec_to_int_loss["type_conv_status"], "CAST_REQUIRED")
+
+        num_zero_to_bigint = analyze_cross_column_compatibility("NUMBER(10,0)", "BIGINT", "ORACLE", "DWS")
+        self.assertEqual(num_zero_to_bigint["capacity_status"], "CONTAINED")
+        self.assertEqual(num_zero_to_bigint["type_conv_status"], "SAFE_CAST")
+
+        # 6. VARCHAR <-> DATE / TIMESTAMP（核心场景）
+        v_to_date = analyze_cross_column_compatibility("VARCHAR(20)", "DATE")
+        self.assertEqual(v_to_date["type_conv_status"], "CAST_REQUIRED")
+        self.assertTrue(v_to_date["has_type_conversion"])
+        self.assertIn("字符→日期", v_to_date["type_conv_label"])
+        self.assertEqual(v_to_date["capacity_status"], "RISK")
+
+        date_to_v_ok = analyze_cross_column_compatibility("DATE", "VARCHAR(20)")
+        self.assertEqual(date_to_v_ok["type_conv_status"], "CAST_REQUIRED")
+        self.assertEqual(date_to_v_ok["capacity_status"], "CONTAINED")
+
+        date_to_v_short = analyze_cross_column_compatibility("DATE", "VARCHAR(6)")
+        self.assertEqual(date_to_v_short["type_conv_status"], "CAST_REQUIRED")
+        self.assertEqual(date_to_v_short["capacity_status"], "INSUFFICIENT")
+
+        ts_to_v_short = analyze_cross_column_compatibility("TIMESTAMP", "VARCHAR(10)")
+        self.assertEqual(ts_to_v_short["type_conv_status"], "CAST_REQUIRED")
+        self.assertEqual(ts_to_v_short["capacity_status"], "INSUFFICIENT")
+
+        ts_to_date = analyze_cross_column_compatibility("TIMESTAMP", "DATE")
+        self.assertEqual(ts_to_date["type_conv_status"], "CAST_REQUIRED")
+        self.assertEqual(ts_to_date["capacity_status"], "INSUFFICIENT")
+
+        date_to_ts = analyze_cross_column_compatibility("DATE", "TIMESTAMP")
+        self.assertEqual(date_to_ts["type_conv_status"], "SAFE_CAST")
+        self.assertEqual(date_to_ts["capacity_status"], "CONTAINED")
+
 
 if __name__ == "__main__":
     unittest.main()

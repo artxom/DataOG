@@ -604,6 +604,16 @@ export const crossApi = {
       "/api/modules/cross_comparator/prefetch-pairs",
       withRequestOpts({ method: "POST", body: payload }, opts)
     ),
+  searchPairs: (keyword = "", limit = 200, opts = {}) => {
+    const qs = new URLSearchParams();
+    if (keyword) qs.set("keyword", keyword);
+    if (limit) qs.set("limit", String(limit));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return requestJson(
+      `/api/modules/cross_comparator/pairs/search${suffix}`,
+      withRequestOpts({}, opts)
+    );
+  },
   bindRole: (payload, opts = {}) =>
     requestJson(
       "/api/modules/cross_comparator/bind-role",

@@ -8,6 +8,7 @@
 import { crossApi, isAbortError, platformApi, standardsApi } from "../core/api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
+import { analyzeCrossColumnCompat } from "../core/type_compat.js";
 import { openExportReportModal } from "../ui/export_report_modal.js";
 import { Modal } from "../ui/modal.js";
 import { openStandardPickerModal } from "../ui/standard_picker_modal.js";
@@ -91,6 +92,80 @@ export class CrossComparatorView {
     this._prefetchedSignature = "";
     this._destroyed = false;
 
+    this.pairPickerOpen = false;
+    this.pairSearchQuery = "";
+    this.pairSearchTimer = null;
+    this.pairSearchAbort = null;
+    this.remotePairSearchResults = null;
+    this.pairHighlightIdx = -1;
+    this._filteredPairItems = [];
+
+    this.pairSearchInput = el("input", {
+      className: "mac-input input-xs cross-pair-input",
+      type: "search",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      "aria-label": "已保存映射表对",
+      placeholder: "已保存映射表对 (搜表/字段)...",
+      onFocus: () => this._openPairPicker(),
+      onClick: () => {
+        if (!this.pairPickerOpen) this._openPairPicker();
+      },
+      onInput: (e) => this._handlePairSearchInput(e.target.value),
+      onKeydown: (e) => this._handlePairPickerKeydown(e),
+    });
+    this.pairPickerBadge = el("span", { className: "badge cross-pair-count", text: "0" });
+    this.pairClearBtn = el("button", {
+      type: "button",
+      className: "cross-chip-remove cross-pair-clear-btn",
+      title: "清空搜索或取消已选表对",
+      text: "×",
+      hidden: true,
+      onClick: (e) => {
+        e.stopPropagation();
+        if (this.pairPickerOpen && this.pairSearchQuery) {
+          this.pairSearchQuery = "";
+          this.pairSearchInput.value = "";
+          this.remotePairSearchResults = null;
+          this._renderPairPopover();
+          this._syncPairPickerDisplay();
+          this.pairSearchInput.focus();
+          return;
+        }
+        if (this.activeTableKey) {
+          this.activeTableKey = "";
+          this._closePairPicker();
+          if (this.loadedOnce && this.overview) {
+            this.loadPairComparison("", false);
+          } else {
+            this.loadOverview("", false);
+          }
+        }
+      },
+    });
+    this.pairPopover = el("div", { className: "cross-pair-popover", hidden: true });
+    this.pairPickerRoot = el(
+      "div",
+      { className: "cross-pair-picker" },
+      el(
+        "div",
+        { className: "cross-pair-input-wrap" },
+        el("span", { className: "cross-pair-icon" }, svgIcon("search", 12)),
+        this.pairSearchInput,
+        this.pairClearBtn,
+        this.pairPickerBadge
+      ),
+      this.pairPopover
+    );
+    this._onDocPointerDown = (e) => {
+      if (this.pairPickerOpen && this.pairPickerRoot && !this.pairPickerRoot.contains(e.target)) {
+        this._closePairPicker();
+      }
+    };
+    document.addEventListener("pointerdown", this._onDocPointerDown);
+
     this.activityBar = new TaskActivityBar();
     this.activityBar.el.style.margin = "6px 14px 0";
     this.activityBar.el.style.flexShrink = "0";
@@ -108,6 +183,9 @@ export class CrossComparatorView {
 
   destroy() {
     this._destroyed = true;
+    clearTimeout(this.pairSearchTimer);
+    this.pairSearchAbort?.abort();
+    document.removeEventListener("pointerdown", this._onDocPointerDown);
     this.activityBar?.destroy();
     this._unsubStore?.();
     this._unsubStore = null;
@@ -330,6 +408,29 @@ export class CrossComparatorView {
     } else {
       row.bookmark_state = "SPLIT_UNBOUND";
     }
+    const sDb = String(this.overview?.source_connection?.db_type || "");
+    const tDb = String(this.overview?.target_connection?.db_type || "");
+    if (!paired) {
+      row.cross_compat = analyzeCrossColumnCompat("", "");
+    } else {
+      const sType = String(row.source_col?.data_type || "");
+      const tType = String(row.target_col?.data_type || "");
+      const prev = row.cross_compat;
+      if (
+        !prev ||
+        prev._srcType !== sType ||
+        prev._tgtType !== tType ||
+        prev._srcDb !== sDb ||
+        prev._tgtDb !== tDb
+      ) {
+        const nextCc = analyzeCrossColumnCompat(sType, tType, sDb, tDb);
+        nextCc._srcType = sType;
+        nextCc._tgtType = tType;
+        nextCc._srcDb = sDb;
+        nextCc._tgtDb = tDb;
+        row.cross_compat = nextCc;
+      }
+    }
     return row;
   }
 
@@ -343,6 +444,9 @@ export class CrossComparatorView {
       unbound_src: this.sourceCandidates.length,
       unbound_tgt: this.targetCandidates.length,
       target_needs_migration: 0,
+      capacity_insufficient: 0,
+      capacity_risk: 0,
+      type_conversion: 0,
     };
     for (const r of this.centerRows) {
       this._recomputeRowState(r);
@@ -351,6 +455,12 @@ export class CrossComparatorView {
       else if (r.bookmark_state === "SPLIT_DIFF") sum.split_diff += 1;
       else sum.split_partial += 1;
       if (r.target_needs_migration) sum.target_needs_migration += 1;
+      const cc = r.cross_compat;
+      if (cc?.applicable) {
+        if (cc.capacity_status === "INSUFFICIENT") sum.capacity_insufficient += 1;
+        else if (cc.capacity_status === "RISK") sum.capacity_risk += 1;
+        if (cc.has_type_conversion) sum.type_conversion += 1;
+      }
     }
     return sum;
   }
@@ -414,6 +524,18 @@ export class CrossComparatorView {
       if (boundTgt) seenTgt.add(String(boundTgt.column_name || "").toLowerCase());
 
       if (boundSrc || boundTgt) {
+        const sDb = String(this.overview?.source_connection?.db_type || "");
+        const tDb = String(this.overview?.target_connection?.db_type || "");
+        let initCc = null;
+        if (boundSrc && boundTgt && dr.cross_compat && dr.cross_compat.capacity_status !== undefined) {
+          initCc = {
+            ...dr.cross_compat,
+            _srcType: String(boundSrc.data_type || ""),
+            _tgtType: String(boundTgt.data_type || ""),
+            _srcDb: sDb,
+            _tgtDb: tDb,
+          };
+        }
         this.centerRows.push(
           this._recomputeRowState({
             row_id: dr.row_id || `row_${this.centerRows.length + 1}`,
@@ -425,6 +547,7 @@ export class CrossComparatorView {
             target_std: boundTgt && dr.target_std ? { ...dr.target_std } : null,
             target_compliance: boundTgt && dr.target_compliance ? { ...dr.target_compliance } : null,
             target_needs_migration: Boolean(boundTgt && dr.target_needs_migration),
+            cross_compat: initCc,
           })
         );
       }
@@ -1739,13 +1862,31 @@ export class CrossComparatorView {
     const isUnified = row.bookmark_state === "UNIFIED";
     const isTgt = side === "target";
     const tgtCompliant = row.target_compliance?.status === "COMPLIANT";
+    const cc = row.cross_compat;
+    const showCompat = Boolean(isTgt && row.paired && cc && cc.applicable);
+    const capTone =
+      cc?.capacity_status === "CONTAINED"
+        ? "success"
+        : cc?.capacity_status === "INSUFFICIENT"
+        ? "danger"
+        : cc?.capacity_status === "RISK"
+        ? "warn"
+        : "neutral";
+    const convTone =
+      cc?.type_conv_status === "CAST_REQUIRED"
+        ? "warn"
+        : cc?.type_conv_status === "SAFE_CAST"
+        ? "info"
+        : "neutral";
 
     return el(
       "div",
       {
         className: `cross-bound-chip ${isUnified ? "is-unified" : ""}`.trim(),
         draggable: true,
-        title: `${colObj.column_name} (${colObj.data_type || "-"})`,
+        title: showCompat
+          ? `${colObj.column_name} (${colObj.data_type || "-"}) | ${cc.capacity_label || "-"} | ${cc.type_conv_label || "-"}`
+          : `${colObj.column_name} (${colObj.data_type || "-"})`,
         onDragstart: (e) => {
           this.dragPayload = { kind: "bound", side, colName: colObj.column_name, rowIdx };
           if (e.dataTransfer) {
@@ -1806,7 +1947,18 @@ export class CrossComparatorView {
         colObj.column_comment
           ? el("span", { className: "cross-cand-comment", text: colObj.column_comment })
           : null
-      )
+      ),
+      showCompat
+        ? el(
+            "div",
+            {
+              className: "cross-compat-tags",
+              title: [cc.capacity_detail, cc.type_conv_detail].filter(Boolean).join("；"),
+            },
+            badge(cc.capacity_short || cc.capacity_label || "-", capTone),
+            badge(cc.type_conv_short || cc.type_conv_label || "-", convTone)
+          )
+        : null
     );
   }
 
@@ -2027,51 +2179,375 @@ export class CrossComparatorView {
     return el("div", { className: "cross-matrix-pane" }, ...matrixRows, newStdDropzone);
   }
 
+  _splitColsCsv(csvText) {
+    return String(csvText || "")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+  }
+
+  _getFilteredSavedPairs() {
+    const tables = this.overview?.tables || [];
+    const kw = String(this.pairSearchQuery || "").trim();
+    const kwLow = kw.toLowerCase();
+
+    const byKey = new Map();
+    const remoteItems =
+      kwLow &&
+      this.remotePairSearchResults &&
+      String(this.remotePairSearchResults.keyword || "").trim().toLowerCase() === kwLow
+        ? this.remotePairSearchResults.items || []
+        : null;
+
+    if (remoteItems) {
+      for (const r of remoteItems) {
+        byKey.set(String(r.std_table_key || "").toLowerCase(), r);
+      }
+    }
+
+    if (!kwLow) {
+      return tables.map((t) => ({
+        std_table_key: t.std_table_key,
+        source_schema: t.source_schema || "",
+        source_table: t.source_table || t.std_table_name || "",
+        target_schema: t.target_schema || "",
+        target_table: t.target_table || t.std_table_name || "",
+        std_table_name: t.std_table_name || "",
+        column_count: Number(t.column_count || 0),
+        match_scope: "all",
+        matched_source_cols: [],
+        matched_target_cols: [],
+      }));
+    }
+
+    const out = [];
+    const seen = new Set();
+
+    for (const t of tables) {
+      const tKey = String(t.std_table_key || "").toLowerCase();
+      const sSch = String(t.source_schema || "");
+      const sTbl = String(t.source_table || t.std_table_name || "");
+      const tSch = String(t.target_schema || "");
+      const tTbl = String(t.target_table || t.std_table_name || "");
+      const remoteHit = byKey.get(tKey);
+
+      const tblHit = [
+        tKey,
+        sSch.toLowerCase(),
+        sTbl.toLowerCase(),
+        tSch.toLowerCase(),
+        tTbl.toLowerCase(),
+        String(t.std_table_name || "").toLowerCase(),
+        `${sSch}.${sTbl}`.toLowerCase(),
+        `${tSch}.${tTbl}`.toLowerCase(),
+      ].some((v) => v && v.includes(kwLow));
+
+      const localSrcCols = this._splitColsCsv(t.source_cols_text).filter((c) =>
+        c.toLowerCase().includes(kwLow)
+      );
+      const localTgtCols = this._splitColsCsv(t.target_cols_text).filter((c) =>
+        c.toLowerCase().includes(kwLow)
+      );
+      const localStdCols = this._splitColsCsv(t.std_cols_text).filter((c) =>
+        c.toLowerCase().includes(kwLow)
+      );
+      const localComments = this._splitColsCsv(t.std_comments_text).filter((c) =>
+        c.toLowerCase().includes(kwLow)
+      );
+
+      const mSrc = [...localSrcCols];
+      const mTgt = [...localTgtCols];
+      if (remoteHit) {
+        for (const rc of remoteHit.matched_source_cols || []) {
+          if (!mSrc.some((x) => x.toLowerCase() === rc.toLowerCase())) mSrc.push(rc);
+        }
+        for (const rc of remoteHit.matched_target_cols || []) {
+          if (!mTgt.some((x) => x.toLowerCase() === rc.toLowerCase())) mTgt.push(rc);
+        }
+      }
+
+      const colHit =
+        Boolean(remoteHit) ||
+        mSrc.length > 0 ||
+        mTgt.length > 0 ||
+        localStdCols.length > 0 ||
+        localComments.length > 0;
+      if (!tblHit && !colHit) continue;
+
+      seen.add(tKey);
+      out.push({
+        std_table_key: t.std_table_key,
+        source_schema: sSch,
+        source_table: sTbl,
+        target_schema: tSch,
+        target_table: tTbl,
+        std_table_name: t.std_table_name || "",
+        column_count: Number(t.column_count || 0),
+        match_scope: tblHit && colHit ? "both" : tblHit ? "table" : "column",
+        matched_source_cols: mSrc.slice(0, 4),
+        matched_target_cols: mTgt.slice(0, 4),
+        matched_std_hints: [...localStdCols, ...localComments].slice(0, 2),
+      });
+    }
+
+    if (remoteItems) {
+      for (const r of remoteItems) {
+        const rk = String(r.std_table_key || "").toLowerCase();
+        if (!seen.has(rk)) {
+          seen.add(rk);
+          out.push(r);
+        }
+      }
+    }
+
+    return out;
+  }
+
+  _syncPairPickerDisplay() {
+    const tables = this.overview?.tables || [];
+    this.pairPickerBadge.textContent = String(tables.length);
+    if (!this.pairPickerOpen && document.activeElement !== this.pairSearchInput) {
+      const active = tables.find((t) => t.std_table_key === this.activeTableKey);
+      if (active) {
+        this.pairSearchInput.value = `${active.source_table || active.std_table_name} ↔ ${active.target_table || active.std_table_name}`;
+        this.pairSearchInput.classList.add("has-selection");
+        this.pairClearBtn.hidden = false;
+      } else {
+        this.pairSearchInput.value = "";
+        this.pairSearchInput.classList.remove("has-selection");
+        this.pairClearBtn.hidden = true;
+      }
+    } else {
+      this.pairClearBtn.hidden = !(this.pairSearchQuery || this.activeTableKey);
+    }
+  }
+
+  _openPairPicker() {
+    this.pairPickerOpen = true;
+    this.pairPickerRoot.classList.add("is-open");
+    this.pairSearchInput.classList.remove("has-selection");
+    this.pairSearchInput.value = this.pairSearchQuery;
+    this.pairHighlightIdx = -1;
+    this._renderPairPopover();
+    this.pairPopover.hidden = false;
+    this._syncPairPickerDisplay();
+  }
+
+  _closePairPicker() {
+    this.pairPickerOpen = false;
+    this.pairPickerRoot.classList.remove("is-open");
+    this.pairPopover.hidden = true;
+    this.pairSearchQuery = "";
+    this.remotePairSearchResults = null;
+    this.pairHighlightIdx = -1;
+    clearTimeout(this.pairSearchTimer);
+    this.pairSearchAbort?.abort();
+    this._syncPairPickerDisplay();
+  }
+
+  _selectSavedPair(tableKey) {
+    this.activeTableKey = tableKey || "";
+    this._closePairPicker();
+    if (this.loadedOnce && this.overview) {
+      this.loadPairComparison(this.activeTableKey, false);
+    } else {
+      this.loadOverview(this.activeTableKey, false);
+    }
+  }
+
+  _handlePairSearchInput(val) {
+    this.pairSearchQuery = val;
+    if (!this.pairPickerOpen) {
+      this.pairPickerOpen = true;
+      this.pairPickerRoot.classList.add("is-open");
+      this.pairPopover.hidden = false;
+    }
+    this.pairHighlightIdx = 0;
+    this._syncPairPickerDisplay();
+    this._renderPairPopover();
+
+    clearTimeout(this.pairSearchTimer);
+    const kw = String(val || "").trim();
+    if (!kw) {
+      this.remotePairSearchResults = null;
+      this.pairSearchAbort?.abort();
+      return;
+    }
+    this.pairSearchTimer = setTimeout(async () => {
+      if (this._destroyed || !this.pairPickerOpen) return;
+      this.pairSearchAbort?.abort();
+      this.pairSearchAbort = new AbortController();
+      try {
+        const res = await crossApi.searchPairs(kw, 120, {
+          signal: this.pairSearchAbort.signal,
+        });
+        if (!this._destroyed && this.pairPickerOpen && String(this.pairSearchQuery || "").trim() === kw) {
+          this.remotePairSearchResults = res;
+          this._renderPairPopover();
+        }
+      } catch (_ignore) {
+        // 忽略中断或离线检索失败，本地字段匹配仍可用
+      }
+    }, 120);
+  }
+
+  _handlePairPickerKeydown(e) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      this._closePairPicker();
+      this.pairSearchInput.blur();
+      return;
+    }
+    if (!this.pairPickerOpen) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        this._openPairPicker();
+      }
+      return;
+    }
+    const items = this._filteredPairItems || [];
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      if (!items.length) return;
+      this.pairHighlightIdx = (this.pairHighlightIdx + 1) % items.length;
+      this._renderPairPopover();
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!items.length) return;
+      this.pairHighlightIdx = this.pairHighlightIdx <= 0 ? items.length - 1 : this.pairHighlightIdx - 1;
+      this._renderPairPopover();
+    } else if (e.key === "Enter") {
+      if (items.length > 0) {
+        e.preventDefault();
+        const idx = this.pairHighlightIdx >= 0 && this.pairHighlightIdx < items.length ? this.pairHighlightIdx : 0;
+        this._selectSavedPair(items[idx].std_table_key);
+      }
+    }
+  }
+
+  _renderPairPopover() {
+    const items = this._getFilteredSavedPairs();
+    this._filteredPairItems = items;
+    if (this.pairHighlightIdx >= items.length) {
+      this.pairHighlightIdx = items.length ? 0 : -1;
+    }
+    const kw = String(this.pairSearchQuery || "").trim();
+
+    const head = el(
+      "div",
+      { className: "cross-pair-popover-head" },
+      el("span", {
+        text: kw ? `匹配 ${items.length} 对映射（表名/字段）` : `已保存映射表对 (${items.length})`,
+      }),
+      this.activeTableKey
+        ? el("button", {
+            type: "button",
+            className: "btn btn-xs btn-ghost",
+            text: "清除选择",
+            onClick: (e) => {
+              e.stopPropagation();
+              this._selectSavedPair("");
+            },
+          })
+        : null
+    );
+
+    const listNodes = items.length
+      ? items.map((item, idx) => {
+          const isActive = item.std_table_key === this.activeTableKey;
+          const isHl = idx === this.pairHighlightIdx;
+          const hitParts = [];
+          if ((item.matched_source_cols || []).length) {
+            hitParts.push(`源: ${item.matched_source_cols.join(", ")}`);
+          }
+          if ((item.matched_target_cols || []).length) {
+            hitParts.push(`目标: ${item.matched_target_cols.join(", ")}`);
+          }
+          if (!hitParts.length && (item.matched_std_hints || []).length) {
+            hitParts.push(`标准: ${item.matched_std_hints.join(", ")}`);
+          }
+          const schemaLine =
+            item.source_schema || item.target_schema
+              ? `${item.source_schema ? item.source_schema + "." : ""}${item.source_table} → ${item.target_schema ? item.target_schema + "." : ""}${item.target_table}`
+              : "";
+
+          return el(
+            "button",
+            {
+              type: "button",
+              className: `cross-pair-option ${isActive ? "is-active" : ""} ${isHl ? "is-highlighted" : ""}`.trim(),
+              onClick: () => this._selectSavedPair(item.std_table_key),
+            },
+            el(
+              "div",
+              { className: "cross-pair-option-top" },
+              el("span", {
+                className: "mono cross-pair-option-title",
+                text: `${item.source_table || item.std_table_name} ↔ ${item.target_table || item.std_table_name}`,
+              }),
+              el(
+                "span",
+                { style: { display: "inline-flex", gap: "4px", flexShrink: "0" } },
+                isActive ? badge("当前", "info") : null,
+                item.column_count ? badge(`${item.column_count}列`, "neutral") : null
+              )
+            ),
+            schemaLine
+              ? el("div", { className: "mono cross-pair-option-sub", text: schemaLine })
+              : null,
+            hitParts.length
+              ? el("div", {
+                  className: "cross-pair-option-hits",
+                  text: `命中字段 · ${hitParts.join(" | ")}`,
+                })
+              : null
+          );
+        })
+      : [
+          el("div", {
+            className: "cross-pair-empty",
+            text: kw ? `未找到匹配「${kw}」的表或字段` : "暂无已保存映射表对，可在下方选择库表或上传铺底",
+          }),
+        ];
+
+    clearEl(
+      this.pairPopover,
+      head,
+      el("div", { className: "cross-pair-popover-list" }, listNodes)
+    );
+  }
+
   render() {
     const ov = this.overview || { active_comparison: null, tables: [] };
     const comp = ov.active_comparison;
     const srcPanel = comp?.source_panel || {};
     const bkSum = this._computeBookmarkSummary();
 
-    const tableSelect = el(
-      "select",
-      {
-        className: "mac-input input-xs cross-saved-pair-select",
-        "aria-label": "已保存映射表对",
-        onChange: (e) => {
-          this.activeTableKey = e.target.value;
-          if (this.loadedOnce && this.overview) {
-            this.loadPairComparison(this.activeTableKey, false);
-          } else {
-            this.loadOverview(this.activeTableKey, false);
-          }
-        },
-      },
-      [
-        el("option", { value: "", text: "已保存映射表对" }),
-        ...(ov.tables || []).map((t) => {
-          const o = el("option", {
-            value: t.std_table_key,
-            text: `${t.source_table || t.std_table_name} ↔ ${t.target_table || t.std_table_name}`,
-          });
-          if (t.std_table_key === this.activeTableKey) o.selected = true;
-          return o;
-        }),
-      ]
-    );
+    this._syncPairPickerDisplay();
+    if (this.pairPickerOpen) {
+      this._renderPairPopover();
+    }
 
     const subbar = el(
       "div",
       { className: "mac-subbar" },
       el(
         "div",
-        { className: "mac-subbar-group", style: { gap: "10px" } },
-        tableSelect,
+        { className: "mac-subbar-group", style: { gap: "8px" } },
+        this.pairPickerRoot,
         statusDot(`一致 ${bkSum.unified}`, "success"),
         statusDot(`差异 ${bkSum.split_diff}`, "danger"),
         statusDot(`单侧 ${bkSum.split_partial}`, "warn"),
         bkSum.target_needs_migration > 0
           ? badge(`待贯标 ${bkSum.target_needs_migration}`, "warn")
+          : null,
+        bkSum.capacity_insufficient > 0
+          ? badge(`位长/精度不足 ${bkSum.capacity_insufficient}`, "danger")
+          : bkSum.capacity_risk > 0
+          ? badge(`容量待核验 ${bkSum.capacity_risk}`, "warn")
+          : null,
+        bkSum.type_conversion > 0
+          ? badge(`类型转换 ${bkSum.type_conversion}`, "info")
           : null
       ),
       el(

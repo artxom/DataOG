@@ -3329,6 +3329,248 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 )
                 self._run_node_probe(node_bin, tmp, "cross_dom_probe.cjs", cross_dom_probe)
 
+    def test_cross_compat_pair_search_and_report_columns(self) -> None:
+        """端到端验证：跨库长度/精度包络、类型转换判定、/pairs/search 字段级检索及报告列展示."""
+        with tempfile.TemporaryDirectory() as tmp:
+            src_db = os.path.join(tmp, "src_compat.db")
+            tgt_db = os.path.join(tmp, "tgt_compat.db")
+
+            with contextlib.closing(sqlite3.connect(src_db)) as sc:
+                sc.executescript(
+                    """
+                    CREATE TABLE ods_acct (
+                        cust_name VARCHAR(100),
+                        open_dt VARCHAR(20),
+                        bal_amt DECIMAL(18,2),
+                        unmapped_src_phone VARCHAR(30)
+                    );
+                    CREATE TABLE ods_txn (
+                        txn_id VARCHAR(32),
+                        txn_amt DECIMAL(12,2)
+                    );
+                    """
+                )
+            with contextlib.closing(sqlite3.connect(tgt_db)) as tc:
+                tc.executescript(
+                    """
+                    CREATE TABLE dwd_acct (
+                        cust_name VARCHAR(50),
+                        open_dt DATE,
+                        bal_amt DECIMAL(10,2),
+                        unmapped_tgt_email VARCHAR(80)
+                    );
+                    CREATE TABLE dwd_txn (
+                        txn_id VARCHAR(64),
+                        txn_amt DECIMAL(18,4)
+                    );
+                    """
+                )
+
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            ctx = app.state.platform_ctx
+            client = TestClient(app)
+
+            src_cid = client.post(
+                "/api/platform/connections",
+                json={"name": "源兼容库", "db_type": "SQLITE", "sqlite_path": src_db, "auto_refresh_metadata": True},
+            ).json()["connection"]["connection_id"]
+            tgt_cid = client.post(
+                "/api/platform/connections",
+                json={"name": "目标兼容库", "db_type": "SQLITE", "sqlite_path": tgt_db, "auto_refresh_metadata": True},
+            ).json()["connection"]["connection_id"]
+
+            # 预热物理字段缓存，确保 meta_columns 内包含未保存映射的物理字段 unmapped_src_phone / unmapped_tgt_email
+            ctx.metadata_hub.get_table_metadata(src_cid, "main", "ods_acct")
+            ctx.metadata_hub.get_table_metadata(tgt_cid, "main", "dwd_acct")
+
+            for code, cn, abbr, dws_t in (
+                ("S_NAME", "客户名称", "cust_name", "VARCHAR(100)"),
+                ("S_DATE", "开户日期", "open_dt", "DATE"),
+                ("S_AMT", "账户余额", "bal_amt", "DECIMAL(18,2)"),
+                ("S_TXN", "交易流水号", "txn_id", "VARCHAR(32)"),
+            ):
+                ctx.standard_catalog.upsert_item(
+                    {"std_code": code, "cn_name": cn, "en_abbr": abbr, "type_dws": dws_t}
+                )
+
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "source", "connection_id": src_cid})
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "target", "connection_id": tgt_cid})
+
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "acct_pair",
+                        "source_schema": "main",
+                        "source_table": "ods_acct",
+                        "target_schema": "main",
+                        "target_table": "dwd_acct",
+                        "pairings": [
+                            {"source_col": "cust_name", "target_col": "cust_name", "source_std_code": "S_NAME", "target_std_code": "S_NAME"},
+                            {"source_col": "open_dt", "target_col": "open_dt", "source_std_code": "S_DATE", "target_std_code": "S_DATE"},
+                            {"source_col": "bal_amt", "target_col": "bal_amt", "source_std_code": "S_AMT", "target_std_code": "S_AMT"},
+                        ],
+                    },
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "txn_pair",
+                        "source_schema": "main",
+                        "source_table": "ods_txn",
+                        "target_schema": "main",
+                        "target_table": "dwd_txn",
+                        "pairings": [
+                            {"source_col": "txn_id", "target_col": "txn_id", "source_std_code": "S_TXN", "target_std_code": "S_TXN"},
+                        ],
+                    },
+                ).status_code,
+                200,
+            )
+
+            # 1. 验证 /compare-pair 返回精确的双维兼容性字段与汇总统计
+            cmp_res = client.get("/api/modules/cross_comparator/compare-pair?table_key=acct_pair").json()
+            self.assertTrue(cmp_res["ok"])
+            comp = cmp_res["active_comparison"]
+            self.assertEqual(comp["bookmark_summary"]["capacity_insufficient"], 2)
+            self.assertEqual(comp["bookmark_summary"]["capacity_risk"], 1)
+            self.assertEqual(comp["bookmark_summary"]["type_conversion"], 1)
+
+            rows_by_col = {
+                (r["source_col"]["column_name"] if r.get("source_col") else ""): r
+                for r in comp["dual_rows"]
+            }
+            self.assertEqual(rows_by_col["cust_name"]["cross_compat"]["capacity_status"], "INSUFFICIENT")
+            self.assertIn("100→50", rows_by_col["cust_name"]["cross_compat"]["capacity_label"])
+            self.assertFalse(rows_by_col["cust_name"]["cross_compat"]["has_type_conversion"])
+
+            self.assertTrue(rows_by_col["open_dt"]["cross_compat"]["has_type_conversion"])
+            self.assertEqual(rows_by_col["open_dt"]["cross_compat"]["type_conv_status"], "CAST_REQUIRED")
+            self.assertIn("字符→日期", rows_by_col["open_dt"]["cross_compat"]["type_conv_label"])
+            self.assertEqual(rows_by_col["open_dt"]["cross_compat"]["capacity_status"], "RISK")
+
+            self.assertEqual(rows_by_col["bal_amt"]["cross_compat"]["capacity_status"], "INSUFFICIENT")
+            self.assertIn("整数位 16→8位", rows_by_col["bal_amt"]["cross_compat"]["capacity_label"])
+
+            # 2. 验证 list_cross_tables 聚合字段与 /pairs/search 接口（按表名、已保存字段、缓存物理字段检索）
+            ov_tables = cmp_res["tables"]
+            acct_tbl = next(t for t in ov_tables if t["std_table_key"] == "acct_pair")
+            self.assertIn("cust_name", acct_tbl["source_cols_text"])
+            self.assertIn("bal_amt", acct_tbl["target_cols_text"])
+
+            s_by_src_col = client.get("/api/modules/cross_comparator/pairs/search?keyword=open_dt").json()
+            self.assertEqual(s_by_src_col["total"], 1)
+            self.assertEqual(s_by_src_col["items"][0]["std_table_key"], "acct_pair")
+            self.assertIn("open_dt", s_by_src_col["items"][0]["matched_source_cols"])
+            self.assertIn("open_dt", s_by_src_col["items"][0]["matched_target_cols"])
+
+            s_by_meta_col = client.get("/api/modules/cross_comparator/pairs/search?keyword=unmapped_src_phone").json()
+            self.assertEqual(s_by_meta_col["total"], 1)
+            self.assertEqual(s_by_meta_col["items"][0]["std_table_key"], "acct_pair")
+            self.assertIn("unmapped_src_phone", s_by_meta_col["items"][0]["matched_source_cols"])
+
+            s_by_tgt_meta = client.get("/api/modules/cross_comparator/pairs/search?keyword=unmapped_tgt_email").json()
+            self.assertEqual(s_by_tgt_meta["total"], 1)
+            self.assertIn("unmapped_tgt_email", s_by_tgt_meta["items"][0]["matched_target_cols"])
+
+            s_by_tbl = client.get("/api/modules/cross_comparator/pairs/search?keyword=dwd_txn").json()
+            self.assertEqual(s_by_tbl["total"], 1)
+            self.assertEqual(s_by_tbl["items"][0]["std_table_key"], "txn_pair")
+
+            # 3. 验证单 Sheet 库级 Excel、三方绑定 Excel 与离线 HTML 均包含两个新增字段及统计
+            rep_xlsx = client.get("/api/modules/cross_comparator/report.xlsx").content
+            wb = openpyxl.load_workbook(io.BytesIO(rep_xlsx))
+            ws = wb.active
+            hdrs = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+            self.assertEqual(hdrs[21], "目标长度/精度包络")
+            self.assertEqual(hdrs[22], "是否涉及类型转换")
+            self.assertEqual(hdrs[23], "差异与诊断详情")
+            data_rows = list(ws.iter_rows(min_row=2, values_only=True))
+            open_dt_row = next(r for r in data_rows if r[4] == "ods_acct" and r[5] == "open_dt")
+            self.assertIn("需核验", open_dt_row[21])
+            self.assertIn("字符→日期", open_dt_row[22])
+            cust_row = next(r for r in data_rows if r[4] == "ods_acct" and r[5] == "cust_name")
+            self.assertIn("100→50", cust_row[21])
+            self.assertEqual(cust_row[22], "否")
+
+            legacy_xlsx = client.get("/api/modules/cross_comparator/bindings/export.xlsx?table_key=acct_pair").content
+            wb_l = openpyxl.load_workbook(io.BytesIO(legacy_xlsx))
+            hdrs_l = list(wb_l.active.iter_rows(min_row=1, max_row=1, values_only=True))[0]
+            self.assertIn("目标长度/精度包络", hdrs_l)
+            self.assertIn("是否涉及类型转换", hdrs_l)
+
+            rep_html = client.get("/api/modules/cross_comparator/report.html").text
+            m_json = re.search(
+                r'<script id="report-data" type="application/json">(.*?)</script>',
+                rep_html,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(m_json)
+            payload = json.loads(m_json.group(1))
+            self.assertEqual(payload["aggregate"]["capacity_insufficient_cols"], 2)
+            self.assertEqual(payload["aggregate"]["capacity_risk_cols"], 1)
+            self.assertEqual(payload["aggregate"]["type_conversion_cols"], 1)
+            self.assertEqual(payload["excel_headers"][21], "目标长度/精度包络")
+            self.assertEqual(payload["excel_headers"][22], "是否涉及类型转换")
+
+            # 4. 前端静态与 Node 校验：type_compat.js 与后端判定一致、可搜索选择器保留持久化节点且零 XSS
+            static_dir = resolve_static_dir()
+            with open(os.path.join(static_dir, "js", "views", "cross_comparator_view.js"), "r", encoding="utf-8") as f:
+                cross_js = f.read()
+            self.assertIn("cross-pair-picker", cross_js)
+            self.assertIn("analyzeCrossColumnCompat", cross_js)
+            self.assertIn("searchPairs", cross_js)
+
+            node_bin = shutil.which("node")
+            if node_bin:
+                with open(os.path.join(static_dir, "js", "core", "type_compat.js"), "r", encoding="utf-8") as f:
+                    tc_js = f.read()
+                tc_cjs = tc_js.replace("export function ", "function ") + "\n" + (
+                    "const r1 = analyzeCrossColumnCompat('VARCHAR(20)', 'DATE');\n"
+                    "if (!r1.has_type_conversion || r1.type_conv_status !== 'CAST_REQUIRED' || !r1.type_conv_label.includes('字符→日期')) throw new Error('bad r1');\n"
+                    "const r2 = analyzeCrossColumnCompat('DECIMAL(18,2)', 'DECIMAL(10,2)');\n"
+                    "if (r2.capacity_status !== 'INSUFFICIENT' || r2.has_type_conversion) throw new Error('bad r2');\n"
+                    "const r3 = analyzeCrossColumnCompat('INT(11)', 'INTEGER', 'MYSQL', 'DWS');\n"
+                    "if (r3.capacity_status !== 'CONTAINED' || r3.has_type_conversion) throw new Error('bad r3');\n"
+                )
+                self._run_node_probe(node_bin, tmp, "type_compat_probe.cjs", tc_cjs)
+
+                scripts = re.findall(r"<script[^>]*>(.*?)</script>", rep_html, re.DOTALL)
+                self.assertEqual(len(scripts), 2)
+                off_app_js = scripts[1]
+                off_probe = (
+                    "class Node{}\n"
+                    "function makeNode(tag){const n=new Node();Object.assign(n,{tagName:String(tag).toUpperCase(),children:[],style:{},dataset:{},_ev:{},className:'',type:'',placeholder:'',value:'',hidden:false,appendChild(c){this.children.push(c);return c;},removeChild(c){const i=this.children.indexOf(c);if(i>=0)this.children.splice(i,1);return c;},remove(){},click(){this.dispatchEvent({type:'click'});},get firstChild(){return this.children[0]||null;},replaceChildren(...a){this.children=a;},addEventListener(e,f){(this._ev[e]||(this._ev[e]=[])).push(f);},dispatchEvent(ev){if(!ev.target)ev.target=this;ev.currentTarget=this;(this._ev[ev.type]||[]).forEach(f=>f(ev));},setAttribute(k,v){this[k]=v;},getAttribute(k){return this[k];},querySelector(sel){const c=sel[0]==='.'?sel.slice(1):null;let f=null;const walk=x=>{if(f)return;if(c&&(x.className||'').split(/\\s+/).includes(c)){f=x;return;}(x.children||[]).forEach(walk);};walk(this);return f;},closest(){return null;},focus(){}});return n;}\n"
+                    "const txtOf=n=>(n.textContent||'')+(n.children||[]).map(txtOf).join(' ');\n"
+                    "const findAll=(n,p,o=[])=>{if(p(n))o.push(n);(n.children||[]).forEach(c=>findAll(c,p,o));return o;};\n"
+                    "global.Node=Node;\n"
+                    "const _els={};const root=makeNode('div');root.id='app-root';_els['app-root']=root;\n"
+                    "const dataEl=makeNode('script');dataEl.id='report-data';dataEl.textContent=" + json.dumps(m_json.group(1)) + ";_els['report-data']=dataEl;\n"
+                    "global.window={matchMedia:()=>({matches:false})};\n"
+                    "global.document={documentElement:makeNode('html'),body:makeNode('body'),createElement:makeNode,createTextNode:t=>Object.assign(new Node(),{nodeType:3,textContent:t}),getElementById:id=>_els[id]||null};\n"
+                    "const dlBlobs=[];global.URL={createObjectURL:b=>{dlBlobs.push(b);return 'blob:0';},revokeObjectURL(){}};global.Blob=class{constructor(p){this._buf=Buffer.concat(p.map(x=>Buffer.from(x)));}};\n"
+                    + off_app_js
+                    + "\nconst expBtn=findAll(root,n=>n.tagName==='BUTTON'&&txtOf(n).includes('导出全库 Excel'))[0];\n"
+                    + "expBtn.click();\n"
+                    + "if(!dlBlobs.length) throw new Error('missing js xlsx download');\n"
+                    + "const inp=findAll(root,n=>n.tagName==='INPUT')[0];\n"
+                    + "inp.value='open_dt';inp.dispatchEvent({type:'input'});\n"
+                    + "const navItems=findAll(root,n=>n.tagName==='BUTTON'&&(n.className||'').includes('nav-item'));\n"
+                    + "if(!navItems.some(b=>txtOf(b).includes('ods_acct'))) throw new Error('sidebar search did not match column open_dt');\n"
+                    + "process.stdout.write(dlBlobs[0]._buf.toString('base64'));\n"
+                )
+                js_xlsx_b64 = self._run_node_probe(node_bin, tmp, "cross_compat_off_probe.cjs", off_probe)
+                wb_off = openpyxl.load_workbook(io.BytesIO(base64.b64decode(js_xlsx_b64.strip())))
+                off_vals = list(wb_off.active.iter_rows(min_row=1, values_only=True))
+                self.assertEqual(len(off_vals[0]), 24)
+                self.assertEqual(off_vals[0][21], "目标长度/精度包络")
+                self.assertEqual(off_vals[0][22], "是否涉及类型转换")
+                off_open_dt = next(r for r in off_vals[1:] if r[4] == "ods_acct" and r[5] == "open_dt")
+                self.assertIn("字符→日期", off_open_dt[22])
+
 
 if __name__ == "__main__":
     unittest.main()
