@@ -61,9 +61,9 @@
    - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
 
 ## 5. 当前代码基线快照（供下次会话快速定位）
-- **当前主干里程碑版本**：`v2.4.0`（官方品牌名 `Data.O.G`，按数据库持久化落标标准 · macOS 五虚拟列跨环境图形化比对与顶栏防遮蔽重构版，`main` 分支与 `v2.4.0` 标签同步至 `origin`）。
+- **当前主干里程碑版本**：`v2.5.0`（官方品牌名 `Data.O.G`，全平台实时任务进度微日志 · 60s 温连接跨环境秒切 · 库级离线交互网页与单 Sheet Excel 报告版，`main` 分支与 `v2.5.0` 标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI `2.4.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
+  - `app.py`：FastAPI `2.5.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
   - `requirements.txt`：保持 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），零新增第三方依赖。
   - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（去除重复静态资源拷贝、排除非运行时重型包与测试子模块、自动剥离 `.pyi`/`.pxd`/`__pycache__` 冗余元数据，保障冻结态 `--test` 自检）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
