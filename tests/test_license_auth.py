@@ -588,11 +588,24 @@ class TestOfflineLicenseAuth(unittest.TestCase):
                 with open(probe_c, "w", encoding="utf-8") as fh:
                     fh.write(
                         '#include "license_core.h"\n'
+                        "static int hex_nibble(char c) {\n"
+                        "    if (c >= '0' && c <= '9') return c - '0';\n"
+                        "    if (c >= 'a' && c <= 'f') return c - 'a' + 10;\n"
+                        "    if (c >= 'A' && c <= 'F') return c - 'A' + 10;\n"
+                        "    return -1;\n"
+                        "}\n"
                         "int main(int argc, char **argv) {\n"
                         "    if (argc < 2) return 2;\n"
-                        "    char req[384] = {0}, jhost[128] = {0};\n"
-                        '    if (dataog_encode_request_code("MCH-UTF8-1111-2222-3333", "192.168.1.88", argv[1], req, sizeof(req)) != 0) return 3;\n'
-                        "    dataog_sanitize_utf8_host(argv[1], jhost, sizeof(jhost), 64u, 1);\n"
+                        "    char raw_in[256] = {0}, req[384] = {0}, jhost[160] = {0};\n"
+                        "    size_t rpos = 0;\n"
+                        "    for (size_t i = 0; argv[1][i] && argv[1][i + 1] && rpos + 1 < sizeof(raw_in); i += 2) {\n"
+                        "        int hi = hex_nibble(argv[1][i]), lo = hex_nibble(argv[1][i + 1]);\n"
+                        "        if (hi < 0 || lo < 0) return 4;\n"
+                        "        raw_in[rpos++] = (char)((hi << 4) | lo);\n"
+                        "    }\n"
+                        "    raw_in[rpos] = '\\0';\n"
+                        '    if (dataog_encode_request_code("MCH-UTF8-1111-2222-3333", "192.168.1.88", raw_in, req, sizeof(req)) != 0) return 3;\n'
+                        "    dataog_sanitize_utf8_host(raw_in, jhost, sizeof(jhost), 64u, 1);\n"
                         '    printf("{\\"req\\":\\"%s\\",\\"jhost\\":\\"%s\\"}\\n", req, jhost);\n'
                         "    return 0;\n"
                         "}\n"
@@ -602,11 +615,25 @@ class TestOfflineLicenseAuth(unittest.TestCase):
                     build_cmd.extend(["-lws2_32", "-liphlpapi", "-ladvapi32"])
                 bproc = subprocess.run(build_cmd, capture_output=True, text=True, check=False)
                 if bproc.returncode == 0 and os.path.isfile(probe_bin):
-                    out_u8 = subprocess.check_output([probe_bin, cn_35], text=True, timeout=10)
+                    out_u8 = subprocess.check_output(
+                        [probe_bin, cn_35.encode("utf-8").hex()],
+                        encoding="utf-8",
+                        timeout=10,
+                    )
                     parsed_u8 = json.loads(out_u8)
                     self.assertEqual(parsed_u8["req"], py_req_cn)
                     self.assertEqual(decode_request_code(parsed_u8["req"])["hostname"], cn_35[:32])
                     self.assertEqual(parsed_u8["jhost"], cn_35)
+
+                    dirty_bytes = b"\xff\xfe|\"\\" + "测试Node".encode("utf-8") + b"\xed\xa0\x80"
+                    out_dirty = subprocess.check_output(
+                        [probe_bin, dirty_bytes.hex()],
+                        encoding="utf-8",
+                        timeout=10,
+                    )
+                    parsed_dirty = json.loads(out_dirty)
+                    self.assertEqual(parsed_dirty["jhost"], "测试Node")
+                    self.assertEqual(decode_request_code(parsed_dirty["req"])["hostname"], '"\\测试Node')
 
         clang_bin = shutil.which("clang")
         if os.name != "nt" and clang_bin:
