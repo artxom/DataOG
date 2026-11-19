@@ -96,12 +96,12 @@
   - 四大桌面应用视图 `js/views/`：
     - **系统配置**：`settings_view.js` + `connections_view.js`（外观与图标 / 数据库连接 / JDBC 驱动 / AI 模型）
     - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单、实时任务微日志并支持探查 SQL 一键同步至主编辑器）
-    - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片与统一库级报告导出） + `cross_comparator_view.js`（macOS 五虚拟列图形化工作台 + `.mac-subbar` 可搜索表名/字段级 `.cross-pair-picker` 防遮蔽布局 + 拖拽联动实时长度包络与类型转换胶囊 + `TaskActivityBar` 秒切预热 + 统一库级报告导出）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
+    - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片与统一库级报告导出） + `cross_comparator_view.js`（macOS Sequoia 五虚拟列防重叠工作台 + 吸顶毛玻璃三列表头分隔与平静分段筛选栏/IME 安全检索 + 持久化双端 macOS 弹出选单与可搜索缓存表浮层 + `.mac-subbar` 可搜索表名/字段级 `.cross-pair-picker` + 按需紧凑长度包络/类型转换诊断底栏 + `TaskActivityBar` 秒切预热 + 统一库级报告导出）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
     - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
-- **全量自动化测试套件 (`tests/`，当前共 50 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
+- **全量自动化测试套件 (`tests/`，当前共 51 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
   - `tests/test_core.py`（14 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、跨库长度/精度包络与类型转换双维判定全矩阵（`test_cross_column_capacity_and_type_conversion_matrix`）、DDL 互译与四层视图穿透核心引擎。
   - `tests/test_platform.py`（15 项）：验证旧版状态库无损迁移、数据源 `standard_format` 幂等迁移与持久化、`TaskProgressHub` 缩略微日志与 SSE、`ConnectionHub.probe_session` 60s 温连接复用、`MetadataHub` 120s 负缓存与单连接视图穿透、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索与单会话多表批量探查（含 DWS/PG 会话级锁等待超时降级与逐表异常熔断）、`StandardCatalog` 46 列导入与多库格式解析及 B-Tree 区间绑定清理、Excel 公式最终结果求值与 `#N/A` 置空清洗、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
-  - `tests/test_modules_and_api.py`（15 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 按库设标与落标绑定核验 -> 跨环境五虚拟列拖拽配对、Schema 隔离与 `.mac-subbar` 顶栏防遮蔽闭环）、跨库长度/精度包络与类型转换判定、`/pairs/search` 表及字段级检索与 24 列报告导出（`test_cross_compat_pair_search_and_report_columns`）、`/compare-pair` 轻量切表与 `/prefetch-pairs` 批量预热及跨模块 `X-Task-Id` 缩略微日志、单库与跨环境库级离线交互 `.html` / 单 Sheet `.xlsx` 报告（空目录先采再出、推荐同名未保存表不预比对、Node.js 内嵌纯 JS `.xlsx` 24 列闭环与搜索框 DOM 稳定性校验）、4631 行×160 表批量绑标压测与离线探查熔断保护、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
+  - `tests/test_modules_and_api.py`（16 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 按库设标与落标绑定核验 -> 跨环境五虚拟列防重叠网格、吸顶表头对齐、筛选态 `realIdx` 完整性、Schema 隔离与 `.mac-subbar` 顶栏防遮蔽闭环）、跨库长度/精度包络与类型转换判定、`/pairs/search` 表及字段级检索与 24 列报告导出（`test_cross_compat_pair_search_and_report_columns`）、`/compare-pair` 轻量切表与 `/prefetch-pairs` 批量预热及跨模块 `X-Task-Id` 缩略微日志、单库与跨环境库级离线交互 `.html` / 单 Sheet `.xlsx` 报告（空目录先采再出、推荐同名未保存表不预比对、Node.js 内嵌纯 JS `.xlsx` 24 列闭环与搜索框 DOM 稳定性校验）、4631 行×160 表批量绑标压测与离线探查熔断保护、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
   - `tests/test_license_auth.py`（6 项）：验证 RFC 8032 Ed25519 标准向量、C 原生护盾 64 位挑战-应答 MAC 防补丁桥接与闰年日历对拍、生产混淆公钥预签发向量核验、Gate 1 + Gate 2 双重未激活 `401` 拦截、确定性设备专属码（多网卡适配、异机/异 IP 拷贝状态库拦截、篡改状态库拦截）、全局通用码/过期/防时钟回拨水位线/手动锁定/账号模式禁用与独立零依赖 C 生成器编译与 CLI 全链路闭环。
 
 ## 6. AI 只读探查硬隔离铁律与后续演进守则

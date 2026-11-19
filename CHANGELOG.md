@@ -6,6 +6,18 @@
 
 ## [Unreleased]
 
+### Changed
+- **整体重新设计「3. 跨环境比对」为原生 macOS Sequoia 视觉与五虚拟列工作台 (`static/js/views/cross_comparator_view.js`, `static/css/workbench.css`, `static/css/tokens.css`, `static/js/core/dom.js`)**：
+  - 重构顶部控制栏与对称双端数据源配置甲板（`来源库` ⇄ `标准对齐` ⇄ `目标库`，`< 920px` 窄窗自动纵向叠放）：将所有 `<select>` 升级为明暗双主题原生感 macOS `NSPopUpButton` 上下箭头弹出按钮，将双端 `Schema` / `表名` 输入框升级为持久化防失焦节点（支持粘贴 `schema.table` 自动拆分覆盖旧模式名），并将 `选表 (N) ▾` 升级为支持关键字实时检索、中文输入法组合态 (`isComposing`) 防误触、键盘上下选表、`150` 项截断保护、一键目录刷新及矮屏自适应翻转钳高 (`.is-flip-up`) 的 macOS 毛玻璃浮层。
+  - 在中栏吸顶毛玻璃表头（`position: sticky` + `backdrop-filter`，含三列标题徽标聚拢与竖向列分隔线）下集成单行定高对齐的平静中性 macOS 状态筛选栏（`全部` / `一致` / `差异` / `单侧` / `待贯标` / `位长/精度不足` / `类型转换`，消除未选中红橙边框噪音、支持滚轮横向滑动与柔化边缘渐隐，并配合响应式五栏轨道保障 `1024px`/`840px` 五列同屏完整可见且零生硬截字）与 IME 安全的实时搜索框，支持在筛选态下基于真实行索引 (`realIdx`) 精准增删改配对、绑定新标自动揭示隐藏行且全量保存绝不丢失隐藏行。
+  - 将中栏对标卡片升级为纯粹中性的明暗双主题 macOS 卡片 + 水平连接桥线与左侧风险色条（彻底移除一致态整卡绿框与红绿撞色噪音，异标三键统一为无歧义的 `采用源标` / `采用目标` / `拆为两行`）；正常兼容行自动收敛为紧凑双行卡片（省去冗余 `可包住` / `无转换` 底栏，`1440×900` 同屏清晰容纳 9+ 行），修复长物理类型胶囊（如 `TIMESTAMP(6) WITHOUT TIME ZONE`）块级省略号截断，并补齐四套明暗主题细滚动条令牌避免经典白色滚动条突兀展示。
+
+### Fixed
+- **彻底根除「3. 跨环境比对」多字段行纵向挤压互相叠加、滚动位置丢失与表头裁切错位问题 (`static/css/workbench.css`, `static/js/views/cross_comparator_view.js`, `tests/test_modules_and_api.py`)**：
+  - 修复原 `.cross-matrix-pane` 采用 `display: flex; flex-direction: column` 配合 `.cross-matrix-row { min-height: 52px }`（未声明 `flex-shrink: 0`）导致字段数较多时每行被强制压缩至 `52px`、内部 3 行卡片内容向下溢出并互相叠加覆盖的严重布局缺陷；改用纯块级滚动容器 + `display: grid; grid-auto-rows: max-content; align-content: start` 与 `flex-shrink: 0` 双重防挤压机制，确保任意行数与内容高度自适应零重叠。
+  - 将五栏滚动容器改为持久化 DOM 实例挂载，彻底解决点击待选卡片、解绑、绑标或统一异标时重渲染导致三栏 `scrollTop` 跳回顶部（`0`）的问题，并支持 `Escape` 取消已选待选字段及已绑字段拖入 `+ 绑定新标准` 另建新行。
+  - 将中央三列表头移入与 `.cross-matrix-row` 共享同一滚动容器与 `--cross-matrix-cols: minmax(0, ...)` 弹性轨道变量的吸顶层（移除多余 `scrollbar-gutter: stable` 空白槽并统一三栏表头检索区 `40px` 行高），彻底消除悬浮/经典 `16px` 滚动条偏移与中等分辨率下右侧徽标裁切问题，新增第 51 项自动化回归测试 `test_cross_comparator_macos_layout_anti_overlap_and_filter_integrity`。
+
 ---
 
 ## [2.6.0] - 2026-11-19
