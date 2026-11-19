@@ -136,6 +136,8 @@ const ICON_PATHS = {
   unlink: "M15 7h2a5 5 0 0 1 0 10h-2m-6 0H7A5 5 0 0 1 7 7h2",
   chevronsUpDown: "M8 9l4-4 4 4M8 15l4 4 4-4",
   chevronDown: "M6 9l6 6 6-6",
+  layers: "M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5",
+  merge: "M6 3v12m0 0a3 3 0 1 0 0 6 3 3 0 0 0 0-6zm12 0a3 3 0 1 0 0 6 3 3 0 0 0 0-6zm0 0v-3a4 4 0 0 0-4-4H6",
 };
 
 /**

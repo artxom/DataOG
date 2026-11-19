@@ -136,3 +136,22 @@ class StandardDictItemPayload(BaseModel):
     extra_attrs: Dict[str, Any] = Field(default_factory=dict)
 
 
+class WorkspaceCreatePayload(BaseModel):
+    name: str = Field(..., min_length=1, max_length=80)
+    description: str = Field(default="", max_length=240)
+    clone_from_workspace_id: Optional[str] = None
+    switch_immediately: bool = True
+
+
+class WorkspaceUpdatePayload(BaseModel):
+    name: Optional[str] = Field(default=None, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=240)
+
+
+class WorkspaceMergeExecutePayload(BaseModel):
+    merge_token: str = Field(..., min_length=24, max_length=64)
+    selected_modules: List[str] = Field(default_factory=list)
+    strategy: str = Field(default="supplement")
+
+
+

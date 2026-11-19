@@ -333,6 +333,51 @@ export const platformApi = {
     }),
 };
 
+export const workspaceApi = {
+  list: () => requestJson("/api/platform/workspaces", { cache: "no-store" }),
+  create: (payload) =>
+    requestJson("/api/platform/workspaces", { method: "POST", body: payload }),
+  update: (workspaceId, payload) =>
+    requestJson(`/api/platform/workspaces/${encodeURIComponent(workspaceId)}`, {
+      method: "PUT",
+      body: payload,
+    }),
+  switchTo: (workspaceId) =>
+    requestJson(`/api/platform/workspaces/${encodeURIComponent(workspaceId)}/switch`, {
+      method: "POST",
+    }),
+  remove: (workspaceId) =>
+    requestJson(`/api/platform/workspaces/${encodeURIComponent(workspaceId)}`, {
+      method: "DELETE",
+    }),
+  exportFile: ({ workspaceId = "", includeMetadataCache = true, fallbackName = "DataOG_Workspace.dataog.db" } = {}) => {
+    const qs = new URLSearchParams();
+    if (workspaceId) qs.set("workspace_id", workspaceId);
+    qs.set("include_metadata_cache", includeMetadataCache ? "true" : "false");
+    return downloadApiFile(`/api/platform/workspaces/export?${qs.toString()}`, {
+      fallbackName,
+    });
+  },
+  importAsNew: (file, { name = "", description = "", switchImmediately = true } = {}) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (name) fd.append("name", name);
+    if (description) fd.append("description", description);
+    fd.append("switch_immediately", switchImmediately ? "true" : "false");
+    return uploadFormData("/api/platform/workspaces/import", fd);
+  },
+  inspectMerge: (file) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFormData("/api/platform/workspaces/merge/inspect", fd);
+  },
+  executeMerge: (payload) =>
+    requestJson("/api/platform/workspaces/merge/execute", {
+      method: "POST",
+      body: payload,
+    }),
+};
+
 export const standardsApi = {
   list: ({ keyword = "", regCategory = "", dataCategory = "", page = 1, pageSize = 50 } = {}) => {
     const qs = new URLSearchParams({

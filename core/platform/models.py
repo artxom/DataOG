@@ -3,7 +3,59 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+
+_SECRET_PROP_TOKENS = ("password", "passwd", "pwd", "secret", "token", "apikey", "api_key", "credential")
+
+
+def split_extra_props_secrets(extra_props: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """将扩展连接属性拆分为公开拓扑属性与私密凭据属性，防止敏感键值落入共享工作区."""
+    public_props: Dict[str, Any] = {}
+    secret_props: Dict[str, Any] = {}
+    if not isinstance(extra_props, dict):
+        return public_props, secret_props
+    for k, v in extra_props.items():
+        ks = str(k or "").strip()
+        if not ks:
+            continue
+        low = ks.lower()
+        if any(tok in low for tok in _SECRET_PROP_TOKENS):
+            secret_props[ks] = v
+        else:
+            public_props[ks] = v
+    return public_props, secret_props
+
+
+def compute_connection_fingerprint(
+    *,
+    driver_track: str = "NATIVE",
+    db_type: str = "",
+    host: str = "",
+    port: int = 0,
+    dbname: str = "",
+    jdbc_url: str = "",
+    sqlite_path: str = "",
+) -> str:
+    """计算数据源端点的无密码标准化指纹，用于跨工作区自动匹配本机个人凭据及合并连接映射."""
+    dt = (db_type or "").strip().upper()
+    track = (driver_track or "NATIVE").strip().upper()
+    if dt == "SQLITE":
+        sp = (sqlite_path or dbname or "").strip()
+        if not sp:
+            return ""
+        return f"SQLITE|{os.path.normcase(sp)}"
+    if track == "JDBC" and (jdbc_url or "").strip():
+        return f"JDBC|{dt}|{(jdbc_url or '').strip().lower()}"
+    h = (host or "").strip().lower()
+    if not h:
+        if (jdbc_url or "").strip():
+            return f"JDBC|{dt}|{(jdbc_url or '').strip().lower()}"
+        return ""
+    p = int(port or 0)
+    dbn = (dbname or "").strip().lower()
+    return f"{dt}|{h}|{p}|{dbn}"
 
 
 @dataclass
@@ -107,6 +159,18 @@ class ConnectionProfile:
     standard_format: str = "AUTO"
     created_at: str = ""
     updated_at: str = ""
+    credential_status: str = "BOUND"  # BOUND | AUTO_MATCHED | MISSING
+
+    def endpoint_fingerprint(self) -> str:
+        return compute_connection_fingerprint(
+            driver_track=self.driver_track,
+            db_type=self.db_type,
+            host=self.host,
+            port=self.port,
+            dbname=self.dbname,
+            jdbc_url=self.jdbc_url,
+            sqlite_path=self.sqlite_path,
+        )
 
     def effective_default_schema(self) -> str:
         """解析当前数据库方言下的真实默认 Schema（兼容 SQLite main、MySQL dbname 与 Inceptor default）."""
@@ -127,6 +191,7 @@ class ConnectionProfile:
 
     def to_public_dict(self) -> Dict[str, Any]:
         """输出脱敏后的前端安全字典（绝不直接暴露明文密码）."""
+        public_props, _ = split_extra_props_secrets(self.extra_props)
         return {
             "connection_id": self.connection_id,
             "name": self.name,
@@ -139,13 +204,14 @@ class ConnectionProfile:
             "user": self.user,
             "has_saved_password": bool(self.password),
             "password_masked": "******" if self.password else "",
+            "credential_status": self.credential_status or "BOUND",
             "sslmode": self.sslmode,
             "auth_mode": self.auth_mode,
             "sqlite_path": self.sqlite_path,
             "jdbc_driver_id": self.jdbc_driver_id,
             "jdbc_url": self.jdbc_url,
             "jdbc_driver_class": self.jdbc_driver_class,
-            "extra_props": dict(self.extra_props or {}),
+            "extra_props": public_props,
             "standard_format": self.standard_format or "AUTO",
             "created_at": self.created_at,
             "updated_at": self.updated_at,

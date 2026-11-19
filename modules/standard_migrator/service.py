@@ -58,10 +58,20 @@ class StandardMigratorService:
     def _sync_engine_with_active_profile(self) -> Optional[Any]:
         cid = self.get_active_connection_id()
         if not cid:
+            if getattr(self.ctx.store, "is_split_storage", False):
+                with self.engine._conn_lock:
+                    self.engine._conn_config["configured"] = False
+                    self.engine._conn_config["host"] = ""
+                    self.engine._conn_config["dbname"] = ""
+                    self.engine._conn_config["user"] = ""
+                    self.engine._conn_config["password"] = ""
             return None
         prof = self.ctx.connection_hub.get_profile(cid)
         if prof and prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host:
             self.engine._apply_profile_to_conn_config(prof)
+        elif getattr(self.ctx.store, "is_split_storage", False):
+            with self.engine._conn_lock:
+                self.engine._conn_config["configured"] = False
         return prof
 
     def get_workspace_state(self) -> Dict[str, Any]:
@@ -100,18 +110,19 @@ class StandardMigratorService:
         self.ctx.store.save_meta("migrator_connection_id", prof.connection_id)
         if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host:
             self.engine._apply_profile_to_conn_config(prof)
-            self.ctx.store.save_meta(
-                "dws_conn_saved",
-                {
-                    "configured": True,
-                    "host": prof.host,
-                    "port": prof.port,
-                    "dbname": prof.dbname,
-                    "user": prof.user,
-                    "password": prof.password,
-                    "sslmode": prof.sslmode,
-                },
-            )
+            if not getattr(self.ctx.store, "is_split_storage", False):
+                self.ctx.store.save_meta(
+                    "dws_conn_saved",
+                    {
+                        "configured": True,
+                        "host": prof.host,
+                        "port": prof.port,
+                        "dbname": prof.dbname,
+                        "user": prof.user,
+                        "password": prof.password,
+                        "sslmode": prof.sslmode,
+                    },
+                )
         report(24.0, "绑定数据源", f"已绑定数据源 [{prof.name}] ({prof.db_type})", 0, 1)
 
         sync_warning = ""

@@ -25,7 +25,10 @@ class WorkbenchStore {
   constructor() {
     this.state = {
       brandName: "Data.O.G",
+      storageMode: "SEPARATED",
       license: null,
+      activeWorkspace: null,
+      workspaces: [],
       connections: [],
       catalogTrees: {},
       drivers: [],
@@ -49,7 +52,7 @@ class WorkbenchStore {
       minimizedApps: [], // 已最小化至 Dock 右侧收纳区的应用 ID 列表（严格保留内存状态）
       maximizedApps: new Set(),
       appSummaries: {
-        settings: "外观 · 连接 · AI",
+        settings: "外观 · 工作区 · 连接 · AI",
         explorer: "SQL 查询",
         standard: "字典 · 落标 · 比对",
         polyglot: "命名 · 方言",
@@ -82,8 +85,17 @@ class WorkbenchStore {
 
   applyBootstrap(data) {
     this.state.brandName = data.brand_name || "Data.O.G";
+    if (data.storage_mode) {
+      this.state.storageMode = data.storage_mode;
+    }
     if (data.license) {
       this.state.license = data.license;
+    }
+    if (data.active_workspace) {
+      this.state.activeWorkspace = data.active_workspace;
+    }
+    if (Array.isArray(data.workspaces)) {
+      this.state.workspaces = data.workspaces;
     }
     this.state.connections = data.connections || [];
     this.state.catalogTrees = data.catalog_trees || {};
@@ -120,6 +132,17 @@ class WorkbenchStore {
   updateLicense(license) {
     this.state.license = license || null;
     this.emit("license");
+  }
+
+  updateWorkspaces(activeWorkspace, workspaces, bootstrapData = null) {
+    if (bootstrapData) {
+      this.applyBootstrap(bootstrapData);
+      this.emit("workspace_switched");
+    } else {
+      if (activeWorkspace) this.state.activeWorkspace = activeWorkspace;
+      if (Array.isArray(workspaces)) this.state.workspaces = workspaces;
+      this.emit("workspace_meta");
+    }
   }
 
   updateLlmState(providers, availableModels) {

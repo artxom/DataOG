@@ -17,6 +17,8 @@ from core.platform.metadata_hub import MetadataHub
 from core.platform.query_engine import QueryEngine
 from core.platform.standard_catalog import StandardCatalog
 from core.platform.storage import PlatformStateStore
+from core.platform.storage_paths import resolve_private_storage_layout
+from core.platform.workspace_hub import WorkspaceManager
 
 
 class PlatformContext:
@@ -24,21 +26,79 @@ class PlatformContext:
 
     def __init__(
         self,
-        db_path: str,
+        db_path: Optional[str] = None,
         drivers_dir: Optional[str] = None,
         assets_dir: Optional[str] = None,
         verifier_pubkey: Optional[bytes] = None,
+        *,
+        private_root: Optional[str] = None,
+        workspace_db_path: Optional[str] = None,
+        legacy_data_dir: Optional[str] = None,
     ) -> None:
-        abs_db = os.path.abspath(db_path)
-        self.data_dir = os.path.dirname(abs_db)
-        os.makedirs(self.data_dir, exist_ok=True)
-        eff_drivers_dir = drivers_dir or os.path.join(self.data_dir, "drivers")
-        eff_assets_dir = assets_dir or os.path.join(self.data_dir, "assets")
-        os.makedirs(eff_drivers_dir, exist_ok=True)
-        os.makedirs(eff_assets_dir, exist_ok=True)
+        if db_path is None:
+            layout = resolve_private_storage_layout(
+                private_root_override=private_root,
+                create_dirs=True,
+            )
+            self.data_dir = layout.private_root
+            eff_drivers_dir = drivers_dir or layout.drivers_dir
+            eff_assets_dir = assets_dir or layout.assets_dir
+            eff_workspaces_dir = layout.workspaces_dir
+            eff_tmp_dir = layout.tmp_dir
+            eff_clock_anchor = layout.clock_anchor_path
+            eff_ws_db = (
+                os.path.abspath(workspace_db_path)
+                if workspace_db_path
+                else layout.default_workspace_path
+            )
+            os.makedirs(eff_drivers_dir, exist_ok=True)
+            os.makedirs(eff_assets_dir, exist_ok=True)
+            os.makedirs(eff_workspaces_dir, exist_ok=True)
+            os.makedirs(eff_tmp_dir, exist_ok=True)
 
-        self.store = PlatformStateStore(abs_db)
-        self.license_hub = LicenseHub(self.store, verifier_pubkey=verifier_pubkey)
+            self.store = PlatformStateStore(
+                layout.private_db_path,
+                workspace_db_path=eff_ws_db,
+                clock_anchor_path=eff_clock_anchor,
+            )
+            # 生产启动或显式指定 legacy_data_dir 时，自动无损迁移旧版 <exe_dir>/data/
+            eff_legacy_dir = (
+                legacy_data_dir
+                if legacy_data_dir is not None
+                else (None if layout.is_env_overridden else layout.legacy_app_data_dir)
+            )
+            if eff_legacy_dir:
+                self.store.migrate_legacy_install_dir(
+                    eff_legacy_dir,
+                    assets_dir=eff_assets_dir,
+                    drivers_dir=eff_drivers_dir,
+                    clock_anchor_path=eff_clock_anchor,
+                )
+        else:
+            abs_db = os.path.abspath(db_path)
+            self.data_dir = os.path.dirname(abs_db)
+            os.makedirs(self.data_dir, exist_ok=True)
+            eff_drivers_dir = drivers_dir or os.path.join(self.data_dir, "drivers")
+            eff_assets_dir = assets_dir or os.path.join(self.data_dir, "assets")
+            eff_workspaces_dir = os.path.join(self.data_dir, "workspaces")
+            eff_tmp_dir = os.path.join(self.data_dir, "tmp")
+            eff_clock_anchor = os.path.join(self.data_dir, ".chk", "m_anchor.bin")
+            os.makedirs(eff_drivers_dir, exist_ok=True)
+            os.makedirs(eff_assets_dir, exist_ok=True)
+            os.makedirs(eff_workspaces_dir, exist_ok=True)
+            os.makedirs(eff_tmp_dir, exist_ok=True)
+
+            self.store = PlatformStateStore(
+                abs_db,
+                workspace_db_path=workspace_db_path,
+                clock_anchor_path=eff_clock_anchor,
+            )
+
+        self.license_hub = LicenseHub(
+            self.store,
+            verifier_pubkey=verifier_pubkey,
+            anchor_file=eff_clock_anchor,
+        )
         self.driver_manager = DriverManager(self.store, drivers_dir=eff_drivers_dir)
         self.connection_hub = ConnectionHub(self.store, self.driver_manager)
         self.metadata_hub = MetadataHub(self.store, self.connection_hub)
@@ -46,6 +106,13 @@ class PlatformContext:
         self.asset_store = AssetStore(self.store, assets_dir=eff_assets_dir)
         self.llm_hub = LLMHub(self.store)
         self.standard_catalog = StandardCatalog(self.store)
+        self.workspace_hub = WorkspaceManager(
+            self.store,
+            self.connection_hub,
+            self.metadata_hub,
+            workspaces_dir=eff_workspaces_dir,
+            tmp_dir=eff_tmp_dir,
+        )
         self.import_progress = ImportProgressHub()
         self.task_progress = self.import_progress
         self._registered_modules: List[Dict[str, str]] = []
@@ -84,8 +151,11 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.6.1",
+            "version": "2.7.0",
+            "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": self.license_hub.get_auth_status(),
+            "active_workspace": self.workspace_hub.get_active_workspace_summary(),
+            "workspaces": self.workspace_hub.list_workspaces(),
             "appearance": self.asset_store.get_public_appearance(),
             "connections": connections,
             "catalog_trees": trees_summary,

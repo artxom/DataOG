@@ -1,8 +1,11 @@
-# Data.O.G v2.6.1 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.7.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
-系统以 **“强共享平台底座 + 独立定制化桌面应用模块”** 为核心设计：底层一次配置数据库连接、JDBC 驱动与 AI 大模型（内置 **DeepSeek** 与 **Google Gemini** 接入），全平台零延迟共享元数据与智能能力；内建 **离线非对称激活码授权与 C 原生防反编译护盾**，无网络环境亦可通过确定性一机一码与全局通用码安全管控试用授权；前端采用克制干练的 macOS 桌面与窗口交互体系，支持自定义桌面壁纸与软件/模块图标本地持久化，并可一键打包为独立免安装 Windows `DataOG.exe` 程序。
+系统采用 **「无状态程序包 × 本地私有保险箱 × 团队可共享工作区 (`.dataog.db`)」三层分离架构**：
+- **升级覆盖零丢失**：程序目录完全无状态，后续版本升级直接覆盖安装目录绝不会抹掉个人授权、AI 密钥、数据库密码或业务进度；
+- **个人私密与团队协同彻底解耦**：激活码授权、AI 大模型 API 密钥、个人数据库账号密码、自定义壁纸图标、JDBC 驱动与 AI 探查历史严格隔离在操作系统当前用户私有隐藏存储中；企业数据标准字典、字段绑标、跨环境表/字段映射、贯标队列与无密码数据源拓扑保存在纯净的 `.dataog.db` 工作区中，一键导出分享或引导式增量合并同事进度；
+- **零延迟平台共享与离线安全授权**：底层一次配置数据库连接（支持按端点指纹自动匹配本机个人凭据）、JDBC 驱动与 AI 大模型（内置 **DeepSeek** 与 **Google Gemini** 接入），内建 **离线非对称激活码授权与 C 原生防反编译护盾**，并可一键打包为独立免安装 Windows `DataOG.exe` 程序。
 
 - **GitHub 仓库**：https://github.com/artxom/DataOG
 - **项目架构记忆与工程规范**：详见 [AGENTS.md](./AGENTS.md)
@@ -14,7 +17,7 @@
 
 ### 1. 离线登录授权、桌面 Dock 与窗口控制语义（红黄绿三键）
 - **离线非对称激活码登录门禁（默认开启）**：未激活、到期、跨机拷贝或手动锁定时全屏毛玻璃门禁拦截，默认选中「激活码模式」（「账号密码登录」在离线试用期标注暂未开放），自动采集展示本机 IP 与机器码并支持一键复制设备申请码 (`REQ1-...`)；激活时弹出 `<dialog>` 提示 **`当前激活码可用日期至 YYYY-MM-DD`**，有效期内再次打开直接进入工作台，支持顶部菜单栏查看授权、在线续期或一键锁定退回登录页。
-- **顶部 28px 毛玻璃全局菜单栏**：提供 `Data.O.G` 快速显示桌面、当前活动应用指示、`授权至 YYYY-MM-DD` 授权胶囊、AI 模型状态胶囊、`⌘K` Spotlight 秒级库表字段检索、SQL 执行审计日志弹窗、自动/浅色/深色外观切换与实时时钟。
+- **顶部 28px 毛玻璃全局菜单栏**：提供 `Data.O.G` 快速显示桌面、当前活动应用指示、当前团队工作区快速入口胶囊、`授权至 YYYY-MM-DD` 授权胶囊、AI 模型状态胶囊、`⌘K` Spotlight 秒级库表字段检索、SQL 执行审计日志弹窗、自动/浅色/深色外观切换与实时时钟。
 - **底部居中悬浮毛玻璃 macOS Dock 栏**：纯净桌面壁纸留白，底部居中 Dock 承载四大应用图标（悬停放大上浮、名称气泡与运行圆点），常规窗口态常驻底部，全屏最大化时自动下沉隐藏、鼠标贴底即可唤出。
 - 🔴 **关闭 (`✕`)**：关闭当前窗口返回桌面，并**彻底销毁重置当前工具的运行时界面状态**（已落盘的 SQLite 配置与数据标准不受影响）。
 - 🟡 **最小化 (`−`)**：将当前工作窗口收纳至 **Dock 栏竖直分隔线右侧缩略窗口区**，**100% 保留内存 DOM、未提交的编辑内容与滚动位置**；点击 Dock 缩略窗口即可瞬间恢复回离开前的工作现场。
@@ -22,8 +25,9 @@
 
 ### 2. 桌面四大独立功能模块
 1. **系统配置 (`settings`)**
-   - **外观与图标**：内置多款亮暗自适应壁纸预设，支持上传本地自定义桌面壁纸（支持 `铺满` / `适应`）、上传自定义 `Data.O.G` 软件主图标（同步更新浏览器 Favicon）以及四大模块自定义图标，全部安全持久化保存于本地 `data/assets/`。
-   - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
+   - **外观与图标**：内置多款亮暗自适应壁纸预设，支持上传本地自定义桌面壁纸（支持 `铺满` / `适应`）、上传自定义 `Data.O.G` 软件主图标（同步更新浏览器 Favicon）以及四大模块自定义图标，全部安全持久化于本地私有存储。
+   - **工作区协作**：支持多工作区新建（空白/克隆）、重命名、热切换、删除与业务统计看板；一键导出零密钥、自包含的 `.dataog.db` 团队共享工作区（可选是否携带元数据缓存），一键导入同事分享的工作区为独立工作区，或启动 **三步引导式「合并同事进度」向导**（同时兼容 `.dataog.db` 与旧版 `dataog_state.db`，严格白名单只读过滤私密表、按端点指纹自动对齐数据源、支持勾选模块与 `仅补充缺失/未绑定` / `按更新时间保留较新` / `覆盖冲突项` 三大策略，并在落盘前提供跨环境映射表对差异预览）。
+   - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——无密码连接拓扑随工作区协同共享，个人账号与密码严格落盘于本机私有凭据库并支持按 `(db_type, host, port, dbname)` / `jdbc_url` 端点指纹跨工作区自动匹配；免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
    - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
 2. **数据探查 (`explorer`)**
    - 顶栏分段切换 **`SQL 查询` | `AI 探查`**，左侧统一维持 **DataGrip 风格四级已连接数据库目录树**（`连接` → `Schema` → `表/视图` → `字段`）。
@@ -45,9 +49,11 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.6.1 微内核入口（安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.7.0 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
+│   │   ├── storage_paths.py      # 三层分离混淆私有路径解析器（OS 用户隐藏目录、时钟锚点混淆编码与 DATAOG_HOME 隔离）
+│   │   ├── workspace_hub.py      # 团队共享工作区生命周期管理、零密钥 .dataog.db 导出与三步引导式增量合并引擎
 │   │   ├── license_hub.py        # RFC 8032 Ed25519 离线激活码中枢、Gate 2 能力校验、双位置时钟防回拨与 C 原生护盾桥接
 │   │   ├── _license_native_src/  # 纯标准 C 密码学核心与 _license_shield 原生动态库源码（64 位挑战-应答防补丁）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
@@ -57,10 +63,10 @@ DataOG/
 │   │   ├── llm_hub.py            # 零额外依赖标准库 DeepSeek / Gemini / OpenAI 兼容协议大模型中枢
 │   │   ├── readonly_guard.py     # 双模态词法/语法级只读 SQL 白名单沙箱校验器
 │   │   ├── driver_manager.py     # 双轨驱动引擎（Python 原生驱动 + 自定义 JDBC .jar 懒加载 + 硬件只读模式）
-│   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文（含 readonly_session 无条件回滚与 60s 温探查池）
+│   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文（无密码拓扑 × 私有凭据自动匹配、readonly_session 与 60s 温探查池）
 │   │   ├── metadata_hub.py       # 双层单会话批量元数据探查器（含 120s 负缓存、单连接视图穿透与锁超时熔断）与本地 SQLite 缓存检索中枢
 │   │   ├── query_engine.py       # 跨驱动安全截断查询、硬件级只读执行通道与 CSV/Excel 导出引擎
-│   │   ├── storage.py            # data/dataog_state.db WAL 状态库、旧版无损迁移与幂等列演进
+│   │   ├── storage.py            # 双库分离 WAL 引擎（本地私有保险箱 + 共享工作区 *.dataog.db）、旧版 <exe_dir>/data 无损自动迁移与幂等列演进
 │   │   └── dialects/             # 标识符清洗、类型映射矩阵、跨库长度/精度包络与类型转换诊断、DDL 生成与四层视图血缘穿透
 │   ├── dws_engine.py             # 单库保序重建、Kahn 拓扑改名与分区继承核心引擎
 │   ├── excel_formula.py          # Excel 公式最终结果兜底求值（VLOOKUP/XLOOKUP/INDEX+MATCH）与 #N/A 错误值置空引擎
@@ -74,7 +80,7 @@ DataOG/
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（登录门禁联动、底部 Dock 与窗口管理器）、core/（含 type_compat.js）、ui/（含 AuthGate / TaskActivityBar / ExportReportModal）、views/（四大模块视图）
 ├── tools/                        # 独立零环境依赖 C 激活码生成器源码与构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
-├── tests/                        # 52 项全量自动化测试（核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 表及字段级 /pairs/search / 库级离线报告与单 Sheet Excel / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
+├── tests/                        # 60 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -100,7 +106,8 @@ DataOG/
 | **`v2.5.1`** | `chore/exe-icon-v2.5.1` → `main` | **Windows 独立程序 (`DataOG.exe`) 多尺寸品牌图标定制**：新增 7 档分辨率（`16px~256px`）标准 `.ico` 品牌图标 `static/dataog.ico` 并接入 `build_exe.py` PyInstaller `--icon` 打包参数 |
 | **`v2.5.2`** | `feat/cross-compat-and-pair-search` → `main` | **跨库长度/精度包络与类型转换诊断、24 列报告及表/字段级映射检索**：新增跨方言字段位长/定点数整数小数双维精度包络与显式类型转换诊断（透传五虚拟列及 24 列 `.xlsx`/`.html` 报告），并在左上角 `.mac-subbar` 落地按表名与字段名秒级检索的 `.cross-pair-picker` |
 | **`v2.6.0`** | `feat/offline-license-auth` → `main` | **离线非对称激活码登录拦截、C 原生防反编译护盾与零依赖独立生成器**：基于 RFC 8032 Ed25519 + C 编译态动态库 64 位挑战-应答桥接 + Gate 1/2 双门禁与单调时钟防回拨水印实现「一机一码/全局码」离线授权登录；新增全屏毛玻璃登录门禁与菜单栏授权管理，提供独立零环境依赖 C 可执行激活码生成器 (`tools/build_keygen.py`) |
-| **`v2.6.1`**（当前正式版） | `fix/cross-comparator-macos-layout` & `fix/windows-shield-release-v2.6.1` → `main` | **macOS Sequoia 跨环境比对防重叠工作台与 Windows 原生护盾云端打包闭环**：整体重塑「3. 跨环境比对」五虚拟列防重叠网格、吸顶毛玻璃表头/平静分段筛选与防遮挡向上翻转选表浮层；修复 Windows 云端打包 `_license_shield.dll` 注册表 `KEY_WOW64_64KEY` SDK 宏兼容、MinGW/Clang/MSVC 静态运行时构建与 DLL 文件锁并自动发布 `DataOG.exe` Release |
+| **`v2.6.1`** | `fix/cross-comparator-macos-layout` & `fix/windows-shield-release-v2.6.1` → `main` | **macOS Sequoia 跨环境比对防重叠工作台与 Windows 原生护盾云端打包闭环**：整体重塑「3. 跨环境比对」五虚拟列防重叠网格、吸顶毛玻璃表头/平静分段筛选与防遮挡向上翻转选表浮层；修复 Windows 云端打包 `_license_shield.dll` 注册表 `KEY_WOW64_64KEY` SDK 宏兼容、MinGW/Clang/MSVC 静态运行时构建与 DLL 文件锁并自动发布 `DataOG.exe` Release |
+| **`v2.7.0`**（当前正式版） | `feat/three-tier-storage-v2.7` → `main` | **三层分离存储架构（无状态程序包 + 混淆本地私有库 + 团队共享工作区 `.dataog.db`）与引导式增量合并**：彻底分离个人机密（激活码、AI API Key、个人 DB 凭据、外观、驱动、AI 探查会话）与团队共建业务数据（标准字典、绑标、跨环境映射、贯标队列、无密码连接拓扑、元数据缓存）；覆盖安装升级零丢数；新增系统配置「工作区协作」与三步引导式增量合并向导（含跨环境表对差异预览、端点指纹自动匹配个人凭据与旧版 `<exe_dir>/data/` 无损自动迁移） |
 
 ---
 
@@ -111,7 +118,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（52 项核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、表/字段级映射表对检索、库级离线报告与单 Sheet Excel、批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（60 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检
