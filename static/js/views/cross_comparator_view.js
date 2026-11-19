@@ -6,7 +6,7 @@
  */
 
 import { crossApi, isAbortError, platformApi, standardsApi } from "../core/api.js";
-import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
+import { badge, clearEl, el, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { analyzeCrossColumnCompat } from "../core/type_compat.js";
 import { openExportReportModal } from "../ui/export_report_modal.js";
@@ -47,34 +47,73 @@ export class CrossComparatorView {
     this.selectedCandidate = null; // { side: 'source'|'target', columnName: string }
     this.srcCandidateFilter = "";
     this.tgtCandidateFilter = "";
+    this.matrixFilter = "ALL"; // ALL | UNIFIED | SPLIT_DIFF | SPLIT_PARTIAL | MIGRATION | CAPACITY_RISK | TYPE_CONV
+    this.matrixKeyword = "";
+    this._lastHydratedPairSig = "";
     this.srcCandidateListMount = el("div", { className: "cross-cand-list" });
     this.tgtCandidateListMount = el("div", { className: "cross-cand-list" });
+    this.matrixListMount = el("div", { className: "cross-matrix-list" });
+    this.srcCandCountBadge = badge("0", "neutral");
+    this.tgtCandCountBadge = badge("0", "neutral");
+    this.centerSrcCountBadge = badge("0", "neutral");
+    this.centerStdCountBadge = badge("0", "neutral");
+    this.centerTgtCountBadge = badge("0", "neutral");
+    this.filterBarMount = el("div", {
+      className: "cross-filter-bar",
+      role: "group",
+      "aria-label": "跨环境比对状态筛选",
+      onScroll: () => this._syncFilterBarOverflowMask(),
+      onWheel: (e) => {
+        const bar = this.filterBarMount;
+        if (!bar || bar.scrollWidth <= bar.clientWidth + 2) return;
+        if (Math.abs(e.deltaY || 0) > Math.abs(e.deltaX || 0)) {
+          e.preventDefault?.();
+          bar.scrollLeft += e.deltaY;
+          this._syncFilterBarOverflowMask();
+        }
+      },
+    });
+    this.subbarMount = el("div", { className: "mac-subbar cross-toolbar" });
+    this.envStripMount = el("div", { className: "cross-env-strip" });
+    this._mountedBodyEl = null;
     this.srcSearchInput = el("input", {
-      className: "mac-input input-xs",
+      className: "mac-input cross-cand-search-input",
       type: "search",
       autocomplete: "off",
       autocorrect: "off",
       autocapitalize: "none",
       spellcheck: "false",
       placeholder: "筛选待选字段...",
-      style: { width: "100%" },
       onInput: (e) => {
         this.srcCandidateFilter = e.target.value;
         this._populateCandidateList("source");
       },
     });
     this.tgtSearchInput = el("input", {
-      className: "mac-input input-xs",
+      className: "mac-input cross-cand-search-input",
       type: "search",
       autocomplete: "off",
       autocorrect: "off",
       autocapitalize: "none",
       spellcheck: "false",
       placeholder: "筛选待选字段...",
-      style: { width: "100%" },
       onInput: (e) => {
         this.tgtCandidateFilter = e.target.value;
         this._populateCandidateList("target");
+      },
+    });
+    this.matrixSearchInput = el("input", {
+      className: "mac-input cross-matrix-search-input",
+      type: "search",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      "aria-label": "筛选已绑定字段与标准",
+      placeholder: "筛选字段 / 标准...",
+      onInput: (e) => {
+        this.matrixKeyword = e.target.value;
+        this._populateCenterMatrix();
       },
     });
 
@@ -163,8 +202,198 @@ export class CrossComparatorView {
       if (this.pairPickerOpen && this.pairPickerRoot && !this.pairPickerRoot.contains(e.target)) {
         this._closePairPicker();
       }
+      for (const role of ["source", "target"]) {
+        const ctrl = this.epControls?.[role];
+        if (ctrl?.pickerOpen && ctrl.bodyEl && !ctrl.bodyEl.contains(e.target)) {
+          this._closeTablePicker(role);
+        }
+      }
+    };
+    this._onDocKeyDown = (e) => {
+      if (this._isImeComposing(e)) return;
+      if (e.key === "Escape") {
+        if (this.root?.isConnected === false) return;
+        if (globalThis.document?.querySelector?.("dialog[open]")) return;
+        if (this._isAnyTablePickerOpen()) {
+          e.preventDefault?.();
+          this._closeAllTablePickers({ restoreFocus: true });
+          return;
+        }
+        if (this.pairPickerOpen) {
+          e.preventDefault?.();
+          this._closePairPicker();
+          this.pairSearchInput?.blur?.();
+          return;
+        }
+        if (this.selectedCandidate) {
+          this.selectedCandidate = null;
+          this.render();
+        }
+      }
+    };
+    this._onWinResize = () => {
+      this._syncFilterBarOverflowMask();
+      if (this.pairPickerOpen) this._positionPairPopover();
+      for (const role of ["source", "target"]) {
+        if (this.epControls?.[role]?.pickerOpen) this._positionTablePicker(role);
+      }
     };
     document.addEventListener("pointerdown", this._onDocPointerDown);
+    document.addEventListener("keydown", this._onDocKeyDown);
+    globalThis.window?.addEventListener?.("resize", this._onWinResize);
+
+    clearEl(
+      this.subbarMount,
+      el("div", { className: "cross-toolbar-left" }, this.pairPickerRoot),
+      el(
+        "div",
+        { className: "cross-toolbar-right" },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "mac-btn mac-btn-sm",
+            title: "强制重新从数据源读取当前表对结构",
+            onClick: () => {
+              if (this.loadedOnce && this.overview) {
+                if (this.activeTableKey) {
+                  this.loadPairComparison(this.activeTableKey, true, {
+                    sourceFormatProfile: this.sourceFormatProfile,
+                    targetFormatProfile: this.targetFormatProfile,
+                  });
+                } else if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
+                  this.previewSelectedTables(true);
+                } else {
+                  this.loadOverview("", true);
+                }
+              } else {
+                this.loadOverview(this.activeTableKey, true);
+              }
+            },
+          },
+          svgIcon("refresh", 12),
+          el("span", { text: "强制刷新" })
+        ),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "mac-btn mac-btn-sm",
+            onClick: () => this.openPairingUploadWizard(),
+          },
+          svgIcon("upload", 12),
+          el("span", { text: "上传映射铺底" })
+        ),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "mac-btn mac-btn-sm",
+            onClick: () => this.openExportDialog(),
+          },
+          svgIcon("download", 12),
+          el("span", { text: "导出报告" })
+        ),
+        el("button", {
+          type: "button",
+          className: "mac-btn mac-btn-sm mac-btn-ghost",
+          text: "送入多邻国 →",
+          onClick: () =>
+            store.openApp("polyglot", {
+              mode: "dialect",
+              connectionId: this.overview?.source_connection?.connection_id || "",
+              schemaName: this.draftTableBind.source_schema,
+              tableName: this.draftTableBind.source_table,
+              stdTableKey: this.activeTableKey,
+            }),
+        })
+      )
+    );
+
+    this.epControls = {
+      source: this._createSideEndpointControls("source"),
+      target: this._createSideEndpointControls("target"),
+    };
+    this.srcConnSelect = this.epControls.source.connSelect;
+    this.tgtConnSelect = this.epControls.target.connSelect;
+    this.srcFmtSelect = this.epControls.source.fmtSelect;
+    this.tgtFmtSelect = this.epControls.target.fmtSelect;
+    this.srcSchemaInput = this.epControls.source.schemaInput;
+    this.srcTableInput = this.epControls.source.tableInput;
+    this.tgtSchemaInput = this.epControls.target.schemaInput;
+    this.tgtTableInput = this.epControls.target.tableInput;
+
+    this.centerBridgeCountEl = el("span", { className: "mono", text: "0 组" });
+    this.centerBridgeEl = el(
+      "div",
+      { className: "cross-env-center-pill" },
+      el("span", { className: "cross-bridge-icon" }, svgIcon("swap", 12)),
+      el("span", { style: { fontWeight: "600", color: "var(--os-text)" }, text: "标准对齐" }),
+      this.centerBridgeCountEl
+    );
+    clearEl(
+      this.envStripMount,
+      this.epControls.source.cardEl,
+      this.centerBridgeEl,
+      this.epControls.target.cardEl
+    );
+
+    this.srcCandColEl = this._buildCandidateColumnShell("source");
+    this.tgtCandColEl = this._buildCandidateColumnShell("target");
+    this.matrixPaneEl = el(
+      "div",
+      { className: "cross-matrix-pane" },
+      el(
+        "div",
+        { className: "cross-center-sticky-top" },
+        el(
+          "div",
+          { className: "cross-center-col-headers" },
+          el(
+            "div",
+            { className: "cross-col-head" },
+            el("span", { className: "cross-col-head-title", text: "来源表已绑定数标字段" }),
+            this.centerSrcCountBadge
+          ),
+          el(
+            "div",
+            { className: "cross-col-head is-center" },
+            el("span", { className: "cross-col-head-title", text: "数据标准" }),
+            this.centerStdCountBadge
+          ),
+          el(
+            "div",
+            { className: "cross-col-head" },
+            el("span", { className: "cross-col-head-title", text: "目标表已绑定数标字段" }),
+            this.centerTgtCountBadge
+          )
+        ),
+        el(
+          "div",
+          { className: "cross-center-filterbar" },
+          this.filterBarMount,
+          el(
+            "search",
+            { className: "cross-inline-search" },
+            svgIcon("search", 12),
+            this.matrixSearchInput
+          )
+        )
+      ),
+      this.matrixListMount
+    );
+    this.centerStageEl = el("section", { className: "cross-center-stage" }, this.matrixPaneEl);
+    this.workspaceEl = el(
+      "div",
+      { className: "cross-five-workspace" },
+      el(
+        "div",
+        { className: "cross-five-inner" },
+        this.srcCandColEl,
+        this.centerStageEl,
+        this.tgtCandColEl
+      )
+    );
 
     this.activityBar = new TaskActivityBar();
     this.activityBar.el.style.margin = "6px 14px 0";
@@ -186,9 +415,25 @@ export class CrossComparatorView {
     clearTimeout(this.pairSearchTimer);
     this.pairSearchAbort?.abort();
     document.removeEventListener("pointerdown", this._onDocPointerDown);
+    document.removeEventListener("keydown", this._onDocKeyDown);
+    globalThis.window?.removeEventListener?.("resize", this._onWinResize);
     this.activityBar?.destroy();
     this._unsubStore?.();
     this._unsubStore = null;
+  }
+
+  _leaveDropTarget(e) {
+    if (e?.relatedTarget && e.currentTarget?.contains?.(e.relatedTarget)) return;
+    e.currentTarget?.classList?.remove("is-drop-target");
+  }
+
+  _resetScrollPositions({ centerOnly = false } = {}) {
+    if (this.matrixPaneEl) this.matrixPaneEl.scrollTop = 0;
+    if (!centerOnly) {
+      if (this.srcCandidateListMount) this.srcCandidateListMount.scrollTop = 0;
+      if (this.tgtCandidateListMount) this.tgtCandidateListMount.scrollTop = 0;
+      if (this.workspaceEl) this.workspaceEl.scrollLeft = 0;
+    }
   }
 
   _syncConnectionsFromStore(connections) {
@@ -215,6 +460,8 @@ export class CrossComparatorView {
     }
     if (changed) {
       this.render();
+    } else {
+      this._syncEndpointDeck();
     }
   }
 
@@ -481,7 +728,16 @@ export class CrossComparatorView {
     this.sourceCandidates = [];
     this.targetCandidates = [];
     this.centerRows = [];
-    if (!comp) return;
+    this._closeAllTablePickers();
+    if (!comp) {
+      this._lastHydratedPairSig = "";
+      this.matrixFilter = "ALL";
+      this.matrixKeyword = "";
+      this.matrixSearchInput.value = "";
+      this._syncEndpointInputsFromDraft({ force: true });
+      this._resetScrollPositions();
+      return;
+    }
 
     const tb = comp.table_binding || {};
     this.draftTableBind = {
@@ -490,6 +746,15 @@ export class CrossComparatorView {
       target_schema: tb.target_schema || comp.target_panel?.schema_name || "",
       target_table: tb.target_table || comp.target_panel?.table_name || "",
     };
+    this._syncEndpointInputsFromDraft({ force: true });
+    const nextPairSig = `${this.draftTableBind.source_schema}.${this.draftTableBind.source_table}::${this.draftTableBind.target_schema}.${this.draftTableBind.target_table}`.toLowerCase();
+    if (nextPairSig !== this._lastHydratedPairSig) {
+      this._lastHydratedPairSig = nextPairSig;
+      this.matrixFilter = "ALL";
+      this.matrixKeyword = "";
+      this.matrixSearchInput.value = "";
+      this._resetScrollPositions();
+    }
 
     if (comp.source_format_profile) this.sourceFormatProfile = comp.source_format_profile;
     if (comp.target_format_profile) this.targetFormatProfile = comp.target_format_profile;
@@ -705,18 +970,53 @@ export class CrossComparatorView {
     }
   }
 
+  _isImeComposing(e) {
+    return Boolean(e?.isComposing || e?.keyCode === 229);
+  }
+
+  _cleanQualPart(v) {
+    return String(v || "")
+      .trim()
+      .replace(/^["'“”‘’`「」『』\s]+|["'“”‘’`「」『』\s]+$/g, "");
+  }
+
+  _normalizeDraftEndpoints() {
+    let mutated = false;
+    for (const role of ["source", "target"]) {
+      const schKey = `${role}_schema`;
+      const tblKey = `${role}_table`;
+      const rawTbl = this._cleanQualPart(this.draftTableBind[tblKey]);
+      const dotIdx = rawTbl.lastIndexOf(".");
+      if (dotIdx > 0 && dotIdx < rawTbl.length - 1) {
+        const prefix = this._cleanQualPart(rawTbl.slice(0, dotIdx));
+        const suffix = this._cleanQualPart(rawTbl.slice(dotIdx + 1));
+        if (prefix && suffix) {
+          this.draftTableBind[schKey] = prefix;
+          this.draftTableBind[tblKey] = suffix;
+          mutated = true;
+        }
+      }
+    }
+    if (mutated) {
+      this._syncEndpointInputsFromDraft({ force: true });
+    }
+  }
+
   _splitTbl(rawSch, rawTbl) {
-    const cleanLow = (v) =>
-      String(v || "")
-        .trim()
-        .replace(/^["'“”‘’`「」『』\s]+|["'“”‘’`「」『』\s]+$/g, "")
-        .toLowerCase();
+    const cleanLow = (v) => this._cleanQualPart(v).toLowerCase();
     let sch = cleanLow(rawSch);
     let tbl = cleanLow(rawTbl);
     const dotIdx = tbl.lastIndexOf(".");
     if (dotIdx !== -1) {
-      if (!sch) sch = cleanLow(tbl.slice(0, dotIdx));
-      tbl = cleanLow(tbl.slice(dotIdx + 1));
+      const pfx = cleanLow(tbl.slice(0, dotIdx));
+      const sfx = cleanLow(tbl.slice(dotIdx + 1));
+      if (pfx && sfx) {
+        sch = pfx;
+        tbl = sfx;
+      } else {
+        if (!sch && pfx) sch = pfx;
+        tbl = sfx;
+      }
     }
     return [sch, tbl];
   }
@@ -777,6 +1077,7 @@ export class CrossComparatorView {
   }
 
   async previewSelectedTables(forceRefresh = false) {
+    this._normalizeDraftEndpoints();
     const { source_schema, source_table, target_schema, target_table } = this.draftTableBind;
     if (!source_table && !target_table) {
       Toast.warn("请先在左侧或右侧选择表名");
@@ -828,6 +1129,7 @@ export class CrossComparatorView {
   }
 
   async saveCurrentPairings(forceRefresh = false) {
+    this._normalizeDraftEndpoints();
     const key = this._deriveSaveTableKey();
     if (!key) {
       Toast.warn("请先选择或输入来源库/目标库表名");
@@ -1090,6 +1392,8 @@ export class CrossComparatorView {
         }
         if (!prevRow.source_col && !prevRow.target_col) {
           this.centerRows.splice(removeFromRowIdx, 1);
+        } else {
+          this._recomputeRowState(prevRow);
         }
       }
     }
@@ -1176,6 +1480,80 @@ export class CrossComparatorView {
     }
   }
 
+  _ensureRowVisibleInMatrix(targetRow) {
+    if (!targetRow) return;
+    this._recomputeRowState(targetRow);
+    if (this._matchesMatrixRow(targetRow)) return;
+    this.matrixFilter = "ALL";
+    if (!this._matchesMatrixRow(targetRow)) {
+      this.matrixKeyword = "";
+      this.matrixSearchInput.value = "";
+    }
+    Toast.info("已绑定标准，已切换至「全部」以显示新绑定行");
+  }
+
+  _commitNewStandardBinding(side, colObj, picked, { removeFromRowIdx = -1 } = {}) {
+    if (!picked || !colObj) return;
+    this._cacheStdItem(picked);
+    const stdCode = picked.std_code;
+    const brief = this._toStdBrief(picked, side);
+    const oppSide = side === "source" ? "target" : "source";
+
+    // 若已存在同标准编号且当前侧为空槽的半边行，自动合并对齐成 UNIFIED
+    const existingRow = this.centerRows.find(
+      (r, idx) => idx !== removeFromRowIdx && !r[`${side}_col`] && r[`${oppSide}_std_code`] === stdCode
+    );
+    if (existingRow) {
+      const existingIdx = this.centerRows.indexOf(existingRow);
+      this._bindFieldToRow(side, colObj, existingIdx, { removeFromRowIdx, stdItem: picked });
+      if (!this._matchesMatrixRow(existingRow)) {
+        this._ensureRowVisibleInMatrix(existingRow);
+        this.render();
+      }
+      return;
+    }
+
+    if (removeFromRowIdx !== -1) {
+      const prevRow = this.centerRows[removeFromRowIdx];
+      if (prevRow) {
+        prevRow[`${side}_col`] = null;
+        prevRow[`${side}_std_code`] = "";
+        prevRow[`${side}_std`] = null;
+        if (side === "target") {
+          prevRow.target_compliance = null;
+          prevRow.target_needs_migration = false;
+        }
+        if (!prevRow.source_col && !prevRow.target_col) {
+          this.centerRows.splice(removeFromRowIdx, 1);
+        } else {
+          this._recomputeRowState(prevRow);
+        }
+      }
+    }
+
+    const newRow = {
+      row_id: `${side}_${colObj.column_name}_${Date.now()}`,
+      source_col: side === "source" ? colObj : null,
+      target_col: side === "target" ? colObj : null,
+      source_std_code: side === "source" ? stdCode : "",
+      target_std_code: side === "target" ? stdCode : "",
+      source_std: side === "source" ? brief : null,
+      target_std: side === "target" ? brief : null,
+      target_compliance: null,
+      target_needs_migration: false,
+    };
+    if (side === "target") {
+      const ev = this._evaluateProvisionalTargetCompliance(colObj, brief);
+      newRow.target_compliance = ev.target_compliance;
+      newRow.target_needs_migration = ev.target_needs_migration;
+    }
+    this._recomputeRowState(newRow);
+    this.centerRows.push(newRow);
+    this.selectedCandidate = null;
+    this._ensureRowVisibleInMatrix(newRow);
+    this._markDirty();
+  }
+
   _openPickerForCandidate(side, columnName) {
     const list = side === "source" ? this.sourceCandidates : this.targetCandidates;
     const colObj = list.find(
@@ -1197,41 +1575,38 @@ export class CrossComparatorView {
       formatProfile: fmt,
       onSelect: (picked) => {
         if (!picked) return;
-        this._cacheStdItem(picked);
         const taken = this._takeCandidate(side, colObj.column_name);
         if (!taken) return;
-        const stdCode = picked.std_code;
-        const brief = this._toStdBrief(picked, side);
-        const oppSide = side === "source" ? "target" : "source";
+        this._commitNewStandardBinding(side, taken, picked);
+      },
+    });
+  }
 
-        // 若已存在同标准编号且当前侧为空槽的半边行，自动合并对齐成 UNIFIED
-        const existingIdx = this.centerRows.findIndex(
-          (r) => !r[`${side}_col`] && r[`${oppSide}_std_code`] === stdCode
-        );
-        if (existingIdx !== -1) {
-          this._bindFieldToRow(side, taken, existingIdx, { stdItem: picked });
-          return;
-        }
+  _openPickerForBoundFieldNewRow(side, fromRowIdx) {
+    const fromRow = this.centerRows[fromRowIdx];
+    const colObj = fromRow?.[`${side}_col`];
+    if (!colObj) return;
+    const ov = this.overview || {};
+    const dbType =
+      side === "source"
+        ? ov.source_connection?.db_type || "DWS"
+        : ov.target_connection?.db_type || "DWS";
+    const fmt = side === "source" ? this.sourceFormatProfile : this.targetFormatProfile;
+    const curCode = fromRow[`${side}_std_code`] || "";
 
-        const newRow = {
-          row_id: `${side}_${taken.column_name}_${Date.now()}`,
-          source_col: side === "source" ? taken : null,
-          target_col: side === "target" ? taken : null,
-          source_std_code: side === "source" ? stdCode : "",
-          target_std_code: side === "target" ? stdCode : "",
-          source_std: side === "source" ? brief : null,
-          target_std: side === "target" ? brief : null,
-          target_compliance: null,
-          target_needs_migration: false,
-        };
-        if (side === "target") {
-          const ev = this._evaluateProvisionalTargetCompliance(taken, brief);
-          newRow.target_compliance = ev.target_compliance;
-          newRow.target_needs_migration = ev.target_needs_migration;
-        }
-        this.centerRows.push(this._recomputeRowState(newRow));
-        this.selectedCandidate = null;
-        this._markDirty();
+    openStandardPickerModal({
+      title: `另绑${side === "source" ? "来源" : "目标"}字段新标准 · ${colObj.column_name}`,
+      initialQuery: colObj.column_comment || colObj.column_name || curCode,
+      currentStdCode: curCode,
+      dbType,
+      formatProfile: fmt,
+      onSelect: (picked) => {
+        if (!picked) return;
+        const liveIdx = this.centerRows.indexOf(fromRow);
+        if (liveIdx === -1 || !fromRow[`${side}_col`]) return;
+        this._commitNewStandardBinding(side, fromRow[`${side}_col`], picked, {
+          removeFromRowIdx: liveIdx,
+        });
       },
     });
   }
@@ -1622,99 +1997,671 @@ export class CrossComparatorView {
     }
   }
 
-  _makeRoleConnSelect(role, currentId, placeholder) {
-    const conns = this.overview?.connections?.length
-      ? this.overview.connections
-      : store.state.connections || [];
-
-    return el(
-      "select",
-      {
-        className: "mac-input input-xs",
-        style: { flex: "1", minWidth: "110px" },
-        "aria-label": role === "source" ? "选择来源库" : "选择目标库",
-        onChange: (e) => this.bindRoleConnection(role, e.target.value),
-      },
-      [
-        el("option", { value: "", text: placeholder }),
-        ...conns.map((c) => {
-          const o = el("option", { value: c.connection_id, text: `${c.name} · ${c.db_type}` });
-          if (c.connection_id === currentId) o.selected = true;
-          return o;
-        }),
-      ]
-    );
-  }
-
-  _makeTableDropdown(role, tablesList) {
+  _createSideEndpointControls(role) {
+    const isSrc = role === "source";
     const schKey = `${role}_schema`;
     const tblKey = `${role}_table`;
-    const curVal = this.draftTableBind[tblKey]
-      ? `${this.draftTableBind[schKey] ? this.draftTableBind[schKey] + "." : ""}${this.draftTableBind[tblKey]}`
-      : "";
 
-    return el(
-      "select",
-      {
-        className: "mac-input input-xs",
-        style: { flex: "1", minWidth: "120px" },
-        "aria-label": role === "source" ? "选择来源库表" : "选择目标库表",
-        onChange: (e) => {
-          const v = e.target.value;
-          if (!v) return;
-          if (v.includes(".")) {
-            const [s, t] = v.split(".", 2);
-            this.draftTableBind[schKey] = s;
-            this.draftTableBind[tblKey] = t;
-          } else {
-            this.draftTableBind[schKey] = "";
-            this.draftTableBind[tblKey] = v;
-          }
+    const ctrl = {
+      role,
+      pickerOpen: false,
+      pickerQuery: "",
+      pickerHighlightIdx: -1,
+      filteredTables: [],
+      _lastConnSig: null,
+      _lastFmtSig: null,
+    };
+
+    ctrl.connSelect = el("select", {
+      className: "mac-input cross-ep-select",
+      "aria-label": isSrc ? "选择来源库" : "选择目标库",
+      onChange: (e) => {
+        this._closeAllTablePickers();
+        this.bindRoleConnection(role, e.target.value);
+      },
+    });
+    const connSelectWrap = el(
+      "span",
+      { className: "cross-popup-select-wrap is-conn" },
+      ctrl.connSelect,
+      el("span", { className: "cross-popup-chev", "aria-hidden": "true" }, svgIcon("chevronsUpDown", 11))
+    );
+
+    ctrl.fmtSelect = el("select", {
+      className: "mac-input cross-ep-fmt-select",
+      "aria-label": isSrc ? "来源库落标标准" : "目标库落标标准",
+      title: isSrc ? "来源库沿用的落标标准格式" : "目标库沿用的落标标准格式",
+      onChange: (e) => {
+        if (isSrc) this.sourceFormatProfile = e.target.value;
+        else this.targetFormatProfile = e.target.value;
+        this._reloadCurrentComparison(
+          {
+            sourceFormatProfile: this.sourceFormatProfile,
+            targetFormatProfile: this.targetFormatProfile,
+          },
+          { pairOnly: true }
+        );
+      },
+    });
+    const fmtSelectWrap = el(
+      "span",
+      { className: "cross-popup-select-wrap is-fmt" },
+      ctrl.fmtSelect,
+      el("span", { className: "cross-popup-chev", "aria-hidden": "true" }, svgIcon("chevronsUpDown", 11))
+    );
+
+    const listId = `cross-tbl-listbox-${role}`;
+    ctrl.schemaInput = el("input", {
+      className: "cross-ep-schema-input",
+      "aria-label": isSrc ? "来源 Schema" : "目标 Schema",
+      placeholder: "Schema",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      onInput: (e) => {
+        this.draftTableBind[schKey] = e.target.value.trim();
+        if (ctrl.pickerOpen) this._renderTablePickerList(role);
+      },
+      onKeydown: (e) => {
+        if (this._isImeComposing(e)) return;
+        if (e.key === "Enter") {
+          e.preventDefault?.();
+          this._closeAllTablePickers();
           this.previewSelectedTables(false);
+        }
+      },
+    });
+
+    ctrl.tableInput = el("input", {
+      className: "cross-ep-tbl-input",
+      "aria-label": isSrc ? "来源表或视图名" : "目标表名",
+      placeholder: isSrc ? "来源表 / 视图名" : "目标表名",
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      onInput: (e) => {
+        this.draftTableBind[tblKey] = e.target.value.trim();
+        if (ctrl.pickerOpen) this._renderTablePickerList(role);
+      },
+      onKeydown: (e) => {
+        if (this._isImeComposing(e)) return;
+        if (e.key === "Enter") {
+          e.preventDefault?.();
+          this._closeAllTablePickers();
+          this.previewSelectedTables(false);
+        }
+      },
+    });
+
+    ctrl.quickBtnLabel = el("span", { className: "cross-ep-quickpick-label", text: "选表" });
+    ctrl.quickBtn = el(
+      "button",
+      {
+        type: "button",
+        className: "cross-ep-quickpick is-empty",
+        "aria-haspopup": "listbox",
+        "aria-expanded": "false",
+        "aria-controls": listId,
+        "aria-label": isSrc ? "选择来源库表" : "选择目标库表",
+        onClick: (e) => {
+          e.stopPropagation?.();
+          this._toggleTablePicker(role);
         },
       },
-      [
-        el("option", { value: "", text: tablesList.length ? "选取表/视图..." : "暂无缓存表" }),
-        ...tablesList.map((t) => {
-          const fq = t.schema_name ? `${t.schema_name}.${t.table_name}` : t.table_name;
-          const o = el("option", {
-            value: fq,
-            text: t.object_type === "VIEW" ? `${fq} (视图)` : fq,
-          });
-          if (fq.toLowerCase() === curVal.toLowerCase()) o.selected = true;
-          return o;
-        }),
-      ]
+      ctrl.quickBtnLabel,
+      svgIcon("chevronDown", 10)
     );
+
+    ctrl.pickerSearchInput = el("input", {
+      className: "mac-input input-xs cross-table-search-input",
+      type: "search",
+      role: "combobox",
+      "aria-autocomplete": "list",
+      "aria-expanded": "true",
+      "aria-controls": listId,
+      autocomplete: "off",
+      autocorrect: "off",
+      autocapitalize: "none",
+      spellcheck: "false",
+      "aria-label": isSrc ? "搜索来源库缓存表" : "搜索目标库缓存表",
+      placeholder: "搜索 Schema / 表名 / 视图 / 注释...",
+      onInput: (e) => this._handleTablePickerSearch(role, e.target.value),
+      onKeydown: (e) => this._handleTablePickerKeydown(role, e),
+    });
+    ctrl.pickerMetaEl = el("span", { className: "cross-table-popover-meta", text: "0" });
+    ctrl.pickerRefreshBtn = el(
+      "button",
+      {
+        type: "button",
+        className: "cross-table-refresh-btn",
+        title: isSrc ? "重新采集来源库表与视图目录" : "重新采集目标库表与视图目录",
+        "aria-label": isSrc ? "刷新来源库表目录" : "刷新目标库表目录",
+        onClick: (e) => {
+          e.stopPropagation?.();
+          this._refreshSideCatalogFromPicker(role);
+        },
+      },
+      svgIcon("refresh", 11)
+    );
+    ctrl.pickerListEl = el("div", {
+      id: listId,
+      className: "cross-table-popover-list",
+      role: "listbox",
+      "aria-label": isSrc ? "来源库缓存表列表" : "目标库缓存表列表",
+    });
+    ctrl.pickerFootEl = el("div", { className: "cross-table-popover-foot", hidden: true });
+    ctrl.popoverEl = el(
+      "div",
+      { className: "cross-table-popover", hidden: true },
+      el(
+        "div",
+        { className: "cross-table-popover-head" },
+        el(
+          "div",
+          { className: "cross-table-search-wrap" },
+          svgIcon("search", 12),
+          ctrl.pickerSearchInput
+        ),
+        ctrl.pickerMetaEl,
+        ctrl.pickerRefreshBtn
+      ),
+      ctrl.pickerListEl,
+      ctrl.pickerFootEl
+    );
+
+    ctrl.lineageTextEl = el("span", { className: "mono cross-ep-lineage-text" });
+    ctrl.lineageEl = el(
+      "div",
+      { className: "cross-ep-lineage", hidden: true },
+      svgIcon("link", 10),
+      el("span", { className: "cross-ep-lineage-label", text: "视图穿透:" }),
+      ctrl.lineageTextEl
+    );
+
+    ctrl.bodyEl = el(
+      "div",
+      { className: "cross-ep-body" },
+      el(
+        "div",
+        { className: "cross-ep-pathbar" },
+        ctrl.schemaInput,
+        el("span", { className: "cross-ep-path-sep", text: "." }),
+        ctrl.tableInput,
+        ctrl.quickBtn,
+        el("button", {
+          type: "button",
+          className: "cross-ep-load-btn",
+          text: "读取",
+          onClick: () => {
+            this._closeAllTablePickers();
+            this.previewSelectedTables(true);
+          },
+        })
+      ),
+      ctrl.popoverEl
+    );
+
+    ctrl.cardEl = el(
+      "div",
+      { className: `cross-endpoint-card is-${role}` },
+      el(
+        "div",
+        { className: "cross-ep-head" },
+        el(
+          "span",
+          { className: `cross-role-pill is-${role}` },
+          el("span", { className: `dot ${isSrc ? "dot-info" : "dot-success"}` }),
+          el("span", { text: isSrc ? "来源库" : "目标库" })
+        ),
+        connSelectWrap,
+        el(
+          "span",
+          { className: "cross-ep-fmt-wrap" },
+          el("span", { className: "cross-ep-fmt-label", text: "标准格式" }),
+          fmtSelectWrap
+        )
+      ),
+      ctrl.bodyEl,
+      ctrl.lineageEl
+    );
+
+    return ctrl;
   }
 
-  _makeSideFormatSelect(side) {
-    const cur = side === "source" ? this.sourceFormatProfile : this.targetFormatProfile;
-    return el(
-      "select",
-      {
-        className: "mac-input input-xs",
-        style: { width: "145px", flexShrink: "0" },
-        "aria-label": side === "source" ? "来源库落标标准" : "目标库落标标准",
-        title: side === "source" ? "来源库沿用的落标标准格式" : "目标库沿用的落标标准格式",
-        onChange: (e) => {
-          if (side === "source") this.sourceFormatProfile = e.target.value;
-          else this.targetFormatProfile = e.target.value;
-          this._reloadCurrentComparison(
-            {
-              sourceFormatProfile: this.sourceFormatProfile,
-              targetFormatProfile: this.targetFormatProfile,
+  _syncEndpointInputsFromDraft({ force = false } = {}) {
+    if (!this.epControls) return;
+    const pairs = [
+      [this.epControls.source.schemaInput, this.draftTableBind.source_schema || ""],
+      [this.epControls.source.tableInput, this.draftTableBind.source_table || ""],
+      [this.epControls.target.schemaInput, this.draftTableBind.target_schema || ""],
+      [this.epControls.target.tableInput, this.draftTableBind.target_table || ""],
+    ];
+    for (const [inp, nextVal] of pairs) {
+      if (!inp) continue;
+      if (!force && globalThis.document?.activeElement === inp) continue;
+      if (inp.value !== nextVal) inp.value = nextVal;
+    }
+  }
+
+  _isAnyTablePickerOpen() {
+    return Boolean(this.epControls?.source?.pickerOpen || this.epControls?.target?.pickerOpen);
+  }
+
+  _closeAllTablePickers({ restoreFocus = false } = {}) {
+    if (!this.epControls) return;
+    for (const role of ["source", "target"]) {
+      if (this.epControls[role]?.pickerOpen) {
+        this._closeTablePicker(role, { restoreFocus });
+      }
+    }
+  }
+
+  _toggleTablePicker(role) {
+    const ctrl = this.epControls?.[role];
+    if (!ctrl) return;
+    if (ctrl.pickerOpen) {
+      this._closeTablePicker(role, { restoreFocus: true });
+    } else {
+      this._openTablePicker(role);
+    }
+  }
+
+  _getClipBoundsRect() {
+    const host = this.root?.closest?.(".win-body") || this.root;
+    if (host?.getBoundingClientRect) {
+      return host.getBoundingClientRect();
+    }
+    const vh = Number(globalThis.window?.innerHeight || 0);
+    const vw = Number(globalThis.window?.innerWidth || 0);
+    return vh > 0 ? { top: 0, bottom: vh, left: 0, right: vw } : null;
+  }
+
+  _positionTablePicker(role) {
+    const ctrl = this.epControls?.[role];
+    if (!ctrl?.bodyEl?.getBoundingClientRect) return;
+    const clipRect = this._getClipBoundsRect();
+    if (!clipRect) return;
+    const anchorRect = ctrl.bodyEl.getBoundingClientRect();
+    const spaceBelow = clipRect.bottom - anchorRect.bottom - 10;
+    const spaceAbove = anchorRect.top - clipRect.top - 10;
+    const shouldFlipUp = spaceBelow < 210 && spaceAbove > spaceBelow;
+    ctrl.popoverEl.classList.toggle("is-flip-up", shouldFlipUp);
+    const avail = shouldFlipUp ? spaceAbove : spaceBelow;
+    const maxH = Math.max(128, Math.min(332, Math.floor(avail)));
+    ctrl.popoverEl.style.maxHeight = `${maxH}px`;
+  }
+
+  _openTablePicker(role) {
+    const ctrl = this.epControls?.[role];
+    if (!ctrl) return;
+    const opp = role === "source" ? "target" : "source";
+    if (this.epControls?.[opp]?.pickerOpen) {
+      this._closeTablePicker(opp);
+    }
+    if (this.pairPickerOpen) {
+      this._closePairPicker();
+    }
+    ctrl.pickerOpen = true;
+    ctrl.pickerQuery = "";
+    ctrl.pickerSearchInput.value = "";
+    const curSch = String(this.draftTableBind[`${role}_schema`] || "").trim().toLowerCase();
+    const curTbl = String(this.draftTableBind[`${role}_table`] || "").trim().toLowerCase();
+    const initialList = this._getFilteredSideTables(role).slice(0, 150);
+    ctrl.pickerHighlightIdx = curTbl
+      ? initialList.findIndex((t) => {
+          const tSch = String(t.schema_name || "").trim().toLowerCase();
+          const tName = String(t.table_name || "").trim().toLowerCase();
+          return tName === curTbl && (!curSch || !tSch || tSch === curSch);
+        })
+      : -1;
+    ctrl.cardEl.classList.add("is-picker-open");
+    ctrl.quickBtn.classList.add("is-open");
+    ctrl.quickBtn.setAttribute("aria-expanded", "true");
+    this._renderTablePickerList(role, { scrollHighlight: ctrl.pickerHighlightIdx >= 0 });
+    ctrl.popoverEl.hidden = false;
+    this._positionTablePicker(role);
+    ctrl.pickerSearchInput.focus();
+  }
+
+  _closeTablePicker(role, { restoreFocus = false } = {}) {
+    const ctrl = this.epControls?.[role];
+    if (!ctrl || !ctrl.pickerOpen) return;
+    ctrl.pickerOpen = false;
+    ctrl.pickerQuery = "";
+    ctrl.pickerHighlightIdx = -1;
+    ctrl.cardEl.classList.remove("is-picker-open");
+    ctrl.quickBtn.classList.remove("is-open");
+    ctrl.quickBtn.setAttribute("aria-expanded", "false");
+    ctrl.popoverEl.classList.remove("is-flip-up");
+    ctrl.popoverEl.style.maxHeight = "";
+    ctrl.popoverEl.hidden = true;
+    if (restoreFocus) {
+      ctrl.quickBtn.focus();
+    }
+  }
+
+  _handleTablePickerSearch(role, val) {
+    const ctrl = this.epControls?.[role];
+    if (!ctrl) return;
+    ctrl.pickerQuery = val;
+    ctrl.pickerHighlightIdx = 0;
+    this._renderTablePickerList(role);
+  }
+
+  _handleTablePickerKeydown(role, e) {
+    if (this._isImeComposing(e)) return;
+    const ctrl = this.epControls?.[role];
+    if (!ctrl) return;
+    if (e.key === "Escape") {
+      e.preventDefault?.();
+      e.stopPropagation?.();
+      this._closeTablePicker(role, { restoreFocus: true });
+      return;
+    }
+    const items = ctrl.filteredTables || [];
+    if (e.key === "ArrowDown") {
+      e.preventDefault?.();
+      if (!items.length) return;
+      ctrl.pickerHighlightIdx = (ctrl.pickerHighlightIdx + 1) % items.length;
+      this._renderTablePickerList(role, { scrollHighlight: true });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault?.();
+      if (!items.length) return;
+      ctrl.pickerHighlightIdx = ctrl.pickerHighlightIdx <= 0 ? items.length - 1 : ctrl.pickerHighlightIdx - 1;
+      this._renderTablePickerList(role, { scrollHighlight: true });
+    } else if (e.key === "Enter") {
+      if (items.length > 0) {
+        e.preventDefault?.();
+        const idx = ctrl.pickerHighlightIdx >= 0 && ctrl.pickerHighlightIdx < items.length ? ctrl.pickerHighlightIdx : 0;
+        this._selectTableFromPicker(role, items[idx]);
+      }
+    }
+  }
+
+  _getSideTables(role) {
+    const ov = this.overview || {};
+    const sideConn = role === "source" ? ov.source_connection : ov.target_connection;
+    if (Array.isArray(sideConn?.tables) && sideConn.tables.length) {
+      return sideConn.tables;
+    }
+    const cid = sideConn?.connection_id;
+    if (cid && store.state.catalogTrees?.[cid]?.tables?.length) {
+      return store.state.catalogTrees[cid].tables;
+    }
+    return sideConn?.tables || [];
+  }
+
+  _getFilteredSideTables(role) {
+    const ctrl = this.epControls?.[role];
+    const tablesList = this._getSideTables(role);
+    const kw = String(ctrl?.pickerQuery || "").trim().toLowerCase();
+    if (!kw) return tablesList;
+    return tablesList.filter((t) => {
+      const sch = String(t.schema_name || "").toLowerCase();
+      const tbl = String(t.table_name || "").toLowerCase();
+      const fq = sch ? `${sch}.${tbl}` : tbl;
+      const comm = String(t.table_comment || "").toLowerCase();
+      const objType = t.object_type === "VIEW" ? "view 视图" : "table 表";
+      return fq.includes(kw) || tbl.includes(kw) || sch.includes(kw) || comm.includes(kw) || objType.includes(kw);
+    });
+  }
+
+  _selectTableFromPicker(role, tblItem) {
+    if (!tblItem) return;
+    const schKey = `${role}_schema`;
+    const tblKey = `${role}_table`;
+    this.draftTableBind[schKey] = String(tblItem.schema_name || "").trim();
+    this.draftTableBind[tblKey] = String(tblItem.table_name || "").trim();
+    this._syncEndpointInputsFromDraft({ force: true });
+    this._closeTablePicker(role);
+    this.previewSelectedTables(false);
+  }
+
+  async _refreshSideCatalogFromPicker(role) {
+    const ctrl = this.epControls?.[role];
+    if (ctrl?._refreshingCatalog) return;
+    const ov = this.overview || {};
+    const sideKey = role === "source" ? "source_connection" : "target_connection";
+    const cid = ov[sideKey]?.connection_id;
+    if (!cid) {
+      Toast.warn(role === "source" ? "请先选择来源库连接" : "请先选择目标库连接");
+      return;
+    }
+    if (ctrl) {
+      ctrl._refreshingCatalog = true;
+      if (ctrl.pickerRefreshBtn) ctrl.pickerRefreshBtn.disabled = true;
+    }
+    try {
+      const res = await this.activityBar.track(
+        `采集${role === "source" ? "来源库" : "目标库"}表目录`,
+        async () => platformApi.refreshMetadata(cid, null),
+        { prefix: "cmp" }
+      );
+      if (this._destroyed) return;
+      store.updateCatalogTree(cid, res);
+      if (this.overview?.[sideKey]) {
+        this.overview[sideKey].tables = res?.tables || [];
+        this.overview[sideKey].schemas = (res?.schemas || []).map((s) =>
+          typeof s === "string" ? s : s.schema_name
+        );
+      }
+      this._syncEndpointDeck();
+      Toast.success(`已刷新目录：共 ${(res?.tables || []).length} 张表/视图`);
+    } catch (err) {
+      if (!isAbortError(err)) Toast.error(err.message);
+    } finally {
+      if (ctrl) {
+        ctrl._refreshingCatalog = false;
+        if (ctrl.pickerRefreshBtn) ctrl.pickerRefreshBtn.disabled = false;
+      }
+    }
+  }
+
+  _renderTablePickerList(role, { scrollHighlight = false } = {}) {
+    const ctrl = this.epControls?.[role];
+    if (!ctrl) return;
+    const allTables = this._getSideTables(role);
+    const filtered = this._getFilteredSideTables(role);
+    const MAX_VISIBLE = 150;
+    const capped = filtered.slice(0, MAX_VISIBLE);
+    ctrl.filteredTables = capped;
+    if (ctrl.pickerHighlightIdx >= capped.length) {
+      ctrl.pickerHighlightIdx = capped.length ? 0 : -1;
+    }
+
+    const kw = String(ctrl.pickerQuery || "").trim();
+    ctrl.pickerMetaEl.textContent = kw ? `${filtered.length}/${allTables.length}` : `${allTables.length} 项`;
+
+    const schKey = `${role}_schema`;
+    const tblKey = `${role}_table`;
+    const curSch = String(this.draftTableBind[schKey] || "").trim().toLowerCase();
+    const curTbl = String(this.draftTableBind[tblKey] || "").trim().toLowerCase();
+
+    let highlightedEl = null;
+    let highlightedId = "";
+    if (capped.length) {
+      const optNodes = capped.map((t, idx) => {
+        const tSch = String(t.schema_name || "").trim();
+        const tName = String(t.table_name || "").trim();
+        const fq = tSch ? `${tSch}.${tName}` : tName;
+        const optId = `cross-tbl-opt-${role}-${idx}`;
+        const isActive =
+          Boolean(curTbl) &&
+          tName.toLowerCase() === curTbl &&
+          (!curSch || !tSch || tSch.toLowerCase() === curSch);
+        const isHl = idx === ctrl.pickerHighlightIdx;
+        const isView = String(t.object_type || "").toUpperCase() === "VIEW";
+        const optBtn = el(
+          "button",
+          {
+            id: optId,
+            type: "button",
+            role: "option",
+            "aria-selected": isActive ? "true" : "false",
+            className: `cross-table-option ${isActive ? "is-active" : ""} ${isHl ? "is-highlighted" : ""}`.trim(),
+            title: `${fq}${t.table_comment ? " · " + t.table_comment : ""}`,
+            onClick: (e) => {
+              e.stopPropagation?.();
+              this._selectTableFromPicker(role, t);
             },
-            { pairOnly: true }
-          );
-        },
-      },
-      this.formatProfiles.map((p) => {
-        const o = el("option", { value: p.value, text: p.label });
-        if (p.value === cur) o.selected = true;
-        return o;
-      })
-    );
+          },
+          el(
+            "div",
+            { className: "cross-table-option-main" },
+            el("span", { className: "mono cross-table-option-fq", text: fq }),
+            t.table_comment
+              ? el("span", { className: "cross-table-option-comment", text: t.table_comment })
+              : null
+          ),
+          el(
+            "span",
+            { style: { display: "inline-flex", alignItems: "center", gap: "4px", flexShrink: "0" } },
+            isView ? badge("视图", "info") : null,
+            isActive ? badge("当前", "success") : null
+          )
+        );
+        if (isHl) {
+          highlightedEl = optBtn;
+          highlightedId = optId;
+        }
+        return optBtn;
+      });
+      clearEl(ctrl.pickerListEl, optNodes);
+    } else {
+      const emptyBox = el(
+        "div",
+        { className: "cross-table-empty" },
+        el("span", {
+          text: allTables.length
+            ? `未找到匹配「${kw}」的表或视图`
+            : "当前数据源暂无已缓存表，可直接输入表名读取或采集目录",
+        }),
+        !allTables.length
+          ? el("button", {
+              type: "button",
+              className: "mac-btn btn-xs",
+              text: "↻ 立即采集库表目录",
+              onClick: (e) => {
+                e.stopPropagation?.();
+                this._refreshSideCatalogFromPicker(role);
+              },
+            })
+          : null
+      );
+      clearEl(ctrl.pickerListEl, emptyBox);
+    }
+    if (highlightedId) {
+      ctrl.pickerSearchInput.setAttribute("aria-activedescendant", highlightedId);
+    } else {
+      ctrl.pickerSearchInput.setAttribute("aria-activedescendant", "");
+    }
+
+    if (filtered.length > MAX_VISIBLE) {
+      ctrl.pickerFootEl.textContent = `仅展示前 ${MAX_VISIBLE} 项（匹配 ${filtered.length} 项），请继续输入关键字缩小范围`;
+      ctrl.pickerFootEl.hidden = false;
+    } else {
+      ctrl.pickerFootEl.hidden = true;
+    }
+
+    if (scrollHighlight && highlightedEl) {
+      highlightedEl.scrollIntoView?.({ block: "nearest" });
+    }
+  }
+
+  _syncEndpointDeck() {
+    if (!this.epControls) return;
+    const ov = this.overview || { active_comparison: null };
+    const comp = ov.active_comparison;
+    const conns = ov.connections?.length ? ov.connections : store.state.connections || [];
+    const connSig = conns.map((c) => `${c.connection_id}:${c.name}:${c.db_type}`).join("|");
+    const fmtSig = (this.formatProfiles || []).map((p) => `${p.value}:${p.label}`).join("|");
+
+    for (const role of ["source", "target"]) {
+      const isSrc = role === "source";
+      const ctrl = this.epControls[role];
+      const sideConn = isSrc ? ov.source_connection : ov.target_connection;
+      const curCid = String(sideConn?.connection_id || "");
+      const placeholder = isSrc ? "选择来源库" : "选择目标库";
+
+      if (ctrl._lastConnSig !== connSig) {
+        ctrl._lastConnSig = connSig;
+        clearEl(ctrl.connSelect, [
+          el("option", { value: "", text: placeholder }),
+          ...conns.map((c) => {
+            const o = el("option", { value: c.connection_id, text: `${c.name} · ${c.db_type}` });
+            if (c.connection_id === curCid) o.selected = true;
+            return o;
+          }),
+        ]);
+      } else {
+        for (const opt of ctrl.connSelect.children || []) {
+          opt.selected = opt.value === curCid;
+        }
+      }
+      if (ctrl.connSelect.value !== curCid) {
+        ctrl.connSelect.value = curCid;
+      }
+
+      const curFmt = isSrc ? this.sourceFormatProfile : this.targetFormatProfile;
+      if (ctrl._lastFmtSig !== fmtSig) {
+        ctrl._lastFmtSig = fmtSig;
+        clearEl(
+          ctrl.fmtSelect,
+          (this.formatProfiles || []).map((p) => {
+            const o = el("option", { value: p.value, text: p.label });
+            if (p.value === curFmt) o.selected = true;
+            return o;
+          })
+        );
+      } else {
+        for (const opt of ctrl.fmtSelect.children || []) {
+          opt.selected = opt.value === curFmt;
+        }
+      }
+      if (ctrl.fmtSelect.value !== curFmt) {
+        ctrl.fmtSelect.value = curFmt;
+      }
+
+      const sideTables = this._getSideTables(role);
+      ctrl.quickBtnLabel.textContent = sideTables.length ? `选表 (${sideTables.length})` : "选表";
+      ctrl.quickBtn.classList.toggle("is-empty", sideTables.length === 0);
+      ctrl.quickBtn.title = sideTables.length
+        ? `从 ${sideTables.length} 张已缓存表与视图中搜索选取`
+        : "当前数据源暂无缓存表，可点击采集目录或直接输入表名读取";
+      if (ctrl.pickerOpen) {
+        this._renderTablePickerList(role);
+      }
+
+      const panel = isSrc ? comp?.source_panel : comp?.target_panel;
+      const penetrated = panel?.penetrated_base_tables || [];
+      if (penetrated.length) {
+        const joined = penetrated.join(", ");
+        ctrl.lineageTextEl.textContent = joined;
+        ctrl.lineageEl.title = `视图血缘穿透底表：${joined}`;
+        ctrl.lineageEl.hidden = false;
+      } else {
+        ctrl.lineageEl.hidden = true;
+      }
+    }
+
+    this._syncEndpointInputsFromDraft({ force: false });
+    if (this.centerBridgeCountEl) {
+      this.centerBridgeCountEl.textContent = `${this.centerRows.length} 组`;
+    }
+  }
+
+  _syncFilterBarOverflowMask() {
+    const bar = this.filterBarMount;
+    if (!bar) return;
+    const sw = Number(bar.scrollWidth || 0);
+    const cw = Number(bar.clientWidth || 0);
+    const sl = Number(bar.scrollLeft || 0);
+    const hasLeft = sl > 2;
+    const hasRight = sw - cw - sl > 2;
+    bar.classList.toggle("is-mask-left", hasLeft);
+    bar.classList.toggle("is-mask-right", hasRight);
   }
 
   _populateCandidateList(side) {
@@ -1729,6 +2676,9 @@ export class CrossComparatorView {
             String(c.data_type || "").toLowerCase().includes(kw)
         )
       : list;
+
+    const countBadge = isSrc ? this.srcCandCountBadge : this.tgtCandCountBadge;
+    countBadge.textContent = kw ? `${filtered.length}/${list.length}` : String(list.length);
 
     const cards = filtered.length
       ? filtered.map((col) => {
@@ -1782,7 +2732,7 @@ export class CrossComparatorView {
             el(
               "div",
               { className: "cross-cand-meta" },
-              el("span", { className: "mono", text: col.data_type || "-" }),
+              el("span", { className: "cross-type-pill", text: col.data_type || "-" }),
               col.column_comment
                 ? el("span", { className: "cross-cand-comment", text: col.column_comment })
                 : null
@@ -1791,8 +2741,8 @@ export class CrossComparatorView {
         })
       : [
           el("div", {
-            style: { padding: "18px 8px", textAlign: "center", fontSize: "11.5px", color: "var(--os-muted)" },
-            text: list.length ? "无匹配字段" : "暂无待选字段",
+            style: { padding: "22px 10px", textAlign: "center", fontSize: "11.5px", color: "var(--os-muted)" },
+            text: list.length ? "无匹配待选字段" : "全部字段均已绑定",
           }),
         ];
 
@@ -1800,32 +2750,56 @@ export class CrossComparatorView {
     clearEl(listMount, cards);
   }
 
-  _renderCandidateColumn(side) {
+  _buildCandidateColumnShell(side) {
     const isSrc = side === "source";
     const searchInput = isSrc ? this.srcSearchInput : this.tgtSearchInput;
-    searchInput.value = isSrc ? this.srcCandidateFilter : this.tgtCandidateFilter;
+    const countBadge = isSrc ? this.srcCandCountBadge : this.tgtCandCountBadge;
     const listMount = isSrc ? this.srcCandidateListMount : this.tgtCandidateListMount;
-    this._populateCandidateList(side);
 
     return el(
-      "div",
+      "aside",
       {
-        className: `cross-cand-col ${isSrc ? "" : "is-right"}`.trim(),
+        className: `cross-cand-col ${isSrc ? "is-left" : "is-right"}`.trim(),
         onDragover: (e) => {
           if (!this.dragPayload || this.dragPayload.kind !== "bound" || this.dragPayload.side !== side) return;
           e.preventDefault();
           e.currentTarget.classList.add("is-drop-target");
         },
-        onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+        onDragleave: (e) => this._leaveDropTarget(e),
         onDrop: (e) => {
           e.preventDefault();
           e.currentTarget.classList.remove("is-drop-target");
           this._handleDropOnCandidatePool(side);
         },
       },
-      el("div", { className: "cross-cand-search" }, el("search", {}, searchInput)),
+      el(
+        "div",
+        { className: "cross-col-head" },
+        el("span", {
+          className: "cross-col-head-title",
+          text: isSrc ? "来源表待选字段" : "目标表待选字段",
+        }),
+        countBadge
+      ),
+      el(
+        "div",
+        { className: "cross-cand-search" },
+        el(
+          "search",
+          { className: "cross-cand-search-box" },
+          svgIcon("search", 12),
+          searchInput
+        )
+      ),
       listMount
     );
+  }
+
+  _syncCandidateColumn(side) {
+    const isSrc = side === "source";
+    const searchInput = isSrc ? this.srcSearchInput : this.tgtSearchInput;
+    searchInput.value = isSrc ? this.srcCandidateFilter : this.tgtCandidateFilter;
+    this._populateCandidateList(side);
   }
 
   _renderBoundChipOrSlot(side, row, rowIdx) {
@@ -1833,11 +2807,12 @@ export class CrossComparatorView {
     const hasSelectedForSide = this.selectedCandidate && this.selectedCandidate.side === side;
 
     if (!colObj) {
+      const sideLabel = side === "source" ? "来源" : "目标";
       return el(
         "div",
         {
           className: `cross-slot-target ${hasSelectedForSide ? "is-click-target" : ""}`.trim(),
-          title: hasSelectedForSide ? "点击绑定选中字段到此标准" : "拖入或点选待选字段至此",
+          title: hasSelectedForSide ? "点击绑定选中字段到此标准" : `拖入或点选${sideLabel}待选字段至此`,
           onClick: () => {
             if (hasSelectedForSide) {
               this._assignCandidateToRow(side, this.selectedCandidate.columnName, rowIdx);
@@ -1848,14 +2823,14 @@ export class CrossComparatorView {
             e.preventDefault();
             e.currentTarget.classList.add("is-drop-target");
           },
-          onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+          onDragleave: (e) => this._leaveDropTarget(e),
           onDrop: (e) => {
             e.preventDefault();
             e.currentTarget.classList.remove("is-drop-target");
             this._handleDropOnCenterTarget(rowIdx, side);
           },
         },
-        el("span", { text: hasSelectedForSide ? "+ 点击绑定" : "+" })
+        el("span", { text: hasSelectedForSide ? `+ 点击绑定「${this.selectedCandidate.columnName}」` : `+ 拖入${sideLabel}字段` })
       );
     }
 
@@ -1864,6 +2839,7 @@ export class CrossComparatorView {
     const tgtCompliant = row.target_compliance?.status === "COMPLIANT";
     const cc = row.cross_compat;
     const showCompat = Boolean(isTgt && row.paired && cc && cc.applicable);
+    const hasCapError = Boolean(showCompat && cc?.capacity_status === "INSUFFICIENT");
     const capTone =
       cc?.capacity_status === "CONTAINED"
         ? "success"
@@ -1878,11 +2854,20 @@ export class CrossComparatorView {
         : cc?.type_conv_status === "SAFE_CAST"
         ? "info"
         : "neutral";
+    const compatBadges = [];
+    if (showCompat) {
+      if (cc.capacity_status === "INSUFFICIENT" || cc.capacity_status === "RISK") {
+        compatBadges.push(badge(cc.capacity_short || cc.capacity_label || "-", capTone));
+      }
+      if (cc.has_type_conversion) {
+        compatBadges.push(badge(cc.type_conv_short || cc.type_conv_label || "-", convTone));
+      }
+    }
 
     return el(
       "div",
       {
-        className: `cross-bound-chip ${isUnified ? "is-unified" : ""}`.trim(),
+        className: `cross-bound-chip ${isUnified ? "is-unified" : ""} ${hasCapError ? "has-cap-error" : ""}`.trim(),
         draggable: true,
         title: showCompat
           ? `${colObj.column_name} (${colObj.data_type || "-"}) | ${cc.capacity_label || "-"} | ${cc.type_conv_label || "-"}`
@@ -1904,7 +2889,7 @@ export class CrossComparatorView {
           e.preventDefault();
           e.currentTarget.classList.add("is-drop-target");
         },
-        onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+        onDragleave: (e) => this._leaveDropTarget(e),
         onDrop: (e) => {
           e.preventDefault();
           e.currentTarget.classList.remove("is-drop-target");
@@ -1922,7 +2907,7 @@ export class CrossComparatorView {
         el("span", { className: "mono cross-cand-name", text: colObj.column_name }),
         el(
           "div",
-          { style: { display: "inline-flex", alignItems: "center", gap: "3px", flexShrink: "0" } },
+          { className: "cross-bound-chip-actions" },
           isTgt && row.target_needs_migration
             ? badge("待贯标", "warn")
             : isTgt && tgtCompliant
@@ -1943,20 +2928,19 @@ export class CrossComparatorView {
       el(
         "div",
         { className: "cross-cand-meta" },
-        el("span", { className: "mono", text: colObj.data_type || "-" }),
+        el("span", { className: "cross-type-pill", text: colObj.data_type || "-" }),
         colObj.column_comment
           ? el("span", { className: "cross-cand-comment", text: colObj.column_comment })
           : null
       ),
-      showCompat
+      compatBadges.length
         ? el(
             "div",
             {
               className: "cross-compat-tags",
               title: [cc.capacity_detail, cc.type_conv_detail].filter(Boolean).join("；"),
             },
-            badge(cc.capacity_short || cc.capacity_label || "-", capTone),
-            badge(cc.type_conv_short || cc.type_conv_label || "-", convTone)
+            compatBadges
           )
         : null
     );
@@ -1972,7 +2956,7 @@ export class CrossComparatorView {
         e.preventDefault();
         e.currentTarget.classList.add("is-drop-target");
       },
-      onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+      onDragleave: (e) => this._leaveDropTarget(e),
       onDrop: (e) => {
         e.preventDefault();
         e.currentTarget.classList.remove("is-drop-target");
@@ -2006,11 +2990,11 @@ export class CrossComparatorView {
                 this._openBookmarkPicker(rowIdx, "source");
               },
             },
-            el("span", { className: "mono", style: { fontSize: "10px", fontWeight: "700" }, text: sStd.std_code }),
+            el("span", { className: "mono cross-std-split-code", style: { color: "var(--os-accent)" }, text: sStd.std_code }),
             el("span", { className: "cross-cand-comment", style: { fontSize: "10.5px" }, text: sStd.cn_name })
           ),
           el("span", {
-            style: { color: "var(--status-danger)", fontWeight: "700", fontSize: "13px", flexShrink: "0" },
+            className: "cross-std-split-neq",
             text: "≠",
           }),
           el(
@@ -2027,7 +3011,7 @@ export class CrossComparatorView {
                 this._openBookmarkPicker(rowIdx, "target");
               },
             },
-            el("span", { className: "mono", style: { fontSize: "10px", fontWeight: "700" }, text: tStd.std_code }),
+            el("span", { className: "mono cross-std-split-code", style: { color: "var(--status-warn)" }, text: tStd.std_code }),
             el("span", { className: "cross-cand-comment", style: { fontSize: "10.5px" }, text: tStd.cn_name })
           )
         ),
@@ -2037,21 +3021,22 @@ export class CrossComparatorView {
           el("button", {
             type: "button",
             className: "btn btn-xs",
-            text: "← 统一",
-            title: "两侧均采用来源标准",
+            text: "采用源标",
+            title: "两侧均统一为左侧来源标准",
             onClick: () => this._unifyDiffRow(rowIdx, "source"),
           }),
           el("button", {
             type: "button",
             className: "btn btn-xs",
-            text: "统一 →",
-            title: "两侧均采用目标标准",
+            text: "采用目标",
+            title: "两侧均统一为右侧目标标准",
             onClick: () => this._unifyDiffRow(rowIdx, "target"),
           }),
           el("button", {
             type: "button",
-            className: "btn btn-xs btn-ghost",
+            className: "btn btn-xs",
             text: "拆为两行",
+            title: "拆解为独立的来源单侧行与目标单侧行",
             onClick: () => this._splitRow(rowIdx),
           })
         )
@@ -2060,17 +3045,25 @@ export class CrossComparatorView {
 
     const rep = row.source_std || row.target_std;
     const isUnified = st === "UNIFIED";
+    const partialSideCls = !isUnified
+      ? row.source_col
+        ? "has-source"
+        : row.target_col
+        ? "has-target"
+        : ""
+      : "";
     const sType = row.source_std?.resolved_type || "";
     const tType = row.target_std?.resolved_type || "";
     const typeLabel =
       sType && tType && sType !== tType
-        ? `${sType} / ${tType}`
+        ? `${sType} → ${tType}`
         : tType || sType || "";
 
     return el(
       "div",
       {
-        className: `cross-std-card ${isUnified ? "is-unified" : "is-partial"} ${hasSelected ? "is-click-target" : ""}`.trim(),
+        className: `cross-std-card ${isUnified ? "is-unified" : "is-partial"} ${partialSideCls} ${hasSelected ? "is-click-target" : ""}`.trim(),
+        title: `${rep?.std_code || "-"} · ${rep?.cn_name || "未知标准"}${typeLabel ? " · " + typeLabel : ""}`,
         ...commonDropHandlers,
         onClick: () => {
           if (this.selectedCandidate) {
@@ -2087,10 +3080,15 @@ export class CrossComparatorView {
         { className: "cross-std-card-main" },
         el(
           "div",
-          { style: { display: "flex", alignItems: "center", gap: "5px", minWidth: "0" } },
-          badge(rep?.std_code || "-", isUnified ? "success" : "info"),
+          { className: "cross-std-title-wrap" },
+          el(
+            "span",
+            { className: "cross-std-code-pill" },
+            el("span", { className: `dot ${isUnified ? "dot-success" : "dot-info"}` }),
+            el("span", { className: "cross-std-code-text", text: rep?.std_code || "-" })
+          ),
           el("span", {
-            style: { fontWeight: "600", fontSize: "12px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+            className: "cross-std-cn-name",
             text: rep?.cn_name || "未知标准",
           })
         ),
@@ -2109,29 +3107,119 @@ export class CrossComparatorView {
       ),
       el(
         "div",
-        { className: "cross-cand-meta" },
-        el("span", { className: "mono", text: rep?.en_abbr || "" }),
-        typeLabel ? el("span", { className: "mono", text: typeLabel }) : null
+        { className: "cross-std-sub" },
+        el("span", { className: "mono cross-std-abbr", text: rep?.en_abbr || "" }),
+        typeLabel ? el("span", { className: "mono cross-std-types", text: typeLabel }) : null
       )
     );
   }
 
-  _renderCenterMatrix() {
-    const matrixRows = this.centerRows.map((row, idx) =>
-      el(
+  _matchesMatrixRow(row) {
+    const f = this.matrixFilter || "ALL";
+    if (f === "UNIFIED" && row.bookmark_state !== "UNIFIED") return false;
+    if (f === "SPLIT_DIFF" && row.bookmark_state !== "SPLIT_DIFF") return false;
+    if (f === "SPLIT_PARTIAL" && row.bookmark_state !== "SPLIT_PARTIAL" && row.bookmark_state !== "SPLIT_UNBOUND") {
+      return false;
+    }
+    if (f === "MIGRATION" && !row.target_needs_migration) return false;
+    if (f === "CAPACITY_RISK") {
+      const st = row.cross_compat?.capacity_status;
+      if (!row.cross_compat?.applicable || (st !== "INSUFFICIENT" && st !== "RISK")) return false;
+    }
+    if (f === "TYPE_CONV") {
+      if (!row.cross_compat?.applicable || !row.cross_compat?.has_type_conversion) return false;
+    }
+
+    const kw = String(this.matrixKeyword || "").trim().toLowerCase();
+    if (!kw) return true;
+    const hay = [
+      row.source_col?.column_name,
+      row.source_col?.column_comment,
+      row.source_col?.data_type,
+      row.target_col?.column_name,
+      row.target_col?.column_comment,
+      row.target_col?.data_type,
+      row.source_std_code,
+      row.target_std_code,
+      row.source_std?.cn_name,
+      row.source_std?.en_abbr,
+      row.target_std?.cn_name,
+      row.target_std?.en_abbr,
+      row.cross_compat?.capacity_label,
+      row.cross_compat?.type_conv_label,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return hay.includes(kw);
+  }
+
+  _populateCenterMatrix() {
+    const visibleEntries = [];
+    let totalSrcBound = 0;
+    let totalTgtBound = 0;
+    this.centerRows.forEach((row, realIdx) => {
+      this._recomputeRowState(row);
+      if (row.source_col) totalSrcBound += 1;
+      if (row.target_col) totalTgtBound += 1;
+      if (this._matchesMatrixRow(row)) {
+        visibleEntries.push({ row, realIdx });
+      }
+    });
+
+    const isFiltered = this.matrixFilter !== "ALL" || Boolean(String(this.matrixKeyword || "").trim());
+    this.centerSrcCountBadge.textContent = isFiltered
+      ? `${visibleEntries.filter((x) => Boolean(x.row.source_col)).length}/${totalSrcBound}`
+      : String(totalSrcBound);
+    this.centerStdCountBadge.textContent = isFiltered
+      ? `${visibleEntries.length}/${this.centerRows.length}`
+      : String(this.centerRows.length);
+    this.centerTgtCountBadge.textContent = isFiltered
+      ? `${visibleEntries.filter((x) => Boolean(x.row.target_col)).length}/${totalTgtBound}`
+      : String(totalTgtBound);
+
+    const matrixRows = visibleEntries.map(({ row, realIdx }) => {
+      const isDiffRow = row.bookmark_state === "SPLIT_DIFF";
+      const isRiskRow =
+        !isDiffRow &&
+        row.cross_compat?.applicable &&
+        row.cross_compat?.capacity_status === "INSUFFICIENT";
+      return el(
         "div",
-        { className: "cross-matrix-row" },
-        this._renderBoundChipOrSlot("source", row, idx),
-        this._renderCenterStandardCard(row, idx),
-        this._renderBoundChipOrSlot("target", row, idx)
-      )
-    );
+        {
+          className: `cross-matrix-row ${isDiffRow ? "is-diff-row" : ""} ${isRiskRow ? "is-risk-row" : ""}`.trim(),
+        },
+        this._renderBoundChipOrSlot("source", row, realIdx),
+        this._renderCenterStandardCard(row, realIdx),
+        this._renderBoundChipOrSlot("target", row, realIdx)
+      );
+    });
+
+    const emptyFilterHint =
+      this.centerRows.length > 0 && visibleEntries.length === 0
+        ? el(
+            "div",
+            { className: "cross-filter-empty" },
+            el("span", { text: "当前筛选条件下暂无匹配的已绑定字段" }),
+            el("button", {
+              type: "button",
+              className: "mac-btn mac-btn-sm",
+              text: `显示全部 (${this.centerRows.length})`,
+              onClick: () => {
+                this.matrixFilter = "ALL";
+                this.matrixKeyword = "";
+                this.matrixSearchInput.value = "";
+                this.render();
+              },
+            })
+          )
+        : null;
 
     const hasSelected = Boolean(this.selectedCandidate);
     const newStdDropzone = el(
       "div",
       {
-        className: "cross-matrix-row",
+        className: "cross-matrix-row is-dropzone-row",
       },
       el("div", {}),
       el(
@@ -2152,18 +3240,21 @@ export class CrossComparatorView {
             }
           },
           onDragover: (e) => {
-            if (!this.dragPayload || this.dragPayload.kind !== "candidate") return;
+            if (!this.dragPayload || (this.dragPayload.kind !== "candidate" && this.dragPayload.kind !== "bound")) return;
             e.preventDefault();
             e.currentTarget.classList.add("is-drop-target");
           },
-          onDragleave: (e) => e.currentTarget.classList.remove("is-drop-target"),
+          onDragleave: (e) => this._leaveDropTarget(e),
           onDrop: (e) => {
             e.preventDefault();
             e.currentTarget.classList.remove("is-drop-target");
             const payload = this.dragPayload;
             this.dragPayload = null;
-            if (payload && payload.kind === "candidate") {
+            if (!payload) return;
+            if (payload.kind === "candidate") {
               this._openPickerForCandidate(payload.side, payload.colName);
+            } else if (payload.kind === "bound" && typeof payload.rowIdx === "number") {
+              this._openPickerForBoundFieldNewRow(payload.side, payload.rowIdx);
             }
           },
         },
@@ -2176,7 +3267,7 @@ export class CrossComparatorView {
       el("div", {})
     );
 
-    return el("div", { className: "cross-matrix-pane" }, ...matrixRows, newStdDropzone);
+    clearEl(this.matrixListMount, emptyFilterHint, ...matrixRows, newStdDropzone);
   }
 
   _splitColsCsv(csvText) {
@@ -2322,7 +3413,18 @@ export class CrossComparatorView {
     }
   }
 
+  _positionPairPopover() {
+    if (!this.pairPickerRoot?.getBoundingClientRect) return;
+    const clipRect = this._getClipBoundsRect();
+    if (!clipRect) return;
+    const anchorRect = this.pairPickerRoot.getBoundingClientRect();
+    const spaceBelow = clipRect.bottom - anchorRect.bottom - 10;
+    const maxH = Math.max(140, Math.min(372, Math.floor(spaceBelow)));
+    this.pairPopover.style.maxHeight = `${maxH}px`;
+  }
+
   _openPairPicker() {
+    this._closeAllTablePickers();
     this.pairPickerOpen = true;
     this.pairPickerRoot.classList.add("is-open");
     this.pairSearchInput.classList.remove("has-selection");
@@ -2330,12 +3432,14 @@ export class CrossComparatorView {
     this.pairHighlightIdx = -1;
     this._renderPairPopover();
     this.pairPopover.hidden = false;
+    this._positionPairPopover();
     this._syncPairPickerDisplay();
   }
 
   _closePairPicker() {
     this.pairPickerOpen = false;
     this.pairPickerRoot.classList.remove("is-open");
+    this.pairPopover.style.maxHeight = "";
     this.pairPopover.hidden = true;
     this.pairSearchQuery = "";
     this.remotePairSearchResults = null;
@@ -2392,8 +3496,10 @@ export class CrossComparatorView {
   }
 
   _handlePairPickerKeydown(e) {
+    if (this._isImeComposing(e)) return;
     if (e.key === "Escape") {
-      e.preventDefault();
+      e.preventDefault?.();
+      e.stopPropagation?.();
       this._closePairPicker();
       this.pairSearchInput.blur();
       return;
@@ -2410,12 +3516,12 @@ export class CrossComparatorView {
       e.preventDefault();
       if (!items.length) return;
       this.pairHighlightIdx = (this.pairHighlightIdx + 1) % items.length;
-      this._renderPairPopover();
+      this._renderPairPopover({ scrollHighlight: true });
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       if (!items.length) return;
       this.pairHighlightIdx = this.pairHighlightIdx <= 0 ? items.length - 1 : this.pairHighlightIdx - 1;
-      this._renderPairPopover();
+      this._renderPairPopover({ scrollHighlight: true });
     } else if (e.key === "Enter") {
       if (items.length > 0) {
         e.preventDefault();
@@ -2425,7 +3531,7 @@ export class CrossComparatorView {
     }
   }
 
-  _renderPairPopover() {
+  _renderPairPopover({ scrollHighlight = false } = {}) {
     const items = this._getFilteredSavedPairs();
     this._filteredPairItems = items;
     if (this.pairHighlightIdx >= items.length) {
@@ -2452,6 +3558,7 @@ export class CrossComparatorView {
         : null
     );
 
+    let highlightedEl = null;
     const listNodes = items.length
       ? items.map((item, idx) => {
           const isActive = item.std_table_key === this.activeTableKey;
@@ -2471,7 +3578,7 @@ export class CrossComparatorView {
               ? `${item.source_schema ? item.source_schema + "." : ""}${item.source_table} → ${item.target_schema ? item.target_schema + "." : ""}${item.target_table}`
               : "";
 
-          return el(
+          const optBtn = el(
             "button",
             {
               type: "button",
@@ -2502,6 +3609,8 @@ export class CrossComparatorView {
                 })
               : null
           );
+          if (isHl) highlightedEl = optBtn;
+          return optBtn;
         })
       : [
           el("div", {
@@ -2515,275 +3624,138 @@ export class CrossComparatorView {
       head,
       el("div", { className: "cross-pair-popover-list" }, listNodes)
     );
+    if (scrollHighlight && highlightedEl) {
+      highlightedEl.scrollIntoView?.({ block: "nearest" });
+    }
   }
 
   render() {
     const ov = this.overview || { active_comparison: null, tables: [] };
-    const comp = ov.active_comparison;
-    const srcPanel = comp?.source_panel || {};
     const bkSum = this._computeBookmarkSummary();
 
     this._syncPairPickerDisplay();
     if (this.pairPickerOpen) {
       this._renderPairPopover();
     }
+    if (
+      globalThis.document?.activeElement !== this.matrixSearchInput &&
+      this.matrixSearchInput.value !== this.matrixKeyword
+    ) {
+      this.matrixSearchInput.value = this.matrixKeyword;
+    }
 
-    const subbar = el(
-      "div",
-      { className: "mac-subbar" },
-      el(
-        "div",
-        { className: "mac-subbar-group", style: { gap: "8px" } },
-        this.pairPickerRoot,
-        statusDot(`一致 ${bkSum.unified}`, "success"),
-        statusDot(`差异 ${bkSum.split_diff}`, "danger"),
-        statusDot(`单侧 ${bkSum.split_partial}`, "warn"),
-        bkSum.target_needs_migration > 0
-          ? badge(`待贯标 ${bkSum.target_needs_migration}`, "warn")
-          : null,
-        bkSum.capacity_insufficient > 0
-          ? badge(`位长/精度不足 ${bkSum.capacity_insufficient}`, "danger")
-          : bkSum.capacity_risk > 0
-          ? badge(`容量待核验 ${bkSum.capacity_risk}`, "warn")
-          : null,
-        bkSum.type_conversion > 0
-          ? badge(`类型转换 ${bkSum.type_conversion}`, "info")
-          : null
-      ),
-      el(
-        "div",
-        { className: "mac-subbar-group" },
-        el(
-          "button",
-          {
-            type: "button",
-            className: "btn btn-xs",
-            title: "强制重新从数据源读取当前表对结构",
-            onClick: () => {
-              if (this.loadedOnce && this.overview) {
-                if (this.activeTableKey) {
-                  this.loadPairComparison(this.activeTableKey, true, {
-                    sourceFormatProfile: this.sourceFormatProfile,
-                    targetFormatProfile: this.targetFormatProfile,
-                  });
-                } else if (this.draftTableBind.source_table || this.draftTableBind.target_table) {
-                  this.previewSelectedTables(true);
-                } else {
-                  this.loadOverview("", true);
-                }
-              } else {
-                this.loadOverview(this.activeTableKey, true);
-              }
-            },
-          },
-          svgIcon("refresh", 12),
-          el("span", { text: "强制刷新" })
-        ),
-        el(
-          "button",
-          {
-            type: "button",
-            className: "btn btn-xs",
-            onClick: () => this.openPairingUploadWizard(),
-          },
-          svgIcon("upload", 12),
-          el("span", { text: "上传映射铺底" })
-        ),
-        el("button", {
+    let activePillEl = null;
+    const makeFilterPill = (id, label, count, { dotTone = "", title = "" } = {}) => {
+      const isAct = this.matrixFilter === id;
+      const pill = el(
+        "button",
+        {
           type: "button",
-          className: "btn btn-xs",
-          text: "导出报告",
-          onClick: () => this.openExportDialog(),
-        }),
-        el("button", {
-          type: "button",
-          className: "btn btn-xs btn-ghost",
-          text: "送入多邻国 →",
-          onClick: () =>
-            store.openApp("polyglot", {
-              mode: "dialect",
-              connectionId: ov.source_connection?.connection_id || "",
-              schemaName: this.draftTableBind.source_schema,
-              tableName: this.draftTableBind.source_table,
-              stdTableKey: this.activeTableKey,
-            }),
-        })
-      )
-    );
+          className: `cross-filter-pill ${isAct ? "is-active" : ""}`.trim(),
+          "aria-pressed": isAct ? "true" : "false",
+          title: title || `按「${label}」筛选对标行`,
+          onClick: () => {
+            this.matrixFilter = this.matrixFilter === id && id !== "ALL" ? "ALL" : id;
+            this._resetScrollPositions({ centerOnly: true });
+            this.render();
+          },
+        },
+        dotTone ? el("span", { className: `dot dot-${dotTone}` }) : null,
+        el("span", { text: label }),
+        el("span", { className: "cross-filter-count", text: String(count) })
+      );
+      if (isAct) activePillEl = pill;
+      return pill;
+    };
 
-    const srcTables = ov.source_connection?.tables || [];
-    const tgtTables = ov.target_connection?.tables || [];
-
-    const envStrip = el(
-      "div",
-      { className: "cross-env-strip" },
-      el(
-        "div",
-        { className: "cross-env-lane" },
-        el(
-          "div",
-          { className: "cross-env-row" },
-          badge("来源", "info"),
-          this._makeRoleConnSelect("source", ov.source_connection?.connection_id || "", "选择来源库"),
-          this._makeTableDropdown("source", srcTables),
-          this._makeSideFormatSelect("source")
-        ),
-        el(
-          "div",
-          { className: "cross-env-row" },
-          el("input", {
-            className: "mac-input input-xs",
-            style: { width: "92px" },
-            placeholder: "Schema",
-            value: this.draftTableBind.source_schema,
-            onInput: (e) => (this.draftTableBind.source_schema = e.target.value.trim()),
-          }),
-          el("input", {
-            className: "mac-input input-xs",
-            style: { flex: "1" },
-            placeholder: "来源表 / 视图名",
-            value: this.draftTableBind.source_table,
-            onInput: (e) => (this.draftTableBind.source_table = e.target.value.trim()),
-            onKeydown: (e) => {
-              if (e.key === "Enter") this.previewSelectedTables(false);
-            },
-          }),
-          el("button", {
-            type: "button",
-            className: "btn btn-xs",
-            text: "读取",
-            onClick: () => this.previewSelectedTables(true),
-          }),
-          (srcPanel.penetrated_base_tables || []).length
-            ? badge(`穿透: ${srcPanel.penetrated_base_tables.join(", ")}`, "info")
-            : null
-        )
-      ),
-      el(
-        "div",
-        { className: "cross-env-center-pill" },
-        el("span", { style: { fontWeight: "600", color: "var(--os-text)" }, text: "标准对齐" }),
-        el("span", {
-          className: "mono",
-          text: `${this.centerRows.length} 组`,
-        })
-      ),
-      el(
-        "div",
-        { className: "cross-env-lane" },
-        el(
-          "div",
-          { className: "cross-env-row" },
-          badge("目标", "neutral"),
-          this._makeRoleConnSelect("target", ov.target_connection?.connection_id || "", "选择目标库"),
-          this._makeTableDropdown("target", tgtTables),
-          this._makeSideFormatSelect("target")
-        ),
-        el(
-          "div",
-          { className: "cross-env-row" },
-          el("input", {
-            className: "mac-input input-xs",
-            style: { width: "92px" },
-            placeholder: "Schema",
-            value: this.draftTableBind.target_schema,
-            onInput: (e) => (this.draftTableBind.target_schema = e.target.value.trim()),
-          }),
-          el("input", {
-            className: "mac-input input-xs",
-            style: { flex: "1" },
-            placeholder: "目标表名",
-            value: this.draftTableBind.target_table,
-            onInput: (e) => (this.draftTableBind.target_table = e.target.value.trim()),
-            onKeydown: (e) => {
-              if (e.key === "Enter") this.previewSelectedTables(false);
-            },
-          }),
-          el("button", {
-            type: "button",
-            className: "btn btn-xs",
-            text: "读取",
-            onClick: () => this.previewSelectedTables(true),
-          })
-        )
-      )
+    const capIssueTotal = bkSum.capacity_insufficient + bkSum.capacity_risk;
+    clearEl(
+      this.filterBarMount,
+      makeFilterPill("ALL", "全部", bkSum.total_rows),
+      makeFilterPill("UNIFIED", "一致", bkSum.unified, { dotTone: "success" }),
+      makeFilterPill("SPLIT_DIFF", "差异", bkSum.split_diff, { dotTone: "danger" }),
+      makeFilterPill("SPLIT_PARTIAL", "单侧", bkSum.split_partial, { dotTone: "warn" }),
+      bkSum.target_needs_migration > 0 || this.matrixFilter === "MIGRATION"
+        ? makeFilterPill("MIGRATION", "待贯标", bkSum.target_needs_migration, { dotTone: "warn" })
+        : null,
+      capIssueTotal > 0 || this.matrixFilter === "CAPACITY_RISK"
+        ? makeFilterPill(
+            "CAPACITY_RISK",
+            bkSum.capacity_insufficient > 0 ? "位长/精度不足" : "容量待核验",
+            capIssueTotal,
+            {
+              dotTone: bkSum.capacity_insufficient > 0 ? "danger" : "warn",
+              title: `位长/精度不足 ${bkSum.capacity_insufficient} · 容量待核验 ${bkSum.capacity_risk}`,
+            }
+          )
+        : null,
+      bkSum.type_conversion > 0 || this.matrixFilter === "TYPE_CONV"
+        ? makeFilterPill("TYPE_CONV", "类型转换", bkSum.type_conversion, { dotTone: "info" })
+        : null
     );
+    if (activePillEl) {
+      activePillEl.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    }
+    this._syncFilterBarOverflowMask();
+    globalThis.requestAnimationFrame?.(() => {
+      if (!this._destroyed) this._syncFilterBarOverflowMask();
+    });
+
+    this._syncEndpointDeck();
 
     const hasAnyField =
       this.centerRows.length > 0 ||
       this.sourceCandidates.length > 0 ||
       this.targetCandidates.length > 0;
 
-    const mainBody = hasAnyField
-      ? el(
+    let mainBody;
+    if (hasAnyField) {
+      this._syncCandidateColumn("source");
+      this._populateCenterMatrix();
+      this._syncCandidateColumn("target");
+      mainBody = this.workspaceEl;
+    } else {
+      const savedPairCount = (ov.tables || []).length;
+      mainBody = el(
+        "div",
+        { className: "explorer-empty-state" },
+        el(
           "div",
-          { className: "cross-five-workspace" },
+          { className: "explorer-empty-card", style: { maxWidth: "460px", padding: "26px 28px" } },
+          el("div", { className: "cross-empty-hero-icon" }, svgIcon("swap", 22)),
+          el("h3", { style: { margin: "0 0 6px 0", fontSize: "14px", fontWeight: "600" }, text: "选择来源与目标库表开始比对" }),
+          el("p", {
+            style: { margin: "0 0 16px 0", fontSize: "12px", color: "var(--os-text-secondary)", lineHeight: "1.5" },
+            text: "在上方左右两侧选取数据源与表名，或导入映射模板快速构建五栏跨环境数标对标视图。",
+          }),
           el(
             "div",
-            { className: "cross-five-inner" },
-            el(
-              "div",
-              { className: "cross-five-col-headers" },
-              el(
-                "div",
-                { className: "cross-col-head" },
-                el("span", { text: "来源表待选字段" }),
-                badge(String(this.sourceCandidates.length), "neutral")
-              ),
-              el(
-                "div",
-                { className: "cross-col-head" },
-                el("span", { text: "来源表已绑定数标字段" }),
-                badge(String(this.centerRows.filter((r) => Boolean(r.source_col)).length), "info")
-              ),
-              el(
-                "div",
-                { className: "cross-col-head is-center" },
-                el("span", { text: "数据标准" }),
-                badge(String(this.centerRows.length), "success")
-              ),
-              el(
-                "div",
-                { className: "cross-col-head" },
-                el("span", { text: "目标表已绑定数标字段" }),
-                badge(String(this.centerRows.filter((r) => Boolean(r.target_col)).length), "info")
-              ),
-              el(
-                "div",
-                { className: "cross-col-head" },
-                el("span", { text: "目标表待选字段" }),
-                badge(String(this.targetCandidates.length), "neutral")
-              )
-            ),
-            el(
-              "div",
-              { className: "cross-five-body" },
-              this._renderCandidateColumn("source"),
-              this._renderCenterMatrix(),
-              this._renderCandidateColumn("target")
-            )
+            { style: { display: "inline-flex", alignItems: "center", gap: "8px", flexWrap: "wrap", justifyContent: "center" } },
+            savedPairCount > 0
+              ? el("button", {
+                  type: "button",
+                  className: "mac-btn mac-btn-sm",
+                  text: `选择已保存表对 (${savedPairCount})`,
+                  onClick: () => {
+                    this._openPairPicker();
+                    this.pairSearchInput.focus();
+                  },
+                })
+              : null,
+            el("button", {
+              type: "button",
+              className: "mac-btn mac-btn-sm mac-btn-primary",
+              text: "上传映射铺底",
+              onClick: () => this.openPairingUploadWizard(),
+            })
           )
         )
-      : el(
-          "div",
-          { className: "explorer-empty-state" },
-          el(
-            "div",
-            { className: "explorer-empty-card", style: { maxWidth: "420px", padding: "22px" } },
-            el("div", { style: { marginBottom: "8px", color: "var(--os-accent)" } }, svgIcon("bookmark", 28)),
-            el("h3", { style: { margin: "0 0 12px 0", fontSize: "14px" }, text: "选择来源与目标库表开始比对" }),
-            el(
-              "button",
-              {
-                type: "button",
-                className: "mac-btn mac-btn-sm mac-btn-primary",
-                text: "上传映射铺底",
-                onClick: () => this.openPairingUploadWizard(),
-              }
-            )
-          )
-        );
+      );
+    }
 
-    clearEl(this.root, subbar, this.activityBar.el, envStrip, mainBody);
+    if (this._mountedBodyEl !== mainBody) {
+      this._mountedBodyEl = mainBody;
+      clearEl(this.root, this.subbarMount, this.activityBar.el, this.envStripMount, mainBody);
+    }
   }
 }
