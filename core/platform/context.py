@@ -5,12 +5,13 @@ from __future__ import annotations
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from core.platform.asset_store import AssetStore
 from core.platform.connection_hub import ConnectionHub
 from core.platform.driver_manager import DriverManager
 from core.platform.import_progress import ImportProgressHub
+from core.platform.license_hub import LicenseHub
 from core.platform.llm_hub import LLMHub
 from core.platform.metadata_hub import MetadataHub
 from core.platform.query_engine import QueryEngine
@@ -26,6 +27,7 @@ class PlatformContext:
         db_path: str,
         drivers_dir: Optional[str] = None,
         assets_dir: Optional[str] = None,
+        verifier_pubkey: Optional[bytes] = None,
     ) -> None:
         abs_db = os.path.abspath(db_path)
         self.data_dir = os.path.dirname(abs_db)
@@ -36,6 +38,7 @@ class PlatformContext:
         os.makedirs(eff_assets_dir, exist_ok=True)
 
         self.store = PlatformStateStore(abs_db)
+        self.license_hub = LicenseHub(self.store, verifier_pubkey=verifier_pubkey)
         self.driver_manager = DriverManager(self.store, drivers_dir=eff_drivers_dir)
         self.connection_hub = ConnectionHub(self.store, self.driver_manager)
         self.metadata_hub = MetadataHub(self.store, self.connection_hub)
@@ -81,7 +84,8 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.5.2",
+            "version": "2.6.0",
+            "license": self.license_hub.get_auth_status(),
             "appearance": self.asset_store.get_public_appearance(),
             "connections": connections,
             "catalog_trees": trees_summary,
@@ -97,8 +101,19 @@ class PlatformContext:
 
 
 def get_platform_context(request: Request) -> PlatformContext:
-    """FastAPI Depends 依赖注入入口."""
+    """FastAPI Depends 依赖注入入口（附带 Gate 2 独立授权能力令牌二次核验）."""
     ctx: Optional[PlatformContext] = getattr(request.app.state, "platform_ctx", None)
     if ctx is None:
         raise RuntimeError("PlatformContext 尚未绑定至 FastAPI 应用实例")
+    ok, auth_info = ctx.license_hub.verify_request_capability(request)
+    if not ok:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "ok": False,
+                "code": "LICENSE_REQUIRED",
+                "license_status": auth_info.get("status", "UNACTIVATED"),
+                "error": auth_info.get("status_message") or "系统尚未激活或授权已失效，请先输入有效激活码",
+            },
+        )
     return ctx

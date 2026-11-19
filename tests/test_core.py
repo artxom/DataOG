@@ -161,9 +161,31 @@ class TestDWSMigrator(unittest.TestCase):
         self.assertEqual(parsed2[0]["new_col_type"], "VARCHAR2(64)")
 
     def test_clean_init_and_password_persistence(self) -> None:
+        import datetime
+        from core.platform.license_hub import (
+            SCOPE_GLOBAL,
+            ed25519_derive_pubkey,
+            issue_activation_code_for_seed,
+        )
+
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test_state.db")
             app = create_app(db_path=db_path)
+
+            # 未激活前访问 /api/bootstrap 必须被 401 拦截
+            st_unauth, _, _ = asyncio.run(_call_asgi(app, "GET", "/api/bootstrap"))
+            self.assertEqual(st_unauth, 401)
+
+            # 注入测试公钥并通过真实激活流程激活
+            seed = b"DataOG-CoreTest-Seed-Ed25519-001"
+            app.state.platform_ctx.license_hub._bind_test_pubkey(ed25519_derive_pubkey(seed))
+            code = issue_activation_code_for_seed(
+                seed,
+                scope=SCOPE_GLOBAL,
+                duration_days=90,
+                expiry_date=datetime.date.today() + datetime.timedelta(days=89),
+            )
+            app.state.platform_ctx.license_hub.activate(code)
 
             # 验证纯净初始化：无任何预置沙盒假数据
             status, _, body = asyncio.run(_call_asgi(app, "GET", "/api/bootstrap"))

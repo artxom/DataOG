@@ -17,6 +17,7 @@ from core.platform.import_progress import ImportProgressHub
 from core.platform.schemas import (
     AppearanceResetPayload,
     AppearanceUpdatePayload,
+    AuthActivatePayload,
     ConnectionPayload,
     ConnectionStandardFormatPayload,
     LLMProviderPayload,
@@ -37,6 +38,68 @@ def _err(message: str, status_code: int = 400) -> JSONResponse:
 def extract_task_id(request: Request, query_task_id: str = "") -> str:
     candidate = (query_task_id or request.headers.get("x-task-id", "") or "").strip()
     return candidate if ImportProgressHub.is_valid_id(candidate) else ""
+
+
+# =========================================================================
+# 离线激活码与登录鉴权路由 (/api/platform/auth/*，免前置拦截)
+# =========================================================================
+
+
+@router.get("/auth/status")
+def api_auth_status(ctx: PlatformContext = Depends(get_platform_context)):
+    status = ctx.license_hub.get_auth_status(force_refresh_ip=True)
+    return {
+        "ok": True,
+        "license": status,
+        "appearance": ctx.asset_store.get_public_appearance(),
+        **status,
+    }
+
+
+@router.post("/auth/activate")
+def api_auth_activate(
+    payload: AuthActivatePayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        status = ctx.license_hub.activate(
+            activation_code=payload.activation_code,
+            login_mode=payload.login_mode,
+        )
+        exp_date = status.get("expires_date") or ""
+        msg = f"激活成功！当前激活码可用日期至 {exp_date}" if exp_date else "激活成功！"
+        resp = JSONResponse(
+            content={
+                "ok": True,
+                "license": status,
+                "message": msg,
+            }
+        )
+        resp.set_cookie(
+            key="dataog_session",
+            value=ctx.license_hub.issue_session_cookie_value(),
+            httponly=True,
+            samesite="strict",
+            path="/",
+            max_age=86400,
+        )
+        return resp
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
+@router.post("/auth/lock")
+def api_auth_lock(ctx: PlatformContext = Depends(get_platform_context)):
+    status = ctx.license_hub.lock()
+    resp = JSONResponse(
+        content={
+            "ok": True,
+            "license": status,
+            "message": "工作台已安全锁定",
+        }
+    )
+    resp.delete_cookie(key="dataog_session", path="/")
+    return resp
 
 
 @router.get("/bootstrap")

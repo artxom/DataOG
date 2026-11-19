@@ -123,6 +123,7 @@ try:
 
     from core.dws_engine import DWSMigratorEngine
     from core.platform.context import PlatformContext
+    from core.platform.license_hub import AUTH_PUBLIC_EXEMPT_PREFIXES
     from core.platform.router import router as platform_router
     from modules.cross_comparator.router import router as cross_comparator_router
     from modules.data_explorer.router import router as data_explorer_router
@@ -292,7 +293,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.5.2",
+        version="2.6.0",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -301,24 +302,49 @@ def create_app(
     app.state.store = store
     app.state.engine = engine
 
+    def _apply_security_headers(resp: Response) -> Response:
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "DENY")
+        resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        resp.headers.setdefault("Permissions-Policy", "camera=(), geolocation=(), microphone=()")
+        resp.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+        resp.headers.setdefault("Content-Security-Policy", _SECURITY_CSP)
+        return resp
+
     @app.middleware("http")
     async def security_headers_and_csrf_middleware(request: Request, call_next):
-        if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.url.path.startswith("/api/"):
+        req_path = request.url.path
+        if request.method in ("POST", "PUT", "PATCH", "DELETE") and req_path.startswith("/api/"):
             sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
             if sec_fetch_site and sec_fetch_site not in ("same-origin", "same-site", "none"):
-                return JSONResponse(
-                    status_code=403,
-                    content={"ok": False, "error": "禁止跨站伪造请求 (Cross-Site Request Blocked)"},
+                return _apply_security_headers(
+                    JSONResponse(
+                        status_code=403,
+                        content={"ok": False, "error": "禁止跨站伪造请求 (Cross-Site Request Blocked)"},
+                    )
+                )
+
+        # Gate 1: 全量 /api/* 请求离线非对称激活码鉴权拦截（仅放行公开认证与外观静态图片读取）
+        if req_path.startswith("/api/") and not any(
+            req_path.startswith(pref) for pref in AUTH_PUBLIC_EXEMPT_PREFIXES
+        ):
+            ok_auth, auth_info = ctx.license_hub.check_and_stamp_request(request)
+            if not ok_auth:
+                return _apply_security_headers(
+                    JSONResponse(
+                        status_code=401,
+                        content={
+                            "ok": False,
+                            "code": "LICENSE_REQUIRED",
+                            "license_status": auth_info.get("status", "UNACTIVATED"),
+                            "error": auth_info.get("status_message")
+                            or "系统尚未激活或授权已过期，请先输入有效激活码",
+                        },
+                    )
                 )
 
         response = await call_next(request)
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-        response.headers.setdefault("Permissions-Policy", "camera=(), geolocation=(), microphone=()")
-        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
-        response.headers.setdefault("Content-Security-Policy", _SECURITY_CSP)
-        return response
+        return _apply_security_headers(response)
 
     # 注册平台公共底座路由与四大独立插件模块路由
     app.include_router(platform_router)
@@ -354,7 +380,18 @@ def create_app(
         return payload
 
     @app.get("/api/bootstrap", include_in_schema=False)
-    async def api_bootstrap() -> JSONResponse:
+    async def api_bootstrap(request: Request) -> JSONResponse:
+        ok, auth_info = ctx.license_hub.verify_request_capability(request)
+        if not ok:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "ok": False,
+                    "code": "LICENSE_REQUIRED",
+                    "license_status": auth_info.get("status", "UNACTIVATED"),
+                    "error": auth_info.get("status_message") or "系统尚未激活或授权已失效",
+                },
+            )
         data = await anyio.to_thread.run_sync(_build_full_state_dict)
         return JSONResponse(data)
 
@@ -415,7 +452,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.5.2 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.6.0 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")

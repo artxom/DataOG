@@ -36,12 +36,17 @@ from core.platform.context import PlatformContext
 
 class _CaseInsensitiveHeaders:
     def __init__(self, pairs: List[Tuple[bytes, bytes]]) -> None:
+        self._pairs = list(pairs)
         self._map: Dict[str, str] = {
             k.decode("latin-1").lower(): v.decode("latin-1") for k, v in pairs
         }
 
     def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
         return self._map.get(key.lower(), default)
+
+    def get_all(self, key: str) -> List[str]:
+        lk = key.lower()
+        return [v.decode("latin-1") for k, v in self._pairs if k.decode("latin-1").lower() == lk]
 
     def __contains__(self, key: str) -> bool:
         return key.lower() in self._map
@@ -61,13 +66,47 @@ class _AsgiResponse:
         return json.loads(self.text)
 
 
+_TEST_LICENSE_SEED = b"DataOG-UnitTest-Ed25519-Seed-001"
+
+
 class TestClient:
     """零第三方 HTTP 依赖的标准库内存 ASGI 测试客户端（免打包 httpx / httpcore / certifi）."""
 
     __test__ = False
 
-    def __init__(self, app: Any) -> None:
+    def __init__(self, app: Any, *, auto_activate: bool = True) -> None:
         self.app = app
+        self._cookies: Dict[str, str] = {}
+        if auto_activate:
+            self._ensure_activated()
+
+    def _ensure_activated(self) -> None:
+        ctx = getattr(getattr(self.app, "state", None), "platform_ctx", None)
+        if ctx is None:
+            return
+        lic_hub = getattr(ctx, "license_hub", None)
+        if lic_hub is None:
+            return
+        if lic_hub.get_auth_status()["authorized"]:
+            return
+        import datetime
+        from core.platform.license_hub import (
+            SCOPE_GLOBAL,
+            ed25519_derive_pubkey,
+            issue_activation_code_for_seed,
+        )
+
+        test_pub = ed25519_derive_pubkey(_TEST_LICENSE_SEED)
+        lic_hub._bind_test_pubkey(test_pub)
+        code = issue_activation_code_for_seed(
+            _TEST_LICENSE_SEED,
+            scope=SCOPE_GLOBAL,
+            duration_days=90,
+            expiry_date=datetime.date.today() + datetime.timedelta(days=89),
+        )
+        res = self.post("/api/platform/auth/activate", json={"activation_code": code})
+        if res.status_code != 200:
+            raise RuntimeError(f"TestClient 自动激活失败: {res.status_code} {res.text}")
 
     @staticmethod
     def _encode_multipart(
@@ -102,6 +141,8 @@ class TestClient:
         headers: Optional[Dict[str, str]] = None,
     ) -> _AsgiResponse:
         hdrs: Dict[str, str] = {"host": "127.0.0.1:18080"}
+        if self._cookies:
+            hdrs["cookie"] = "; ".join(f"{k}={v}" for k, v in self._cookies.items())
         if headers:
             for hk, hv in headers.items():
                 hdrs[hk.lower()] = hv
@@ -169,7 +210,17 @@ class TestClient:
                 await self.app(scope, receive, send)
             finally:
                 response_complete.set()
-            return _AsgiResponse(status_code, resp_headers, b"".join(resp_chunks))
+            resp = _AsgiResponse(status_code, resp_headers, b"".join(resp_chunks))
+            for sc in resp.headers.get_all("set-cookie"):
+                first_part = sc.split(";", 1)[0].strip()
+                if "=" not in first_part:
+                    continue
+                ck_name, ck_val = first_part.split("=", 1)
+                if "max-age=0" in sc.lower() or not ck_val:
+                    self._cookies.pop(ck_name.strip(), None)
+                else:
+                    self._cookies[ck_name.strip()] = ck_val.strip()
+            return resp
 
         return asyncio.run(_invoke())
 
