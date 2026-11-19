@@ -149,6 +149,9 @@ export class CrossComparatorView {
       "aria-label": "已保存映射表对",
       placeholder: "已保存映射表对 (搜表/字段)...",
       onFocus: () => this._openPairPicker(),
+      onBlur: () => {
+        if (!this.pairPickerOpen) this._syncPairPickerDisplay();
+      },
       onClick: () => {
         if (!this.pairPickerOpen) this._openPairPicker();
       },
@@ -199,6 +202,7 @@ export class CrossComparatorView {
       this.pairPopover
     );
     this._onDocPointerDown = (e) => {
+      if (this.root?.isConnected === false) return;
       if (this.pairPickerOpen && this.pairPickerRoot && !this.pairPickerRoot.contains(e.target)) {
         this._closePairPicker();
       }
@@ -340,46 +344,53 @@ export class CrossComparatorView {
 
     this.srcCandColEl = this._buildCandidateColumnShell("source");
     this.tgtCandColEl = this._buildCandidateColumnShell("target");
-    this.matrixPaneEl = el(
+    this.stickyTopEl = el(
       "div",
-      { className: "cross-matrix-pane" },
+      { className: "cross-center-sticky-top" },
       el(
         "div",
-        { className: "cross-center-sticky-top" },
+        { className: "cross-center-col-headers" },
         el(
           "div",
-          { className: "cross-center-col-headers" },
-          el(
-            "div",
-            { className: "cross-col-head" },
-            el("span", { className: "cross-col-head-title", text: "来源表已绑定数标字段" }),
-            this.centerSrcCountBadge
-          ),
-          el(
-            "div",
-            { className: "cross-col-head is-center" },
-            el("span", { className: "cross-col-head-title", text: "数据标准" }),
-            this.centerStdCountBadge
-          ),
-          el(
-            "div",
-            { className: "cross-col-head" },
-            el("span", { className: "cross-col-head-title", text: "目标表已绑定数标字段" }),
-            this.centerTgtCountBadge
-          )
+          { className: "cross-col-head" },
+          el("span", { className: "cross-col-head-title", text: "来源表已绑定数标字段" }),
+          this.centerSrcCountBadge
         ),
         el(
           "div",
-          { className: "cross-center-filterbar" },
-          this.filterBarMount,
-          el(
-            "search",
-            { className: "cross-inline-search" },
-            svgIcon("search", 12),
-            this.matrixSearchInput
-          )
+          { className: "cross-col-head is-center" },
+          el("span", { className: "cross-col-head-title", text: "数据标准" }),
+          this.centerStdCountBadge
+        ),
+        el(
+          "div",
+          { className: "cross-col-head" },
+          el("span", { className: "cross-col-head-title", text: "目标表已绑定数标字段" }),
+          this.centerTgtCountBadge
         )
       ),
+      el(
+        "div",
+        { className: "cross-center-filterbar" },
+        this.filterBarMount,
+        el(
+          "search",
+          { className: "cross-inline-search" },
+          svgIcon("search", 12),
+          this.matrixSearchInput
+        )
+      )
+    );
+    this.matrixPaneEl = el(
+      "div",
+      {
+        className: "cross-matrix-pane",
+        onDragover: (e) => {
+          const topInset = Number(this.stickyTopEl?.offsetHeight || 72);
+          this._autoScrollContainerOnDrag(this.matrixPaneEl, e, { topInset });
+        },
+      },
+      this.stickyTopEl,
       this.matrixListMount
     );
     this.centerStageEl = el("section", { className: "cross-center-stage" }, this.matrixPaneEl);
@@ -427,6 +438,73 @@ export class CrossComparatorView {
     e.currentTarget?.classList?.remove("is-drop-target");
   }
 
+  _getDropzoneLabelText() {
+    if (this.dragPayload?.colName) {
+      return this.dragPayload.kind === "bound"
+        ? `+ 松开为「${this.dragPayload.colName}」另绑新标准`
+        : `+ 松开为「${this.dragPayload.colName}」绑定新标准`;
+    }
+    if (this.selectedCandidate?.columnName) {
+      return `+ 为「${this.selectedCandidate.columnName}」绑定新标准`;
+    }
+    return "+ 绑定新标准";
+  }
+
+  _syncDropzoneLabel() {
+    if (this._dropzoneLabelEl) {
+      this._dropzoneLabelEl.textContent = this._getDropzoneLabelText();
+    }
+    if (this._dropzoneRowEl) {
+      this._dropzoneRowEl.classList.toggle(
+        "is-active-dropzone",
+        Boolean(this.selectedCandidate || this.dragPayload)
+      );
+    }
+  }
+
+  _startFieldDrag(payload, cardEl = null) {
+    this.dragPayload = payload;
+    cardEl?.classList?.add("is-dragging");
+    this.workspaceEl?.classList?.add("is-field-dragging");
+    this._syncDropzoneLabel();
+  }
+
+  _endFieldDrag(cardEl = null) {
+    this.dragPayload = null;
+    cardEl?.classList?.remove("is-dragging");
+    this.workspaceEl?.classList?.remove("is-field-dragging");
+    this._syncDropzoneLabel();
+  }
+
+  _autoScrollContainerOnDrag(scrollEl, e, { topInset = 0 } = {}) {
+    if (!this.dragPayload || !scrollEl?.getBoundingClientRect) return;
+    const y = Number(e?.clientY);
+    if (!Number.isFinite(y)) return;
+    const rect = scrollEl.getBoundingClientRect();
+    if (rect.height <= 0) return;
+    const edgeZone = 46;
+    const topBandEnd = Math.min(rect.bottom - edgeZone, rect.top + topInset + edgeZone);
+    const botBandStart = Math.max(rect.top, rect.bottom - edgeZone);
+    let delta = 0;
+    if (y >= rect.top && y < topBandEnd) {
+      const denom = Math.max(1, topBandEnd - rect.top);
+      const ratio = Math.min(1, (topBandEnd - y) / denom);
+      delta = -Math.ceil(4 + ratio * 14);
+    } else if (y <= rect.bottom && y > botBandStart) {
+      const ratio = Math.min(1, (y - botBandStart) / edgeZone);
+      delta = Math.ceil(4 + ratio * 14);
+    }
+    if (delta !== 0) {
+      const now = Date.now();
+      if (now - (this._lastDragScrollTs || 0) >= 16) {
+        this._lastDragScrollTs = now;
+        const maxScroll = Math.max(0, Number(scrollEl.scrollHeight || 0) - Number(scrollEl.clientHeight || 0));
+        const nextTop = Math.max(0, Math.min(maxScroll || Infinity, Number(scrollEl.scrollTop || 0) + delta));
+        scrollEl.scrollTop = nextTop;
+      }
+    }
+  }
+
   _resetScrollPositions({ centerOnly = false } = {}) {
     if (this.matrixPaneEl) this.matrixPaneEl.scrollTop = 0;
     if (!centerOnly) {
@@ -466,7 +544,13 @@ export class CrossComparatorView {
   }
 
   async ensureLoaded(force = false) {
-    if (this.loadedOnce && !force) return;
+    if (this.loadedOnce && !force) {
+      const loadedKey = String(this.overview?.active_table_key || "");
+      if (!this.dirty && this.activeTableKey && this.overview && loadedKey !== this.activeTableKey) {
+        await this.loadPairComparison(this.activeTableKey, false);
+      }
+      return;
+    }
     await this.loadOverview(this.activeTableKey, false);
   }
 
@@ -724,7 +808,7 @@ export class CrossComparatorView {
   _hydrateDraftFromComparison(comp) {
     this.dirty = false;
     this.selectedCandidate = null;
-    this.dragPayload = null;
+    this._endFieldDrag();
     this.sourceCandidates = [];
     this.targetCandidates = [];
     this.centerRows = [];
@@ -1453,7 +1537,7 @@ export class CrossComparatorView {
 
   _handleDropOnCenterTarget(targetRowIdx, fixedSide = null) {
     const payload = this.dragPayload;
-    this.dragPayload = null;
+    this._endFieldDrag();
     if (!payload) return;
     const side = fixedSide || payload.side;
     if (payload.side !== side) return;
@@ -1473,7 +1557,7 @@ export class CrossComparatorView {
 
   _handleDropOnCandidatePool(targetSide) {
     const payload = this.dragPayload;
-    this.dragPayload = null;
+    this._endFieldDrag();
     if (!payload || payload.kind !== "bound" || payload.side !== targetSide) return;
     if (typeof payload.rowIdx === "number") {
       this._unbindBoundField(targetSide, payload.rowIdx);
@@ -1637,32 +1721,54 @@ export class CrossComparatorView {
       dbType,
       formatProfile: fmt,
       onSelect: (picked) => {
+        const liveIdx = this.centerRows.indexOf(row);
+        if (liveIdx === -1) return;
         if (!picked) {
           if (isBoth) {
             if (row.source_col) this._returnToCandidates("source", row.source_col);
             if (row.target_col) this._returnToCandidates("target", row.target_col);
-            this.centerRows.splice(rowIdx, 1);
+            this.centerRows.splice(liveIdx, 1);
           } else {
-            this._unbindBoundField(side, rowIdx);
+            this._unbindBoundField(side, liveIdx);
             return;
           }
-        } else {
-          const code = picked.std_code;
-          this._cacheStdItem(picked);
-          if (isBoth || side === "source") {
-            row.source_std_code = code;
-            row.source_std = this._toStdBrief(picked, "source");
-          }
-          if (isBoth || side === "target") {
-            row.target_std_code = code;
-            row.target_std = this._toStdBrief(picked, "target");
-            const ev = this._evaluateProvisionalTargetCompliance(row.target_col, row.target_std);
-            row.target_compliance = ev.target_compliance;
-            row.target_needs_migration = ev.target_needs_migration;
-          }
-          this._recomputeRowState(row);
+          this._markDirty();
+          return;
         }
+        const code = picked.std_code;
+        this._cacheStdItem(picked);
+        if (!isBoth) {
+          const oppSide = side === "source" ? "target" : "source";
+          if (!row[`${oppSide}_col`] && row[`${side}_col`]) {
+            const existingRow = this.centerRows.find(
+              (r, idx) => idx !== liveIdx && !r[`${side}_col`] && r[`${oppSide}_std_code`] === code
+            );
+            if (existingRow) {
+              const existingIdx = this.centerRows.indexOf(existingRow);
+              this._bindFieldToRow(side, row[`${side}_col`], existingIdx, {
+                removeFromRowIdx: liveIdx,
+                stdItem: picked,
+              });
+              return;
+            }
+          }
+        }
+        if (isBoth || side === "source") {
+          row.source_std_code = code;
+          row.source_std = this._toStdBrief(picked, "source");
+        }
+        if (isBoth || side === "target") {
+          row.target_std_code = code;
+          row.target_std = this._toStdBrief(picked, "target");
+          const ev = this._evaluateProvisionalTargetCompliance(row.target_col, row.target_std);
+          row.target_compliance = ev.target_compliance;
+          row.target_needs_migration = ev.target_needs_migration;
+        }
+        this._recomputeRowState(row);
         this._markDirty();
+        if (row.source_std?._pendingType || row.target_std?._pendingType) {
+          this._resolvePendingStdTypesAsync([code]);
+        }
       },
     });
   }
@@ -2317,6 +2423,7 @@ export class CrossComparatorView {
         })
       : -1;
     ctrl.cardEl.classList.add("is-picker-open");
+    this.envStripMount?.classList?.add("has-open-picker");
     ctrl.quickBtn.classList.add("is-open");
     ctrl.quickBtn.setAttribute("aria-expanded", "true");
     this._renderTablePickerList(role, { scrollHighlight: ctrl.pickerHighlightIdx >= 0 });
@@ -2332,6 +2439,9 @@ export class CrossComparatorView {
     ctrl.pickerQuery = "";
     ctrl.pickerHighlightIdx = -1;
     ctrl.cardEl.classList.remove("is-picker-open");
+    if (!this._isAnyTablePickerOpen()) {
+      this.envStripMount?.classList?.remove("has-open-picker");
+    }
     ctrl.quickBtn.classList.remove("is-open");
     ctrl.quickBtn.setAttribute("aria-expanded", "false");
     ctrl.popoverEl.classList.remove("is-flip-up");
@@ -2702,16 +2812,14 @@ export class CrossComparatorView {
               },
               onDblclick: () => this._openPickerForCandidate(side, col.column_name),
               onDragstart: (e) => {
-                this.dragPayload = { kind: "candidate", side, colName: col.column_name };
                 if (e.dataTransfer) {
                   e.dataTransfer.effectAllowed = "move";
                   e.dataTransfer.setData("text/plain", `${side}:${col.column_name}`);
                 }
-                e.currentTarget.classList.add("is-dragging");
+                this._startFieldDrag({ kind: "candidate", side, colName: col.column_name }, e.currentTarget);
               },
               onDragend: (e) => {
-                this.dragPayload = null;
-                e.currentTarget.classList.remove("is-dragging");
+                this._endFieldDrag(e.currentTarget);
               },
             },
             el(
@@ -2761,6 +2869,7 @@ export class CrossComparatorView {
       {
         className: `cross-cand-col ${isSrc ? "is-left" : "is-right"}`.trim(),
         onDragover: (e) => {
+          this._autoScrollContainerOnDrag(listMount, e, { topInset: 0 });
           if (!this.dragPayload || this.dragPayload.kind !== "bound" || this.dragPayload.side !== side) return;
           e.preventDefault();
           e.currentTarget.classList.add("is-drop-target");
@@ -2873,16 +2982,14 @@ export class CrossComparatorView {
           ? `${colObj.column_name} (${colObj.data_type || "-"}) | ${cc.capacity_label || "-"} | ${cc.type_conv_label || "-"}`
           : `${colObj.column_name} (${colObj.data_type || "-"})`,
         onDragstart: (e) => {
-          this.dragPayload = { kind: "bound", side, colName: colObj.column_name, rowIdx };
           if (e.dataTransfer) {
             e.dataTransfer.effectAllowed = "move";
             e.dataTransfer.setData("text/plain", `bound:${side}:${rowIdx}`);
           }
-          e.currentTarget.classList.add("is-dragging");
+          this._startFieldDrag({ kind: "bound", side, colName: colObj.column_name, rowIdx }, e.currentTarget);
         },
         onDragend: (e) => {
-          this.dragPayload = null;
-          e.currentTarget.classList.remove("is-dragging");
+          this._endFieldDrag(e.currentTarget);
         },
         onDragover: (e) => {
           if (!this.dragPayload || this.dragPayload.side !== side) return;
@@ -2972,6 +3079,11 @@ export class CrossComparatorView {
         {
           className: `cross-std-card is-diff ${hasSelected ? "is-click-target" : ""}`.trim(),
           ...commonDropHandlers,
+          onClick: () => {
+            if (this.selectedCandidate) {
+              this._assignCandidateToRow(this.selectedCandidate.side, this.selectedCandidate.columnName, rowIdx);
+            }
+          },
         },
         el(
           "div",
@@ -2982,7 +3094,8 @@ export class CrossComparatorView {
               type: "button",
               className: "cross-std-split-pill",
               title: `${sStd.std_code} · ${sStd.cn_name} (${sStd.resolved_type || "-"})`,
-              onClick: () => {
+              onClick: (e) => {
+                e.stopPropagation?.();
                 if (this.selectedCandidate) {
                   this._assignCandidateToRow(this.selectedCandidate.side, this.selectedCandidate.columnName, rowIdx);
                   return;
@@ -3003,7 +3116,8 @@ export class CrossComparatorView {
               type: "button",
               className: "cross-std-split-pill",
               title: `${tStd.std_code} · ${tStd.cn_name} (${tStd.resolved_type || "-"})`,
-              onClick: () => {
+              onClick: (e) => {
+                e.stopPropagation?.();
                 if (this.selectedCandidate) {
                   this._assignCandidateToRow(this.selectedCandidate.side, this.selectedCandidate.columnName, rowIdx);
                   return;
@@ -3023,21 +3137,30 @@ export class CrossComparatorView {
             className: "btn btn-xs",
             text: "采用源标",
             title: "两侧均统一为左侧来源标准",
-            onClick: () => this._unifyDiffRow(rowIdx, "source"),
+            onClick: (e) => {
+              e.stopPropagation?.();
+              this._unifyDiffRow(rowIdx, "source");
+            },
           }),
           el("button", {
             type: "button",
             className: "btn btn-xs",
             text: "采用目标",
             title: "两侧均统一为右侧目标标准",
-            onClick: () => this._unifyDiffRow(rowIdx, "target"),
+            onClick: (e) => {
+              e.stopPropagation?.();
+              this._unifyDiffRow(rowIdx, "target");
+            },
           }),
           el("button", {
             type: "button",
             className: "btn btn-xs",
             text: "拆为两行",
             title: "拆解为独立的来源单侧行与目标单侧行",
-            onClick: () => this._splitRow(rowIdx),
+            onClick: (e) => {
+              e.stopPropagation?.();
+              this._splitRow(rowIdx);
+            },
           })
         )
       );
@@ -3216,10 +3339,14 @@ export class CrossComparatorView {
         : null;
 
     const hasSelected = Boolean(this.selectedCandidate);
+    const isDropzoneActive = Boolean(hasSelected || this.dragPayload);
+    this._dropzoneLabelEl = el("span", {
+      text: this._getDropzoneLabelText(),
+    });
     const newStdDropzone = el(
       "div",
       {
-        className: "cross-matrix-row is-dropzone-row",
+        className: `cross-matrix-row is-dropzone-row ${isDropzoneActive ? "is-active-dropzone" : ""}`.trim(),
       },
       el("div", {}),
       el(
@@ -3249,7 +3376,7 @@ export class CrossComparatorView {
             e.preventDefault();
             e.currentTarget.classList.remove("is-drop-target");
             const payload = this.dragPayload;
-            this.dragPayload = null;
+            this._endFieldDrag();
             if (!payload) return;
             if (payload.kind === "candidate") {
               this._openPickerForCandidate(payload.side, payload.colName);
@@ -3258,14 +3385,11 @@ export class CrossComparatorView {
             }
           },
         },
-        el("span", {
-          text: hasSelected
-            ? `+ 为「${this.selectedCandidate.columnName}」绑定新标准`
-            : "+ 绑定新标准",
-        })
+        this._dropzoneLabelEl
       ),
       el("div", {})
     );
+    this._dropzoneRowEl = newStdDropzone;
 
     clearEl(this.matrixListMount, emptyFilterHint, ...matrixRows, newStdDropzone);
   }
@@ -3397,7 +3521,7 @@ export class CrossComparatorView {
   _syncPairPickerDisplay() {
     const tables = this.overview?.tables || [];
     this.pairPickerBadge.textContent = String(tables.length);
-    if (!this.pairPickerOpen && document.activeElement !== this.pairSearchInput) {
+    if (!this.pairPickerOpen) {
       const active = tables.find((t) => t.std_table_key === this.activeTableKey);
       if (active) {
         this.pairSearchInput.value = `${active.source_table || active.std_table_name} ↔ ${active.target_table || active.std_table_name}`;
@@ -3446,6 +3570,9 @@ export class CrossComparatorView {
     this.pairHighlightIdx = -1;
     clearTimeout(this.pairSearchTimer);
     this.pairSearchAbort?.abort();
+    if (globalThis.document?.activeElement === this.pairSearchInput) {
+      this.pairSearchInput.blur?.();
+    }
     this._syncPairPickerDisplay();
   }
 
@@ -3465,6 +3592,7 @@ export class CrossComparatorView {
       this.pairPickerOpen = true;
       this.pairPickerRoot.classList.add("is-open");
       this.pairPopover.hidden = false;
+      this._positionPairPopover();
     }
     this.pairHighlightIdx = 0;
     this._syncPairPickerDisplay();

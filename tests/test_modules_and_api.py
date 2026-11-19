@@ -3715,6 +3715,12 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
         self.assertNotIn("inline-flex", type_pill_m.group(1))
         self.assertIn(".cross-type-pill:only-child", css_text)
         self.assertIn(".cross-table-popover.is-flip-up", css_text)
+        self.assertIn(".cross-env-strip.has-open-picker", css_text)
+        self.assertIn(".cross-pair-input::-webkit-search-cancel-button", css_text)
+        self.assertIn(".cross-matrix-row.is-dropzone-row.is-active-dropzone", css_text)
+        ep_card_m = re.search(r"\.cross-endpoint-card\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(ep_card_m)
+        self.assertIn("justify-content: flex-start", ep_card_m.group(1))
         self.assertIn("@supports (scrollbar-color: auto)", css_text)
         five_inner_m = re.search(r"\.cross-five-inner\s*\{([^}]*)\}", css_text)
         self.assertIsNotNone(five_inner_m)
@@ -4107,30 +4113,97 @@ if (!lastCompareUrl.includes("source_schema=mart_core") || !lastCompareUrl.inclu
   throw new Error("explicit schema.table in tableInput kept stale schema: " + lastCompareUrl);
 }}
 
-// 12) 超矮窗口堆叠态下打开底部目标库选表浮层：当下方空间不足而上方空间充足时自动向上翻转 (.is-flip-up) 并钳制 maxHeight
+// 12) 超矮窗口堆叠态下打开底部目标库选表浮层：当下方空间不足而上方空间充足时自动向上翻转 (.is-flip-up)、提升 .cross-env-strip 层级 (.has-open-picker) 并钳制 maxHeight
 view.root.getBoundingClientRect = () => ({{ top: 70, bottom: 430, left: 0, right: 840 }});
 view.epControls.target.bodyEl.getBoundingClientRect = () => ({{ top: 295, bottom: 320, left: 10, right: 820 }});
 view.epControls.target.quickBtn.click();
-if (!view.epControls.target.popoverEl.classList.contains("is-flip-up") || !view.epControls.target.popoverEl.style.maxHeight) {{
-  throw new Error("expected target table popover to flip upward with clamped maxHeight on short viewport");
+if (
+  !view.epControls.target.popoverEl.classList.contains("is-flip-up") ||
+  !view.epControls.target.popoverEl.style.maxHeight ||
+  !view.envStripMount.classList.contains("has-open-picker")
+) {{
+  throw new Error("expected target table popover to flip upward with has-open-picker and clamped maxHeight on short viewport");
 }}
 view._closeAllTablePickers();
+if (view.envStripMount.classList.contains("has-open-picker")) {{
+  throw new Error("expected has-open-picker to clear after closing table pickers");
+}}
 
-// 13) 已保存表对浮层 (.cross-pair-popover) 打开时按 Escape（无论焦点在输入框还是失焦到文档）：仅关闭浮层且不误清空已选待选字段
+// 13) 已保存表对浮层 (.cross-pair-popover)：打开后按 Escape 或点击外部 (pointerdown 早于 blur) 均须恢复已选表对标题且不误清待选字段
+view.overview.tables = [
+  {{ std_table_key: "pair_cd", source_table: "t_c", target_table: "t_d", column_count: 3 }},
+  {{ std_table_key: "pair_ef", source_table: "t_e", target_table: "t_f", column_count: 2 }},
+];
+view.activeTableKey = "pair_cd";
+view._syncPairPickerDisplay();
+if (view.pairSearchInput.value !== "t_c ↔ t_d" || !view.pairSearchInput.classList.contains("has-selection")) {{
+  throw new Error("expected initial pairSearchInput display 't_c ↔ t_d', got " + view.pairSearchInput.value);
+}}
 const candForPairEsc = findAll(view.srcCandidateListMount, x => (x.className || "").includes("cross-cand-card"))[0];
 candForPairEsc.click();
 if (!view.selectedCandidate) throw new Error("expected selectedCandidate before pairPicker Escape test");
-view._openPairPicker();
 view.pairSearchInput.focus();
+view._openPairPicker();
+if (view.pairSearchInput.value !== "") throw new Error("expected blank search input while pairPicker open");
 view.pairSearchInput.dispatchEvent({{ type: "keydown", key: "Escape" }});
-if (view.pairPickerOpen || !view.selectedCandidate) {{
-  throw new Error("Escape on focused pairSearchInput failed or cleared selectedCandidate");
+if (view.pairPickerOpen || !view.selectedCandidate || view.pairSearchInput.value !== "t_c ↔ t_d" || !view.pairSearchInput.classList.contains("has-selection")) {{
+  throw new Error("Escape on focused pairSearchInput failed to restore active pair label: val=" + view.pairSearchInput.value);
+}}
+view.pairSearchInput.focus();
+view._openPairPicker();
+// 模拟真实浏览器 pointerdown 早于 blur 触发（点击外部空白处时 activeElement 仍为 pairSearchInput）
+globalThis.document.dispatchEvent({{ type: "pointerdown", target: view.workspaceEl }});
+if (view.pairPickerOpen || view.pairSearchInput.value !== "t_c ↔ t_d" || !view.pairSearchInput.classList.contains("has-selection")) {{
+  throw new Error("Outside pointerdown failed to restore active pair label: val=" + view.pairSearchInput.value);
 }}
 view._openPairPicker();
 view.pairSearchInput.blur();
 globalThis.document.dispatchEvent({{ type: "keydown", key: "Escape" }});
-if (view.pairPickerOpen || !view.selectedCandidate) {{
+if (view.pairPickerOpen || !view.selectedCandidate || view.pairSearchInput.value !== "t_c ↔ t_d") {{
   throw new Error("Document Escape while pairPickerOpen failed or cleared selectedCandidate");
+}}
+
+// 14) 拖拽态吸底「+ 绑定新标准」激活与长表上下边缘自动滚屏 (dragover auto-scroll)
+view.selectedCandidate = null;
+view.render();
+const dragCandCard = findAll(view.srcCandidateListMount, x => (x.className || "").includes("cross-cand-card"))[0];
+dragCandCard.dispatchEvent({{ type: "dragstart", dataTransfer: {{ setData() {{}} }} }});
+if (
+  !view.workspaceEl.classList.contains("is-field-dragging") ||
+  !view._dropzoneRowEl.classList.contains("is-active-dropzone") ||
+  !view._dropzoneLabelEl.textContent.includes("松开为")
+) {{
+  throw new Error("dragstart did not activate sticky dropzone state");
+}}
+view.stickyTopEl.offsetHeight = 72;
+view.matrixPaneEl.scrollHeight = 2400;
+view.matrixPaneEl.clientHeight = 500;
+view.matrixPaneEl.scrollTop = 200;
+view.matrixPaneEl.getBoundingClientRect = () => ({{ top: 100, bottom: 600, height: 500 }});
+view._lastDragScrollTs = 0;
+view.matrixPaneEl.dispatchEvent({{ type: "dragover", clientY: 590 }});
+if (!(view.matrixPaneEl.scrollTop > 200)) {{
+  throw new Error("dragover near bottom edge did not scroll down: " + view.matrixPaneEl.scrollTop);
+}}
+const scrolledDownTop = view.matrixPaneEl.scrollTop;
+view._lastDragScrollTs = 0;
+view.matrixPaneEl.dispatchEvent({{ type: "dragover", clientY: 165 }});
+if (!(view.matrixPaneEl.scrollTop < scrolledDownTop)) {{
+  throw new Error("dragover near sticky header top edge did not scroll up: " + view.matrixPaneEl.scrollTop);
+}}
+dragCandCard.dispatchEvent({{ type: "dragend" }});
+if (view.workspaceEl.classList.contains("is-field-dragging") || view._dropzoneRowEl.classList.contains("is-active-dropzone")) {{
+  throw new Error("dragend did not clean up sticky dropzone state");
+}}
+
+// 15) Spotlight / 上下文切换外部变更 activeTableKey 后调用 ensureLoaded(false) 必须拉取新表对而非残留旧表列
+lastCompareUrl = "";
+view.overview.active_table_key = "pair_cd";
+view.dirty = false;
+view.activeTableKey = "pair_ef";
+await view.ensureLoaded(false);
+if (!lastCompareUrl.includes("table_key=pair_ef")) {{
+  throw new Error("ensureLoaded(false) ignored updated activeTableKey: " + lastCompareUrl);
 }}
 
 view.destroy();

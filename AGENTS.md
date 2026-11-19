@@ -96,7 +96,7 @@
   - 四大桌面应用视图 `js/views/`：
     - **系统配置**：`settings_view.js` + `connections_view.js`（外观与图标 / 数据库连接 / JDBC 驱动 / AI 模型）
     - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单、实时任务微日志并支持探查 SQL 一键同步至主编辑器）
-    - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片与统一库级报告导出） + `cross_comparator_view.js`（macOS Sequoia 五虚拟列防重叠工作台 + 吸顶毛玻璃三列表头分隔与平静分段筛选栏/IME 安全检索 + 持久化双端 macOS 弹出选单与可搜索缓存表浮层 + `.mac-subbar` 可搜索表名/字段级 `.cross-pair-picker` + 按需紧凑长度包络/类型转换诊断底栏 + `TaskActivityBar` 秒切预热 + 统一库级报告导出）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
+    - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片与统一库级报告导出） + `cross_comparator_view.js`（macOS Sequoia 五虚拟列防重叠工作台 + 吸顶毛玻璃三列表头分隔与平静分段筛选栏/IME 安全检索 + 拖拽边缘自动滚屏与吸底 `+ 绑定新标准` 投放区 + 持久化双端 macOS 弹出选单与防遮挡向上翻转缓存表浮层 + `.mac-subbar` 可搜索表名/字段级 `.cross-pair-picker` + 按需紧凑长度包络/类型转换诊断底栏 + `TaskActivityBar` 秒切预热 + 统一库级报告导出）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
     - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
 - **全量自动化测试套件 (`tests/`，当前共 51 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
   - `tests/test_core.py`（14 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、跨库长度/精度包络与类型转换双维判定全矩阵（`test_cross_column_capacity_and_type_conversion_matrix`）、DDL 互译与四层视图穿透核心引擎。
