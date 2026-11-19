@@ -15,7 +15,8 @@
 ### Fixed
 - **彻底根除「3. 跨环境比对」多字段行纵向挤压互相叠加、滚动位置丢失与表头裁切错位问题 (`static/css/workbench.css`, `static/js/views/cross_comparator_view.js`, `tests/test_modules_and_api.py`)**：
   - 修复原 `.cross-matrix-pane` 采用 `display: flex; flex-direction: column` 配合 `.cross-matrix-row { min-height: 52px }`（未声明 `flex-shrink: 0`）导致字段数较多时每行被强制压缩至 `52px`、内部 3 行卡片内容向下溢出并互相叠加覆盖的严重布局缺陷；改用纯块级滚动容器 + `display: grid; grid-auto-rows: max-content; align-content: start` 与 `flex-shrink: 0` 双重防挤压机制，确保任意行数与内容高度自适应零重叠。
-  - 将五栏滚动容器改为持久化 DOM 实例挂载，彻底解决点击待选卡片、解绑、绑标或统一异标时重渲染导致三栏 `scrollTop` 跳回顶部（`0`）的问题，并支持 `Escape` 取消已选待选字段及已绑字段拖入 `+ 绑定新标准` 另建新行。
+  - 将五栏滚动容器改为持久化 DOM 实例挂载，彻底解决点击待选卡片、解绑、绑标或统一异标时重渲染导致三栏 `scrollTop` 跳回顶部（`0`）的问题，支持 `Escape` 取消已选待选字段、长表拖拽上下边缘自动滚屏（`dragover` auto-scroll）及点选/拖拽态下吸底悬浮 `+ 绑定新标准` 投放栏（任意滚动位置零翻页直达绑标）。
+  - 修复矮屏向上翻转选表浮层（`.cross-table-popover.is-flip-up`）受父级层叠上下文限制被 `.mac-subbar` 遮挡拦截、`.cross-pair-picker` 按 `Escape`/点击外部关闭时因 `pointerdown` 早于 `blur` 丢失当前表对回显标题、原生 `search` 重复清除叉号、单侧视图血缘（`视图穿透:`）导致左右配置卡基线错位及 Spotlight 上下文切表未触发二次拉取等边界缺陷。
   - 将中央三列表头移入与 `.cross-matrix-row` 共享同一滚动容器与 `--cross-matrix-cols: minmax(0, ...)` 弹性轨道变量的吸顶层（移除多余 `scrollbar-gutter: stable` 空白槽并统一三栏表头检索区 `40px` 行高），彻底消除悬浮/经典 `16px` 滚动条偏移与中等分辨率下右侧徽标裁切问题，新增第 51 项自动化回归测试 `test_cross_comparator_macos_layout_anti_overlap_and_filter_integrity`。
 
 ---
