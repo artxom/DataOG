@@ -66,14 +66,17 @@ jobs:
         run: python build_exe.py
 
       - name: 验证打包后的 DataOG.exe 内置自检通过
-        run: dist\DataOG\DataOG.exe --test
+        shell: pwsh
+        run: |
+          $env:DATAOG_HOME = Join-Path $env:RUNNER_TEMP "dataog_ci_home"
+          dist\DataOG\DataOG.exe --test
 
       - name: 压缩可执行程序目录
         shell: pwsh
         run: |
-          Get-ChildItem -Path "dist/DataOG/data" -Force -ErrorAction SilentlyContinue |
-            Where-Object { -not $_.PSIsContainer -or ($_.Name -notin @("drivers", "assets")) } |
-            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          if (Test-Path "dist/DataOG/data") {
+            Remove-Item -Path "dist/DataOG/data" -Recurse -Force -ErrorAction SilentlyContinue
+          }
           $shortSha = (git rev-parse --short HEAD).Trim()
           $version = if ("${{ github.ref_name }}" -like "v*") { "${{ github.ref_name }}" } else { "dev-$shortSha" }
           $zipName = "DataOG-Windows-x64-$version.zip"

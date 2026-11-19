@@ -298,8 +298,10 @@ def build_executable() -> None:
                     if dname == "__pycache__":
                         _safe_rmtree(os.path.join(root, dname))
 
-        os.makedirs(os.path.join(dist_bundle_dir, "data", "drivers"), exist_ok=True)
-        os.makedirs(os.path.join(dist_bundle_dir, "data", "assets"), exist_ok=True)
+        # Layer 1 无状态程序包铁律：绝不在打包产物目录中创建或携带 data/ 目录，确保全量覆盖升级绝不丢失用户数据
+        legacy_dist_data = os.path.join(dist_bundle_dir, "data")
+        if os.path.exists(legacy_dist_data):
+            _safe_rmtree(legacy_dist_data)
         if shield_bin_path and os.path.isfile(shield_bin_path):
             shield_fname = os.path.basename(shield_bin_path)
             bundled_shield = any(
