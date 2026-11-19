@@ -75,9 +75,16 @@ class TestOfflineLicenseAuth(unittest.TestCase):
             self.assertEqual(epoch_day_to_date(date_to_epoch_day(dt)), dt)
 
         # C 原生护盾一致性与机器码校验
+        import core.platform.license_hub as _lh_mod
+
         shield = NativeLicenseShield()
         if not getattr(sys, "frozen", False):
-            self.assertTrue(shield.is_loaded, "开发环境必须成功编译并加载 C 原生防反编译护盾")
+            self.assertTrue(
+                shield.is_loaded,
+                f"开发环境必须成功编译并加载 C 原生防反编译护盾: {_lh_mod.LAST_SHIELD_COMPILE_ERROR}",
+            )
+        elif any(os.path.isfile(p) for p in _lh_mod._candidate_shield_paths()):
+            self.assertTrue(shield.is_loaded, "冻结态安装包内已包含 _license_shield 但加载失败")
 
         if shield.is_loaded:
             probed = shield.probe_device()
@@ -467,6 +474,138 @@ class TestOfflineLicenseAuth(unittest.TestCase):
             self.assertEqual(r_glob.status_code, 200)
             self.assertEqual(r_glob.json()["license"]["scope"], "GLOBAL")
             self.assertIn("莫政辉", CONTACT_INFO["notice"])
+
+    def test_windows_shield_compiler_matrix_and_win32_c_header_parity(self) -> None:
+        """验证 Windows 多编译器静态运行时命令矩阵、重复强制编译防文件锁与 _WIN32 C 头文件兼容性."""
+        import core.platform.license_hub as _lh_mod
+
+        with mock.patch.object(_lh_mod.os, "name", "nt"), mock.patch.object(_lh_mod.sys, "platform", "win32"):
+            gcc_cmds = _lh_mod._build_shield_compiler_commands("gcc", "gcc.exe", "src.c", "out.dll", "tmp")
+            self.assertIn("-static", gcc_cmds[0])
+            self.assertIn("-static-libgcc", gcc_cmds[0])
+            self.assertIn("-fno-stack-protector", gcc_cmds[0])
+
+            clang_cmds = _lh_mod._build_shield_compiler_commands("clang", "clang.exe", "src.c", "out.dll", "tmp")
+            self.assertNotIn("-static-libgcc", clang_cmds[0])
+            self.assertIn("--dependent-lib=libcmt", clang_cmds[0])
+
+            cl_cmds = _lh_mod._build_shield_compiler_commands("cl", "cl.exe", "src.c", "out.dll", "tmp")
+            self.assertIn("/MT", cl_cmds[0])
+            self.assertTrue(any(arg.startswith("/Fo:") for arg in cl_cmds[0]))
+            self.assertTrue(any(arg.startswith("/IMPLIB:") for arg in cl_cmds[0]))
+
+        if getattr(sys, "frozen", False):
+            return
+
+        # 验证已加载 NativeLicenseShield 后再次调用 compile_native_license_shield(force=True) 不抛锁冲突
+        _ = NativeLicenseShield()
+        rebuilt = _lh_mod.compile_native_license_shield(force=True)
+        if any(shutil.which(c) for c in ("clang", "gcc", "cl", "cc")):
+            self.assertIsNotNone(rebuilt)
+            self.assertTrue(os.path.isfile(rebuilt))
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        native_dir = os.path.join(project_root, "core", "platform", "_license_native_src")
+        core_h_path = os.path.join(native_dir, "license_core.h")
+        with open(core_h_path, "r", encoding="utf-8") as fh:
+            core_h_src = fh.read()
+
+        # 严禁依赖 Windows 10 专属宏 RRF_SUBKEY_WOW6464KEY，确保兼容全系列 MinGW/MSVC SDK 与 Win7+
+        self.assertNotIn("RRF_SUBKEY_WOW6464KEY", core_h_src)
+        self.assertIn("RegOpenKeyExA", core_h_src)
+        self.assertIn("KEY_WOW64_64KEY", core_h_src)
+
+        clang_bin = shutil.which("clang")
+        if os.name != "nt" and clang_bin:
+            stub_headers = {
+                "winsock2.h": (
+                    "#ifndef _WINSOCK2_H\n#define _WINSOCK2_H\n#include <stdint.h>\n"
+                    "typedef uintptr_t SOCKET;\n#define INVALID_SOCKET ((SOCKET)(~0))\n"
+                    "#define AF_INET 2\n#define SOCK_DGRAM 2\n#define IPPROTO_UDP 17\n"
+                    "#define INADDR_NONE 0xffffffffUL\ntypedef unsigned short WORD;\n"
+                    "#define MAKEWORD(a,b) ((WORD)(((a)&0xff)|(((b)&0xff)<<8)))\n"
+                    "typedef struct WSAData { char d[32]; } WSADATA;\n"
+                    "struct in_addr { uint32_t s_addr; };\n"
+                    "struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n"
+                    "struct sockaddr_in { short sin_family; unsigned short sin_port; struct in_addr sin_addr; char z[8]; };\n"
+                    "int WSAStartup(WORD, WSADATA *); int WSACleanup(void); int gethostname(char *, int);\n"
+                    "unsigned long inet_addr(const char *); uint32_t ntohl(uint32_t); uint32_t htonl(uint32_t);\n"
+                    "uint16_t htons(uint16_t); SOCKET socket(int, int, int);\n"
+                    "int connect(SOCKET, const struct sockaddr *, int);\n"
+                    "int getsockname(SOCKET, struct sockaddr *, int *); int closesocket(SOCKET);\n#endif\n"
+                ),
+                "ws2tcpip.h": "#ifndef _WS2TCPIP_H\n#define _WS2TCPIP_H\n#endif\n",
+                "windows.h": (
+                    "#ifndef _WINDOWS_H\n#define _WINDOWS_H\n#include <stdint.h>\n"
+                    "typedef unsigned long DWORD; typedef unsigned long ULONG; typedef long LONG;\n"
+                    "typedef unsigned char BYTE, *LPBYTE; typedef void *HKEY; typedef DWORD REGSAM;\n"
+                    "#define HKEY_LOCAL_MACHINE ((HKEY)(uintptr_t)0x80000002)\n"
+                    "#define ERROR_SUCCESS 0L\n#define ERROR_BUFFER_OVERFLOW 111L\n#define NO_ERROR 0L\n"
+                    "#define KEY_READ 0x20019u\n#define KEY_WOW64_64KEY 0x0100u\n"
+                    "#define REG_SZ 1u\n#define REG_EXPAND_SZ 2u\n"
+                    "int SetConsoleOutputCP(unsigned int); int SetConsoleCP(unsigned int);\n#endif\n"
+                ),
+                "winreg.h": (
+                    "#ifndef _WINREG_H\n#define _WINREG_H\n#include <windows.h>\n"
+                    "LONG RegOpenKeyExA(HKEY, const char *, DWORD, REGSAM, HKEY *);\n"
+                    "LONG RegQueryValueExA(HKEY, const char *, DWORD *, DWORD *, LPBYTE, DWORD *);\n"
+                    "LONG RegCloseKey(HKEY);\n#endif\n"
+                ),
+                "iphlpapi.h": (
+                    "#ifndef _IPHLPAPI_H\n#define _IPHLPAPI_H\n#include <windows.h>\n"
+                    "#define MIB_IF_TYPE_LOOPBACK 24u\n"
+                    "typedef struct { char String[16]; } IP_ADDRESS_STRING;\n"
+                    "typedef struct _IP_ADDR_STRING { struct _IP_ADDR_STRING *Next; IP_ADDRESS_STRING IpAddress; } IP_ADDR_STRING, *PIP_ADDR_STRING;\n"
+                    "typedef struct _IP_ADAPTER_INFO { struct _IP_ADAPTER_INFO *Next; char AdapterName[260]; char Description[132]; unsigned int Type; IP_ADDR_STRING IpAddressList; } IP_ADAPTER_INFO, *PIP_ADAPTER_INFO;\n"
+                    "ULONG GetAdaptersInfo(PIP_ADAPTER_INFO, ULONG *);\n#endif\n"
+                ),
+            }
+            with tempfile.TemporaryDirectory() as tmp:
+                for fname, content in stub_headers.items():
+                    with open(os.path.join(tmp, fname), "w", encoding="utf-8") as fh:
+                        fh.write(content)
+                with open(os.path.join(tmp, "keygen_secret_tables.h"), "w", encoding="utf-8") as fh:
+                    perm_csv = ",".join(str(i) for i in range(32))
+                    fh.write(
+                        f"#include <stdint.h>\nstatic const uint8_t DOG_SK_PERM[32]={{{perm_csv}}};\n"
+                        "static const uint64_t DOG_SK_T0[4]={0};\nstatic const uint64_t DOG_SK_T1[4]={0};\n"
+                        "static const uint64_t DOG_SK_T2[4]={0};\nstatic const uint64_t DOG_SK_T3[4]={0};\n"
+                    )
+                shim = os.path.join(tmp, "win32_shim.h")
+                with open(shim, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        "#include <stdio.h>\n#include <time.h>\n#undef __APPLE__\n#define _WIN32 1\n"
+                        "static inline int localtime_s(struct tm *t, const time_t *n){*t=*gmtime(n);return 0;}\n"
+                        "static inline FILE *_popen(const char *c, const char *m){(void)c;(void)m;return NULL;}\n"
+                        "static inline int _pclose(FILE *f){(void)f;return 0;}\n"
+                    )
+                for rel_c in (
+                    os.path.join("core", "platform", "_license_native_src", "license_shield.c"),
+                    os.path.join("tools", "keygen_src", "keygen.c"),
+                ):
+                    c_path = os.path.join(project_root, rel_c)
+                    proc = subprocess.run(
+                        [
+                            clang_bin,
+                            "-fsyntax-only",
+                            "-std=c11",
+                            "-fdeclspec",
+                            "-Wall",
+                            "-Wextra",
+                            "-Werror",
+                            "-Wno-unused-function",
+                            "-Wno-ignored-attributes",
+                            "-include",
+                            shim,
+                            f"-I{tmp}",
+                            f"-I{native_dir}",
+                            c_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(proc.returncode, 0, f"_WIN32 语法校验未通过 ({rel_c}): {proc.stderr}")
 
 
 if __name__ == "__main__":

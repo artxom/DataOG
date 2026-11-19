@@ -1,4 +1,4 @@
-# Data.O.G v2.6.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.6.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -45,7 +45,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.6.0 微内核入口（安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.6.1 微内核入口（安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── license_hub.py        # RFC 8032 Ed25519 离线激活码中枢、Gate 2 能力校验、双位置时钟防回拨与 C 原生护盾桥接
@@ -74,7 +74,7 @@ DataOG/
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（登录门禁联动、底部 Dock 与窗口管理器）、core/（含 type_compat.js）、ui/（含 AuthGate / TaskActivityBar / ExportReportModal）、views/（四大模块视图）
 ├── tools/                        # 独立零环境依赖 C 激活码生成器源码与构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
-├── tests/                        # 51 项全量自动化测试（核心算法与兼容矩阵 / 离线非对称授权与 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 表及字段级 /pairs/search / 库级离线报告与单 Sheet Excel / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
+├── tests/                        # 52 项全量自动化测试（核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 表及字段级 /pairs/search / 库级离线报告与单 Sheet Excel / 批量绑标与锁超时熔断 / 公式与#N/A解析 / 只读红队矩阵 / 模块隔离）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -99,7 +99,8 @@ DataOG/
 | **`v2.5.0`** | `feat/task-progress-smooth-ux` & `feat/offline-db-report` → `main` | **全平台实时任务进度微日志、60s 温连接秒切与库级离线交互网页 / 单 Sheet Excel 报告**：新增 `TaskProgressHub`（SSE + 节流缩略微日志 + 取消控制）与 `TaskActivityBar` 毛玻璃活动条；落地 `probe_session` 60 秒温连接池、120 秒负缓存与 `/compare-pair` 双库并发秒切预热；单库与跨环境统一升级免勾表库级离线交互网页报告（`.html`，内嵌纯 JS 单 Sheet `.xlsx` 导出器）与单 Sheet 库级 Excel（`.xlsx`，空目录先采再出、跨环境附带未配对同名推荐表清单） |
 | **`v2.5.1`** | `chore/exe-icon-v2.5.1` → `main` | **Windows 独立程序 (`DataOG.exe`) 多尺寸品牌图标定制**：新增 7 档分辨率（`16px~256px`）标准 `.ico` 品牌图标 `static/dataog.ico` 并接入 `build_exe.py` PyInstaller `--icon` 打包参数 |
 | **`v2.5.2`** | `feat/cross-compat-and-pair-search` → `main` | **跨库长度/精度包络与类型转换诊断、24 列报告及表/字段级映射检索**：新增跨方言字段位长/定点数整数小数双维精度包络与显式类型转换诊断（透传五虚拟列及 24 列 `.xlsx`/`.html` 报告），并在左上角 `.mac-subbar` 落地按表名与字段名秒级检索的 `.cross-pair-picker` |
-| **`v2.6.0`**（当前正式版） | `feat/offline-license-auth` → `main` | **离线非对称激活码登录拦截、C 原生防反编译护盾与零依赖独立生成器**：基于 RFC 8032 Ed25519 + C 编译态动态库 64 位挑战-应答桥接 + Gate 1/2 双门禁与单调时钟防回拨水印实现「一机一码/全局码」离线授权登录；新增全屏毛玻璃登录门禁与菜单栏授权管理，提供独立零环境依赖 C 可执行激活码生成器 (`tools/build_keygen.py`) |
+| **`v2.6.0`** | `feat/offline-license-auth` → `main` | **离线非对称激活码登录拦截、C 原生防反编译护盾与零依赖独立生成器**：基于 RFC 8032 Ed25519 + C 编译态动态库 64 位挑战-应答桥接 + Gate 1/2 双门禁与单调时钟防回拨水印实现「一机一码/全局码」离线授权登录；新增全屏毛玻璃登录门禁与菜单栏授权管理，提供独立零环境依赖 C 可执行激活码生成器 (`tools/build_keygen.py`) |
+| **`v2.6.1`**（当前正式版） | `fix/cross-comparator-macos-layout` & `fix/windows-shield-release-v2.6.1` → `main` | **macOS Sequoia 跨环境比对防重叠工作台与 Windows 原生护盾云端打包闭环**：整体重塑「3. 跨环境比对」五虚拟列防重叠网格、吸顶毛玻璃表头/平静分段筛选与防遮挡向上翻转选表浮层；修复 Windows 云端打包 `_license_shield.dll` 注册表 `KEY_WOW64_64KEY` SDK 宏兼容、MinGW/Clang/MSVC 静态运行时构建与 DLL 文件锁并自动发布 `DataOG.exe` Release |
 
 ---
 
@@ -110,7 +111,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（51 项核心引擎与兼容判定矩阵、离线非对称激活码与 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、表/字段级映射表对检索、库级离线报告与单 Sheet Excel、批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（52 项核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、表/字段级映射表对检索、库级离线报告与单 Sheet Excel、批量绑标与锁超时熔断、标准字典与公式/#N/A 解析、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检

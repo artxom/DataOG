@@ -104,6 +104,25 @@ def build_executable() -> None:
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)
 
+    # 先于单元测试编译 C 原生激活校验防反编译护盾（避免 Windows 下 unittest 预先通过 ctypes 映射旧 DLL 造成文件锁）
+    shield_bin_path = None
+    try:
+        import core.platform.license_hub as _lh
+
+        shield_bin_path = _lh.compile_native_license_shield(force=True)
+        if shield_bin_path and os.path.isfile(shield_bin_path):
+            print(f"[预检] C 原生防反编译护盾已编译就绪: {shield_bin_path}")
+        elif any(shutil.which(c) for c in ("gcc", "clang", "cl", "cc")):
+            print("[错误] 检测到 C 编译器但编译 _license_shield 原生护盾失败：")
+            if getattr(_lh, "LAST_SHIELD_COMPILE_ERROR", ""):
+                print(_lh.LAST_SHIELD_COMPILE_ERROR)
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"[警告] 编译原生护盾出现异常: {exc}")
+        shield_bin_path = None
+
     run_pre_build_tests(project_dir)
     _install_resilient_rmtree()
 
@@ -124,14 +143,6 @@ def build_executable() -> None:
     if not os.path.isfile(icon_src):
         print(f"[错误] 找不到可执行程序图标文件: {icon_src}")
         sys.exit(1)
-
-    # 编译 C 原生激活校验防反编译护盾并随安装包内嵌（绝对不打包 tools / .keygen_secrets / keygen）
-    try:
-        from core.platform.license_hub import compile_native_license_shield
-
-        shield_bin_path = compile_native_license_shield(force=True)
-    except Exception:
-        shield_bin_path = None
 
     add_static_arg = f"{static_src}{os.pathsep}static"
     add_tests_arg = f"{tests_src}{os.pathsep}tests"
@@ -285,6 +296,14 @@ def build_executable() -> None:
 
         os.makedirs(os.path.join(dist_bundle_dir, "data", "drivers"), exist_ok=True)
         os.makedirs(os.path.join(dist_bundle_dir, "data", "assets"), exist_ok=True)
+        if shield_bin_path and os.path.isfile(shield_bin_path):
+            shield_fname = os.path.basename(shield_bin_path)
+            bundled_shield = any(
+                shield_fname in fs for _, _, fs in os.walk(dist_bundle_dir)
+            )
+            if not bundled_shield:
+                print(f"[错误] 打包产物中缺失原生防反编译护盾文件: {shield_fname}")
+                sys.exit(1)
         total_bytes = sum(
             os.path.getsize(os.path.join(r, f))
             for r, _, fs in os.walk(dist_bundle_dir)

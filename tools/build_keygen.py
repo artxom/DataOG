@@ -171,22 +171,56 @@ def build_keygen(
         with open(hdr_path, "w", encoding="utf-8") as fh:
             fh.write(_build_secret_header(seed))
 
-        last_err = ""
+        err_logs: List[str] = []
         built = False
         for kind, compiler in compilers:
             if kind == "cl":
-                cmd: List[str] = [
+                cmd_variants: List[List[str]] = [
+                    [
+                        compiler,
+                        "/nologo",
+                        "/O2",
+                        "/MT",
+                        f"/I{tmpdir}",
+                        f"/I{native_inc}",
+                        keygen_c,
+                        f"/Fo:{os.path.join(tmpdir, 'keygen.obj')}",
+                        f"/Fe:{out_bin}",
+                        "ws2_32.lib",
+                        "iphlpapi.lib",
+                        "advapi32.lib",
+                    ]
+                ]
+            elif os.name == "nt" and kind == "clang":
+                base_cmd = [
                     compiler,
-                    "/nologo",
-                    "/O2",
-                    "/MT",
-                    f"/I{tmpdir}",
-                    f"/I{native_inc}",
+                    "-O2",
+                    "-std=c11",
+                    f"-I{tmpdir}",
+                    f"-I{native_inc}",
                     keygen_c,
-                    f"/Fe:{out_bin}",
-                    "ws2_32.lib",
-                    "iphlpapi.lib",
-                    "advapi32.lib",
+                    "-o",
+                    out_bin,
+                ]
+                cmd_variants = [
+                    base_cmd + ["-D_MT", "-Xclang", "--dependent-lib=libcmt", "-lws2_32", "-liphlpapi", "-ladvapi32"],
+                    base_cmd + ["-lws2_32", "-liphlpapi", "-ladvapi32"],
+                ]
+            elif os.name == "nt":
+                base_cmd = [
+                    compiler,
+                    "-O2",
+                    "-std=c11",
+                    "-fno-stack-protector",
+                    f"-I{tmpdir}",
+                    f"-I{native_inc}",
+                    keygen_c,
+                    "-o",
+                    out_bin,
+                ]
+                cmd_variants = [
+                    base_cmd + ["-static", "-static-libgcc", "-lws2_32", "-liphlpapi", "-ladvapi32"],
+                    base_cmd + ["-static-libgcc", "-lws2_32", "-liphlpapi", "-ladvapi32"],
                 ]
             else:
                 cmd = [
@@ -199,19 +233,26 @@ def build_keygen(
                     "-o",
                     out_bin,
                 ]
-                if os.name == "nt":
-                    cmd.extend(["-static", "-lws2_32", "-liphlpapi", "-ladvapi32"])
-                elif sys.platform != "darwin":
+                if sys.platform != "darwin":
                     cmd.append("-Wl,-s")
+                cmd_variants = [cmd]
 
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            if proc.returncode == 0 and os.path.isfile(out_bin):
-                built = True
+            for cmd in cmd_variants:
+                try:
+                    if os.path.exists(out_bin):
+                        os.remove(out_bin)
+                except OSError:
+                    pass
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode == 0 and os.path.isfile(out_bin):
+                    built = True
+                    break
+                err_logs.append(f"[{kind}] {proc.stdout}\n{proc.stderr}")
+            if built:
                 break
-            last_err = f"[{kind}] {proc.stdout}\n{proc.stderr}"
 
         if not built:
-            raise RuntimeError(f"编译激活码生成器失败:\n{last_err}")
+            raise RuntimeError("编译激活码生成器失败:\n" + "\n".join(err_logs))
 
         if os.name != "nt":
             strip_bin = shutil.which("strip")
