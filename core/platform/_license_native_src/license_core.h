@@ -40,6 +40,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <wchar.h>
 
 #ifdef _WIN32
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -872,6 +873,116 @@ static void dataog_trim_upper_inplace(char *s) {
     }
 }
 
+static void dataog_sanitize_utf8_host(
+    const char *src,
+    char *dst,
+    size_t dst_cap,
+    size_t max_codepoints,
+    int strip_json_special
+) {
+    if (!dst || dst_cap == 0u) return;
+    dst[0] = '\0';
+    if (!src) return;
+    size_t pos = 0u;
+    size_t cp_count = 0u;
+    size_t i = 0u;
+    while (src[i] != '\0' && cp_count < max_codepoints) {
+        unsigned char b0 = (unsigned char)src[i];
+        if (b0 < 0x80u) {
+            if (b0 < 32u || b0 == 0x7fu || b0 == '|' ||
+                (strip_json_special && (b0 == '"' || b0 == '\\'))) {
+                i += 1u;
+                continue;
+            }
+            if (pos + 1u >= dst_cap) break;
+            dst[pos++] = (char)b0;
+            cp_count += 1u;
+            i += 1u;
+        } else if (b0 >= 0xC2u && b0 <= 0xDFu) {
+            unsigned char b1 = (unsigned char)src[i + 1u];
+            if ((b1 & 0xC0u) == 0x80u) {
+                if (pos + 2u >= dst_cap) break;
+                dst[pos++] = (char)b0;
+                dst[pos++] = (char)b1;
+                cp_count += 1u;
+                i += 2u;
+            } else {
+                i += 1u;
+            }
+        } else if (b0 >= 0xE0u && b0 <= 0xEFu) {
+            unsigned char b1 = (unsigned char)src[i + 1u];
+            unsigned char b2 = (b1 != 0u) ? (unsigned char)src[i + 2u] : 0u;
+            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u &&
+                !(b0 == 0xE0u && b1 < 0xA0u) &&
+                !(b0 == 0xEDu && b1 >= 0xA0u)) {
+                if (pos + 3u >= dst_cap) break;
+                dst[pos++] = (char)b0;
+                dst[pos++] = (char)b1;
+                dst[pos++] = (char)b2;
+                cp_count += 1u;
+                i += 3u;
+            } else {
+                i += 1u;
+            }
+        } else if (b0 >= 0xF0u && b0 <= 0xF4u) {
+            unsigned char b1 = (unsigned char)src[i + 1u];
+            unsigned char b2 = (b1 != 0u) ? (unsigned char)src[i + 2u] : 0u;
+            unsigned char b3 = (b2 != 0u) ? (unsigned char)src[i + 3u] : 0u;
+            if ((b1 & 0xC0u) == 0x80u && (b2 & 0xC0u) == 0x80u && (b3 & 0xC0u) == 0x80u &&
+                !(b0 == 0xF0u && b1 < 0x90u) &&
+                !(b0 == 0xF4u && b1 >= 0x90u)) {
+                if (pos + 4u >= dst_cap) break;
+                dst[pos++] = (char)b0;
+                dst[pos++] = (char)b1;
+                dst[pos++] = (char)b2;
+                dst[pos++] = (char)b3;
+                cp_count += 1u;
+                i += 4u;
+            } else {
+                i += 1u;
+            }
+        } else {
+            i += 1u;
+        }
+    }
+    dst[pos] = '\0';
+}
+
+static void dataog_get_utf8_hostname(char *out, size_t cap) {
+    if (!out || cap == 0u) return;
+    out[0] = '\0';
+#ifdef _WIN32
+    {
+        wchar_t wbuf[256] = {0};
+        DWORD wlen = 255u;
+        if (GetComputerNameExW(ComputerNameDnsHostname, wbuf, &wlen) && wlen > 0u) {
+            int u8len = WideCharToMultiByte(
+                CP_UTF8, 0, wbuf, (int)wlen, out, (int)(cap - 1u), NULL, NULL
+            );
+            if (u8len > 0) {
+                out[u8len] = '\0';
+                return;
+            }
+        }
+    }
+#endif
+    {
+#ifdef _WIN32
+        WSADATA wsa_hn;
+        int wsa_hn_ok = (WSAStartup(MAKEWORD(2, 2), &wsa_hn) == 0);
+#endif
+        char raw_host[128] = {0};
+        if (gethostname(raw_host, (int)(sizeof(raw_host) - 1u)) == 0 && raw_host[0] != '\0') {
+            dataog_sanitize_utf8_host(raw_host, out, cap, 64u, 0);
+        }
+#ifdef _WIN32
+        if (wsa_hn_ok) {
+            WSACleanup();
+        }
+#endif
+    }
+}
+
 static void dataog_read_raw_machine_id(char *out, size_t cap) {
     if (!out || cap == 0u) return;
     out[0] = '\0';
@@ -961,22 +1072,14 @@ static void dataog_read_raw_machine_id(char *out, size_t cap) {
     }
 #endif
     {
-#ifdef _WIN32
-        WSADATA wsa_mc;
-        int wsa_mc_ok = (WSAStartup(MAKEWORD(2, 2), &wsa_mc) == 0);
-#endif
         char host[128] = {0};
-        if (gethostname(host, sizeof(host) - 1) == 0 && host[0] != '\0') {
+        dataog_get_utf8_hostname(host, sizeof(host));
+        if (host[0] != '\0') {
             snprintf(out, cap, "HOST-%s", host);
             dataog_trim_upper_inplace(out);
         } else {
             snprintf(out, cap, "DATAOG-OFFLINE-NODE");
         }
-#ifdef _WIN32
-        if (wsa_mc_ok) {
-            WSACleanup();
-        }
-#endif
     }
 }
 
@@ -1137,11 +1240,15 @@ static void dataog_collect_local_ips(char *out_primary, size_t p_cap, char *out_
     ULONG buf_len = 16384;
     PIP_ADAPTER_INFO adapter_info = (PIP_ADAPTER_INFO)malloc(buf_len);
     if (adapter_info) {
-        if (GetAdaptersInfo(adapter_info, &buf_len) == ERROR_BUFFER_OVERFLOW) {
+        ULONG arc = GetAdaptersInfo(adapter_info, &buf_len);
+        if (arc == ERROR_BUFFER_OVERFLOW) {
             free(adapter_info);
             adapter_info = (PIP_ADAPTER_INFO)malloc(buf_len);
+            if (adapter_info) {
+                arc = GetAdaptersInfo(adapter_info, &buf_len);
+            }
         }
-        if (adapter_info && GetAdaptersInfo(adapter_info, &buf_len) == NO_ERROR) {
+        if (adapter_info && arc == NO_ERROR) {
             for (PIP_ADAPTER_INFO cur = adapter_info; cur != NULL; cur = cur->Next) {
                 if (cur->Type == MIB_IF_TYPE_LOOPBACK) continue;
                 int is_virt = (
@@ -1161,8 +1268,17 @@ static void dataog_collect_local_ips(char *out_primary, size_t p_cap, char *out_
         }
         free(adapter_info);
     }
-    if (count == 0) {
-        dataog_udp_route_probe_ips(items, &count);
+    {
+        int has_physical_ip = 0;
+        for (int i = 0; i < count; ++i) {
+            if (items[i].is_virtual == 0) {
+                has_physical_ip = 1;
+                break;
+            }
+        }
+        if (!has_physical_ip) {
+            dataog_udp_route_probe_ips(items, &count);
+        }
     }
     if (wsa_ip_ok) {
         WSACleanup();
@@ -1183,8 +1299,17 @@ static void dataog_collect_local_ips(char *out_primary, size_t p_cap, char *out_
         }
         freeifaddrs(ifaddr);
     }
-    if (count == 0) {
-        dataog_udp_route_probe_ips(items, &count);
+    {
+        int has_physical_ip = 0;
+        for (int i = 0; i < count; ++i) {
+            if (items[i].is_virtual == 0) {
+                has_physical_ip = 1;
+                break;
+            }
+        }
+        if (!has_physical_ip) {
+            dataog_udp_route_probe_ips(items, &count);
+        }
     }
 #endif
 
@@ -1349,14 +1474,8 @@ static int dataog_encode_request_code(
     size_t out_cap
 ) {
     char body[160] = {0};
-    char safe_host[36] = {0};
-    size_t hpos = 0;
-    for (size_t i = 0; hostname && hostname[i] && hpos < 32; ++i) {
-        char ch = hostname[i];
-        if (ch == '|' || iscntrl((unsigned char)ch)) continue;
-        safe_host[hpos++] = ch;
-    }
-    safe_host[hpos] = '\0';
+    char safe_host[104] = {0};
+    dataog_sanitize_utf8_host(hostname ? hostname : "LOCAL", safe_host, sizeof(safe_host), 32u, 0);
     int n = snprintf(body, sizeof(body), "1|%s|%s|%s", machine_code, primary_ip, safe_host);
     if (n <= 0 || (size_t)n + 2 >= sizeof(body)) return -1;
     uint16_t crc = dataog_crc16_ccitt((const uint8_t *)body, (size_t)n);

@@ -106,13 +106,14 @@ def build_executable() -> None:
 
     # 先于单元测试编译 C 原生激活校验防反编译护盾（避免 Windows 下 unittest 预先通过 ctypes 映射旧 DLL 造成文件锁）
     shield_bin_path = None
+    has_c_compiler = any(shutil.which(c) for c in ("gcc", "clang", "cl", "cc"))
     try:
         import core.platform.license_hub as _lh
 
         shield_bin_path = _lh.compile_native_license_shield(force=True)
         if shield_bin_path and os.path.isfile(shield_bin_path):
             print(f"[预检] C 原生防反编译护盾已编译就绪: {shield_bin_path}")
-        elif any(shutil.which(c) for c in ("gcc", "clang", "cl", "cc")):
+        elif has_c_compiler:
             print("[错误] 检测到 C 编译器但编译 _license_shield 原生护盾失败：")
             if getattr(_lh, "LAST_SHIELD_COMPILE_ERROR", ""):
                 print(_lh.LAST_SHIELD_COMPILE_ERROR)
@@ -120,6 +121,9 @@ def build_executable() -> None:
     except SystemExit:
         raise
     except Exception as exc:
+        if has_c_compiler:
+            print(f"[错误] 编译原生防反编译护盾发生未预期异常: {exc}")
+            sys.exit(1)
         print(f"[警告] 编译原生护盾出现异常: {exc}")
         shield_bin_path = None
 

@@ -335,7 +335,7 @@ def decode_request_code(req_code: str) -> Dict[str, str]:
     body, crc_bytes = raw[:-2], raw[-2:]
     if struct.unpack(">H", crc_bytes)[0] != _crc16_ccitt(body):
         raise ValueError("设备申请码 CRC 校验失败")
-    parts = body.decode("utf-8").split("|")
+    parts = body.decode("utf-8", errors="replace").split("|")
     if len(parts) != 4 or parts[0] != "1":
         raise ValueError("设备申请码版本不受支持")
     return {"machine_code": parts[1], "primary_ip": parts[2], "hostname": parts[3]}
@@ -653,6 +653,56 @@ def _build_shield_compiler_commands(
     ]
 
 
+def _install_compiled_shield_binary(tmp_lib: str, out_lib: str, src_mtime: float) -> Tuple[bool, str]:
+    """原子落盘新编译的原生动态库；兼容 Windows 跨盘符移动与进程内存映射旧 DLL 文件锁."""
+    out_dir = os.path.dirname(out_lib)
+    out_base = os.path.basename(out_lib)
+    try:
+        for fn in os.listdir(out_dir):
+            if fn.startswith(out_base + ".old_"):
+                try:
+                    os.remove(os.path.join(out_dir, fn))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    try:
+        os.replace(tmp_lib, out_lib)
+        return True, ""
+    except PermissionError as perm_exc:
+        first_err: Exception = perm_exc
+    except OSError:
+        try:
+            shutil.copyfile(tmp_lib, out_lib)
+            return True, ""
+        except OSError as copy_exc:
+            first_err = copy_exc
+
+    # 若目标动态库已被当前或其他进程映射且时间戳已不旧于源码，直接复用现有文件
+    try:
+        if os.path.isfile(out_lib) and os.path.getmtime(out_lib) >= src_mtime:
+            return True, ""
+    except OSError:
+        pass
+
+    # Windows 允许对已内存映射的旧版 DLL 执行同目录改名腾位后再写入新版 DLL
+    if os.path.isfile(out_lib):
+        stale_path = f"{out_lib}.old_{os.getpid()}_{int(time.time() * 1000)}"
+        try:
+            os.replace(out_lib, stale_path)
+            shutil.copyfile(tmp_lib, out_lib)
+            try:
+                os.remove(stale_path)
+            except OSError:
+                pass
+            return True, ""
+        except OSError as rename_exc:
+            return False, f"无法覆盖已锁定的原生护盾动态库 ({out_lib}): {rename_exc} (原始错误: {first_err})"
+
+    return False, f"无法写入原生护盾动态库 ({out_lib}): {first_err}"
+
+
 def compile_native_license_shield(force: bool = False) -> Optional[str]:
     """在非冻结开发/打包环境中将 `license_shield.c` 编译为本地原生动态库."""
     global LAST_SHIELD_COMPILE_ERROR
@@ -709,23 +759,11 @@ def compile_native_license_shield(force: bool = False) -> Optional[str]:
                     err_logs.append(f"[{kind}] 动态库加载自检未通过: {load_err}")
                     continue
 
-                try:
-                    os.replace(tmp_lib, out_lib)
-                except PermissionError:
-                    # Windows 下同盘符若当前进程已映射最新同版 _license_shield.dll，保留现有已映射文件即可
-                    if os.path.isfile(out_lib) and os.path.getmtime(out_lib) >= src_mtime:
-                        LAST_SHIELD_COMPILE_ERROR = ""
-                        return out_lib
-                    raise
-                except OSError:
-                    try:
-                        shutil.copyfile(tmp_lib, out_lib)
-                    except PermissionError:
-                        # Windows 跨盘符 (%TEMP% 位于 C: 而仓库位于 D:) 时 copyfile 命中已映射 DLL 文件锁
-                        if os.path.isfile(out_lib) and os.path.getmtime(out_lib) >= src_mtime:
-                            LAST_SHIELD_COMPILE_ERROR = ""
-                            return out_lib
-                        raise
+                ok_inst, inst_err = _install_compiled_shield_binary(tmp_lib, out_lib, src_mtime)
+                if not ok_inst:
+                    err_logs.append(f"[{kind}] {inst_err}")
+                    LAST_SHIELD_COMPILE_ERROR = "\n".join(err_logs)
+                    return out_lib if (not force and os.path.isfile(out_lib)) else None
 
                 LAST_SHIELD_COMPILE_ERROR = ""
                 return out_lib
@@ -743,7 +781,10 @@ class NativeLicenseShield:
 
     def _load_lib(self) -> None:
         if not getattr(sys, "frozen", False):
-            compile_native_license_shield(force=False)
+            try:
+                compile_native_license_shield(force=False)
+            except Exception:
+                pass
         for cand in _candidate_shield_paths():
             if not os.path.isfile(cand):
                 continue

@@ -102,7 +102,8 @@ int main(int argc, char **argv) {
 
     dataog_get_machine_code(local_mc);
     dataog_collect_local_ips(local_primary_ip, sizeof(local_primary_ip), local_all_ips, sizeof(local_all_ips));
-    if (gethostname(hostname, sizeof(hostname) - 1) != 0 || hostname[0] == '\0') {
+    dataog_get_utf8_hostname(hostname, sizeof(hostname));
+    if (hostname[0] == '\0') {
         snprintf(hostname, sizeof(hostname), "LOCAL-HOST");
     }
     dataog_encode_request_code(local_mc, local_primary_ip, hostname, local_req, sizeof(local_req));
@@ -148,13 +149,7 @@ int main(int argc, char **argv) {
     if (flag_info) {
         if (flag_json) {
             char json_host[128] = {0};
-            size_t jpos = 0;
-            for (size_t k = 0; hostname[k] != '\0' && jpos + 1 < sizeof(json_host); ++k) {
-                unsigned char ch = (unsigned char)hostname[k];
-                if (ch < 32u || ch == '"' || ch == '\\') continue;
-                json_host[jpos++] = (char)ch;
-            }
-            json_host[jpos] = '\0';
+            dataog_sanitize_utf8_host(hostname, json_host, sizeof(json_host), 64u, 1);
             printf(
                 "{\"machine_code\":\"%s\",\"primary_ip\":\"%s\",\"all_ips\":\"%s\","
                 "\"hostname\":\"%s\",\"request_code\":\"%s\",\"today\":\"%s\"}\n",

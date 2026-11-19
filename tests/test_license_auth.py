@@ -498,7 +498,7 @@ class TestOfflineLicenseAuth(unittest.TestCase):
         if getattr(sys, "frozen", False):
             return
 
-        # 验证已加载 NativeLicenseShield 后再次调用 compile_native_license_shield(force=True) 不抛锁冲突（含跨盘符 C:->D: 场景）
+        # 验证已加载 NativeLicenseShield 后再次调用 compile_native_license_shield(force=True) 不抛锁冲突（含跨盘符 C:->D: 与旧版 DLL 改名腾位/全锁降级场景）
         _ = NativeLicenseShield()
         rebuilt = _lh_mod.compile_native_license_shield(force=True)
         if any(shutil.which(c) for c in ("clang", "gcc", "cl", "cc")):
@@ -511,6 +511,62 @@ class TestOfflineLicenseAuth(unittest.TestCase):
                 rebuilt_xdrv = _lh_mod.compile_native_license_shield(force=True)
             self.assertEqual(rebuilt_xdrv, rebuilt)
 
+            # 模拟目标 DLL 时间戳早于源码 (mtime < src_mtime) 且直接覆盖被拒，验证通过改名腾位成功安装新 DLL
+            with tempfile.TemporaryDirectory() as lock_tmp:
+                fake_tmp_dll = os.path.join(lock_tmp, "new_shield.dll")
+                fake_out_dll = os.path.join(lock_tmp, "_license_shield.dll")
+                with open(fake_tmp_dll, "wb") as fh:
+                    fh.write(b"NEW-DLL-BYTES")
+                with open(fake_out_dll, "wb") as fh:
+                    fh.write(b"OLD-DLL-BYTES")
+                os.utime(fake_out_dll, (1000.0, 1000.0))
+
+                orig_replace = os.replace
+
+                def _replace_allow_rename_only(src: str, dst: str) -> None:
+                    if os.path.abspath(dst) == os.path.abspath(fake_out_dll):
+                        raise PermissionError(13, "Mapped DLL cannot be overwritten in place")
+                    orig_replace(src, dst)
+
+                with mock.patch("os.replace", side_effect=_replace_allow_rename_only):
+                    ok_inst, inst_err = _lh_mod._install_compiled_shield_binary(
+                        fake_tmp_dll, fake_out_dll, src_mtime=2000.0
+                    )
+                self.assertTrue(ok_inst, inst_err)
+                with open(fake_out_dll, "rb") as fh:
+                    self.assertEqual(fh.read(), b"NEW-DLL-BYTES")
+
+            # 模拟目标旧版 DLL 连改名也被拒：force=True 返回 None 并记录错误（不抛未捕获 PermissionError），force=False 平滑复用旧文件不崩服务
+            with (
+                mock.patch("os.path.getmtime", side_effect=lambda p: 1000.0 if p == rebuilt else 2000.0),
+                mock.patch("os.replace", side_effect=PermissionError(13, "Access denied")),
+                mock.patch("shutil.copyfile", side_effect=PermissionError(13, "Access denied")),
+            ):
+                locked_force = _lh_mod.compile_native_license_shield(force=True)
+                self.assertIsNone(locked_force)
+                self.assertIn("无法覆盖已锁定的原生护盾动态库", _lh_mod.LAST_SHIELD_COMPILE_ERROR)
+                locked_soft = _lh_mod.compile_native_license_shield(force=False)
+                self.assertEqual(locked_soft, rebuilt)
+
+        # 验证中文多字节 UTF-8 主机名 32 字符边界截断（绝不切碎 3 字节 UTF-8 序列）与非 UTF-8 字节鲁棒性
+        cn_35 = "数据治理测试服务器节点一二三四五六七八九十甲乙丙丁戊己庚辛壬癸子丑寅卯"
+        self.assertEqual(len(cn_35), 35)
+        py_req_cn = encode_request_code("MCH-UTF8-1111-2222-3333", "192.168.1.88", cn_35)
+        dec_cn = decode_request_code(py_req_cn)
+        self.assertEqual(dec_cn["hostname"], cn_35[:32])
+
+        # 构造含 GBK 原始高字节的历史异常申请码载荷，验证 decode_request_code 不抛 UnicodeDecodeError
+        import base64
+        import struct
+        from core.platform.license_hub import _crc16_ccitt
+
+        gbk_body = b"1|MCH-UTF8-1111-2222-3333|192.168.1.88|\xc4\xab\xd5\xfe\xbb\xd4"
+        gbk_raw = gbk_body + struct.pack(">H", _crc16_ccitt(gbk_body))
+        gbk_req = "REQ1-" + base64.b32encode(gbk_raw).decode("ascii").rstrip("=")
+        dec_gbk = decode_request_code(gbk_req)
+        self.assertEqual(dec_gbk["machine_code"], "MCH-UTF8-1111-2222-3333")
+        self.assertEqual(dec_gbk["primary_ip"], "192.168.1.88")
+
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         native_dir = os.path.join(project_root, "core", "platform", "_license_native_src")
         core_h_path = os.path.join(native_dir, "license_core.h")
@@ -521,6 +577,36 @@ class TestOfflineLicenseAuth(unittest.TestCase):
         self.assertNotIn("RRF_SUBKEY_WOW6464KEY", core_h_src)
         self.assertIn("RegOpenKeyExA", core_h_src)
         self.assertIn("KEY_WOW64_64KEY", core_h_src)
+        self.assertIn("GetComputerNameExW", core_h_src)
+        self.assertIn("WideCharToMultiByte", core_h_src)
+
+        c_comp = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
+        if c_comp:
+            with tempfile.TemporaryDirectory() as utf8_tmp:
+                probe_c = os.path.join(utf8_tmp, "utf8_probe.c")
+                probe_bin = os.path.join(utf8_tmp, "utf8_probe.exe" if os.name == "nt" else "utf8_probe")
+                with open(probe_c, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        '#include "license_core.h"\n'
+                        "int main(int argc, char **argv) {\n"
+                        "    if (argc < 2) return 2;\n"
+                        "    char req[384] = {0}, jhost[128] = {0};\n"
+                        '    if (dataog_encode_request_code("MCH-UTF8-1111-2222-3333", "192.168.1.88", argv[1], req, sizeof(req)) != 0) return 3;\n'
+                        "    dataog_sanitize_utf8_host(argv[1], jhost, sizeof(jhost), 64u, 1);\n"
+                        '    printf("{\\"req\\":\\"%s\\",\\"jhost\\":\\"%s\\"}\\n", req, jhost);\n'
+                        "    return 0;\n"
+                        "}\n"
+                    )
+                build_cmd = [c_comp, "-O2", "-std=c11", f"-I{native_dir}", probe_c, "-o", probe_bin]
+                if os.name == "nt":
+                    build_cmd.extend(["-lws2_32", "-liphlpapi", "-ladvapi32"])
+                bproc = subprocess.run(build_cmd, capture_output=True, text=True, check=False)
+                if bproc.returncode == 0 and os.path.isfile(probe_bin):
+                    out_u8 = subprocess.check_output([probe_bin, cn_35], text=True, timeout=10)
+                    parsed_u8 = json.loads(out_u8)
+                    self.assertEqual(parsed_u8["req"], py_req_cn)
+                    self.assertEqual(decode_request_code(parsed_u8["req"])["hostname"], cn_35[:32])
+                    self.assertEqual(parsed_u8["jhost"], cn_35)
 
         clang_bin = shutil.which("clang")
         if os.name != "nt" and clang_bin:
@@ -544,13 +630,16 @@ class TestOfflineLicenseAuth(unittest.TestCase):
                 ),
                 "ws2tcpip.h": "#ifndef _WS2TCPIP_H\n#define _WS2TCPIP_H\n#endif\n",
                 "windows.h": (
-                    "#ifndef _WINDOWS_H\n#define _WINDOWS_H\n#include <stdint.h>\n"
+                    "#ifndef _WINDOWS_H\n#define _WINDOWS_H\n#include <stdint.h>\n#include <wchar.h>\n"
                     "typedef unsigned long DWORD; typedef unsigned long ULONG; typedef long LONG;\n"
                     "typedef unsigned char BYTE, *LPBYTE; typedef void *HKEY; typedef DWORD REGSAM;\n"
+                    "typedef enum { ComputerNameDnsHostname = 1 } COMPUTER_NAME_FORMAT;\n"
                     "#define HKEY_LOCAL_MACHINE ((HKEY)(uintptr_t)0x80000002)\n"
                     "#define ERROR_SUCCESS 0L\n#define ERROR_BUFFER_OVERFLOW 111L\n#define NO_ERROR 0L\n"
                     "#define KEY_READ 0x20019u\n#define KEY_WOW64_64KEY 0x0100u\n"
-                    "#define REG_SZ 1u\n#define REG_EXPAND_SZ 2u\n"
+                    "#define REG_SZ 1u\n#define REG_EXPAND_SZ 2u\n#define CP_UTF8 65001u\n"
+                    "int GetComputerNameExW(COMPUTER_NAME_FORMAT, wchar_t *, DWORD *);\n"
+                    "int WideCharToMultiByte(unsigned int, DWORD, const wchar_t *, int, char *, int, const char *, int *);\n"
                     "int SetConsoleOutputCP(unsigned int); int SetConsoleCP(unsigned int);\n#endif\n"
                 ),
                 "winreg.h": (
