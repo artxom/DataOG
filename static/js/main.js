@@ -28,7 +28,7 @@ import { SqlConsoleView } from "./views/sql_console_view.js";
 import { StandardView } from "./views/standard_view.js";
 
 const DEFAULT_SUMMARIES = {
-  settings: "外观 · 连接 · AI",
+  settings: "外观 · 工作区 · 连接 · AI",
   explorer: "SQL 查询",
   standard: "字典 · 落标 · 比对",
   polyglot: "命名 · 方言",
@@ -272,6 +272,20 @@ function syncMenubarIndicators() {
       activeTitleEl.textContent = store.state.activeApp
         ? getAppTitle(store.state.activeApp)
         : "桌面";
+    }
+  }
+
+  const wsBtn = document.getElementById("btn-menubar-workspace");
+  const wsLabel = document.getElementById("menubar-workspace-label");
+  const activeWs = store.state.activeWorkspace;
+  if (wsBtn && wsLabel) {
+    if (isAuthorized && activeWs) {
+      const wsName = activeWs.name || "默认工作区";
+      wsBtn.hidden = false;
+      wsLabel.textContent = wsName;
+      wsBtn.title = `当前工作区：${wsName}（点击切换、导出或合并）`;
+    } else {
+      wsBtn.hidden = true;
     }
   }
 
@@ -675,6 +689,8 @@ function initLogsDialog() {
 
 export async function bootstrapWorkbench() {
   // 静态挂载菜单栏小图标
+  const wsIconSlot = document.getElementById("menubar-icon-workspace");
+  if (wsIconSlot) clearEl(wsIconSlot, svgIcon("layers", 12));
   const searchIconSlot = document.getElementById("menubar-icon-search");
   if (searchIconSlot) clearEl(searchIconSlot, svgIcon("search", 13));
   const logsIconSlot = document.getElementById("menubar-icon-logs");
@@ -749,6 +765,10 @@ export async function bootstrapWorkbench() {
     if (!isAuthorized) return;
     store.showDesktop();
   });
+  document.getElementById("btn-menubar-workspace")?.addEventListener("click", () => {
+    if (!isAuthorized) return;
+    store.openApp("settings", { section: "workspaces" });
+  });
   document.getElementById("btn-menubar-ai")?.addEventListener("click", () => {
     if (!isAuthorized) return;
     store.openApp("settings", { section: "llm" });
@@ -780,7 +800,21 @@ export async function bootstrapWorkbench() {
       syncMenubarIndicators();
     } else if (reason === "summary") {
       renderMacDock();
-    } else if (reason === "llm" || reason === "logs" || reason === "bootstrap" || reason === "license") {
+    } else if (reason === "workspace_switched") {
+      // 切换或合并工作区后，销毁已缓存的业务模块实例确保下次进入即加载最新工作区数据
+      for (const staleId of ["explorer", "standard", "polyglot"]) {
+        const staleInst = appInstances.get(staleId);
+        if (staleInst) {
+          staleInst.destroy?.();
+          appInstances.delete(staleId);
+        }
+      }
+      store.state.minimizedApps = (store.state.minimizedApps || []).filter(
+        (id) => id === "settings"
+      );
+      renderMacDock();
+      syncMenubarIndicators();
+    } else if (reason === "workspace_meta" || reason === "llm" || reason === "logs" || reason === "bootstrap" || reason === "license") {
       syncMenubarIndicators();
     }
   });

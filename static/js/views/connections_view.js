@@ -49,6 +49,8 @@ export class ConnectionsView {
       jdbc_url: "",
       jdbc_driver_class: "",
       auto_refresh_metadata: true,
+      has_saved_password: false,
+      credential_status: "BOUND",
     };
   }
 
@@ -105,6 +107,8 @@ export class ConnectionsView {
       jdbc_url: prof.jdbc_url || "",
       jdbc_driver_class: prof.jdbc_driver_class || "",
       auto_refresh_metadata: false,
+      has_saved_password: Boolean(prof.has_saved_password),
+      credential_status: prof.credential_status || "BOUND",
     };
     this.render();
   }
@@ -199,6 +203,14 @@ export class ConnectionsView {
       })
     );
 
+    const pwdPlaceholder = !this.editingId
+      ? ""
+      : f.credential_status === "MISSING" || !f.has_saved_password
+      ? "请输入您的个人数据库密码"
+      : f.credential_status === "AUTO_MATCHED"
+      ? "已自动匹配本机凭据，留空沿用或输入新密码"
+      : "留空保持原密码";
+
     const dynamicFields = [];
     if (isSqlite) {
       dynamicFields.push(
@@ -240,7 +252,7 @@ export class ConnectionsView {
         el("div", { className: "form-field" }, el("label", { className: "form-label", text: "Driver 类名" }), bindInput("jdbc_driver_class", { placeholder: "dm.jdbc.driver.DmDriver" })),
         el("div", { className: "form-field" }, el("label", { className: "form-label", text: "默认 Schema" }), bindInput("default_schema", { placeholder: "SYSDBA" })),
         el("div", { className: "form-field" }, el("label", { className: "form-label", text: "用户名" }), bindInput("user", { autocomplete: "username" })),
-        el("div", { className: "form-field" }, el("label", { className: "form-label", text: "密码" }), bindInput("password", { type: "password", placeholder: this.editingId ? "留空保持原密码" : "", autocomplete: "new-password" }))
+        el("div", { className: "form-field" }, el("label", { className: "form-label", text: "密码" }), bindInput("password", { type: "password", placeholder: pwdPlaceholder, autocomplete: "new-password" }))
       );
     } else {
       dynamicFields.push(
@@ -249,7 +261,7 @@ export class ConnectionsView {
         el("div", { className: "form-field" }, el("label", { className: "form-label", text: "数据库" }), bindInput("dbname", { placeholder: "postgres" })),
         el("div", { className: "form-field" }, el("label", { className: "form-label", text: "Schema" }), bindInput("default_schema", { placeholder: "public" })),
         el("div", { className: "form-field" }, el("label", { className: "form-label", text: "用户名" }), bindInput("user", { autocomplete: "username" })),
-        el("div", { className: "form-field" }, el("label", { className: "form-label", text: "密码" }), bindInput("password", { type: "password", placeholder: this.editingId ? "留空保持原密码" : "", autocomplete: "new-password" }))
+        el("div", { className: "form-field" }, el("label", { className: "form-label", text: "密码" }), bindInput("password", { type: "password", placeholder: pwdPlaceholder, autocomplete: "new-password" }))
       );
       if (isInceptor) {
         const authSel = el(
@@ -301,12 +313,20 @@ export class ConnectionsView {
           el("span", { style: { fontSize: "12px", color: "var(--os-text-secondary)" }, text: "保存后自动缓存库表目录" })
         )
       ),
-      el(
-        "div",
-        { style: { display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "14px" } },
-        el("button", { type: "button", className: "mac-btn", text: "连通检测", onClick: () => this._handleTest() }),
-        el("button", { type: "submit", className: "mac-btn mac-btn-primary", text: "保存连接" })
-      )
+        el(
+          "div",
+          { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", marginTop: "14px", flexWrap: "wrap" } },
+          el("span", {
+            style: { fontSize: "11px", color: "var(--os-muted)" },
+            text: "账号与密码仅保存在本机私有库，导出共享工作区时绝不携带",
+          }),
+          el(
+            "div",
+            { style: { display: "flex", gap: "8px" } },
+            el("button", { type: "button", className: "mac-btn", text: "连通检测", onClick: () => this._handleTest() }),
+            el("button", { type: "submit", className: "mac-btn mac-btn-primary", text: "保存连接" })
+          )
+        )
     );
 
     const savedRows = conns.length
@@ -319,9 +339,14 @@ export class ConnectionsView {
               { style: { minWidth: "0", flex: "1" } },
               el(
                 "div",
-                { style: { display: "flex", alignItems: "center", gap: "7px" } },
-                statusDot(c.name, "success"),
-                badge(c.db_type, c.driver_track === "JDBC" ? "warn" : "neutral")
+                { style: { display: "flex", alignItems: "center", gap: "7px", flexWrap: "wrap" } },
+                statusDot(c.name, c.credential_status === "MISSING" ? "warn" : "success"),
+                badge(c.db_type, c.driver_track === "JDBC" ? "warn" : "neutral"),
+                c.credential_status === "AUTO_MATCHED"
+                  ? badge("已自动匹配个人凭据", "info")
+                  : c.credential_status === "MISSING"
+                  ? badge("待填个人账号密码", "warn")
+                  : null
               ),
               el("div", {
                 className: "mono",

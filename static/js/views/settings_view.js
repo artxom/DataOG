@@ -21,6 +21,7 @@ import { DESKTOP_APPS, store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
 import { Toast } from "../ui/toast.js";
 import { ConnectionsView, renderDriversSection } from "./connections_view.js";
+import { WorkspaceView } from "./workspace_view.js";
 
 const WALLPAPER_PRESETS = [
   { id: "default", label: "银昼 / 星夜", bg: "var(--wp-default)" },
@@ -31,6 +32,7 @@ const WALLPAPER_PRESETS = [
 
 const SECTIONS = [
   { id: "appearance", label: "外观与图标" },
+  { id: "workspaces", label: "工作区协作" },
   { id: "connections", label: "数据库连接" },
   { id: "drivers", label: "JDBC 驱动" },
   { id: "llm", label: "AI 模型" },
@@ -40,6 +42,7 @@ export class SettingsView {
   constructor() {
     this.activeSection = "appearance";
     this.connectionsPane = new ConnectionsView({ onChange: () => this.render() });
+    this.workspacePane = new WorkspaceView({ onChange: () => this.render() });
     this.selectedProviderId = "deepseek";
     this.llmDraft = null;
     this.newModelInputText = "";
@@ -47,7 +50,10 @@ export class SettingsView {
 
     this.root = el("div", { className: "mac-split-view" });
     this._unsub = store.subscribe((_state, reason) => {
-      if (["appearance", "llm", "connections", "drivers"].includes(reason)) {
+      if (reason === "workspace_switched") {
+        this.connectionsPane.resetToNew();
+      }
+      if (["appearance", "llm", "connections", "drivers", "workspace_switched", "workspace_meta", "bootstrap"].includes(reason)) {
         this.render();
       }
     });
@@ -77,6 +83,9 @@ export class SettingsView {
     }
     clearEl(container, this.root);
     this._syncLlmDraftFromStore();
+    if (this.activeSection === "workspaces") {
+      this.workspacePane.refreshFromServer();
+    }
     this.render();
     this.refreshHeader?.();
   }
@@ -664,6 +673,9 @@ export class SettingsView {
             className: `mac-nav-item ${this.activeSection === s.id ? "is-active" : ""}`,
             onClick: () => {
               this.activeSection = s.id;
+              if (s.id === "workspaces") {
+                this.workspacePane.refreshFromServer();
+              }
               this.render();
               this.refreshHeader?.();
             },
@@ -671,6 +683,8 @@ export class SettingsView {
           el("span", { text: s.label }),
           s.id === "connections" && store.state.connections.length
             ? badge(store.state.connections.length, "neutral")
+            : s.id === "workspaces" && store.state.workspaces.length > 1
+            ? badge(store.state.workspaces.length, "neutral")
             : null
         )
       )
@@ -679,6 +693,9 @@ export class SettingsView {
     let paneBody;
     if (this.activeSection === "appearance") {
       paneBody = this._renderAppearanceSection();
+    } else if (this.activeSection === "workspaces") {
+      this.workspacePane.render();
+      paneBody = this.workspacePane.root;
     } else if (this.activeSection === "connections") {
       this.connectionsPane.render();
       paneBody = this.connectionsPane.root;
