@@ -86,6 +86,11 @@
   --bookmark-unified-bg: #ebf7ee;
   --bookmark-unified-border: #b8dfc3;
   --bookmark-unified-text: #225c39;
+  --cross-stage-bg: #f4f5f8;
+  --cross-track-bg: rgba(255, 255, 255, 0.82);
+  --cross-card-bg: #ffffff;
+  --cross-card-shadow: 0 1px 2.5px rgba(15, 23, 42, 0.05), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --mac-select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%236e6e73' stroke-width='1.55' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.75 4.5L6 2.25l2.25 2.25M3.75 7.5L6 9.75l2.25-2.25'/%3E%3C/svg%3E");
 
   /* 兼容旧组件别名 */
   --text-primary: var(--os-text);
@@ -134,12 +139,18 @@
     --wp-sonoma: linear-gradient(135deg, #0f2027 0%, #1b3b4b 48%, #243b55 100%);
     --wp-sequoia: linear-gradient(135deg, #2b1b2f 0%, #3b2439 50%, #191a2e 100%);
     --scrollbar-thumb: rgba(160, 160, 172, 0.34);
+    --scrollbar-track: transparent;
     --dock-bg: rgba(28, 28, 34, 0.64);
     --dock-border: rgba(255, 255, 255, 0.14);
     --dock-shadow: 0 22px 50px rgba(0, 0, 0, 0.58), 0 0 0 0.5px rgba(255, 255, 255, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.1);
     --bookmark-unified-bg: rgba(46, 179, 92, 0.14);
     --bookmark-unified-border: rgba(74, 210, 120, 0.34);
     --bookmark-unified-text: #8ee0a9;
+    --cross-stage-bg: #16161a;
+    --cross-track-bg: #1d1d22;
+    --cross-card-bg: #25252c;
+    --cross-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.32), inset 0 0.5px 0 rgba(255, 255, 255, 0.065);
+    --mac-select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23a1a1a6' stroke-width='1.55' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.75 4.5L6 2.25l2.25 2.25M3.75 7.5L6 9.75l2.25-2.25'/%3E%3C/svg%3E");
   }
 }
 
@@ -176,6 +187,13 @@
   --bookmark-unified-bg: rgba(46, 179, 92, 0.14);
   --bookmark-unified-border: rgba(74, 210, 120, 0.34);
   --bookmark-unified-text: #8ee0a9;
+  --cross-stage-bg: #16161a;
+  --cross-track-bg: #1d1d22;
+  --cross-card-bg: #25252c;
+  --cross-card-shadow: 0 1px 3px rgba(0, 0, 0, 0.32), inset 0 0.5px 0 rgba(255, 255, 255, 0.065);
+  --scrollbar-thumb: rgba(160, 160, 172, 0.34);
+  --scrollbar-track: transparent;
+  --mac-select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23a1a1a6' stroke-width='1.55' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.75 4.5L6 2.25l2.25 2.25M3.75 7.5L6 9.75l2.25-2.25'/%3E%3C/svg%3E");
 }
 
 :root:has(> head > meta[name="color-scheme"][content="light"]) {
@@ -209,15 +227,16 @@
   --bookmark-unified-bg: #ebf7ee;
   --bookmark-unified-border: #b8dfc3;
   --bookmark-unified-text: #225c39;
+  --cross-stage-bg: #f4f5f8;
+  --cross-track-bg: rgba(255, 255, 255, 0.82);
+  --cross-card-bg: #ffffff;
+  --cross-card-shadow: 0 1px 2.5px rgba(15, 23, 42, 0.05), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --scrollbar-thumb: rgba(120, 120, 128, 0.36);
+  --scrollbar-track: transparent;
+  --mac-select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%236e6e73' stroke-width='1.55' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3.75 4.5L6 2.25l2.25 2.25M3.75 7.5L6 9.75l2.25-2.25'/%3E%3C/svg%3E");
   --wp-default: radial-gradient(120% 100% at 15% 10%, #dceaff 0%, #edf1f7 46%, #e2e8f3 100%);
   --wp-sonoma: linear-gradient(135deg, #c2e9fb 0%, #a1c4fd 48%, #d4fc79 100%);
   --wp-sequoia: linear-gradient(135deg, #f6d365 0%, #fda085 50%, #a18cd1 100%);
-  --dock-bg: rgba(248, 250, 252, 0.62);
-  --dock-border: rgba(255, 255, 255, 0.56);
-  --dock-shadow: 0 18px 42px rgba(15, 23, 42, 0.16), 0 0 0 0.5px rgba(0, 0, 0, 0.12), inset 0 1px 0 rgba(255, 255, 255, 0.65);
-  --bookmark-unified-bg: #ebf7ee;
-  --bookmark-unified-border: #b8dfc3;
-  --bookmark-unified-text: #225c39;
 }
 
 @supports (color: light-dark(white, black)) {
