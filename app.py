@@ -1,9 +1,9 @@
-"""DataOG 多功能数据工程与数据治理一体化工作台 - FastAPI 微内核服务端入口.
+"""Data.O.G 多功能数据工程与数据治理一体化工作台 - FastAPI 微内核服务端入口.
 
 启动后：
 1. 自动禁用 Windows CMD 控制台快速编辑模式 (QuickEdit Mode)，防止鼠标点击黑窗口挂起服务进程
-2. 初始化全局共享微内核底座 PlatformContext（自动无损迁移旧版 dws_migrator_state.db 至 dataog_state.db）
-3. 挂载平台公共路由 (/api/platform) 与三大高内聚业务插件模块 (/api/modules/*)
+2. 初始化三层分离微内核底座 PlatformContext（应用无状态 + 混淆本地私有保险箱 + 可共享团队工作区，自动无损迁移历史数据）
+3. 挂载平台公共路由 (/api/platform) 与四大高内聚业务插件模块 (/api/modules/*)
 4. 严格绑定本地 127.0.0.1，注入安全响应头并自动打开默认浏览器
 """
 
@@ -88,14 +88,28 @@ def resolve_static_dir() -> str:
 
 
 def get_runtime_data_dir() -> str:
-    """获取可写运行时数据目录（在 Windows exe 模式下保存在 exe 同级 data 目录）."""
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(os.path.abspath(sys.executable))
-    else:
-        base = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base, "data")
-    os.makedirs(data_dir, exist_ok=True)
-    return data_dir
+    """获取可写私有运行时存储目录（内部使用，严禁向用户界面或控制台暴露路径）."""
+    from core.platform.storage_paths import resolve_private_storage_layout
+
+    layout = resolve_private_storage_layout(create_dirs=True)
+    return layout.private_root
+
+
+def _is_test_runtime() -> bool:
+    return "--test" in sys.argv or "unittest" in sys.modules
+
+
+def _write_startup_crash_log(err_text: str) -> None:
+    """将启动崩溃栈安全落盘至私有日志目录，不在终端暴露私有目录路径."""
+    try:
+        from core.platform.storage_paths import resolve_private_storage_layout
+
+        layout = resolve_private_storage_layout(create_dirs=True)
+        err_log_path = os.path.join(layout.logs_dir, "startup_error.log")
+        with open(err_log_path, "w", encoding="utf-8") as f:
+            f.write(err_text)
+    except Exception:
+        pass
 
 
 def pause_on_windows_console(prompt_msg: str = "\n请按回车键 (Enter) 关闭此控制台窗口...") -> None:
@@ -132,16 +146,10 @@ try:
 except BaseException:
     err_text = traceback.format_exc()
     print("=" * 74)
-    print("  [严重错误] DataOG 程序初始化导入依赖模块失败！")
+    print("  [严重错误] Data.O.G 程序初始化导入依赖模块失败！")
     print("=" * 74)
     print(err_text)
-    try:
-        err_log_path = os.path.join(get_runtime_data_dir(), "startup_error.log")
-        with open(err_log_path, "w", encoding="utf-8") as f:
-            f.write(err_text)
-        print(f"  [*] 详细错误日志已写入: {err_log_path}")
-    except Exception:
-        pass
+    _write_startup_crash_log(err_text)
     pause_on_windows_console()
     sys.exit(1)
 
@@ -189,13 +197,16 @@ def setup_console_logging() -> logging.Logger:
         console_handler.setFormatter(formatter)
         log.addHandler(console_handler)
 
-        try:
-            log_file = os.path.join(get_runtime_data_dir(), "dataog_service.log")
-            file_handler = logging.FileHandler(log_file, encoding="utf-8")
-            file_handler.setFormatter(formatter)
-            log.addHandler(file_handler)
-        except Exception:
-            pass
+        if not _is_test_runtime() or bool((os.environ.get("DATAOG_HOME") or "").strip()):
+            try:
+                from core.platform.storage_paths import resolve_private_storage_layout
+
+                layout = resolve_private_storage_layout(create_dirs=True)
+                file_handler = logging.FileHandler(layout.service_log_path, encoding="utf-8")
+                file_handler.setFormatter(formatter)
+                log.addHandler(file_handler)
+            except Exception:
+                pass
 
     for uv_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "dws_migrator"):
         uv_log = logging.getLogger(uv_name)
@@ -253,11 +264,14 @@ def find_available_port(host: str = "127.0.0.1", preferred_port: int = 18080) ->
 def create_app(
     db_path: Optional[str] = None,
     ctx: Optional[PlatformContext] = None,
+    *,
+    private_root: Optional[str] = None,
 ) -> FastAPI:
     if ctx is None:
-        if not db_path:
-            db_path = os.path.join(get_runtime_data_dir(), "dataog_state.db")
-        ctx = PlatformContext(db_path=db_path)
+        if db_path:
+            ctx = PlatformContext(db_path=db_path)
+        else:
+            ctx = PlatformContext(private_root=private_root)
     ctx.register_module_manifest(
         module_id="standard_migrator",
         title="单库落标贯标台",
@@ -293,7 +307,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.6.1",
+        version="2.7.0",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -452,14 +466,12 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.6.1 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.7.0 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")
-    print(f"  [*] 本地 IDE 工作台地址 : {url}")
-    print(
-        f"  [*] 本地状态库存储路径  : {os.path.join(get_runtime_data_dir(), 'dataog_state.db')}"
-    )
+    print(f"  [*] 本地工作台访问地址 : {url}")
+    print("  [*] 数据存储架构       : 本地私有保险箱与团队共享工作区已分离就绪")
     print("  [*] 按 Ctrl + C 可安全停止服务并退出。")
     print("=" * 74)
 
@@ -497,12 +509,6 @@ if __name__ == "__main__":
         print("  [程序运行异常] 服务未能正常启动或运行中断，详细错误如下：")
         print("=" * 74)
         print(crash_text)
-        try:
-            crash_path = os.path.join(get_runtime_data_dir(), "startup_error.log")
-            with open(crash_path, "w", encoding="utf-8") as f:
-                f.write(crash_text)
-            print(f"  [*] 错误详情已保存至: {crash_path}")
-        except Exception:
-            pass
+        _write_startup_crash_log(crash_text)
         pause_on_windows_console()
         sys.exit(1)
