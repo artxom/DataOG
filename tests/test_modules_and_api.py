@@ -3622,6 +3622,521 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 off_open_dt = next(r for r in off_vals[1:] if r[4] == "ods_acct" and r[5] == "open_dt")
                 self.assertIn("字符→日期", off_open_dt[22])
 
+    def test_cross_comparator_macos_layout_anti_overlap_and_filter_integrity(self) -> None:
+        """验证跨环境比对 macOS 重设计防重叠网格契约、四套主题令牌同步及筛选态真实索引(realIdx)与保存完整性."""
+        static_dir = resolve_static_dir()
+        with open(os.path.join(static_dir, "css", "tokens.css"), "r", encoding="utf-8") as f:
+            tokens_css = f.read()
+        with open(os.path.join(static_dir, "css", "workbench.css"), "r", encoding="utf-8") as f:
+            css_text = f.read()
+
+        # 1. 四套主题块 (:root / prefers-color-scheme:dark / meta dark / meta light) 均须定义跨环境表面、滚动条与 macOS 弹出箭头令牌
+        for tok_name in (
+            "--cross-stage-bg",
+            "--cross-track-bg",
+            "--cross-card-bg",
+            "--cross-card-shadow",
+            "--scrollbar-thumb",
+            "--scrollbar-track",
+            "--mac-select-arrow",
+        ):
+            occurrences = re.findall(rf"{re.escape(tok_name)}\s*:", tokens_css)
+            self.assertGreaterEqual(
+                len(occurrences),
+                4,
+                f"{tok_name} must be defined across all 4 light/dark theme blocks in tokens.css",
+            )
+
+        # 2. CSS 防纵向挤压重叠、防横向裁切与表头像素级对齐契约
+        ws_m = re.search(r"\.cross-five-workspace\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(ws_m)
+        self.assertIn("minmax(0,", ws_m.group(1))
+
+        pane_m = re.search(r"\.cross-matrix-pane\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(pane_m)
+        self.assertNotIn("flex-direction: column", pane_m.group(1))
+        self.assertNotIn("scrollbar-gutter: stable", pane_m.group(1))
+        self.assertIn("overflow-y: auto", pane_m.group(1))
+
+        cand_s_m = re.search(r"\.cross-cand-search\s*\{([^}]*)\}", css_text)
+        filt_b_m = re.search(r"\.cross-center-filterbar\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(cand_s_m)
+        self.assertIsNotNone(filt_b_m)
+        self.assertIn("height: 40px", cand_s_m.group(1))
+        self.assertIn("height: 40px", filt_b_m.group(1))
+        self.assertIn("flex-wrap: nowrap", filt_b_m.group(1))
+        self.assertIn("@media (max-width: 920px)", css_text)
+
+        for grid_cls in (r"\.cross-matrix-list", r"\.cross-cand-list"):
+            gm = re.search(rf"{grid_cls}\s*\{{([^}}]*)\}}", css_text)
+            self.assertIsNotNone(gm)
+            self.assertIn("grid-auto-rows: max-content", gm.group(1))
+            self.assertIn("align-content: start", gm.group(1))
+
+        row_m = re.search(r"\.cross-matrix-row\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(row_m)
+        self.assertIn("var(--cross-matrix-cols)", row_m.group(1))
+        self.assertIn("flex-shrink: 0", row_m.group(1))
+        self.assertNotIn("min-height: 52px", row_m.group(1))
+
+        hdr_m = re.search(r"\.cross-center-col-headers\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(hdr_m)
+        self.assertIn("var(--cross-matrix-cols)", hdr_m.group(1))
+
+        sticky_m = re.search(r"\.cross-center-sticky-top\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(sticky_m)
+        self.assertIn("position: sticky", sticky_m.group(1))
+
+        # macOS 弹出按钮样式、中性一致卡片边框、三列表头聚拢分隔与去除未选中红橙胶囊边框契约
+        sel_m = re.search(r"select\.mac-input,\s*select\.input\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(sel_m)
+        self.assertIn("appearance: none", sel_m.group(1))
+        pop_sel_m = re.search(r"\.cross-popup-select-wrap\s*>\s*select\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(pop_sel_m)
+        self.assertIn("appearance: none", pop_sel_m.group(1))
+        self.assertNotIn(".cross-ep-table-select", css_text)
+        self.assertNotIn("is-danger-hint", css_text)
+        self.assertNotIn("is-warn-hint", css_text)
+
+        unif_m = re.search(r"\.cross-std-card\.is-unified\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(unif_m)
+        self.assertIn("border-color: var(--os-border)", unif_m.group(1))
+        self.assertNotIn("--status-success", unif_m.group(1))
+
+        center_hdr_cell_m = re.search(r"\.cross-center-col-headers\s+\.cross-col-head\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(center_hdr_cell_m)
+        self.assertIn("justify-content: flex-start", center_hdr_cell_m.group(1))
+        self.assertIn(".cross-center-col-headers .cross-col-head.is-center::before", css_text)
+
+        # 类型胶囊使用块级容器确保长 SQL 类型真实省略号、五栏窄屏无第 5 列横向截断、选表浮层支持向上翻转防裁切及现代细滚动条
+        type_pill_m = re.search(r"\.cross-type-pill\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(type_pill_m)
+        self.assertIn("display: block", type_pill_m.group(1))
+        self.assertNotIn("inline-flex", type_pill_m.group(1))
+        self.assertIn(".cross-type-pill:only-child", css_text)
+        self.assertIn(".cross-table-popover.is-flip-up", css_text)
+        self.assertIn("@supports (scrollbar-color: auto)", css_text)
+        five_inner_m = re.search(r"\.cross-five-inner\s*\{([^}]*)\}", css_text)
+        self.assertIsNotNone(five_inner_m)
+        self.assertNotIn("min-width: 980px", five_inner_m.group(1))
+
+        # 3. Node.js 真实加载 CrossComparatorView：验证筛选胶囊、IME 安全搜索输入与筛选态下 realIdx 操作及全量保存不丢行
+        import pathlib
+
+        node_bin = shutil.which("node")
+        if node_bin:
+            with tempfile.TemporaryDirectory() as tmp:
+                view_url = pathlib.Path(static_dir, "js", "views", "cross_comparator_view.js").as_uri()
+                probe_mjs = f"""
+class Node {{}}
+class MockElement extends Node {{
+  constructor(tag) {{
+    super();
+    this.tagName = String(tag).toUpperCase();
+    this.children = [];
+    this.style = {{}};
+    this.dataset = {{}};
+    this._ev = {{}};
+    this._txt = "";
+    this.className = "";
+    this.value = "";
+    this.hidden = false;
+    const self = this;
+    this.classList = {{
+      add(...cs) {{
+        const cur = new Set((self.className || "").split(/\\s+/).filter(Boolean));
+        cs.forEach(c => cur.add(c));
+        self.className = [...cur].join(" ");
+      }},
+      remove(...cs) {{
+        const cur = new Set((self.className || "").split(/\\s+/).filter(Boolean));
+        cs.forEach(c => cur.delete(c));
+        self.className = [...cur].join(" ");
+      }},
+      contains(c) {{
+        return (self.className || "").split(/\\s+/).includes(c);
+      }},
+      toggle(c, force) {{
+        const cur = new Set((self.className || "").split(/\\s+/).filter(Boolean));
+        const shouldAdd = force !== undefined ? Boolean(force) : !cur.has(c);
+        if (shouldAdd) cur.add(c);
+        else cur.delete(c);
+        self.className = [...cur].join(" ");
+        return shouldAdd;
+      }},
+    }};
+  }}
+  get textContent() {{
+    return this._txt + (this.children || []).map(c => c.textContent || "").join("");
+  }}
+  set textContent(v) {{
+    this._txt = String(v ?? "");
+    this.children = [];
+  }}
+  appendChild(c) {{ this.children.push(c); return c; }}
+  replaceChildren(...kids) {{ this.children = kids.filter(Boolean); }}
+  addEventListener(e, fn) {{ (this._ev[e] || (this._ev[e] = [])).push(fn); }}
+  removeEventListener(e, fn) {{ this._ev[e] = (this._ev[e] || []).filter(x => x !== fn); }}
+  dispatchEvent(ev) {{
+    if (!ev.target) ev.target = this;
+    ev.currentTarget = this;
+    if (!ev.stopPropagation) ev.stopPropagation = () => {{}};
+    if (!ev.preventDefault) ev.preventDefault = () => {{}};
+    (this._ev[ev.type] || []).forEach(fn => fn(ev));
+  }}
+  click() {{ this.dispatchEvent({{ type: "click" }}); }}
+  setAttribute(k, v) {{ this[k] = String(v); }}
+  contains(other) {{
+    if (this === other) return true;
+    return (this.children || []).some(c => c && c.contains && c.contains(other));
+  }}
+  focus() {{ globalThis.document.activeElement = this; }}
+  blur() {{ if (globalThis.document.activeElement === this) globalThis.document.activeElement = null; }}
+  remove() {{}}
+}}
+const makeNode = (tag) => new MockElement(tag);
+const rawSetTimeout = globalThis.setTimeout;
+const unrefTimeout = (fn, ms) => {{ const t = rawSetTimeout(fn, ms); t?.unref?.(); return t; }};
+globalThis.setTimeout = unrefTimeout;
+const toastRoot = makeNode("div");
+globalThis.Node = Node;
+globalThis.window = {{ matchMedia: () => ({{ matches: false }}), setTimeout: unrefTimeout, clearTimeout }};
+const _docEv = {{}};
+globalThis.document = {{
+  activeElement: null,
+  documentElement: makeNode("html"),
+  head: makeNode("head"),
+  body: makeNode("body"),
+  createElement: makeNode,
+  createElementNS: (_ns, tag) => makeNode(tag),
+  createTextNode: (t) => {{ const tn = new MockElement("#text"); tn._txt = String(t ?? ""); return tn; }},
+  addEventListener(e, fn) {{ (_docEv[e] || (_docEv[e] = [])).push(fn); }},
+  removeEventListener(e, fn) {{ _docEv[e] = (_docEv[e] || []).filter(x => x !== fn); }},
+  dispatchEvent(ev) {{ (_docEv[ev.type] || []).forEach(fn => fn(ev)); }},
+  querySelector: () => null,
+  getElementById: (id) => id === "toast-root" ? toastRoot : null,
+}};
+
+let savedPayload = null;
+let lastCompareUrl = "";
+globalThis.fetch = async (url, opts = {{}}) => {{
+  if (String(url).includes("/compare-pair")) {{
+    lastCompareUrl = String(url);
+    const bodyObj = {{ ok: true, active_table_key: "", tables: [], active_comparison: mockComp("ods_ledger_121", "t_d", "ods") }};
+    return {{
+      ok: true,
+      status: 200,
+      headers: {{ get: () => "application/json" }},
+      json: async () => bodyObj,
+      text: async () => JSON.stringify(bodyObj),
+    }};
+  }}
+  if (String(url).includes("/pairings/save")) {{
+    savedPayload = JSON.parse(opts.body);
+    const bodyObj = {{ ok: true, message: "saved", active_table_key: savedPayload.std_table_key, tables: [], active_comparison: mockComp("t_a", "t_b") }};
+    return {{
+      ok: true,
+      status: 200,
+      headers: {{ get: () => "application/json" }},
+      json: async () => bodyObj,
+      text: async () => JSON.stringify(bodyObj),
+    }};
+  }}
+  const defObj = {{ ok: true, items: [] }};
+  return {{
+    ok: true,
+    status: 200,
+    headers: {{ get: () => "application/json" }},
+    json: async () => defObj,
+    text: async () => JSON.stringify(defObj),
+  }};
+}};
+
+function mockComp(sTbl, tTbl, sSch = "main") {{
+  return {{
+    table_binding: {{ source_schema: sSch, source_table: sTbl, target_schema: "main", target_table: tTbl }},
+    source_panel: {{ schema_name: sSch, table_name: sTbl, penetrated_base_tables: [sSch + ".base_" + sTbl], columns: [{{ column_name: "cand_s1", data_type: "VARCHAR(20)", ordinal_position: 9 }}] }},
+    target_panel: {{ schema_name: "main", table_name: tTbl, penetrated_base_tables: [], columns: [{{ column_name: "cand_t1", data_type: "VARCHAR(20)", ordinal_position: 9 }}] }},
+    dual_rows: [
+      {{
+        row_id: "r0",
+        source_col: {{ column_name: "ok_col", data_type: "VARCHAR(20)", column_comment: "正常列" }},
+        target_col: {{ column_name: "ok_col", data_type: "VARCHAR(50)", column_comment: "正常列" }},
+        source_std_code: "S_OK",
+        target_std_code: "S_OK",
+        source_std: {{ std_code: "S_OK", cn_name: "正常标准", en_abbr: "OK_COL", resolved_type: "VARCHAR(50)" }},
+        target_std: {{ std_code: "S_OK", cn_name: "正常标准", en_abbr: "OK_COL", resolved_type: "VARCHAR(50)" }},
+        target_compliance: {{ status: "COMPLIANT" }},
+        target_needs_migration: false,
+      }},
+      {{
+        row_id: "r1",
+        source_col: {{ column_name: "diff_col", data_type: "VARCHAR(30)" }},
+        target_col: {{ column_name: "diff_col", data_type: "VARCHAR(30)" }},
+        source_std_code: "S_D1",
+        target_std_code: "S_D2",
+        source_std: {{ std_code: "S_D1", cn_name: "源标准", en_abbr: "D1" }},
+        target_std: {{ std_code: "S_D2", cn_name: "目标标准", en_abbr: "D2" }},
+        target_compliance: {{ status: "NON_COMPLIANT" }},
+        target_needs_migration: true,
+      }},
+      {{
+        row_id: "r2",
+        source_col: {{ column_name: "risk_col", data_type: "VARCHAR(100)", column_comment: "超长源列" }},
+        target_col: {{ column_name: "risk_col", data_type: "VARCHAR(20)", column_comment: "超短目标列" }},
+        source_std_code: "S_RISK",
+        target_std_code: "S_RISK",
+        source_std: {{ std_code: "S_RISK", cn_name: "风险标准", en_abbr: "RISK_COL", resolved_type: "VARCHAR(100)" }},
+        target_std: {{ std_code: "S_RISK", cn_name: "风险标准", en_abbr: "RISK_COL", resolved_type: "VARCHAR(100)" }},
+        target_compliance: {{ status: "NON_COMPLIANT" }},
+        target_needs_migration: true,
+      }},
+    ],
+  }};
+}}
+
+const {{ CrossComparatorView }} = await import({json.dumps(view_url)});
+const view = new CrossComparatorView();
+view._applyComparisonResponse({{
+  ok: true,
+  active_table_key: "pair_ab",
+  tables: [{{ std_table_key: "pair_ab", source_table: "t_a", target_table: "t_b", column_count: 3 }}],
+  source_connection: {{ connection_id: "c1", name: "Src", db_type: "DWS", configured: true, tables: [] }},
+  target_connection: {{ connection_id: "c2", name: "Tgt", db_type: "DWS", configured: true, tables: [] }},
+  active_comparison: mockComp("t_a", "t_b"),
+}});
+
+const findAll = (n, pred, out = []) => {{
+  if (pred(n)) out.push(n);
+  (n.children || []).forEach(c => findAll(c, pred, out));
+  return out;
+}};
+
+// 1) IME 安全：中栏搜索框输入时不得重建 input 节点
+const searchBefore = view.matrixSearchInput;
+searchBefore.value = "risk_col";
+searchBefore.dispatchEvent({{ type: "input" }});
+if (view.matrixSearchInput !== searchBefore) throw new Error("matrixSearchInput recreated");
+const rowsAfterSearch = findAll(view.matrixListMount, x => (x.className || "").includes("cross-matrix-row") && !(x.className || "").includes("is-dropzone-row"));
+if (rowsAfterSearch.length !== 1) throw new Error("expected 1 row on search, got " + rowsAfterSearch.length);
+searchBefore.value = "";
+searchBefore.dispatchEvent({{ type: "input" }});
+
+// 2) 筛选「位长/精度不足」时仅展示 r2 (realIdx=2)，此时保存必须仍保留全部 3 行 + 2 个待选字段，绝不丢失隐藏行
+const capPill = findAll(view.root, x => x.tagName === "BUTTON" && x.textContent.includes("位长/精度不足"))[0];
+if (!capPill) throw new Error("missing capacity filter pill");
+capPill.click();
+if (view.matrixFilter !== "CAPACITY_RISK") throw new Error("filter state mismatch");
+const filteredRows = findAll(view.matrixListMount, x => (x.className || "").includes("cross-matrix-row") && !(x.className || "").includes("is-dropzone-row"));
+if (filteredRows.length !== 1) throw new Error("expected 1 capacity risk row");
+
+await view.saveCurrentPairings(false);
+if (!savedPayload || savedPayload.pairings.length !== 5) {{
+  throw new Error("save under active filter dropped rows: " + JSON.stringify(savedPayload?.pairings) + " | toast=" + toastRoot.textContent);
+}}
+
+// 3) 在筛选态下解绑唯一可见行的目标列，必须精确解绑 centerRows[2] (risk_col) 而非 centerRows[0] (ok_col)
+view.matrixFilter = "CAPACITY_RISK";
+view.render();
+const visRows2 = findAll(view.matrixListMount, x => (x.className || "").includes("cross-matrix-row") && !(x.className || "").includes("is-dropzone-row"));
+const removeBtns = findAll(visRows2[0], x => x.tagName === "BUTTON" && (x.className || "").includes("cross-chip-remove"));
+// removeBtns: [source ×, center split ×, target ×]
+removeBtns[removeBtns.length - 1].click();
+if (!view.centerRows[0].target_col || view.centerRows[0].target_col.column_name !== "ok_col") {{
+  throw new Error("wrong row mutated under filter! row 0 was touched");
+}}
+if (view.centerRows[2].target_col !== null) {{
+  throw new Error("expected centerRows[2].target_col to be unbound");
+}}
+
+// 4) 滚动容器节点恒定与 scrollTop 保持 + Escape 取消点选待选字段
+const paneRef = view.matrixPaneEl;
+const wsRef = view.workspaceEl;
+paneRef.scrollTop = 360;
+view.srcCandidateListMount.scrollTop = 140;
+const candCard0 = findAll(view.srcCandidateListMount, x => (x.className || "").includes("cross-cand-card"))[0];
+candCard0.click();
+if (!view.selectedCandidate || view.matrixPaneEl !== paneRef || view.workspaceEl !== wsRef) {{
+  throw new Error("scroll container recreated on candidate click");
+}}
+if (paneRef.scrollTop !== 360 || view.srcCandidateListMount.scrollTop !== 140) {{
+  throw new Error("scrollTop lost on candidate click");
+}}
+globalThis.document.dispatchEvent({{ type: "keydown", key: "Escape" }});
+if (view.selectedCandidate !== null) {{
+  throw new Error("Escape did not clear selectedCandidate");
+}}
+
+// 5) 筛选态下绑定新标准若被当前筛选隐藏，自动切回 ALL 展示新行，绝不让字段凭空消失
+view.matrixFilter = "SPLIT_DIFF";
+view.matrixKeyword = "diff_col";
+view.matrixSearchInput.value = "diff_col";
+view.render();
+const takenCand = view._takeCandidate("source", "cand_s1");
+view._commitNewStandardBinding("source", takenCand, {{ std_code: "S_NEW", cn_name: "新绑标准", en_abbr: "CAND_S1", type_dws: "VARCHAR(20)" }});
+if (view.matrixFilter !== "ALL" || view.matrixKeyword !== "") {{
+  throw new Error("active filter was not auto-reset to reveal newly bound row");
+}}
+
+// 6) 拖拽已绑字段跨行换绑（removeFromRowIdx < targetRowIdx 触发 splice 时仍精准落位且重算残留行）
+// 当前最后一行为仅含 source_col=cand_s1 的单侧行，而 r2 (idx=2) 为仅含 source_col=risk_col 的单侧行
+// 将 idx=2 的 source_col 拖入最后一行的 target 侧不匹配，改为测试同侧从单侧行 r2 拖入另一单侧行
+const tgtTaken = view._takeCandidate("target", "cand_t1");
+view._commitNewStandardBinding("target", tgtTaken, {{ std_code: "S_TGT_SOLO", cn_name: "目标单侧", en_abbr: "CAND_T1", type_dws: "VARCHAR(20)" }});
+const srcSoloIdx = view.centerRows.findIndex(r => r.source_col?.column_name === "risk_col" && !r.target_col);
+const tgtSoloIdx = view.centerRows.findIndex(r => !r.source_col && r.target_col?.column_name === "cand_t1");
+if (srcSoloIdx === -1 || tgtSoloIdx === -1 || !(srcSoloIdx < tgtSoloIdx)) {{
+  throw new Error("unexpected solo row indices: " + srcSoloIdx + ", " + tgtSoloIdx);
+}}
+view.dragPayload = {{ kind: "bound", side: "source", colName: "risk_col", rowIdx: srcSoloIdx }};
+view._handleDropOnCenterTarget(tgtSoloIdx, "source");
+const mergedRow = view.centerRows.find(r => r.target_col?.column_name === "cand_t1");
+if (!mergedRow || mergedRow.source_col?.column_name !== "risk_col" || mergedRow.bookmark_state !== "UNIFIED") {{
+  throw new Error("cross-row bound drop splice corrupted target row: " + JSON.stringify(mergedRow));
+}}
+
+// 7) 切换到另一对表时自动重置筛选器与滚动位置，避免新表空白困惑
+const manySrcTables = Array.from({{ length: 180 }}, (_, i) => ({{
+  schema_name: "ods",
+  table_name: "ods_ledger_" + String(i).padStart(3, "0"),
+  object_type: i % 5 === 0 ? "VIEW" : "TABLE",
+  table_comment: "台账表_" + i,
+}}));
+paneRef.scrollTop = 280;
+view._applyComparisonResponse({{
+  ok: true,
+  active_table_key: "pair_cd",
+  tables: [],
+  source_connection: {{ connection_id: "c1", name: "Src", db_type: "DWS", configured: true, tables: manySrcTables }},
+  target_connection: {{ connection_id: "c2", name: "Tgt", db_type: "DWS", configured: true, tables: [] }},
+  active_comparison: mockComp("t_c", "t_d"),
+}}, {{ mergeBrief: false }});
+if (view.matrixFilter !== "ALL" || view.matrixKeyword !== "" || paneRef.scrollTop !== 0) {{
+  throw new Error("switching table pair did not reset matrixFilter and scrollTop");
+}}
+
+// 8) 正常兼容行 (ok_col) 不得渲染冗余三层 .cross-compat-tags 底栏，而风险行 (risk_col) 仅渲染有效风险徽标且不含「无转换」噪音
+const allVisRows = findAll(view.matrixListMount, x => (x.className || "").includes("cross-matrix-row") && !(x.className || "").includes("is-dropzone-row"));
+const okCompatTags = findAll(allVisRows[0], x => (x.className || "").includes("cross-compat-tags"));
+if (okCompatTags.length !== 0) {{
+  throw new Error("benign row should not render noisy 3rd-tier .cross-compat-tags");
+}}
+const riskCompatTags = findAll(allVisRows[2], x => (x.className || "").includes("cross-compat-tags"));
+if (riskCompatTags.length !== 1 || !riskCompatTags[0].textContent.includes("100→20") || riskCompatTags[0].textContent.includes("无转换")) {{
+  throw new Error("unexpected risk compat tags: " + (riskCompatTags[0]?.textContent || "missing"));
+}}
+
+// 9) 双端 Schema/Table <input> 与 <select> 节点持久化，聚焦输入期间触发 render / Escape 绝不重建节点或丢失输入焦点
+const srcSchRef = view.srcSchemaInput;
+const srcTblRef = view.srcTableInput;
+const tgtSchRef = view.tgtSchemaInput;
+const tgtTblRef = view.tgtTableInput;
+const srcConnRef = view.srcConnSelect;
+const candForEsc = findAll(view.srcCandidateListMount, x => (x.className || "").includes("cross-cand-card"))[0];
+candForEsc.click();
+srcTblRef.focus();
+srcTblRef.value = "t_c_composing_ime";
+srcTblRef.dispatchEvent({{ type: "input" }});
+globalThis.document.dispatchEvent({{ type: "keydown", key: "Escape" }});
+if (
+  view.srcSchemaInput !== srcSchRef ||
+  view.srcTableInput !== srcTblRef ||
+  view.tgtSchemaInput !== tgtSchRef ||
+  view.tgtTableInput !== tgtTblRef ||
+  view.srcConnSelect !== srcConnRef
+) {{
+  throw new Error("endpoint inputs/selects were recreated on render()");
+}}
+if (globalThis.document.activeElement !== srcTblRef || srcTblRef.value !== "t_c_composing_ime") {{
+  throw new Error("focused endpoint input lost focus or IME value on render()");
+}}
+srcTblRef.blur();
+
+// 10) 可搜索 macOS 选表浮层 (180 张表截断保护 + 关键字实时过滤 + Escape 仅关浮层不误清待选字段 + 键盘选表触发比对)
+candForEsc.click();
+if (!view.selectedCandidate) throw new Error("expected selectedCandidate before opening table picker");
+const srcQuickBtn = view.epControls.source.quickBtn;
+if (!srcQuickBtn.textContent.includes("180")) {{
+  throw new Error("expected quickBtn count 180, got " + srcQuickBtn.textContent);
+}}
+srcQuickBtn.click();
+if (!view.epControls.source.pickerOpen || view.epControls.source.popoverEl.hidden) {{
+  throw new Error("source table popover did not open");
+}}
+const initialOpts = findAll(view.epControls.source.pickerListEl, x => x.tagName === "BUTTON" && x.classList.contains("cross-table-option"));
+if (initialOpts.length !== 150 || view.epControls.source.pickerFootEl.hidden) {{
+  throw new Error("expected 150 capped options with footer notice for 180-table schema, got " + initialOpts.length);
+}}
+// Escape 关闭选表浮层并归还焦点，且保留之前选中的待选字段卡片
+globalThis.document.dispatchEvent({{ type: "keydown", key: "Escape" }});
+if (view.epControls.source.pickerOpen || !view.selectedCandidate) {{
+  throw new Error("Escape while table picker open failed or cleared selectedCandidate");
+}}
+// 重新打开并搜索 "ledger_12" -> 先模拟中文输入法组合态 (isComposing / keyCode=229) 不误关浮层不误触发选表 -> ArrowDown -> Enter 选中 ods.ods_ledger_121
+srcQuickBtn.click();
+const tblSearchInp = view.epControls.source.pickerSearchInput;
+tblSearchInp.value = "ledger_12";
+tblSearchInp.dispatchEvent({{ type: "input" }});
+const searchedOpts = findAll(view.epControls.source.pickerListEl, x => x.tagName === "BUTTON" && x.classList.contains("cross-table-option"));
+if (searchedOpts.length !== 10) {{
+  throw new Error("expected 10 filtered tables for ledger_12, got " + searchedOpts.length);
+}}
+lastCompareUrl = "";
+tblSearchInp.dispatchEvent({{ type: "keydown", key: "Enter", isComposing: true, keyCode: 229 }});
+tblSearchInp.dispatchEvent({{ type: "keydown", key: "Escape", isComposing: true, keyCode: 229 }});
+tblSearchInp.dispatchEvent({{ type: "keydown", key: "ArrowDown", isComposing: true, keyCode: 229 }});
+if (!view.epControls.source.pickerOpen || lastCompareUrl !== "" || view.epControls.source.pickerHighlightIdx !== 0) {{
+  throw new Error("IME composing keydown prematurely hijacked table picker");
+}}
+tblSearchInp.dispatchEvent({{ type: "keydown", key: "ArrowDown" }});
+tblSearchInp.dispatchEvent({{ type: "keydown", key: "Enter" }});
+await new Promise(r => rawSetTimeout(r, 20));
+if (!lastCompareUrl.includes("ods_ledger_121") || view.srcSchemaInput.value !== "ods" || view.srcTableInput.value !== "ods_ledger_121") {{
+  throw new Error("keyboard selection in table popover did not load ods.ods_ledger_121: " + lastCompareUrl);
+}}
+
+// 11) 当表名框粘贴或输入 schema.table (如 mart_core.dws_acct_sum) 且 Schema 框已有旧值 ("ods") 时，必须自动覆盖为新 Schema
+lastCompareUrl = "";
+view.srcSchemaInput.value = "ods";
+view.srcSchemaInput.dispatchEvent({{ type: "input" }});
+view.srcTableInput.value = "mart_core.dws_acct_sum";
+view.srcTableInput.dispatchEvent({{ type: "input" }});
+view.srcTableInput.dispatchEvent({{ type: "keydown", key: "Enter" }});
+await new Promise(r => rawSetTimeout(r, 20));
+if (!lastCompareUrl.includes("source_schema=mart_core") || !lastCompareUrl.includes("source_table=dws_acct_sum")) {{
+  throw new Error("explicit schema.table in tableInput kept stale schema: " + lastCompareUrl);
+}}
+
+// 12) 超矮窗口堆叠态下打开底部目标库选表浮层：当下方空间不足而上方空间充足时自动向上翻转 (.is-flip-up) 并钳制 maxHeight
+view.root.getBoundingClientRect = () => ({{ top: 70, bottom: 430, left: 0, right: 840 }});
+view.epControls.target.bodyEl.getBoundingClientRect = () => ({{ top: 295, bottom: 320, left: 10, right: 820 }});
+view.epControls.target.quickBtn.click();
+if (!view.epControls.target.popoverEl.classList.contains("is-flip-up") || !view.epControls.target.popoverEl.style.maxHeight) {{
+  throw new Error("expected target table popover to flip upward with clamped maxHeight on short viewport");
+}}
+view._closeAllTablePickers();
+
+// 13) 已保存表对浮层 (.cross-pair-popover) 打开时按 Escape（无论焦点在输入框还是失焦到文档）：仅关闭浮层且不误清空已选待选字段
+const candForPairEsc = findAll(view.srcCandidateListMount, x => (x.className || "").includes("cross-cand-card"))[0];
+candForPairEsc.click();
+if (!view.selectedCandidate) throw new Error("expected selectedCandidate before pairPicker Escape test");
+view._openPairPicker();
+view.pairSearchInput.focus();
+view.pairSearchInput.dispatchEvent({{ type: "keydown", key: "Escape" }});
+if (view.pairPickerOpen || !view.selectedCandidate) {{
+  throw new Error("Escape on focused pairSearchInput failed or cleared selectedCandidate");
+}}
+view._openPairPicker();
+view.pairSearchInput.blur();
+globalThis.document.dispatchEvent({{ type: "keydown", key: "Escape" }});
+if (view.pairPickerOpen || !view.selectedCandidate) {{
+  throw new Error("Document Escape while pairPickerOpen failed or cleared selectedCandidate");
+}}
+
+view.destroy();
+"""
+                self._run_node_probe(node_bin, tmp, "cross_macos_probe.mjs", probe_mjs)
+
 
 if __name__ == "__main__":
     unittest.main()
