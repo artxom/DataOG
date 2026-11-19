@@ -45,6 +45,9 @@
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX 1
+#  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
 #  include <windows.h>
@@ -1102,18 +1105,18 @@ static void dataog_udp_route_probe_ips(dataog_ip_entry_t items[32], int *count) 
 #endif
             if (getsockname(sock, (struct sockaddr *)&local_sin, &slen) == 0 &&
                 local_sin.sin_family == AF_INET) {
-                uint32_t h_addr = ntohl((uint32_t)local_sin.sin_addr.s_addr);
+                uint32_t host_ip_u32 = ntohl((uint32_t)local_sin.sin_addr.s_addr);
                 char ip_buf[24] = {0};
                 snprintf(
                     ip_buf,
                     sizeof(ip_buf),
                     "%u.%u.%u.%u",
-                    (unsigned)((h_addr >> 24) & 0xffu),
-                    (unsigned)((h_addr >> 16) & 0xffu),
-                    (unsigned)((h_addr >> 8) & 0xffu),
-                    (unsigned)(h_addr & 0xffu)
+                    (unsigned)((host_ip_u32 >> 24) & 0xffu),
+                    (unsigned)((host_ip_u32 >> 16) & 0xffu),
+                    (unsigned)((host_ip_u32 >> 8) & 0xffu),
+                    (unsigned)(host_ip_u32 & 0xffu)
                 );
-                dataog_add_ip_entry(items, count, ip_buf, h_addr, 0);
+                dataog_add_ip_entry(items, count, ip_buf, host_ip_u32, 0);
             }
         }
 #ifdef _WIN32

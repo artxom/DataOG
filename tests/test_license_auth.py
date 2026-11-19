@@ -524,6 +524,7 @@ class TestOfflineLicenseAuth(unittest.TestCase):
                     "#define AF_INET 2\n#define SOCK_DGRAM 2\n#define IPPROTO_UDP 17\n"
                     "#define INADDR_NONE 0xffffffffUL\ntypedef unsigned short WORD;\n"
                     "#define MAKEWORD(a,b) ((WORD)(((a)&0xff)|(((b)&0xff)<<8)))\n"
+                    "#define h_addr h_addr_list[0]\n"
                     "typedef struct WSAData { char d[32]; } WSADATA;\n"
                     "struct in_addr { uint32_t s_addr; };\n"
                     "struct sockaddr { unsigned short sa_family; char sa_data[14]; };\n"
