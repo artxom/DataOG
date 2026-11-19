@@ -25,6 +25,7 @@ class WorkbenchStore {
   constructor() {
     this.state = {
       brandName: "Data.O.G",
+      license: null,
       connections: [],
       catalogTrees: {},
       drivers: [],
@@ -81,6 +82,9 @@ class WorkbenchStore {
 
   applyBootstrap(data) {
     this.state.brandName = data.brand_name || "Data.O.G";
+    if (data.license) {
+      this.state.license = data.license;
+    }
     this.state.connections = data.connections || [];
     this.state.catalogTrees = data.catalog_trees || {};
     this.state.drivers = data.drivers || [];
@@ -111,6 +115,11 @@ class WorkbenchStore {
     if (!appearance) return;
     this.state.appearance = appearance;
     this.emit("appearance");
+  }
+
+  updateLicense(license) {
+    this.state.license = license || null;
+    this.emit("license");
   }
 
   updateLlmState(providers, availableModels) {

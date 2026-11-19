@@ -9,7 +9,7 @@
  *    - 绿色最大化 (+): 在留白桌面窗口与全屏沉浸画布间平滑切换
  */
 
-import { platformApi } from "./core/api.js";
+import { authApi, platformApi } from "./core/api.js";
 import {
   badge,
   clearEl,
@@ -19,6 +19,7 @@ import {
   svgIcon,
 } from "./core/dom.js";
 import { DESKTOP_APPS, store } from "./core/state.js";
+import { AuthGateController } from "./ui/auth_gate.js";
 import { bindDialogLightDismissFallback } from "./ui/modal.js";
 import { Toast } from "./ui/toast.js";
 import { PolyglotView } from "./views/ddl_translator_view.js";
@@ -44,6 +45,8 @@ const THEME_STORAGE_KEY = "dataog_color_scheme";
 const appInstances = new Map();
 let activeWindowDom = null;
 let activeWindowAppId = null;
+let isAuthorized = false;
+let authGateController = null;
 
 function createAppInstance(appId) {
   switch (appId) {
@@ -263,9 +266,28 @@ function renderMacDock() {
 function syncMenubarIndicators() {
   const activeTitleEl = document.getElementById("menubar-active-app");
   if (activeTitleEl) {
-    activeTitleEl.textContent = store.state.activeApp
-      ? getAppTitle(store.state.activeApp)
-      : "桌面";
+    if (!isAuthorized) {
+      activeTitleEl.textContent = "登录授权";
+    } else {
+      activeTitleEl.textContent = store.state.activeApp
+        ? getAppTitle(store.state.activeApp)
+        : "桌面";
+    }
+  }
+
+  const licBtn = document.getElementById("btn-menubar-license");
+  const licDot = document.getElementById("menubar-license-dot");
+  const licLabel = document.getElementById("menubar-license-label");
+  const lic = store.state.license;
+  if (licBtn && licDot && licLabel) {
+    if (isAuthorized && lic && lic.authorized) {
+      licBtn.hidden = false;
+      const days = Number(lic.days_remaining ?? 0);
+      licDot.className = `dot ${days <= 7 ? "dot-warn" : "dot-success"}`;
+      licLabel.textContent = lic.expires_date ? `授权至 ${lic.expires_date}` : "已授权";
+    } else {
+      licBtn.hidden = true;
+    }
   }
 
   const aiDot = document.getElementById("menubar-ai-dot");
@@ -531,6 +553,7 @@ function initSpotlightDialog() {
   };
 
   const openSpotlight = () => {
+    if (!isAuthorized) return;
     if (!dialog.open) {
       dialog.returnValue = "";
       dialog.showModal();
@@ -548,6 +571,7 @@ function initSpotlightDialog() {
   document.getElementById("btn-menubar-search")?.addEventListener("click", openSpotlight);
 
   window.addEventListener("keydown", (e) => {
+    if (!isAuthorized) return;
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
       e.preventDefault();
       if (dialog.open) {
@@ -636,6 +660,7 @@ function initLogsDialog() {
   });
 
   document.getElementById("btn-menubar-logs")?.addEventListener("click", async () => {
+    if (!isAuthorized) return;
     if (!dialog.open) {
       dialog.returnValue = "";
       dialog.showModal();
@@ -661,11 +686,76 @@ export async function bootstrapWorkbench() {
   initLogsDialog();
   initDockAutoHideHover();
 
+  const dockEl = document.getElementById("os-dock");
+  const winHostEl = document.getElementById("window-host");
+  const loginGateEl = document.getElementById("os-login-gate");
+
+  const enterLoginGate = async (statusPayload = null) => {
+    isAuthorized = false;
+    store.state.activeApp = null;
+    if (winHostEl) {
+      winHostEl.hidden = true;
+      clearEl(winHostEl);
+    }
+    if (dockEl) dockEl.hidden = true;
+    activeWindowDom = null;
+    activeWindowAppId = null;
+
+    let status = statusPayload;
+    if (!status) {
+      try {
+        status = await authApi.status();
+      } catch (_e) {
+        status = { authorized: false, status: "UNACTIVATED", status_message: "请完成离线激活码验证" };
+      }
+    }
+    if (status?.appearance) {
+      store.updateAppearance(status.appearance);
+    }
+    store.updateLicense(status);
+    syncMenubarIndicators();
+    authGateController?.render(status);
+  };
+
+  const enterAuthorizedDesktop = async (licInfo = null) => {
+    isAuthorized = true;
+    authGateController?.hide();
+    if (dockEl) dockEl.hidden = false;
+    if (licInfo) {
+      store.updateLicense(licInfo);
+    }
+    const boot = await platformApi.bootstrap();
+    store.applyBootstrap(boot);
+    syncMenubarIndicators();
+  };
+
+  authGateController = new AuthGateController({
+    mountEl: loginGateEl,
+    onAuthenticated: async (lic) => {
+      await enterAuthorizedDesktop(lic);
+    },
+    onLocked: async (lic) => {
+      await enterLoginGate(lic);
+    },
+  });
+
+  window.addEventListener("dataog:auth-required", () => {
+    if (isAuthorized) {
+      enterLoginGate();
+    }
+  });
+
   document.getElementById("btn-menubar-home")?.addEventListener("click", () => {
+    if (!isAuthorized) return;
     store.showDesktop();
   });
   document.getElementById("btn-menubar-ai")?.addEventListener("click", () => {
+    if (!isAuthorized) return;
     store.openApp("settings", { section: "llm" });
+  });
+  document.getElementById("btn-menubar-license")?.addEventListener("click", () => {
+    if (!isAuthorized) return;
+    authGateController?.openLicenseDetailModal();
   });
 
   // 红色关闭按钮 (✕) 销毁回调：清理对应模块实例并重置摘要
@@ -690,20 +780,28 @@ export async function bootstrapWorkbench() {
       syncMenubarIndicators();
     } else if (reason === "summary") {
       renderMacDock();
-    } else if (reason === "llm" || reason === "logs" || reason === "bootstrap") {
+    } else if (reason === "llm" || reason === "logs" || reason === "bootstrap" || reason === "license") {
       syncMenubarIndicators();
     }
   });
 
-  // 初次渲染空态桌面，随后拉取平台 Bootstrap 数据
+  // 初次渲染背景，随后探测离线授权状态：未激活则先拦截至登录门禁页，已激活自动进入桌面
   syncDesktopAppearance();
   syncMenubarIndicators();
 
   try {
-    const boot = await platformApi.bootstrap();
-    store.applyBootstrap(boot);
+    const authRes = await authApi.status();
+    if (authRes.appearance) {
+      store.updateAppearance(authRes.appearance);
+    }
+    if (authRes.authorized) {
+      await enterAuthorizedDesktop(authRes.license || authRes);
+    } else {
+      await enterLoginGate(authRes.license || authRes);
+    }
   } catch (err) {
     Toast.error(`初始化失败: ${err.message}`);
+    await enterLoginGate();
   }
 }
 

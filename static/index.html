@@ -22,6 +22,10 @@
       </div>
 
       <div class="menubar-right">
+        <button id="btn-menubar-license" type="button" class="menubar-pill-btn" title="查看本地授权或锁定" hidden>
+          <span id="menubar-license-dot" class="dot dot-success"></span>
+          <span id="menubar-license-label">已激活</span>
+        </button>
         <button id="btn-menubar-ai" type="button" class="menubar-pill-btn" title="配置 AI 模型">
           <span id="menubar-ai-dot" class="dot dot-muted"></span>
           <span id="menubar-ai-label">AI 未配密钥</span>
@@ -50,6 +54,9 @@
     <!-- 最大化全屏态底部贴边唤出热区与原生 macOS 毛玻璃 Dock 栏 -->
     <div id="dock-hover-zone" class="dock-hover-zone" aria-hidden="true"></div>
     <nav id="os-dock" class="os-dock" aria-label="应用程序坞"></nav>
+
+    <!-- 离线授权登录拦截页 (未激活 / 已过期 / 已锁定时全屏覆盖) -->
+    <section id="os-login-gate" class="os-login-gate" hidden aria-label="系统登录与激活授权"></section>
   </div>
 
   <!-- Spotlight 全局秒级元数据检索 (<dialog>) -->

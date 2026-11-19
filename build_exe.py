@@ -125,6 +125,14 @@ def build_executable() -> None:
         print(f"[错误] 找不到可执行程序图标文件: {icon_src}")
         sys.exit(1)
 
+    # 编译 C 原生激活校验防反编译护盾并随安装包内嵌（绝对不打包 tools / .keygen_secrets / keygen）
+    try:
+        from core.platform.license_hub import compile_native_license_shield
+
+        shield_bin_path = compile_native_license_shield(force=True)
+    except Exception:
+        shield_bin_path = None
+
     add_static_arg = f"{static_src}{os.pathsep}static"
     add_tests_arg = f"{tests_src}{os.pathsep}tests"
     exe_name = "DataOG"
@@ -205,6 +213,8 @@ def build_executable() -> None:
         "uvicorn.protocols.websockets",
         "anyio._backends._trio",
         "anyio.pytest_plugin",
+        # 严禁将激活码生成器构建工具打入客户版安装包
+        "tools",
     ]
 
     pyinstaller_args = [
@@ -236,6 +246,10 @@ def build_executable() -> None:
         "--hidden-import=http.server",
         "--hidden-import=unittest.mock",
     ]
+    if shield_bin_path and os.path.isfile(shield_bin_path):
+        pyinstaller_args.append(
+            f"--add-binary={shield_bin_path}{os.pathsep}core/platform"
+        )
     if importlib.util.find_spec("jpype") is not None:
         pyinstaller_args.append("--collect-all=jpype")
 

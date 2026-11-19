@@ -18,6 +18,16 @@ async function parseJsonOrThrow(resp) {
     }
   }
   if (!resp.ok || (payload && payload.ok === false)) {
+    if (
+      resp.status === 401 ||
+      (payload && payload.code === "LICENSE_REQUIRED")
+    ) {
+      if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+        window.dispatchEvent(
+          new CustomEvent("dataog:auth-required", { detail: payload || {} })
+        );
+      }
+    }
     const msg =
       (payload && (payload.error || payload.detail || payload.message)) ||
       `请求失败 (HTTP ${resp.status})`;
@@ -102,6 +112,16 @@ export async function uploadFormData(url, formData, { onUploadProgress = null } 
         }
         const httpOk = xhr.status >= 200 && xhr.status < 300;
         if (!httpOk || (payload && payload.ok === false)) {
+          if (
+            xhr.status === 401 ||
+            (payload && payload.code === "LICENSE_REQUIRED")
+          ) {
+            if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+              window.dispatchEvent(
+                new CustomEvent("dataog:auth-required", { detail: payload || {} })
+              );
+            }
+          }
           const msg =
             (payload && (payload.error || payload.detail || payload.message)) ||
             `请求失败 (HTTP ${xhr.status})`;
@@ -165,6 +185,13 @@ export async function downloadApiFile(
   downloadBlob(blob, filename);
   return filename;
 }
+
+export const authApi = {
+  status: () => requestJson("/api/platform/auth/status", { cache: "no-store" }),
+  activate: (payload) =>
+    requestJson("/api/platform/auth/activate", { method: "POST", body: payload }),
+  lock: () => requestJson("/api/platform/auth/lock", { method: "POST" }),
+};
 
 export const tasksApi = {
   get: (taskId) =>

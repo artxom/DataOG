@@ -11,7 +11,7 @@
 所有代码设计与功能迭代必须严格遵循 **「平台微内核底座 (`core/platform/`) + macOS 桌面窗口外壳与公共组件 (`static/js/`) + 独立业务功能模块 (`modules/<module_id>/`)」** 架构：
 
 ### 2.1 全局共享底座层 (`core/platform/`)
-严禁任何业务模块私自管理数据库密码或 AI API Key、或重复编写系统目录查询 SQL，一律通过 `PlatformContext` 依赖注入调用底座六大中枢：
+严禁任何业务模块私自管理数据库密码或 AI API Key、或重复编写系统目录查询 SQL，一律通过 `PlatformContext` 依赖注入调用底座七大中枢：
 1. **双轨驱动引擎与全局连接中心 (`DriverManager` & `ConnectionHub`)**：
    - **内置原生通道（免 Java 开箱即用）**：内置纯 Python / 主流 DB-API 驱动（`psycopg2` 覆盖 PG/华为 DWS/openGauss/金仓、`PyMySQL` 覆盖 MySQL/OceanBase/Doris/StarRocks/TiDB、标准库 `sqlite3`、纯 Python `InceptorThriftClient` 覆盖星环 Inceptor/Hive）。
    - **自定义 JDBC 扩展通道（用户上传 `.jar` 驱动）**：支持用户在界面上传标准 JDBC `.jar` 驱动包（安全隔离存放于非静态目录 `data/drivers/`，校验文件头与 SHA-256 指纹），通过按需懒加载的 `JPype1` + 独立 `URLClassLoader` 连接达梦 DM8、Oracle、DB2、GBase 等任意数据库（未安装 JRE 时绝不影响内置原生驱动正常启动运行）。
@@ -29,19 +29,23 @@
 6. **全局数据标准字典与基础设施 (`StandardCatalog` / `Dialects` / `StateStore` / `ExcelIO`)**：
    - `StandardCatalog` (`core/platform/standard_catalog.py`) 以 `数据项编号` (`std_code`) 为唯一主键维护全行一套最新数据标准字典（兼容 46 列多库物理格式 Excel 模板、流式导入与单事务 Upsert），统一提供跨库物理类型智能解析、三维分级落标判定与数据源字段级数标绑定持久化（`field_standard_bindings`）；全系统表格类上传入口统一先提供标准系统模板（含可选按已选库表预填模板）再由用户填写上传。
    - 统一提供 SQL 标识符清洗、跨方言类型归一化与转换矩阵、上游视图四层递归血缘穿透解析、SQLite WAL 模块表幂等注册迁移与 Excel 导入导出基础能力。
+7. **离线非对称激活码授权与原生防反编译护盾 (`LicenseHub`)**：
+   - 客户端仅嵌有混淆拆分的 RFC 8032 Ed25519 32 字节公钥（零私钥），配合编译态 C 原生动态库护盾 (`_license_shield.{dylib,so,dll}` + 64 位随机挑战-应答 MAC 防补丁)、Gate 1 (ASGI 中间件) + Gate 2 (`get_platform_context` 动态 HMAC 请求能力令牌) 双层强制门禁与双位置硬件密封单调时钟回拨防线 (`app_meta['license_clock_seal']` + `data/.sys_clock_anchor`)；
+   - 支持 **设备专属确定性激活码**（严格绑定唯一 `机器码 + 本机物理 IPv4 + 时长 + 截止日`）与 **全局通用激活码**（无视机器与 IP 限制、仅受有效期与防回拨约束），同一入参确定性签发唯一激活码；独立零环境依赖 C 可执行生成器源码位于 `tools/keygen_src/` 与 `tools/build_keygen.py`。
 
 ### 2.2 后端模块化路由与前端 macOS 桌面工作台 (`modules/` & `static/`)
 - **后端技术选型**：采用 **`FastAPI` + `Pydantic` + `Uvicorn`**。每个业务模块位于独立的 `modules/<module_id>/` 目录（含 `router.py`、`schemas.py`、`service.py`），通过 `APIRouter` 注册至 `/api/modules/<module_id>`，模块之间严禁相互私有导入，跨模块协作一律经由底座定义的数据契约或状态存储接口完成。
 - **前端 macOS 桌面级架构（零 Node 构建链）**：
   - 采用浏览器原生 **ES Modules (`<script type="module">`)** + CSS `light-dark()` / `color-scheme` 明暗双主题令牌，不引入 Webpack/Vite 等编译链，保持静态资源零构建运行与 PyInstaller 直接打包能力。
-  - **macOS 桌面与窗口语义**：
-    - 顶部 28px 毛玻璃菜单栏（`Data.O.G` 品牌归位、活动应用名、AI 状态指示、`⌘K` Spotlight 搜索、运行日志弹窗、深浅色切换、实时时钟）。
+  - **macOS 桌面、登录拦截与窗口语义**：
+    - 全屏毛玻璃登录拦截门禁（`static/js/ui/auth_gate.js` `#os-login-gate`）：未激活、过期、设备/IP 变更、时钟回拨或手动锁定时全屏拦截，默认选中「激活码模式」（「账号密码登录」标注离线试用期暂未开放），展示自动采集的本机 IP、本机机器码与「复制设备申请码 (`REQ1-...`)」及管理员联系方式（莫政辉 / `131-6111-4561` / `artxom@outlook.com`），激活成功后弹出 `<dialog>` 提醒 `当前激活码可用日期至 YYYY-MM-DD`，有效期内再次打开直接进入桌面。
+    - 顶部 28px 毛玻璃菜单栏（`Data.O.G` 品牌归位、活动应用名、`授权至 YYYY-MM-DD` 状态胶囊支持查看授权/续期/一键锁定退回登录页、AI 状态指示、`⌘K` Spotlight 搜索、运行日志弹窗、深浅色切换、实时时钟）。
     - 纯净桌面画布 + 底部居中悬浮毛玻璃 **macOS Dock 栏**承载四大独立应用：**`系统配置`** (`settings`)、**`数据探查`** (`explorer`)、**`数据标准`** (`standard`：整合 `1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`)、**`多邻国`** (`polyglot`：整合 `智能命名` | `方言翻译`)。
     - 左上角红黄绿三键语义：🔴 **关闭 (`✕`)** 回到桌面并彻底销毁重置当前工具运行时状态；🟡 **最小化 (`−`)** 收纳至 Dock 竖直分隔线右侧缩略窗口区（100% 保留内存 DOM、光标与未保存输入，点击 Dock 缩略窗口即刻恢复工作现场）；🟢 **最大化 (`+`)** 切换常规留白窗口（Dock 常驻底部）与全屏沉浸工作态（Dock 自动下沉隐藏、鼠标贴底唤出）。
   - **公共 UI 组件库 (`static/js/ui/`)**：统一复用 `DatabaseTree`、`DataGrid`、`ObjectPicker`、`SqlCodeBox`、`UploadWizardModal`（两步式模板先导上传向导 + XHR 上传与服务端解析双阶段实时进度条）、`StandardPickerModal`（标准字典实时检索绑定器）、`ExportReportModal`（库级离线交互 `.html` 与单 Sheet `.xlsx` 导出弹窗）、`Modal`（原生 `<dialog>` + 坐标判定轻关闭兜底与导入期防误关锁）、`Toast`，严格使用 `textContent` / `createElement` 等安全 DOM 操作杜绝 XSS。
 
 ## 3. 安全、数据兼容与跨平台打包红线
-- **安全与本地隔离**：默认仅监听 `127.0.0.1:18080`（启用 CSP 与 `Sec-Fetch-Site` 跨站请求防护）；`data/*.db`、`data/*.log`、驱动目录 `data/drivers/` 及个性化图片目录 `data/assets/` 必须被 `.gitignore` 排除，严禁将任何数据库密码、AI API Key 或本地状态提交至 Git；所有接口返回与日志输出必须脱敏密码与密钥；`.jar` 驱动与壁纸/图标上传均须严格限制体积、校验二进制魔数头并校验 `realpath` 目录边界防路径穿越，资产读取响应强制携带 `X-Content-Type-Options: nosniff` 与独立 `sandbox` CSP。
+- **安全与本地隔离**：默认仅监听 `127.0.0.1:18080`（启用 CSP 与 `Sec-Fetch-Site` 跨站请求防护）；`data/*.db`、`data/*.log`、驱动目录 `data/drivers/`、个性化图片目录 `data/assets/`、本地私钥目录 `.keygen_secrets/`、独立生成器产物 `keygen/` 及原生编译产物 `*.dylib`/`*.so`/`*.dll` 必须被 `.gitignore` 排除，严禁将任何数据库密码、AI API Key、本地状态或 Ed25519 签发私钥提交至 Git（也不得打入客户版 `DataOG.exe`）；所有接口返回与日志输出必须脱敏密码、密钥与激活码；`.jar` 驱动与壁纸/图标上传均须严格限制体积、校验二进制魔数头并校验 `realpath` 目录边界防路径穿越，资产读取响应强制携带 `X-Content-Type-Options: nosniff` 与独立 `sandbox` CSP。
 - **前端零 XSS 与非阻塞交互红线**：前端代码严禁出现 `innerHTML`、`outerHTML`、`insertAdjacentHTML` 及阻塞式 `window.alert`/`confirm`/`prompt`，统一通过 `static/js/core/dom.js` 安全节点工厂与原生 `<dialog>` (`Modal`) 渲染（由单测静态扫描强制守卫）。
 - **状态库前后向无损兼容**：运行时状态库统一为 `data/dataog_state.db`（启动时自动从历史 `dws_migrator_state.db` 及旧版连接键值无损迁移为命名数据源档案）；所有 SQLite 表结构演进必须通过 `register_table_schema` 幂等列自检机制（新增列带安全 `DEFAULT`），保障跨分支切换与版本回退零报错。
 - **Windows `.exe` 与冻结态自检保障**：保留 Windows CMD 快速编辑模式禁用（防点击挂起）、标准流 UTF-8 重配置（防 `cp1252`/`gbk` 编码崩溃）、静态目录多路径探测、多线程 JPype `attachThreadToJVM()` 及 PyInstaller 轻量化裁剪保护（排除 `openai` / `httpx` / `lxml` / `cryptography` / `pytest` 等非必要包与 `.pyi` 类型桩）；模块零互引校验兼容源码 AST 与冻结态 `pkgutil` + `dis` 字节码自省，确保 `DataOG.exe --test` 独立自检通过。
@@ -61,13 +65,15 @@
    - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
 
 ## 5. 当前代码基线快照（供下次会话快速定位）
-- **当前主干里程碑版本**：`v2.5.2`（官方品牌名 `Data.O.G`，跨库长度/精度包络与类型转换诊断及表/字段级映射检索版，`main` 分支与 `v2.5.2` 标签同步至 `origin`）。
+- **当前主干里程碑版本**：`v2.6.0`（官方品牌名 `Data.O.G`，离线非对称激活码登录拦截、C 原生防反编译护盾与零依赖独立生成器版，`main` 分支与 `v2.6.0` 标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI `2.5.2` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 中间件、挂载平台路由与四大插件模块路由，仅保留 `/api/bootstrap` 只读脱敏兼容探针）。
+  - `app.py`：FastAPI `2.6.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 与 Gate 1 全量 `/api/*` 激活码授权拦截中间件、挂载平台路由与四大插件模块路由，保留 `/api/bootstrap` 脱敏兼容探针且受 Gate 2 鉴权）。
   - `requirements.txt`：保持 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），零新增第三方依赖。
-  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（内置 `--icon=static/dataog.ico` 多尺寸 `.exe` 品牌图标、去除重复静态资源拷贝、排除非运行时重型包与测试子模块、自动剥离 `.pyi`/`.pxd`/`__pycache__` 冗余元数据，保障冻结态 `--test` 自检）。
+  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（编译内嵌 `_license_shield` 原生护盾、内置 `--icon=static/dataog.ico` 多尺寸 `.exe` 品牌图标、排除 `tools` 等非运行时包与测试子模块外多余元数据，保障冻结态 `--test` 自检）。
+  - `tools/keygen_src/keygen.c` & `tools/build_keygen.py`：本地零环境依赖独立 C 激活码生成器构建器，读取本地 `.keygen_secrets/master_ed25519.key` 编译产出 `./keygen/DataOG_Keygen`（或 Windows `.exe`），支持自动采集本机 IP/机器码、粘贴远端设备申请码 (`REQ1-...`) 签发与全局通用码签发（严格 `.gitignore` 隔离不入库）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
-  - `context.py` (`PlatformContext`，同时暴露 `task_progress = import_progress`) / `router.py` / `schemas.py` / `models.py`
+  - `context.py` (`PlatformContext`，同时暴露 `task_progress = import_progress`；`get_platform_context` 内置 Gate 2 请求级动态 HMAC 能力令牌复核) / `router.py`（含 `/auth/status`、`/auth/activate`、`/auth/lock` 免拦截认证路由） / `schemas.py` / `models.py`
+  - `license_hub.py` & `_license_native_src/`（`license_core.h` + `license_shield.c`）：RFC 8032 Ed25519 确定性非对称签名校验、混淆拆分公钥查找表、C 原生动态库 64 位随机挑战-应答 MAC 防补丁桥接、跨平台物理机器码与本机 IPv4 探测、防爆破限流、双位置硬件密封单调时钟防回拨水印（`app_meta['license_clock_seal']` + `data/.sys_clock_anchor`）。
   - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，暴露线程安全 `module_db()` 上下文、`count_cross_columns()`、`list_cross_tables()`（含字段文本 `GROUP_CONCAT` 聚合）与批量元数据缓存读写，核心与模块表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`standard_dictionary`、`field_standard_bindings`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_table_bindings`、`cross_column_bindings`、`explorer_sessions`、`explorer_messages`、`execution_logs`)
   - `standard_catalog.py` (`StandardCatalog`，管理全局 46 列标准字典 Upsert/Replace 导入与导出、脱敏系统模板生成、多库物理格式智能解析、三级落标判定、`bulk_save_field_bindings` 单事务分块绑定持久化、B-Tree 半开区间精确清理与 `match_standard_candidates_batch` 批量候选匹配，挂载 `/standards*`)
   - `offline_report.py`（库级单 Sheet `.xlsx` 与零外部依赖离线交互 `.html` 生成引擎：`build_single_db_excel_bytes`、`build_cross_env_excel_bytes`、`build_single_db_html_bytes`、`build_cross_env_html_bytes`，跨环境报告输出含「目标长度/精度包络」「是否涉及类型转换」的 24 列体系、KPI/胶囊/下拉筛选、内嵌纯 JS 单 Sheet OOXML `.xlsx` 导出器、XSS 安全 JSON 嵌入与 Excel 公式防注入清洗）
@@ -86,16 +92,17 @@
 - **前端原生 ES Modules macOS 桌面工作台 (`static/`)**：
   - `dataog.ico`、`index.html`、`css/tokens.css`（明暗双主题与内置壁纸变量）、`css/workbench.css`、`js/main.js`（纯净桌面画布、底部悬浮毛玻璃 macOS Dock 栏、最小化 Dock 右侧收纳、全屏 Dock 自动下沉贴底唤出、`⌘K` Spotlight、日志控制台）
   - 核心层 `js/core/`：`api.js`（含 `AbortSignal`、`X-Task-Id`、`downloadApiFile` 取消与任务追踪、`tasksApi`、`comparePair`/`prefetchPairs`/`crossApi.searchPairs` 与库级报告/全库模板下载接口）、`dom.js`、`state.js`、`type_compat.js`（零依赖前端实时兼容诊断 `analyzeCrossColumnCompat`）
-  - 公共组件 `js/ui/`：`task_activity_bar.js`（`TaskActivityBar`：`180ms` 防闪烁毛玻璃活动条 + SSE/轮询 + 缩略微日志气泡）、`export_report_modal.js`（`openExportReportModal`：统一离线网页 `.html` 与单 Sheet `.xlsx` 导出弹窗）、`database_tree.js`（DataGrip 风格四级数据库目录树，支持 `single`/`multi` 模式、紧凑刷新进度条及表级自定义徽标渲染）、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`upload_wizard_modal.js`、`standard_picker_modal.js`、`modal.js`、`toast.js`
+  - 公共组件 `js/ui/`：`auth_gate.js`（`AuthGateController` 全屏毛玻璃登录拦截页、激活码/账号模式切换、本机 IP/机器码识别与申请码复制、原生 `<dialog>` 过期日期提醒及菜单栏授权管理/锁定弹窗）、`task_activity_bar.js`（`TaskActivityBar`：`180ms` 防闪烁毛玻璃活动条 + SSE/轮询 + 缩略微日志气泡）、`export_report_modal.js`（`openExportReportModal`：统一离线网页 `.html` 与单 Sheet `.xlsx` 导出弹窗）、`database_tree.js`（DataGrip 风格四级数据库目录树，支持 `single`/`multi` 模式、紧凑刷新进度条及表级自定义徽标渲染）、`data_grid.js`、`object_picker.js`、`sql_code_box.js`、`upload_wizard_modal.js`、`standard_picker_modal.js`、`modal.js`、`toast.js`
   - 四大桌面应用视图 `js/views/`：
     - **系统配置**：`settings_view.js` + `connections_view.js`（外观与图标 / 数据库连接 / JDBC 驱动 / AI 模型）
     - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单、实时任务微日志并支持探查 SQL 一键同步至主编辑器）
     - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片与统一库级报告导出） + `cross_comparator_view.js`（macOS 五虚拟列图形化工作台 + `.mac-subbar` 可搜索表名/字段级 `.cross-pair-picker` 防遮蔽布局 + 拖拽联动实时长度包络与类型转换胶囊 + `TaskActivityBar` 秒切预热 + 统一库级报告导出）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
     - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
-- **全量自动化测试套件 (`tests/`，当前共 44 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
+- **全量自动化测试套件 (`tests/`，当前共 50 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
   - `tests/test_core.py`（14 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、跨库长度/精度包络与类型转换双维判定全矩阵（`test_cross_column_capacity_and_type_conversion_matrix`）、DDL 互译与四层视图穿透核心引擎。
   - `tests/test_platform.py`（15 项）：验证旧版状态库无损迁移、数据源 `standard_format` 幂等迁移与持久化、`TaskProgressHub` 缩略微日志与 SSE、`ConnectionHub.probe_session` 60s 温连接复用、`MetadataHub` 120s 负缓存与单连接视图穿透、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索与单会话多表批量探查（含 DWS/PG 会话级锁等待超时降级与逐表异常熔断）、`StandardCatalog` 46 列导入与多库格式解析及 B-Tree 区间绑定清理、Excel 公式最终结果求值与 `#N/A` 置空清洗、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
   - `tests/test_modules_and_api.py`（15 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 按库设标与落标绑定核验 -> 跨环境五虚拟列拖拽配对、Schema 隔离与 `.mac-subbar` 顶栏防遮蔽闭环）、跨库长度/精度包络与类型转换判定、`/pairs/search` 表及字段级检索与 24 列报告导出（`test_cross_compat_pair_search_and_report_columns`）、`/compare-pair` 轻量切表与 `/prefetch-pairs` 批量预热及跨模块 `X-Task-Id` 缩略微日志、单库与跨环境库级离线交互 `.html` / 单 Sheet `.xlsx` 报告（空目录先采再出、推荐同名未保存表不预比对、Node.js 内嵌纯 JS `.xlsx` 24 列闭环与搜索框 DOM 稳定性校验）、4631 行×160 表批量绑标压测与离线探查熔断保护、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
+  - `tests/test_license_auth.py`（6 项）：验证 RFC 8032 Ed25519 标准向量、C 原生护盾 64 位挑战-应答 MAC 防补丁桥接与闰年日历对拍、生产混淆公钥预签发向量核验、Gate 1 + Gate 2 双重未激活 `401` 拦截、确定性设备专属码（多网卡适配、异机/异 IP 拷贝状态库拦截、篡改状态库拦截）、全局通用码/过期/防时钟回拨水位线/手动锁定/账号模式禁用与独立零依赖 C 生成器编译与 CLI 全链路闭环。
 
 ## 6. AI 只读探查硬隔离铁律与后续演进守则
 - **绝对只读四道硬防线（后续任何涉及 AI 自动查询的功能均须严格复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束）**：

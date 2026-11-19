@@ -8,6 +8,26 @@
 
 ---
 
+## [2.6.0] - 2026-11-19
+
+### Added
+- **离线非对称激活码登录拦截与 C 原生防反编译护盾 (`core/platform/license_hub.py`, `core/platform/_license_native_src/`)**：
+  - 全屏 macOS 毛玻璃登录拦截页（`static/js/ui/auth_gate.js` `#os-login-gate`）：支持「激活码模式」（默认开启）与「账号密码登录」（标注离线试用期且不联网暂未开放）；输入框默认留空，展示自动识别的本机 IP、本机机器码及一键「复制设备申请码 (`REQ1-...`)」按钮与管理员联系方式（莫政辉 / `131-6111-4561` / `artxom@outlook.com`）。
+  - 确定性唯一激活码（`DOG1-...`）：基于 RFC 8032 Ed25519 非对称数字签名，对 `(版本, 授权范围, 天数, 截止日期, 机器码摘要, 本机物理 IPv4 摘要)` 签发严格唯一的离线激活码；同时支持 **设备专属激活码**（严格绑定机器码 + IP，跨机拷贝状态库或换 IP 立即失效）与 **全局通用激活码**（无视一切机器与 IP 限制、仅受有效期与防回拨约束）。
+  - 激活成功通过原生 `<dialog>` 明确提醒 `当前激活码可用日期至 YYYY-MM-DD`，有效期内再次进入直接打开桌面；顶部 28px 菜单栏常驻展示 `授权至 YYYY-MM-DD` 状态胶囊，支持在线更换/续期或一键锁定退回登录页。
+  - 新增 `GET /api/platform/auth/status`、`POST /api/platform/auth/activate` 与 `POST /api/platform/auth/lock` 认证接口，以及 **Gate 1 (ASGI 全量 `/api/*` 中间件) + Gate 2 (`get_platform_context` 动态 HMAC 请求能力令牌)** 双重强制拦截门禁。
+- **零环境依赖独立激活码生成器构建器 (`tools/keygen_src/keygen.c`, `tools/build_keygen.py`)**：
+  - 使用纯标准 C 编译产出独立零依赖原生可执行程序 `keygen/DataOG_Keygen`（或 Windows `DataOG_Keygen.exe`），支持交互式向导与 `--info` / `--local` / `--request REQ1-...` / `--machine --ip` / `--global` / `--days` / `--until` 全参数模式，自动探测本机 IP、机器码与申请码并支持多档或自定义时效选择。
+- **全量自动化测试扩展至 50 项 (`tests/test_license_auth.py`)**：新增 6 项认证安全测试，全面验证 RFC 8032 测试向量、C 原生护盾 64 位挑战-应答防补丁一致性、Gate 1/Gate 2 双层 401 拦截、多网卡匹配、防拷贝/防篡改、防时钟回拨水印、手动锁定及独立 C 生成器编译与 CLI 全链路闭环。
+
+### Changed
+- **升级至 `Data.O.G v2.6.0`**：同步升级 `app.py` 与 `PlatformContext` 版本号至 `2.6.0`，`build_exe.py` 打包阶段自动编译并随客户端嵌入 `_license_shield` 原生动态库，同时排除 `tools` 等非运行期构建工具。
+
+### Security
+- **四重防反编译与私钥隔离机制**：客户端仅嵌有 4 组异或+置换拆分的 Ed25519 公钥，彻底不含私钥；核心验签与硬件探测运行于编译态 C 原生机器码动态库并通过 64 位随机挑战-应答 MAC 校验防函数返回值篡改；双位置硬件密封单调时钟水印（`app_meta['license_clock_seal']` + `data/.sys_clock_anchor`）拦截离线回拨系统时间；`.gitignore` 严格隔离 `.keygen_secrets/`、`keygen/` 及原生动态库，确保私钥绝不进入仓库或客户发行包。
+
+---
+
 ## [2.5.2] - 2026-11-19
 
 ### Added

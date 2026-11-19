@@ -13,10 +13,12 @@ data/assets/
 *.sqlite3
 *.log
 
-# 环境变量与本地私密配置
+# 环境变量与本地私密配置（含激活码签发主私钥与独立生成器，严禁提交至 Git）
 .env
 .env.*
 !.env.example
+.keygen_secrets/
+keygen/
 Book1.xlsx
 
 # =============================================================================
@@ -26,6 +28,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.dylib
+*.dll
+*.pyd
 .Python
 .venv/
 venv/
