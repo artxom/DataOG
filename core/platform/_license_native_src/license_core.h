@@ -23,8 +23,14 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #ifdef _WIN32
+#  ifndef _CRT_SECURE_NO_WARNINGS
+#    define _CRT_SECURE_NO_WARNINGS 1
+#  endif
+#  ifndef _WINSOCK_DEPRECATED_NO_WARNINGS
+#    define _WINSOCK_DEPRECATED_NO_WARNINGS 1
+#  endif
 #  ifndef _WIN32_WINNT
-#    define _WIN32_WINNT 0x0600
+#    define _WIN32_WINNT 0x0601
 #  endif
 #endif
 
@@ -41,8 +47,12 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
-#  include <iphlpapi.h>
 #  include <windows.h>
+#  include <iphlpapi.h>
+#  include <winreg.h>
+#  ifndef KEY_WOW64_64KEY
+#    define KEY_WOW64_64KEY 0x0100
+#  endif
 #  ifdef _MSC_VER
 #    pragma comment(lib, "ws2_32.lib")
 #    pragma comment(lib, "iphlpapi.lib")
@@ -860,36 +870,46 @@ static void dataog_trim_upper_inplace(char *s) {
 }
 
 static void dataog_read_raw_machine_id(char *out, size_t cap) {
+    if (!out || cap == 0u) return;
     out[0] = '\0';
 #ifdef _WIN32
-    DWORD dwType = REG_SZ;
-    DWORD dwSize = (DWORD)cap;
-    if (RegGetValueA(
-            HKEY_LOCAL_MACHINE,
-            "SOFTWARE\\Microsoft\\Cryptography",
-            "MachineGuid",
-            RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY,
-            &dwType,
-            out,
-            &dwSize) == ERROR_SUCCESS && out[0] != '\0') {
-        dataog_trim_upper_inplace(out);
-        return;
-    }
-    if (RegGetValueA(
-            HKEY_LOCAL_MACHINE,
-            "SOFTWARE\\Microsoft\\Cryptography",
-            "MachineGuid",
-            RRF_RT_REG_SZ,
-            &dwType,
-            out,
-            &dwSize) == ERROR_SUCCESS && out[0] != '\0') {
-        dataog_trim_upper_inplace(out);
-        return;
-    }
-    DWORD host_cap = (DWORD)cap;
-    if (GetComputerNameA(out, &host_cap) && out[0] != '\0') {
-        dataog_trim_upper_inplace(out);
-        return;
+    {
+        const REGSAM access_modes[2] = {
+            (REGSAM)(KEY_READ | KEY_WOW64_64KEY),
+            (REGSAM)KEY_READ
+        };
+        for (int idx = 0; idx < 2; ++idx) {
+            HKEY hKey = NULL;
+            if (RegOpenKeyExA(
+                    HKEY_LOCAL_MACHINE,
+                    "SOFTWARE\\Microsoft\\Cryptography",
+                    0,
+                    access_modes[idx],
+                    &hKey) == ERROR_SUCCESS && hKey != NULL) {
+                DWORD dwType = 0;
+                DWORD dwSize = (DWORD)(cap - 1u);
+                LONG qrc = RegQueryValueExA(
+                    hKey,
+                    "MachineGuid",
+                    NULL,
+                    &dwType,
+                    (LPBYTE)out,
+                    &dwSize
+                );
+                RegCloseKey(hKey);
+                if (qrc == ERROR_SUCCESS && (dwType == REG_SZ || dwType == REG_EXPAND_SZ)) {
+                    out[cap - 1u] = '\0';
+                    if ((size_t)dwSize < cap) {
+                        out[dwSize] = '\0';
+                    }
+                    dataog_trim_upper_inplace(out);
+                    if (out[0] != '\0') {
+                        return;
+                    }
+                }
+                out[0] = '\0';
+            }
+        }
     }
 #elif defined(__APPLE__)
     FILE *fp = popen("ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null", "r");
@@ -937,12 +957,23 @@ static void dataog_read_raw_machine_id(char *out, size_t cap) {
         }
     }
 #endif
-    char host[128] = {0};
-    if (gethostname(host, sizeof(host) - 1) == 0 && host[0] != '\0') {
-        snprintf(out, cap, "HOST-%s", host);
-        dataog_trim_upper_inplace(out);
-    } else {
-        snprintf(out, cap, "DATAOG-OFFLINE-NODE");
+    {
+#ifdef _WIN32
+        WSADATA wsa_mc;
+        int wsa_mc_ok = (WSAStartup(MAKEWORD(2, 2), &wsa_mc) == 0);
+#endif
+        char host[128] = {0};
+        if (gethostname(host, sizeof(host) - 1) == 0 && host[0] != '\0') {
+            snprintf(out, cap, "HOST-%s", host);
+            dataog_trim_upper_inplace(out);
+        } else {
+            snprintf(out, cap, "DATAOG-OFFLINE-NODE");
+        }
+#ifdef _WIN32
+        if (wsa_mc_ok) {
+            WSACleanup();
+        }
+#endif
     }
 }
 
@@ -967,7 +998,7 @@ static int dataog_is_virtual_ifname(const char *name) {
         "veth", "br-", "virbr", "vmnet", "vboxnet", "tun", "tap", "tailscale",
         "wg", "zt", "ham", "gif", "stf", NULL
     };
-    char lower[64];
+    char lower[128];
     size_t i = 0;
     for (; name[i] && i < sizeof(lower) - 1; ++i) {
         lower[i] = (char)tolower((unsigned char)name[i]);
@@ -977,9 +1008,13 @@ static int dataog_is_virtual_ifname(const char *name) {
         size_t plen = strlen(prefixes[k]);
         if (strncmp(lower, prefixes[k], plen) == 0) return 1;
     }
-    if (strstr(lower, "loopback") || strstr(lower, "vmware") ||
-        strstr(lower, "virtualbox") || strstr(lower, "hyper-v") ||
-        strstr(lower, "vethernet") || strstr(lower, "pseudo")) {
+    /* Distinguish host-only virtual switches (vEthernet / VMnet / VirtualBox Host-Only / WSL)
+     * from guest primary NICs inside enterprise Hyper-V / Azure / VMware VMs. */
+    if (strstr(lower, "loopback") || strstr(lower, "vmnet") ||
+        strstr(lower, "vboxnet") || strstr(lower, "host-only") ||
+        strstr(lower, "virtual ethernet") || strstr(lower, "vethernet") ||
+        strstr(lower, "default switch") || strstr(lower, "wsl") ||
+        strstr(lower, "pseudo")) {
         return 1;
     }
     return 0;
@@ -1008,6 +1043,7 @@ static int dataog_ip_priority(uint32_t addr_host_order) {
 typedef struct {
     char ip[24];
     uint32_t addr;
+    int is_virtual;
     int prio;
 } dataog_ip_entry_t;
 
@@ -1015,17 +1051,76 @@ static void dataog_add_ip_entry(
     dataog_ip_entry_t items[32],
     int *count,
     const char *ip_str,
-    uint32_t host_addr
+    uint32_t host_addr,
+    int is_virtual
 ) {
     if (!dataog_is_usable_ipv4(ip_str, host_addr)) return;
     for (int i = 0; i < *count; ++i) {
-        if (strcmp(items[i].ip, ip_str) == 0) return;
+        if (strcmp(items[i].ip, ip_str) == 0) {
+            if (is_virtual < items[i].is_virtual) {
+                items[i].is_virtual = is_virtual;
+            }
+            return;
+        }
     }
     if (*count < 32) {
         snprintf(items[*count].ip, sizeof(items[*count].ip), "%s", ip_str);
         items[*count].addr = host_addr;
+        items[*count].is_virtual = is_virtual;
         items[*count].prio = dataog_ip_priority(host_addr);
         (*count)++;
+    }
+}
+
+static void dataog_udp_route_probe_ips(dataog_ip_entry_t items[32], int *count) {
+    static const uint32_t probe_targets[4] = {
+        0xc0a80101u, /* 192.168.1.1 */
+        0x0a000001u, /* 10.0.0.1    */
+        0xac100001u, /* 172.16.0.1  */
+        0x08080808u  /* 8.8.8.8     */
+    };
+    for (int k = 0; k < 4; ++k) {
+#ifdef _WIN32
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET) continue;
+#else
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0) continue;
+#endif
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(9u);
+        dst.sin_addr.s_addr = htonl(probe_targets[k]);
+        if (connect(sock, (const struct sockaddr *)&dst, (int)sizeof(dst)) == 0) {
+            struct sockaddr_in local_sin;
+            memset(&local_sin, 0, sizeof(local_sin));
+#ifdef _WIN32
+            int slen = (int)sizeof(local_sin);
+#else
+            socklen_t slen = (socklen_t)sizeof(local_sin);
+#endif
+            if (getsockname(sock, (struct sockaddr *)&local_sin, &slen) == 0 &&
+                local_sin.sin_family == AF_INET) {
+                uint32_t h_addr = ntohl((uint32_t)local_sin.sin_addr.s_addr);
+                char ip_buf[24] = {0};
+                snprintf(
+                    ip_buf,
+                    sizeof(ip_buf),
+                    "%u.%u.%u.%u",
+                    (unsigned)((h_addr >> 24) & 0xffu),
+                    (unsigned)((h_addr >> 16) & 0xffu),
+                    (unsigned)((h_addr >> 8) & 0xffu),
+                    (unsigned)(h_addr & 0xffu)
+                );
+                dataog_add_ip_entry(items, count, ip_buf, h_addr, 0);
+            }
+        }
+#ifdef _WIN32
+        closesocket(sock);
+#else
+        close(sock);
+#endif
     }
 }
 
@@ -1034,6 +1129,8 @@ static void dataog_collect_local_ips(char *out_primary, size_t p_cap, char *out_
     int count = 0;
 
 #ifdef _WIN32
+    WSADATA wsa_ip;
+    int wsa_ip_ok = (WSAStartup(MAKEWORD(2, 2), &wsa_ip) == 0);
     ULONG buf_len = 16384;
     PIP_ADAPTER_INFO adapter_info = (PIP_ADAPTER_INFO)malloc(buf_len);
     if (adapter_info) {
@@ -1043,21 +1140,29 @@ static void dataog_collect_local_ips(char *out_primary, size_t p_cap, char *out_
         }
         if (adapter_info && GetAdaptersInfo(adapter_info, &buf_len) == NO_ERROR) {
             for (PIP_ADAPTER_INFO cur = adapter_info; cur != NULL; cur = cur->Next) {
-                if (dataog_is_virtual_ifname(cur->Description) || dataog_is_virtual_ifname(cur->AdapterName)) {
-                    continue;
-                }
+                if (cur->Type == MIB_IF_TYPE_LOOPBACK) continue;
+                int is_virt = (
+                    dataog_is_virtual_ifname(cur->Description) ||
+                    dataog_is_virtual_ifname(cur->AdapterName)
+                ) ? 1 : 0;
                 for (PIP_ADDR_STRING addr = &cur->IpAddressList; addr != NULL; addr = addr->Next) {
                     const char *ip_s = addr->IpAddress.String;
                     if (ip_s && ip_s[0] && strcmp(ip_s, "0.0.0.0") != 0) {
                         unsigned long raw_in = inet_addr(ip_s);
                         if (raw_in != INADDR_NONE) {
-                            dataog_add_ip_entry(items, &count, ip_s, ntohl((uint32_t)raw_in));
+                            dataog_add_ip_entry(items, &count, ip_s, ntohl((uint32_t)raw_in), is_virt);
                         }
                     }
                 }
             }
         }
         free(adapter_info);
+    }
+    if (count == 0) {
+        dataog_udp_route_probe_ips(items, &count);
+    }
+    if (wsa_ip_ok) {
+        WSACleanup();
     }
 #else
     struct ifaddrs *ifaddr = NULL;
@@ -1066,22 +1171,33 @@ static void dataog_collect_local_ips(char *out_primary, size_t p_cap, char *out_
             if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
             if ((ifa->ifa_flags & IFF_LOOPBACK) != 0) continue;
             if ((ifa->ifa_flags & IFF_UP) == 0) continue;
-            if (dataog_is_virtual_ifname(ifa->ifa_name)) continue;
+            int is_virt = dataog_is_virtual_ifname(ifa->ifa_name) ? 1 : 0;
             const struct sockaddr_in *sin = (const struct sockaddr_in *)ifa->ifa_addr;
             char ip_buf[INET_ADDRSTRLEN] = {0};
             if (inet_ntop(AF_INET, &sin->sin_addr, ip_buf, sizeof(ip_buf)) != NULL) {
-                dataog_add_ip_entry(items, &count, ip_buf, ntohl(sin->sin_addr.s_addr));
+                dataog_add_ip_entry(items, &count, ip_buf, ntohl(sin->sin_addr.s_addr), is_virt);
             }
         }
         freeifaddrs(ifaddr);
     }
+    if (count == 0) {
+        dataog_udp_route_probe_ips(items, &count);
+    }
 #endif
 
-    /* Sort by prio then lexical ip for cross-language determinism */
+    /* Sort physical NICs first (is_virtual == 0), then by prio, then lexical ip */
     for (int i = 0; i < count; ++i) {
         for (int j = i + 1; j < count; ++j) {
-            if (items[j].prio < items[i].prio ||
-                (items[j].prio == items[i].prio && strcmp(items[j].ip, items[i].ip) < 0)) {
+            int swap_needed = 0;
+            if (items[j].is_virtual < items[i].is_virtual) {
+                swap_needed = 1;
+            } else if (items[j].is_virtual == items[i].is_virtual) {
+                if (items[j].prio < items[i].prio ||
+                    (items[j].prio == items[i].prio && strcmp(items[j].ip, items[i].ip) < 0)) {
+                    swap_needed = 1;
+                }
+            }
+            if (swap_needed) {
                 dataog_ip_entry_t tmp = items[i];
                 items[i] = items[j];
                 items[j] = tmp;

@@ -147,10 +147,18 @@ int main(int argc, char **argv) {
 
     if (flag_info) {
         if (flag_json) {
+            char json_host[128] = {0};
+            size_t jpos = 0;
+            for (size_t k = 0; hostname[k] != '\0' && jpos + 1 < sizeof(json_host); ++k) {
+                unsigned char ch = (unsigned char)hostname[k];
+                if (ch < 32u || ch == '"' || ch == '\\') continue;
+                json_host[jpos++] = (char)ch;
+            }
+            json_host[jpos] = '\0';
             printf(
                 "{\"machine_code\":\"%s\",\"primary_ip\":\"%s\",\"all_ips\":\"%s\","
                 "\"hostname\":\"%s\",\"request_code\":\"%s\",\"today\":\"%s\"}\n",
-                local_mc, local_primary_ip, local_all_ips, hostname, local_req, today_str
+                local_mc, local_primary_ip, local_all_ips, json_host, local_req, today_str
             );
         } else {
             printf("本机信息自动采集结果:\n");

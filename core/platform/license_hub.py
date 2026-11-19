@@ -27,6 +27,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -499,8 +500,162 @@ def _candidate_shield_paths() -> List[str]:
     return paths
 
 
+LAST_SHIELD_COMPILE_ERROR: str = ""
+
+
+def _unload_cdll_handle(lib: Any) -> None:
+    handle = getattr(lib, "_handle", None)
+    if not handle:
+        return
+    try:
+        import _ctypes
+
+        if os.name == "nt" and hasattr(_ctypes, "FreeLibrary"):
+            _ctypes.FreeLibrary(handle)
+        elif hasattr(_ctypes, "dlclose"):
+            _ctypes.dlclose(handle)
+    except Exception:
+        pass
+
+
+def _verify_loadable_shield_binary(lib_path: str) -> Tuple[bool, str]:
+    """测试加载动态库并校验导出符号与位数/运行时依赖，校验后立即释放句柄防 Windows 文件锁."""
+    if not os.path.isfile(lib_path):
+        return False, "产物文件不存在"
+    lib = None
+    try:
+        lib = ctypes.CDLL(lib_path)
+        _ = lib.dataog_shield_probe_device
+        _ = lib.dataog_shield_verify
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if lib is not None:
+            _unload_cdll_handle(lib)
+
+
+def _build_shield_compiler_commands(
+    kind: str,
+    compiler: str,
+    src_c: str,
+    tmp_lib: str,
+    tmp_dir: str,
+) -> List[List[str]]:
+    if kind == "cl":
+        tmp_obj = os.path.join(tmp_dir, "license_shield.obj")
+        tmp_imp = os.path.join(tmp_dir, "license_shield.lib")
+        return [
+            [
+                compiler,
+                "/nologo",
+                "/O2",
+                "/MT",
+                "/LD",
+                src_c,
+                f"/Fo:{tmp_obj}",
+                f"/Fe:{tmp_lib}",
+                "ws2_32.lib",
+                "iphlpapi.lib",
+                "advapi32.lib",
+                "/link",
+                f"/IMPLIB:{tmp_imp}",
+            ]
+        ]
+    if sys.platform == "darwin":
+        return [
+            [
+                compiler,
+                "-O2",
+                "-std=c11",
+                "-dynamiclib",
+                "-fvisibility=hidden",
+                src_c,
+                "-o",
+                tmp_lib,
+            ]
+        ]
+    if os.name == "nt":
+        if kind == "clang":
+            return [
+                [
+                    compiler,
+                    "-O2",
+                    "-std=c11",
+                    "-shared",
+                    "-D_MT",
+                    "-Xclang",
+                    "--dependent-lib=libcmt",
+                    src_c,
+                    "-o",
+                    tmp_lib,
+                    "-lws2_32",
+                    "-liphlpapi",
+                    "-ladvapi32",
+                ],
+                [
+                    compiler,
+                    "-O2",
+                    "-std=c11",
+                    "-shared",
+                    src_c,
+                    "-o",
+                    tmp_lib,
+                    "-lws2_32",
+                    "-liphlpapi",
+                    "-ladvapi32",
+                ],
+            ]
+        return [
+            [
+                compiler,
+                "-O2",
+                "-std=c11",
+                "-shared",
+                "-static",
+                "-static-libgcc",
+                "-fno-stack-protector",
+                src_c,
+                "-o",
+                tmp_lib,
+                "-lws2_32",
+                "-liphlpapi",
+                "-ladvapi32",
+            ],
+            [
+                compiler,
+                "-O2",
+                "-std=c11",
+                "-shared",
+                "-static-libgcc",
+                "-fno-stack-protector",
+                src_c,
+                "-o",
+                tmp_lib,
+                "-lws2_32",
+                "-liphlpapi",
+                "-ladvapi32",
+            ],
+        ]
+    return [
+        [
+            compiler,
+            "-O2",
+            "-std=c11",
+            "-shared",
+            "-fPIC",
+            "-fvisibility=hidden",
+            src_c,
+            "-o",
+            tmp_lib,
+            "-Wl,-s",
+        ]
+    ]
+
+
 def compile_native_license_shield(force: bool = False) -> Optional[str]:
     """在非冻结开发/打包环境中将 `license_shield.c` 编译为本地原生动态库."""
+    global LAST_SHIELD_COMPILE_ERROR
     if getattr(sys, "frozen", False):
         return None
     here = os.path.dirname(os.path.abspath(__file__))
@@ -510,9 +665,9 @@ def compile_native_license_shield(force: bool = False) -> Optional[str]:
         return None
 
     out_lib = os.path.join(here, _shield_lib_filename())
+    src_mtime = max(os.path.getmtime(src_c), os.path.getmtime(src_h))
     if not force and os.path.isfile(out_lib):
-        lib_mtime = os.path.getmtime(out_lib)
-        if lib_mtime >= max(os.path.getmtime(src_c), os.path.getmtime(src_h)):
+        if os.path.getmtime(out_lib) >= src_mtime:
             return out_lib
 
     candidates: List[Tuple[str, str]] = []
@@ -521,69 +676,55 @@ def compile_native_license_shield(force: bool = False) -> Optional[str]:
         if found:
             candidates.append((cand, found))
     if not candidates:
+        LAST_SHIELD_COMPILE_ERROR = "未在 PATH 中检测到可用的 C 编译器 (gcc / clang / cl)"
         return out_lib if os.path.isfile(out_lib) else None
 
-    for kind, compiler in candidates:
-        if kind == "cl":
-            cmd = [
-                compiler,
-                "/nologo",
-                "/O2",
-                "/LD",
-                src_c,
-                f"/Fe:{out_lib}",
-                "ws2_32.lib",
-                "iphlpapi.lib",
-                "advapi32.lib",
-            ]
-        elif sys.platform == "darwin":
-            cmd = [
-                compiler,
-                "-O2",
-                "-std=c11",
-                "-dynamiclib",
-                "-fvisibility=hidden",
-                src_c,
-                "-o",
-                out_lib,
-            ]
-        elif os.name == "nt":
-            cmd = [
-                compiler,
-                "-O2",
-                "-std=c11",
-                "-shared",
-                "-static-libgcc",
-                src_c,
-                "-o",
-                out_lib,
-                "-lws2_32",
-                "-liphlpapi",
-                "-ladvapi32",
-            ]
-        else:
-            cmd = [
-                compiler,
-                "-O2",
-                "-std=c11",
-                "-shared",
-                "-fPIC",
-                "-fvisibility=hidden",
-                src_c,
-                "-o",
-                out_lib,
-                "-Wl,-s",
-            ]
+    err_logs: List[str] = []
+    with tempfile.TemporaryDirectory(prefix="dog_shield_bld_") as tmp_dir:
+        tmp_lib = os.path.join(tmp_dir, _shield_lib_filename())
+        for kind, compiler in candidates:
+            for cmd in _build_shield_compiler_commands(kind, compiler, src_c, tmp_lib, tmp_dir):
+                try:
+                    if os.path.exists(tmp_lib):
+                        os.remove(tmp_lib)
+                except OSError:
+                    pass
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0 or not os.path.isfile(tmp_lib):
+                    detail = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+                    err_logs.append(f"[{kind}] rc={proc.returncode}: {detail}")
+                    continue
 
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0 and os.path.isfile(out_lib):
-            if sys.platform == "darwin":
-                cs = shutil.which("codesign")
-                if cs:
-                    subprocess.run([cs, "--force", "--sign", "-", out_lib], capture_output=True, check=False)
-            return out_lib
+                if sys.platform == "darwin":
+                    cs = shutil.which("codesign")
+                    if cs:
+                        subprocess.run(
+                            [cs, "--force", "--sign", "-", tmp_lib],
+                            capture_output=True,
+                            check=False,
+                        )
 
-    return out_lib if os.path.isfile(out_lib) else None
+                ok_load, load_err = _verify_loadable_shield_binary(tmp_lib)
+                if not ok_load:
+                    err_logs.append(f"[{kind}] 动态库加载自检未通过: {load_err}")
+                    continue
+
+                try:
+                    os.replace(tmp_lib, out_lib)
+                except PermissionError:
+                    # Windows 下若当前进程已映射最新同版 _license_shield.dll，保留现有已映射文件即可
+                    if os.path.isfile(out_lib) and os.path.getmtime(out_lib) >= src_mtime:
+                        LAST_SHIELD_COMPILE_ERROR = ""
+                        return out_lib
+                    raise
+                except OSError:
+                    shutil.copyfile(tmp_lib, out_lib)
+
+                LAST_SHIELD_COMPILE_ERROR = ""
+                return out_lib
+
+    LAST_SHIELD_COMPILE_ERROR = "\n".join(err_logs)
+    return out_lib if (not force and os.path.isfile(out_lib)) else None
 
 
 class NativeLicenseShield:
