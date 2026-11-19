@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,7 @@ from core.platform.connection_hub import ConnectionHub
 from core.platform.metadata_hub import MetadataHub
 from core.platform.models import (
     compute_connection_fingerprint,
+    sanitize_jdbc_url,
     split_extra_props_secrets,
 )
 from core.platform.storage import (
@@ -270,7 +272,7 @@ def _read_safe_topology_rows(conn: sqlite3.Connection, tables: Set[str]) -> List
                 "auth_mode": str(r["auth_mode"] if "auth_mode" in select_cols else "LDAP") or "LDAP",
                 "sqlite_path": str(r["sqlite_path"] if "sqlite_path" in select_cols else "") or "",
                 "jdbc_driver_id": str(r["jdbc_driver_id"] if "jdbc_driver_id" in select_cols else "") or "",
-                "jdbc_url": str(r["jdbc_url"] if "jdbc_url" in select_cols else "") or "",
+                "jdbc_url": sanitize_jdbc_url(str(r["jdbc_url"] if "jdbc_url" in select_cols else "") or "")[0],
                 "jdbc_driver_class": str(r["jdbc_driver_class"] if "jdbc_driver_class" in select_cols else "") or "",
                 "extra_props_json": _sanitize_extra_props_json(
                     r["extra_props_json"] if "extra_props_json" in select_cols else "{}"
@@ -545,12 +547,13 @@ class WorkspaceManager:
         }
 
     def list_workspaces(self) -> List[Dict[str, Any]]:
-        self.ensure_default_workspace()
-        active_id = str(self.store.get_meta("active_workspace_id", DEFAULT_WORKSPACE_ID) or DEFAULT_WORKSPACE_ID)
-        return [
-            self._format_public_workspace(rec, active_id)
-            for rec in self.store.list_workspace_records()
-        ]
+        with self._lock:
+            self.ensure_default_workspace()
+            active_id = str(self.store.get_meta("active_workspace_id", DEFAULT_WORKSPACE_ID) or DEFAULT_WORKSPACE_ID)
+            return [
+                self._format_public_workspace(rec, active_id)
+                for rec in self.store.list_workspace_records()
+            ]
 
     def get_active_workspace_summary(self) -> Dict[str, Any]:
         items = self.list_workspaces()
@@ -860,18 +863,24 @@ class WorkspaceManager:
                     is_default=False,
                 )
 
-                # 计算导入连接与本机个人凭据库的自动匹配统计
-                cred_by_cid, cred_by_fp, _ = self.store._load_credential_maps()
+                # 计算导入连接与本机个人凭据库的自动匹配统计（严格按端点指纹兼容校验，绝不将其他库凭据误算作匹配）
+                cred_by_cid_rows, cred_by_fp, _ = self.store._load_credential_maps()
                 auto_matched = 0
                 needs_creds = 0
                 for t in topo_rows:
-                    if str(t.get("db_type") or "").upper() == "SQLITE":
+                    dt = str(t.get("db_type") or "").upper()
+                    if dt == "SQLITE":
                         continue
                     cid = t["connection_id"]
                     fp = _row_fingerprint(t)
-                    if (cid in cred_by_cid and (cred_by_cid[cid].get("user") or cred_by_cid[cid].get("password"))) or (
-                        fp and fp in cred_by_fp
-                    ):
+                    _, c_status = PlatformStateStore._resolve_credential_for_topology(
+                        cred_by_cid_rows,
+                        cred_by_fp,
+                        connection_id=cid,
+                        endpoint_fingerprint=fp,
+                        db_type=dt,
+                    )
+                    if c_status in ("BOUND", "AUTO_MATCHED"):
                         auto_matched += 1
                     else:
                         needs_creds += 1
@@ -943,7 +952,7 @@ class WorkspaceManager:
         src_topos: List[Dict[str, Any]],
         local_topos: List[Dict[str, Any]],
     ) -> Tuple[Dict[str, str], List[Dict[str, Any]], int, int]:
-        """构建来源 connection_id -> 本地 connection_id 映射表（优先精确 ID，其次端点指纹自动对齐）."""
+        """构建来源 connection_id -> 本地 connection_id 映射表（端点兼容时复用同 ID/同端点，ID 冲突但端点不同时分配无冲突新 ID）."""
         local_by_cid = {t["connection_id"]: t for t in local_topos}
         local_by_fp: Dict[str, Dict[str, Any]] = {}
         for t in local_topos:
@@ -951,8 +960,9 @@ class WorkspaceManager:
             if fp and fp not in local_by_fp:
                 local_by_fp[fp] = t
 
-        cred_by_cid, cred_by_fp, _ = self.store._load_credential_maps()
+        cred_by_cid_rows, cred_by_fp, _ = self.store._load_credential_maps()
         conn_id_map: Dict[str, str] = {}
+        reserved_cids: Set[str] = set(local_by_cid.keys())
         preview: List[Dict[str, Any]] = []
         auto_cred_matched = 0
         needs_cred = 0
@@ -960,9 +970,16 @@ class WorkspaceManager:
         for src in src_topos:
             scid = src["connection_id"]
             sfp = _row_fingerprint(src)
-            is_sqlite = str(src.get("db_type") or "").upper() == "SQLITE"
+            dt = str(src.get("db_type") or "").upper()
+            is_sqlite = dt == "SQLITE"
 
-            if scid in local_by_cid:
+            local_same_id = local_by_cid.get(scid)
+            local_same_id_fp = _row_fingerprint(local_same_id) if local_same_id else ""
+            same_id_compatible = local_same_id is not None and (
+                not sfp or not local_same_id_fp or sfp == local_same_id_fp
+            )
+
+            if same_id_compatible:
                 mapped_cid = scid
                 action = "MATCH_ID"
                 cred_match = "EXISTING"
@@ -971,18 +988,35 @@ class WorkspaceManager:
                 action = "MAP_EXISTING"
                 cred_match = "EXISTING"
             else:
-                mapped_cid = scid
+                if scid in reserved_cids:
+                    # 避免不同端点的同 connection_id 碰撞：基于端点指纹确定性派生无冲突新 ID，确保 inspect 与 execute 100% 一致
+                    fp_tag = hashlib.sha256((sfp or src.get("name") or scid).encode("utf-8")).hexdigest()[:6]
+                    cand = f"{scid}_{fp_tag}"
+                    suffix = 2
+                    while cand in reserved_cids:
+                        cand = f"{scid}_{fp_tag}_{suffix}"
+                        suffix += 1
+                    mapped_cid = cand
+                else:
+                    mapped_cid = scid
+                reserved_cids.add(mapped_cid)
                 action = "ADD"
                 if is_sqlite:
                     cred_match = "SQLITE_LOCAL"
-                elif (scid in cred_by_cid and (cred_by_cid[scid].get("user") or cred_by_cid[scid].get("password"))) or (
-                    sfp and sfp in cred_by_fp
-                ):
-                    cred_match = "AUTO_MATCHED"
-                    auto_cred_matched += 1
                 else:
-                    cred_match = "NEEDS_INPUT"
-                    needs_cred += 1
+                    _, c_status = PlatformStateStore._resolve_credential_for_topology(
+                        cred_by_cid_rows,
+                        cred_by_fp,
+                        connection_id=mapped_cid,
+                        endpoint_fingerprint=sfp,
+                        db_type=dt,
+                    )
+                    if c_status in ("BOUND", "AUTO_MATCHED"):
+                        cred_match = "AUTO_MATCHED"
+                        auto_cred_matched += 1
+                    else:
+                        cred_match = "NEEDS_INPUT"
+                        needs_cred += 1
 
             conn_id_map[scid] = mapped_cid
             preview.append(
@@ -1119,14 +1153,17 @@ class WorkspaceManager:
         sconn: sqlite3.Connection, src_tables: Set[str], lconn: sqlite3.Connection
     ) -> Dict[str, int]:
         local_map: Dict[str, Dict[str, Any]] = {}
-        for r in lconn.execute("SELECT std_code, cn_name, en_abbr, type_dws, data_format, updated_at FROM standard_dictionary").fetchall():
+        for r in lconn.execute("SELECT * FROM standard_dictionary").fetchall():
             local_map[str(r["std_code"])] = dict(r)
         if "standard_dictionary" not in src_tables:
             return {"source_count": 0, "local_count": len(local_map), "new_count": 0, "conflict_count": 0, "same_count": 0, "newer_in_source_count": 0}
         scols = _get_table_columns(sconn, "standard_dictionary")
         if "std_code" not in scols:
             return {"source_count": 0, "local_count": len(local_map), "new_count": 0, "conflict_count": 0, "same_count": 0, "newer_in_source_count": 0}
-        srows = sconn.execute("SELECT * FROM standard_dictionary").fetchall()
+        common_cols = [c for c in _STD_DICT_COLS if c in scols]
+        compare_cols = [c for c in common_cols if c not in ("std_code", "updated_at")]
+        col_sql = ", ".join(common_cols)
+        srows = sconn.execute(f"SELECT {col_sql} FROM standard_dictionary").fetchall()
         new_cnt = conf_cnt = same_cnt = newer_cnt = 0
         for r in srows:
             code = str(r["std_code"] or "").strip()
@@ -1136,16 +1173,10 @@ class WorkspaceManager:
             if loc is None:
                 new_cnt += 1
                 continue
-            rk = set(r.keys())
-            diff = (
-                str(r["cn_name"] if "cn_name" in rk else "") != str(loc.get("cn_name") or "")
-                or str(r["en_abbr"] if "en_abbr" in rk else "") != str(loc.get("en_abbr") or "")
-                or str(r["type_dws"] if "type_dws" in rk else "") != str(loc.get("type_dws") or "")
-                or str(r["data_format"] if "data_format" in rk else "") != str(loc.get("data_format") or "")
-            )
+            diff = any(str(r[c] or "") != str(loc.get(c) or "") for c in compare_cols)
             if diff:
                 conf_cnt += 1
-                s_upd = str(r["updated_at"] if "updated_at" in rk else "")
+                s_upd = str(r["updated_at"] or "") if "updated_at" in common_cols else ""
                 if s_upd and s_upd > str(loc.get("updated_at") or ""):
                     newer_cnt += 1
             else:
@@ -1422,6 +1453,9 @@ class WorkspaceManager:
                 new_cnt += 1
             elif int(loc.get("columns_cached") or 0) == 0 and int(r["columns_cached"] or 0) != 0:
                 new_cnt += 1
+            elif int(loc.get("columns_cached") or 0) != 0 and int(r["columns_cached"] or 0) == 0:
+                # 本地已缓存完整列结构而来源仅为目录概要，不降级覆盖
+                same_cnt += 1
             elif str(r["refreshed_at"] or "") != str(loc.get("refreshed_at") or ""):
                 conf_cnt += 1
                 if str(r["refreshed_at"] or "") > str(loc.get("refreshed_at") or ""):
@@ -1721,7 +1755,8 @@ class WorkspaceManager:
                 continue
             ckey_low = ckey_raw.lower()
             s_code = str(r["std_code"] or "").strip()
-            s_upd = str(r["updated_at"] or now)
+            s_upd_raw = str(r["updated_at"] or "")
+            s_upd_write = s_upd_raw or now
             loc = local_map.get((cid, ckey_low))
 
             if loc is None:
@@ -1742,10 +1777,10 @@ class WorkspaceManager:
                         str(r["bind_source"] or "MERGE"),
                         str(r["compliance_status"] or "UNCHECKED"),
                         str(r["compliance_detail"] or ""),
-                        s_upd,
+                        s_upd_write,
                     ),
                 )
-                local_map[(cid, ckey_low)] = {"std_code": s_code, "updated_at": s_upd, "col_key": ckey_raw}
+                local_map[(cid, ckey_low)] = {"std_code": s_code, "updated_at": s_upd_write, "col_key": ckey_raw}
                 added += 1
                 continue
 
@@ -1762,14 +1797,14 @@ class WorkspaceManager:
                         str(r["bind_source"] or "MERGE"),
                         str(r["compliance_status"] or "UNCHECKED"),
                         str(r["compliance_detail"] or ""),
-                        s_upd,
+                        s_upd_write,
                         cid,
                         loc["col_key"],
                     ),
                 )
                 local_map[(cid, ckey_low)] = {
                     "std_code": s_code,
-                    "updated_at": s_upd,
+                    "updated_at": s_upd_write,
                     "col_key": loc["col_key"],
                 }
                 updated += 1
@@ -1780,7 +1815,7 @@ class WorkspaceManager:
                 continue
 
             should_replace = strategy == "overwrite" or (
-                strategy == "newer" and bool(s_code) and s_upd > str(loc.get("updated_at") or "")
+                strategy == "newer" and bool(s_code) and bool(s_upd_raw) and s_upd_raw > str(loc.get("updated_at") or "")
             )
             if should_replace:
                 lconn.execute(
@@ -1794,14 +1829,14 @@ class WorkspaceManager:
                         str(r["bind_source"] or "MERGE"),
                         str(r["compliance_status"] or "UNCHECKED"),
                         str(r["compliance_detail"] or ""),
-                        s_upd,
+                        s_upd_write,
                         cid,
                         loc["col_key"],
                     ),
                 )
                 local_map[(cid, ckey_low)] = {
                     "std_code": s_code,
-                    "updated_at": s_upd,
+                    "updated_at": s_upd_write,
                     "col_key": loc["col_key"],
                 }
                 updated += 1
@@ -1838,7 +1873,8 @@ class WorkspaceManager:
                 continue
             scols = src_cols_by_tbl.get(tk, [])
             lt = local_tbls.get(tk)
-            s_max_upd = max([str(st.get("updated_at") or now), *(str(c.get("updated_at") or "") for c in scols)])
+            s_max_upd_raw = max([str(st.get("updated_at") or ""), *(str(c.get("updated_at") or "") for c in scols)])
+            s_max_upd_write = s_max_upd_raw or now
 
             if lt is None:
                 lconn.execute(
@@ -1857,18 +1893,54 @@ class WorkspaceManager:
                         str(st.get("source_table") or ""),
                         str(st.get("target_schema") or ""),
                         str(st.get("target_table") or ""),
-                        str(st.get("updated_at") or now),
+                        s_max_upd_write,
                     ),
                 )
                 self._insert_cross_col_rows(lconn, tk, scols, now)
+                local_tbls[tk] = {
+                    "std_table_key": tk,
+                    "std_schema_name": str(st.get("std_schema_name") or "public"),
+                    "std_table_name": str(st.get("std_table_name") or tk),
+                    "std_table_comment": str(st.get("std_table_comment") or ""),
+                    "source_schema": str(st.get("source_schema") or ""),
+                    "source_table": str(st.get("source_table") or ""),
+                    "target_schema": str(st.get("target_schema") or ""),
+                    "target_table": str(st.get("target_table") or ""),
+                    "updated_at": s_max_upd_write,
+                }
+                local_cols_by_tbl[tk] = list(scols)
                 added += 1
                 continue
 
             local_tk = str(lt["std_table_key"])
             lcols = local_cols_by_tbl.get(tk, [])
             l_max_upd = max([str(lt.get("updated_at") or ""), *(str(c.get("updated_at") or "") for c in lcols)])
+
+            # 判断表对与列级映射是否与本地完全一致（完全一致时直接跳过，不空转覆盖）
+            src_ref = f"{st.get('source_schema') or ''}.{st.get('source_table') or ''}".strip(".").lower()
+            tgt_ref = f"{st.get('target_schema') or ''}.{st.get('target_table') or ''}".strip(".").lower()
+            l_src_ref = f"{lt.get('source_schema') or ''}.{lt.get('source_table') or ''}".strip(".").lower()
+            l_tgt_ref = f"{lt.get('target_schema') or ''}.{lt.get('target_table') or ''}".strip(".").lower()
+            local_by_sig_cmp = {self._col_sig(c): c for c in lcols}
+            is_table_identical = (
+                src_ref == l_src_ref
+                and tgt_ref == l_tgt_ref
+                and len(scols) == len(lcols)
+                and all(
+                    (self._col_sig(sc) in local_by_sig_cmp)
+                    and str(sc.get("source_std_code") or "").strip().lower()
+                    == str(local_by_sig_cmp[self._col_sig(sc)].get("source_std_code") or "").strip().lower()
+                    and str(sc.get("target_std_code") or "").strip().lower()
+                    == str(local_by_sig_cmp[self._col_sig(sc)].get("target_std_code") or "").strip().lower()
+                    for sc in scols
+                )
+            )
+            if is_table_identical:
+                skipped += 1
+                continue
+
             replace_whole_table = strategy == "overwrite" or (
-                strategy == "newer" and s_max_upd > l_max_upd
+                strategy == "newer" and bool(s_max_upd_raw) and s_max_upd_raw > l_max_upd
             )
 
             if replace_whole_table:
@@ -1887,7 +1959,7 @@ class WorkspaceManager:
                         str(st.get("source_table") or ""),
                         str(st.get("target_schema") or ""),
                         str(st.get("target_table") or ""),
-                        s_max_upd,
+                        s_max_upd_write,
                         local_tk,
                     ),
                 )
@@ -1896,6 +1968,15 @@ class WorkspaceManager:
                     (local_tk, tk),
                 )
                 self._insert_cross_col_rows(lconn, local_tk, scols, now)
+                local_tbls[tk] = {
+                    **lt,
+                    "source_schema": str(st.get("source_schema") or ""),
+                    "source_table": str(st.get("source_table") or ""),
+                    "target_schema": str(st.get("target_schema") or ""),
+                    "target_table": str(st.get("target_table") or ""),
+                    "updated_at": s_max_upd_write,
+                }
+                local_cols_by_tbl[tk] = list(scols)
                 updated += 1
                 continue
 
@@ -2059,7 +2140,7 @@ class WorkspaceManager:
             k = _mkey(sr)
             loc = local_map.get(k)
             if loc is None:
-                lconn.execute(
+                cur = lconn.execute(
                     """
                     INSERT INTO migration_items (
                         row_index, schema_name, table_name,
@@ -2097,6 +2178,7 @@ class WorkspaceManager:
                         str(sr.get("updated_at") or now),
                     ),
                 )
+                local_map[k] = {**sr, "id": cur.lastrowid}
                 next_row_idx += 1
                 added += 1
                 continue
@@ -2302,6 +2384,9 @@ class WorkspaceManager:
             elif int(loc.get("columns_cached") or 0) == 0 and int(t.get("columns_cached") or 0) != 0:
                 _write_table_and_cols()
                 updated += 1
+            elif int(loc.get("columns_cached") or 0) != 0 and int(t.get("columns_cached") or 0) == 0:
+                # 严禁用不含列详情的目录快照降级抹除本机已缓存的完整列结构
+                skipped += 1
             elif strategy == "overwrite" or (
                 strategy == "newer" and str(t.get("refreshed_at") or "") > str(loc.get("refreshed_at") or "")
             ):

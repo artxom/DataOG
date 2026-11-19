@@ -808,6 +808,10 @@ export async function bootstrapWorkbench() {
           staleInst.destroy?.();
           appInstances.delete(staleId);
         }
+        if (DEFAULT_SUMMARIES[staleId]) {
+          store.state.appSummaries[staleId] = DEFAULT_SUMMARIES[staleId];
+        }
+        store.state.maximizedApps.delete(staleId);
       }
       store.state.minimizedApps = (store.state.minimizedApps || []).filter(
         (id) => id === "settings"
