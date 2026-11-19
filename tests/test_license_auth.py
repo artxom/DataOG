@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import json
 import os
@@ -298,7 +299,7 @@ class TestOfflineLicenseAuth(unittest.TestCase):
             self.assertEqual(st_ip["status"], "DEVICE_MISMATCH")
 
             # 模拟攻击者直接修改 SQLite 中存储的激活码或时钟密封值 -> 立即失效
-            with sqlite3.connect(db_path) as conn:
+            with contextlib.closing(sqlite3.connect(db_path)) as conn:
                 conn.execute(
                     "UPDATE app_meta SET value = ? WHERE key = 'license_activation_code'",
                     (tok1[:-1] + ("Z" if tok1[-1] != "Z" else "Y"),),
@@ -497,12 +498,18 @@ class TestOfflineLicenseAuth(unittest.TestCase):
         if getattr(sys, "frozen", False):
             return
 
-        # 验证已加载 NativeLicenseShield 后再次调用 compile_native_license_shield(force=True) 不抛锁冲突
+        # 验证已加载 NativeLicenseShield 后再次调用 compile_native_license_shield(force=True) 不抛锁冲突（含跨盘符 C:->D: 场景）
         _ = NativeLicenseShield()
         rebuilt = _lh_mod.compile_native_license_shield(force=True)
         if any(shutil.which(c) for c in ("clang", "gcc", "cl", "cc")):
             self.assertIsNotNone(rebuilt)
             self.assertTrue(os.path.isfile(rebuilt))
+            with (
+                mock.patch("os.replace", side_effect=OSError(17, "Cannot move to a different disk drive")),
+                mock.patch("shutil.copyfile", side_effect=PermissionError(13, "Permission denied")),
+            ):
+                rebuilt_xdrv = _lh_mod.compile_native_license_shield(force=True)
+            self.assertEqual(rebuilt_xdrv, rebuilt)
 
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         native_dir = os.path.join(project_root, "core", "platform", "_license_native_src")

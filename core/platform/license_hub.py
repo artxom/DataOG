@@ -712,13 +712,20 @@ def compile_native_license_shield(force: bool = False) -> Optional[str]:
                 try:
                     os.replace(tmp_lib, out_lib)
                 except PermissionError:
-                    # Windows 下若当前进程已映射最新同版 _license_shield.dll，保留现有已映射文件即可
+                    # Windows 下同盘符若当前进程已映射最新同版 _license_shield.dll，保留现有已映射文件即可
                     if os.path.isfile(out_lib) and os.path.getmtime(out_lib) >= src_mtime:
                         LAST_SHIELD_COMPILE_ERROR = ""
                         return out_lib
                     raise
                 except OSError:
-                    shutil.copyfile(tmp_lib, out_lib)
+                    try:
+                        shutil.copyfile(tmp_lib, out_lib)
+                    except PermissionError:
+                        # Windows 跨盘符 (%TEMP% 位于 C: 而仓库位于 D:) 时 copyfile 命中已映射 DLL 文件锁
+                        if os.path.isfile(out_lib) and os.path.getmtime(out_lib) >= src_mtime:
+                            LAST_SHIELD_COMPILE_ERROR = ""
+                            return out_lib
+                        raise
 
                 LAST_SHIELD_COMPILE_ERROR = ""
                 return out_lib
