@@ -20,7 +20,7 @@
   - 新增三步引导式 **「合并同事进度」向导**：支持上传 `.dataog.db` 或旧版 `dataog_state.db`，严格以 `mode=ro&immutable=1` + `PRAGMA query_only=ON` 仅读取白名单业务表，自动按端点指纹映射数据源并预览本机个人凭据匹配状态，提供跨环境映射表对差异预览（`新增`/`冲突`/`一致`），支持按模块自由勾选与三种冲突策略（`supplement` 仅补充缺失与未绑定 / `newer` 按 `updated_at` 保留较新 / `overwrite` 覆盖冲突项但保留本地独有项），单事务原子落盘。
   - 在「系统配置 → 数据库连接」列表中新增个人凭据自动匹配徽标（`已自动匹配个人凭据` / `待填个人账号密码`），方便团队导入共享工作区后按需补充个人数据库凭据。
 - **启动自动无损拆分迁移 (`PlatformStateStore.migrate_legacy_install_dir`)**：升级至 `v2.7.0` 首次启动时自动检测旧版 `<exe_dir>/data/dataog_state.db`（或 `dws_migrator_state.db`）、`assets/`、`drivers/` 及 `.sys_clock_anchor`，一次性幂等无损拆分迁移至私有保险箱与默认共享工作区，保留原目录文件作为安全备份。
-- **全量自动化测试扩充至 60 项 (`tests/test_workspace_separation.py`)**：新增 8 项深度端到端测试，全面覆盖三端混淆私有路径（无品牌名且无 `.db` 后缀）与零路径暴露/异常脱敏守卫、物理双库表级隔离与导出原始字节防泄密校验、多工作区生命周期/跨工作区删连接保凭据/重启零幽灵连接/端点指纹凭据自动匹配、旧版状态库及对抗边界增量合并与三大策略、只读目录 WAL 无损迁移幂等性以及 Node.js 真实 ES Module 前端三步合并向导 DOM 交互契约。
+- **全量自动化测试扩充至 61 项 (`tests/test_workspace_separation.py`)**：新增 9 项深度端到端测试，全面覆盖三端混淆私有路径（无品牌名且无 `.db` 后缀）与全平台错误中间件零路径暴露守卫、物理双库表级隔离与导出原始字节（含 JDBC URL 内嵌凭据剥离）防泄密校验、多工作区生命周期/跨工作区删连接保凭据/同 ID 不同端点凭据防互毁与无冲突合并派生/重启零幽灵连接/端点指纹凭据自动匹配、旧版状态库及对抗边界增量合并与三大策略、只读目录 WAL 无损迁移幂等性以及 Node.js 真实 ES Module 前端三步合并向导 DOM 交互契约。
 
 ### Changed
 - **正式升级至重大版本 `Data.O.G v2.7.0`**：同步升级 `app.py` 与 `PlatformContext` 版本号至 `2.7.0`；将 `modules/data_explorer/service.py` 的 `explorer_sessions` 与 `explorer_messages` 显式路由至私有库 (`scope="private"`)，避免个人探查会话混入团队共享工作区。
@@ -30,6 +30,11 @@
   - 补齐全局 `[hidden] { display: none !important; }` 守卫，彻底修复未激活登录门禁页上因 `display: inline-flex/flex` 覆盖 `hidden` 属性导致顶部工作区胶囊、激活状态、日志 `0` 徽标与底部 Dock 意外显露的问题。
   - 修复窄视口（`768px`~`960px`）或长工作区名称下顶部 28px 菜单栏文本折行与竖向裁切，为工作区胶囊与 AI 胶囊补齐单行省略截断与悬停完整标题提示。
   - 修复三步合并向导 Step 2 多表差异预览下 `.dialog-header` 因缺少 `flex-shrink: 0` 被压缩至 `26px`、步骤条序号重复显示以及第 5 列「差异说明」横向裁切与数据源预览卡片挤压问题，并统一 `:focus-visible` macOS 蓝光焦点环。
+- **三层分离存储安全与增量合并深度加固 (`core/platform/storage.py`, `core/platform/workspace_hub.py`, `core/platform/models.py`, `core/platform/storage_paths.py`, `app.py`, `static/js/views/workspace_view.js`, `static/js/main.js`)**：
+  - 修复跨工作区或同事分享文件中出现同 `connection_id`（如 `legacy-dws-workbench`）指向不同数据库端点时引发的凭据串绑、覆写旧工作区密码及合并映射错乱问题：将 `connection_credentials` 主键升级为 `(connection_id, endpoint_fingerprint)` 独立隔离键，凭据匹配严格校验端点指纹兼容性，并在合并 ID 冲突时确定性派生无冲突新 `connection_id`。
+  - 新增全格式 `sanitize_jdbc_url` 清洗器（覆盖 Oracle thin/oci、MySQL/PG authority 与 query、SQLServer/DB2 分号参数），自动剥离 JDBC URL 内嵌凭据至 Layer 2 私有凭据库，杜绝密码随 `jdbc_url` 泄露入共享 `.dataog.db`。
+  - 统一 `redact_private_storage_paths`（覆盖 `abspath`/`realpath` 及 JSON 转义反斜杠）并接入 `app.py` 全平台 `/api/*` 错误响应兜底脱敏与旧库迁移日志脱敏，彻底封堵 `/drivers/upload`、`/appearance/upload` 等非工作区接口及 macOS `/private/var` 软链路径泄露；同步加固 Windows `GetFileAttributesW`/`SetFileAttributesW` `ctypes` 参数签名，以及只读旧库迁移改用 `shutil.copyfile` + `0o600` 权限修复只读文件 WAL 恢复与临时目录清理隐患，并修复旧库迁移切至空白工作区后 `/api/bootstrap` 残留旧连接问题。
+  - 修复增量合并多项边界一致性：标准字典预检升级为全列比对与执行逻辑 1:1 对齐；`newer` 策略不再将空 `updated_at` 误填为当前时间覆写本地较新绑定或跨环境表对；混合大小写重复 `std_table_key` 不再触发唯一约束崩溃；本地已缓存完整列结构（`columns_cached=1`）不被目录概要（`columns_cached=0`）降级覆盖；`list_workspaces` 补齐线程锁消除与删除竞争；前端修复「导入为新工作区」取消勾选立即切换时误触发 `workspace_switched` 销毁已打开窗口、步骤切换滚动复位、表对变更提示及超 300 表截断计数标注。
 
 ### Security
 - **私有存储路径零暴露红线**：移除终端启动横幅中的状态库物理路径打印，严禁在任何 API 响应、前端页面或日志中暴露私有存储根目录与混淆文件名；导出 `.dataog.db` 与导入/合并同事文件严格实行白名单表与白名单列（物理隔离 `user`/`password`/`api_key`/`license_*`）及 SQLite 魔数头与 `realpath` 边界校验。

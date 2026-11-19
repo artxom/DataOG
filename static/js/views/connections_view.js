@@ -361,7 +361,7 @@ export class ConnectionsView {
             ),
             el(
               "div",
-              { style: { display: "flex", gap: "5px" } },
+              { style: { display: "flex", gap: "5px", flexShrink: "0" } },
               el("button", {
                 type: "button",
                 className: "btn btn-xs",

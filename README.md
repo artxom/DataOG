@@ -80,7 +80,7 @@ DataOG/
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（登录门禁联动、底部 Dock 与窗口管理器）、core/（含 type_compat.js）、ui/（含 AuthGate / TaskActivityBar / ExportReportModal）、views/（四大模块视图）
 ├── tools/                        # 独立零环境依赖 C 激活码生成器源码与构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
-├── tests/                        # 60 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 模块隔离与零 XSS 守卫）
+├── tests/                        # 61 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -118,7 +118,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（60 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（61 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检

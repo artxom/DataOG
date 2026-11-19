@@ -23,7 +23,7 @@ from core.platform.license_hub import (
     ed25519_derive_pubkey,
     issue_activation_code_for_seed,
 )
-from core.platform.models import ConnectionProfile
+from core.platform.models import ConnectionProfile, sanitize_jdbc_url
 from core.platform.storage import (
     PRIVATE_ONLY_TABLES,
     WORKSPACE_BUSINESS_TABLES,
@@ -1233,6 +1233,290 @@ class TestWorkspaceThreeTierSeparation(unittest.TestCase):
                 self.assertEqual(mrow["source_table"], "t_mixed_src")
                 self.assertEqual(mrow["target_table"], "t_mixed_tgt")
 
+    def test_security_and_merge_hardening_regressions(self) -> None:
+        """深度回归验证：同 ID 不同端点凭据隔离防互毁、JDBC URL 内嵌凭据零泄露、全端点路径脱敏及合并一致性."""
+        # 1. JDBC URL 内嵌凭据全格式脱敏校验 (Oracle / MySQL / PG / SQLServer / DB2)
+        jdbc_cases = [
+            (
+                "jdbc:oracle:thin:scott/TigerSecret99@//10.2.3.4:1521/orcl",
+                "jdbc:oracle:thin:@//10.2.3.4:1521/orcl",
+                "scott",
+                "TigerSecret99",
+            ),
+            (
+                "jdbc:oracle:thin:@//10.2.3.4:1521/orcl",
+                "jdbc:oracle:thin:@//10.2.3.4:1521/orcl",
+                "",
+                "",
+            ),
+            (
+                "jdbc:mysql://10.2.3.5:3306/app?user=root&password=MySqlJdbcSecret88&useSSL=false",
+                "jdbc:mysql://10.2.3.5:3306/app?useSSL=false",
+                "root",
+                "MySqlJdbcSecret88",
+            ),
+            (
+                "jdbc:postgresql://alice:PgSec%401@10.2.3.6:5432/db?sslmode=require",
+                "jdbc:postgresql://10.2.3.6:5432/db?sslmode=require",
+                "alice",
+                "PgSec@1",
+            ),
+            (
+                "jdbc:sqlserver://10.2.3.7:1433;databaseName=app;user=sa;password=SqlSrv!9;encrypt=true",
+                "jdbc:sqlserver://10.2.3.7:1433;databaseName=app;encrypt=true",
+                "sa",
+                "SqlSrv!9",
+            ),
+            (
+                "jdbc:db2://10.2.3.9:50000/SAMPLE:user=db2inst1;password=Db2Sec!;retrieveMessagesFromServerOnGetMessage=true;",
+                "jdbc:db2://10.2.3.9:50000/SAMPLE:retrieveMessagesFromServerOnGetMessage=true;",
+                "db2inst1",
+                "Db2Sec!",
+            ),
+        ]
+        for raw_url, exp_url, exp_u, exp_p in jdbc_cases:
+            self.assertEqual(sanitize_jdbc_url(raw_url), (exp_url, exp_u, exp_p))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # 2. 同 connection_id 指向不同端点时：导入不串绑、保存不互毁、合并自动派生无冲突新 ID
+            app_a = create_app(private_root=os.path.join(tmp, "alice_vault"))
+            cli_a = TestClient(app_a)
+            ctx_a: PlatformContext = app_a.state.platform_ctx
+            ctx_a.connection_hub.save_profile(
+                {
+                    "connection_id": "legacy-dws-workbench",
+                    "name": "Dev DWS",
+                    "db_type": "DWS",
+                    "host": "10.1.1.1",
+                    "port": 8000,
+                    "dbname": "dev_db",
+                    "user": "alice_dev",
+                    "password": "DevPassword!111",
+                }
+            )
+            ctx_a.standard_catalog.upsert_field_bindings(
+                "legacy-dws-workbench",
+                [{"schema_name": "public", "table_name": "t_dev", "column_name": "c1", "std_code": "STD_DEV"}],
+            )
+            # 含内嵌密码的 JDBC 连接不得把密码写入工作区或导出文件
+            jdbc_saved = ctx_a.connection_hub.save_profile(
+                {
+                    "connection_id": "conn-ora-inline",
+                    "name": "Oracle Inline",
+                    "driver_track": "JDBC",
+                    "db_type": "ORACLE",
+                    "jdbc_url": "jdbc:oracle:thin:scott/TigerSecret99@//10.2.3.4:1521/orcl",
+                }
+            )
+            self.assertEqual(jdbc_saved.user, "scott")
+            self.assertEqual(jdbc_saved.password, "TigerSecret99")
+            self.assertNotIn("TigerSecret99", jdbc_saved.jdbc_url)
+            exp_a = cli_a.get("/api/platform/workspaces/export").content
+            self.assertNotIn(b"TigerSecret99", exp_a)
+
+            app_b = create_app(private_root=os.path.join(tmp, "bob_vault"))
+            cli_b = TestClient(app_b)
+            ctx_b: PlatformContext = app_b.state.platform_ctx
+            ctx_b.connection_hub.save_profile(
+                {
+                    "connection_id": "legacy-dws-workbench",
+                    "name": "Prod DWS",
+                    "db_type": "DWS",
+                    "host": "10.9.9.9",
+                    "port": 8000,
+                    "dbname": "prod_db",
+                    "user": "bob_prod",
+                    "password": "ProdPassword!999",
+                }
+            )
+            ctx_b.standard_catalog.upsert_field_bindings(
+                "legacy-dws-workbench",
+                [{"schema_name": "public", "table_name": "t_prod", "column_name": "p1", "std_code": "STD_PROD"}],
+            )
+            bob_bytes = cli_b.get("/api/platform/workspaces/export").content
+
+            imp = cli_a.post(
+                "/api/platform/workspaces/import",
+                data={"name": "Bob Prod WS", "switch_immediately": "true"},
+                files={"file": ("bob.dataog.db", bob_bytes, "application/octet-stream")},
+            ).json()
+            self.assertEqual(imp["credential_summary"]["auto_matched_count"], 0)
+            self.assertEqual(imp["credential_summary"]["needs_credentials_count"], 1)
+            prod_in_imp = ctx_a.connection_hub.require_profile("legacy-dws-workbench")
+            self.assertEqual(prod_in_imp.credential_status, "MISSING")
+            self.assertEqual(prod_in_imp.user, "")
+            self.assertEqual(prod_in_imp.password, "")
+
+            # 在 Bob 工作区填写 Prod 凭据，切回 ws-default 后 Dev 凭据必须完好无损
+            ctx_a.connection_hub.save_profile(
+                {
+                    "connection_id": "legacy-dws-workbench",
+                    "name": "Prod DWS",
+                    "db_type": "DWS",
+                    "host": "10.9.9.9",
+                    "port": 8000,
+                    "dbname": "prod_db",
+                    "user": "alice_prod",
+                    "password": "AliceProdPassword!999",
+                }
+            )
+            cli_a.post("/api/platform/workspaces/ws-default/switch")
+            dev_after = ctx_a.connection_hub.require_profile("legacy-dws-workbench")
+            self.assertEqual(dev_after.user, "alice_dev")
+            self.assertEqual(dev_after.password, "DevPassword!111")
+            self.assertEqual(dev_after.credential_status, "BOUND")
+
+            # 合并 Bob 工作区进 ws-default：必须为冲突 ID 派生无冲突新 ID 且自动匹配本机 Prod 凭据
+            insp_col = cli_a.post(
+                "/api/platform/workspaces/merge/inspect",
+                files={"file": ("bob.dataog.db", bob_bytes, "application/octet-stream")},
+            ).json()
+            cp = insp_col["connections_preview"][0]
+            self.assertEqual(cp["action"], "ADD")
+            self.assertNotEqual(cp["mapped_connection_id"], "legacy-dws-workbench")
+            self.assertEqual(cp["credential_match"], "AUTO_MATCHED")
+            exec_col = cli_a.post(
+                "/api/platform/workspaces/merge/execute",
+                json={
+                    "merge_token": insp_col["merge_token"],
+                    "selected_modules": ["connection_topology", "field_standard_bindings"],
+                    "strategy": "overwrite",
+                },
+            ).json()
+            self.assertTrue(exec_col["ok"])
+            self.assertEqual(ctx_a.connection_hub.require_profile("legacy-dws-workbench").host, "10.1.1.1")
+            self.assertEqual(ctx_a.connection_hub.require_profile(cp["mapped_connection_id"]).host, "10.9.9.9")
+            self.assertEqual(
+                ctx_a.connection_hub.require_profile(cp["mapped_connection_id"]).password,
+                "AliceProdPassword!999",
+            )
+
+            # 3. 全平台错误响应零私有路径泄露（涵盖 /drivers/upload、/appearance/upload 及 macOS realpath）
+            priv_root = os.path.join(tmp, "secret_priv_err_xyz")
+            app_err = create_app(private_root=priv_root)
+            cli_err = TestClient(app_err)
+            ctx_err: PlatformContext = app_err.state.platform_ctx
+            real_priv = os.path.realpath(priv_root)
+            with mock.patch.object(
+                ctx_err.driver_manager,
+                "register_uploaded_jar",
+                side_effect=PermissionError(f"[Errno 13] Permission denied: '{ctx_err.driver_manager.drivers_dir}/drv_123.jar'"),
+            ):
+                r_drv = cli_err.post(
+                    "/api/platform/drivers/upload",
+                    files={"file": ("a.jar", b"PK\x03\x04", "application/octet-stream")},
+                )
+                self.assertEqual(r_drv.status_code, 400)
+                self.assertNotIn(priv_root, r_drv.text)
+                self.assertNotIn(real_priv, r_drv.text)
+                self.assertNotIn("ext_drv", r_drv.text)
+            with mock.patch.object(
+                ctx_err.asset_store,
+                "save_uploaded_asset",
+                side_effect=PermissionError(f"[Errno 13] Permission denied: '{ctx_err.asset_store.assets_dir}/abc.png'"),
+            ):
+                r_ast = cli_err.post(
+                    "/api/platform/appearance/upload",
+                    data={"slot": "wallpaper"},
+                    files={"file": ("a.png", b"\x89PNG\r\n\x1a\n" + b"0" * 20, "image/png")},
+                )
+                self.assertEqual(r_ast.status_code, 400)
+                self.assertNotIn(priv_root, r_ast.text)
+                self.assertNotIn(real_priv, r_ast.text)
+                self.assertNotIn("res_obj", r_ast.text)
+
+            # 4. 合并一致性：标准字典全列差异预览、空 updated_at 不覆写 newer、重复大小写键不崩溃、已缓存列结构不被降级
+            app_s = create_app(private_root=os.path.join(tmp, "m_src"))
+            cli_s = TestClient(app_s)
+            ctx_s: PlatformContext = app_s.state.platform_ctx
+            ctx_s.connection_hub.save_profile(
+                {"connection_id": "c1", "name": "DWS", "db_type": "DWS", "host": "10.3.3.3", "port": 8000, "dbname": "dw", "user": "u", "password": "p"}
+            )
+            ctx_s.standard_catalog.upsert_item(
+                {"std_code": "STD_M1", "cn_name": "金额", "en_abbr": "amt", "type_dws": "DECIMAL(18,2)", "type_mysql": "DECIMAL(20,4)", "biz_definition": "同事修订"}
+            )
+            with ctx_s.store.module_db("workspace") as sc:
+                sc.execute(
+                    "INSERT INTO field_standard_bindings (connection_id, schema_name, table_name, column_name, col_key, std_code, updated_at) "
+                    "VALUES ('c1','public','t1','col1','public::t1::col1','STD_UNDATED','')"
+                )
+                sc.execute(
+                    "INSERT INTO cross_table_bindings (std_table_key, std_table_name, source_schema, source_table, target_schema, target_table, updated_at) VALUES "
+                    "('t1','t1','ods','t1_old','dwd','t1_old',''), "
+                    "('T_Dup','T_Dup','ods','t_dup','dwd','t_dup','2026-11-19 10:00:00'), "
+                    "('t_dup','t_dup','ods','t_dup','dwd','t_dup','2026-11-19 10:00:00')"
+                )
+                sc.execute(
+                    "INSERT INTO meta_tables (connection_id, schema_name, table_name, columns_cached, refreshed_at) "
+                    "VALUES ('c1','public','t_cached',0,'2026-11-19 12:00:00')"
+                )
+            src_bytes = cli_s.get("/api/platform/workspaces/export").content
+
+            app_l = create_app(private_root=os.path.join(tmp, "m_loc"))
+            cli_l = TestClient(app_l)
+            ctx_l: PlatformContext = app_l.state.platform_ctx
+            ctx_l.connection_hub.save_profile(
+                {"connection_id": "c1", "name": "DWS", "db_type": "DWS", "host": "10.3.3.3", "port": 8000, "dbname": "dw", "user": "u", "password": "p"}
+            )
+            ctx_l.standard_catalog.upsert_item(
+                {"std_code": "STD_M1", "cn_name": "金额", "en_abbr": "amt", "type_dws": "DECIMAL(18,2)", "type_mysql": "DECIMAL(12,2)", "biz_definition": "本地定义"}
+            )
+            with ctx_l.store.module_db("workspace") as lc:
+                lc.execute(
+                    "INSERT INTO field_standard_bindings (connection_id, schema_name, table_name, column_name, col_key, std_code, updated_at) "
+                    "VALUES ('c1','public','t1','col1','public::t1::col1','STD_LOCAL_NEW','2026-11-18 10:00:00')"
+                )
+                lc.execute(
+                    "INSERT INTO cross_table_bindings (std_table_key, std_table_name, source_schema, source_table, target_schema, target_table, updated_at) "
+                    "VALUES ('t1','t1','ods','t1_new','dwd','t1_new','2026-11-18 10:00:00')"
+                )
+                lc.execute(
+                    "INSERT INTO meta_tables (connection_id, schema_name, table_name, columns_cached, refreshed_at) "
+                    "VALUES ('c1','public','t_cached',1,'2026-11-18 12:00:00')"
+                )
+                lc.execute(
+                    "INSERT INTO meta_columns (connection_id, schema_name, table_name, ordinal_position, column_name, data_type) "
+                    "VALUES ('c1','public','t_cached',1,'c1','INT')"
+                )
+
+            insp_m = cli_l.post(
+                "/api/platform/workspaces/merge/inspect",
+                files={"file": ("m_src.dataog.db", src_bytes, "application/octet-stream")},
+            ).json()
+            self.assertEqual(insp_m["modules"]["standard_dictionary"]["conflict_count"], 1)
+            self.assertEqual(insp_m["modules"]["metadata_cache"]["conflict_count"], 0)
+            res_m = cli_l.post(
+                "/api/platform/workspaces/merge/execute",
+                json={
+                    "merge_token": insp_m["merge_token"],
+                    "selected_modules": ["standard_dictionary", "field_standard_bindings", "cross_mappings", "metadata_cache"],
+                    "strategy": "newer",
+                },
+            ).json()
+            self.assertTrue(res_m["ok"])
+            with ctx_l.store.module_db("workspace") as lc:
+                self.assertEqual(lc.execute("SELECT std_code FROM field_standard_bindings").fetchone()[0], "STD_LOCAL_NEW")
+                self.assertEqual(lc.execute("SELECT source_table FROM cross_table_bindings WHERE std_table_key='t1'").fetchone()[0], "t1_new")
+                self.assertEqual(lc.execute("SELECT COUNT(*) FROM cross_table_bindings WHERE LOWER(std_table_key)='t_dup'").fetchone()[0], 1)
+                self.assertEqual(lc.execute("SELECT columns_cached FROM meta_tables WHERE table_name='t_cached'").fetchone()[0], 1)
+
+            # 5. 旧版迁移 dws_conn_saved 后切至空白工作区，/api/bootstrap 不得泄露旧工作区连接
+            legacy_dir = os.path.join(tmp, "legacy_boot")
+            os.makedirs(legacy_dir)
+            with contextlib.closing(sqlite3.connect(os.path.join(legacy_dir, "dataog_state.db"))) as oc:
+                oc.execute("CREATE TABLE app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                oc.execute(
+                    "INSERT INTO app_meta VALUES ('dws_conn_saved', ?)",
+                    (json.dumps({"configured": True, "host": "10.5.5.5", "port": 8000, "dbname": "old_dw", "user": "old_u", "password": "old_p"}),),
+                )
+                oc.commit()
+            app_leg = create_app(ctx=PlatformContext(private_root=os.path.join(tmp, "priv_boot"), legacy_data_dir=legacy_dir))
+            cli_leg = TestClient(app_leg)
+            cli_leg.post("/api/platform/workspaces", json={"name": "Blank WS", "switch_immediately": True})
+            boot_leg = cli_leg.get("/api/bootstrap").json()
+            self.assertFalse(boot_leg["connection"]["configured"])
+            self.assertEqual(boot_leg["connection"]["host"], "")
+
     def test_frontend_workspace_and_settings_dom_interaction_via_node(self) -> None:
         """通过 Node.js 真实执行 ES Modules 验证 WorkspaceView、SettingsView、ConnectionsView 与三步合并向导交互契约."""
         if getattr(sys, "frozen", False) or not shutil.which("node"):
@@ -1507,6 +1791,20 @@ execBtn.click();
 await new Promise((r) => setTimeout(r, 30));
 if (!bodyEl.textContent.includes("增量合并成功：新增 3 项 · 更新 1 项 · 跳过 0 项")) {
   throw new Error("Expected Step 3 merge summary, got: " + bodyEl.textContent);
+}
+// 4. Verify import-without-switch does NOT emit workspace_switched, and pair-change diff & truncation notice render clearly
+let switchedFired = 0;
+const unsubSw = store.subscribe((_s, reason) => {
+  if (reason === "workspace_switched") switchedFired += 1;
+});
+store.updateWorkspaces(
+  { workspace_id: "ws-2", name: "二号工作区", is_active: true, stats: {} },
+  [{ workspace_id: "ws-2", name: "二号工作区", is_active: true, stats: {} }, { workspace_id: "ws-3", name: "后台导入区", is_active: false, stats: {} }],
+  null
+);
+unsubSw();
+if (switchedFired !== 0) {
+  throw new Error("Expected updateWorkspaces(..., null) NOT to emit workspace_switched");
 }
 sv.destroy();
 console.log("NODE_WORKSPACE_UI_OK");

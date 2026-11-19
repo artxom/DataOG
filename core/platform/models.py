@@ -4,10 +4,125 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 
 _SECRET_PROP_TOKENS = ("password", "passwd", "pwd", "secret", "token", "apikey", "api_key", "credential")
+_JDBC_USER_PARAM_NAMES = frozenset({"user", "username", "uid"})
+_JDBC_ORACLE_INLINE_CRED_RE = re.compile(
+    r"^(jdbc:oracle:[^:@]+:)([^/@\s]+)/([^@\s]+)(@.*)$",
+    re.IGNORECASE,
+)
+_JDBC_AUTHORITY_CRED_RE = re.compile(
+    r"^(jdbc:[^:/\s]+(?::[^:/\s]+)*://)([^/@\s:]+):([^/@\s]*)@(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _is_secret_key(key: str) -> bool:
+    low = (key or "").strip().lower()
+    return bool(low) and any(tok in low for tok in _SECRET_PROP_TOKENS)
+
+
+def sanitize_jdbc_url(jdbc_url: str) -> Tuple[str, str, str]:
+    """剥离 JDBC URL 中可能内嵌的明文账号密码与敏感参数，返回 `(clean_jdbc_url, extracted_user, extracted_password)`.
+
+    保障 Layer 3 共享工作区 `.dataog.db` 与连接指纹中彻底零凭据泄露，兼容 Oracle / MySQL / PG / DM8 / SQLServer / DB2 格式。
+    """
+    raw = (jdbc_url or "").strip()
+    if not raw:
+        return "", "", ""
+
+    url = raw
+    extracted_user = ""
+    extracted_pwd = ""
+
+    # 1. Oracle thin/oci 内联凭据: jdbc:oracle:thin:user/pass@...
+    m_ora = _JDBC_ORACLE_INLINE_CRED_RE.match(url)
+    if m_ora:
+        extracted_user = unquote(m_ora.group(2))
+        extracted_pwd = unquote(m_ora.group(3))
+        url = f"{m_ora.group(1)}{m_ora.group(4)}"
+
+    # 2. 标准 authority 内联凭据: jdbc:<proto>://user:pass@host...
+    m_auth = _JDBC_AUTHORITY_CRED_RE.match(url)
+    if m_auth:
+        if not extracted_user:
+            extracted_user = unquote(m_auth.group(2))
+        if not extracted_pwd:
+            extracted_pwd = unquote(m_auth.group(3))
+        url = f"{m_auth.group(1)}{m_auth.group(4)}"
+
+    # 3. Query 参数 (?a=1&password=xxx&user=yyy)
+    if "?" in url:
+        base, qs = url.split("?", 1)
+        kept_pairs: List[str] = []
+        for part in qs.split("&"):
+            if not part:
+                continue
+            if "=" in part:
+                k, v = part.split("=", 1)
+                kl = k.strip().lower()
+                if _is_secret_key(kl):
+                    if not extracted_pwd and kl in ("password", "passwd", "pwd"):
+                        extracted_pwd = unquote(v)
+                    continue
+                if kl in _JDBC_USER_PARAM_NAMES:
+                    if not extracted_user:
+                        extracted_user = unquote(v)
+                    continue
+            kept_pairs.append(part)
+        url = f"{base}?{'&'.join(kept_pairs)}" if kept_pairs else base
+
+    # 4. 分号参数格式 (SQLServer / DB2 / Sybase: ;user=sa;password=xxx; 或 DB2 :user=x;password=y;)
+    if ";" in url:
+        segments = url.split(";")
+        kept_segs: List[str] = []
+        for idx, seg in enumerate(segments):
+            if idx == 0:
+                # 兼容 DB2 Type-4 尾部 `:user=xxx` / `:password=xxx` 紧接首段
+                m_db2 = re.match(r"^(jdbc:db2://[^:\s]+(?::\d+)?/[^:;\s]+:)(.+)$", seg, re.IGNORECASE)
+                if m_db2 and "=" in m_db2.group(2):
+                    k, v = m_db2.group(2).split("=", 1)
+                    kl = k.strip().lower()
+                    if _is_secret_key(kl):
+                        if not extracted_pwd and kl in ("password", "passwd", "pwd"):
+                            extracted_pwd = v
+                        kept_segs.append(m_db2.group(1))
+                        continue
+                    if kl in _JDBC_USER_PARAM_NAMES:
+                        if not extracted_user:
+                            extracted_user = v
+                        kept_segs.append(m_db2.group(1))
+                        continue
+                kept_segs.append(seg)
+                continue
+            if "=" in seg:
+                k, v = seg.split("=", 1)
+                kl = k.strip().lower()
+                if _is_secret_key(kl):
+                    if not extracted_pwd and kl in ("password", "passwd", "pwd"):
+                        extracted_pwd = v
+                    continue
+                if kl in _JDBC_USER_PARAM_NAMES:
+                    if not extracted_user:
+                        extracted_user = v
+                    continue
+            kept_segs.append(seg)
+        # 处理 DB2 前缀以 `:` 结尾后跟非空分号项的拼接
+        if kept_segs and kept_segs[0].endswith(":") and len(kept_segs) > 1:
+            rest = [s for s in kept_segs[1:] if s != ""]
+            if rest:
+                trailing_semi = ";" if raw.endswith(";") else ""
+                url = kept_segs[0] + ";".join(rest) + trailing_semi
+            else:
+                url = kept_segs[0].rstrip(":")
+        else:
+            url = ";".join(kept_segs)
+
+    return url, extracted_user, extracted_pwd
 
 
 def split_extra_props_secrets(extra_props: Optional[Dict[str, Any]]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -46,12 +161,13 @@ def compute_connection_fingerprint(
         if not sp:
             return ""
         return f"SQLITE|{os.path.normcase(sp)}"
-    if track == "JDBC" and (jdbc_url or "").strip():
-        return f"JDBC|{dt}|{(jdbc_url or '').strip().lower()}"
+    clean_jdbc, _, _ = sanitize_jdbc_url(jdbc_url)
+    if track == "JDBC" and clean_jdbc:
+        return f"JDBC|{dt}|{clean_jdbc.lower()}"
     h = (host or "").strip().lower()
     if not h:
-        if (jdbc_url or "").strip():
-            return f"JDBC|{dt}|{(jdbc_url or '').strip().lower()}"
+        if clean_jdbc:
+            return f"JDBC|{dt}|{clean_jdbc.lower()}"
         return ""
     p = int(port or 0)
     dbn = (dbname or "").strip().lower()
@@ -209,7 +325,7 @@ class ConnectionProfile:
             "auth_mode": self.auth_mode,
             "sqlite_path": self.sqlite_path,
             "jdbc_driver_id": self.jdbc_driver_id,
-            "jdbc_url": self.jdbc_url,
+            "jdbc_url": sanitize_jdbc_url(self.jdbc_url)[0],
             "jdbc_driver_class": self.jdbc_driver_class,
             "extra_props": public_props,
             "standard_format": self.standard_format or "AUTO",

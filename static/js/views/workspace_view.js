@@ -386,7 +386,7 @@ async function openImportAsNewWorkspaceFlow(onSuccess) {
           description: wsDesc.trim(),
           switchImmediately: switchNow,
         });
-        store.updateWorkspaces(res.active_workspace, res.workspaces, res.bootstrap);
+        store.updateWorkspaces(res.active_workspace, res.workspaces, switchNow ? res.bootstrap : null);
         Modal.setCloseLocked(false);
         Modal.close("done");
         const cs = res.credential_summary || {};
@@ -424,6 +424,7 @@ async function openImportAsNewWorkspaceFlow(onSuccess) {
 export function openWorkspaceMergeWizard(onMerged = null) {
   const state = {
     step: 1,
+    lastRenderedStep: 1,
     loading: false,
     inspect: null,
     selectedModules: new Set(),
@@ -633,6 +634,11 @@ export function openWorkspaceMergeWizard(onMerged = null) {
     const filteredDiffs = tableDiffs.filter(
       (d) => state.tableDiffFilter === "ALL" || d.status === state.tableDiffFilter
     );
+    const totalDiffsCount = Number(ins.table_diffs_total || tableDiffs.length);
+    const diffHeadTitle =
+      totalDiffsCount > tableDiffs.length
+        ? `跨环境映射表对差异预览 (已展示前 ${tableDiffs.length} / 共 ${totalDiffsCount})`
+        : `跨环境映射表对差异预览 (${totalDiffsCount})`;
     const diffPreviewBox = tableDiffs.length
       ? el(
           "div",
@@ -640,7 +646,7 @@ export function openWorkspaceMergeWizard(onMerged = null) {
           el(
             "div",
             { className: "ws-diff-head" },
-            el("span", { style: { fontWeight: "600", fontSize: "12px" }, text: `跨环境映射表对差异预览 (${ins.table_diffs_total || tableDiffs.length})` }),
+            el("span", { style: { fontWeight: "600", fontSize: "12px" }, text: diffHeadTitle }),
             el(
               "div",
               { className: "seg-group" },
@@ -688,12 +694,17 @@ export function openWorkspaceMergeWizard(onMerged = null) {
                   ? filteredDiffs.map((d) => {
                       const stTone = d.status === "NEW" ? "success" : d.status === "CONFLICT" ? "warn" : "neutral";
                       const stText = d.status === "NEW" ? "新增" : d.status === "CONFLICT" ? "冲突" : "一致";
+                      const pairChanged =
+                        d.status === "CONFLICT" &&
+                        ((d.source_table_ref || "").toLowerCase() !== (d.local_source_table_ref || "").toLowerCase() ||
+                          (d.target_table_ref || "").toLowerCase() !== (d.local_target_table_ref || "").toLowerCase());
                       const diffText =
                         d.status === "NEW"
                           ? `新增 ${d.source_col_count} 个字段映射`
                           : d.status === "SAME"
                           ? "映射完全一致"
                           : [
+                              pairChanged ? "表对映射变更" : "",
                               d.added_cols_count ? `新字段 +${d.added_cols_count}` : "",
                               d.changed_cols_count ? `异标 ${d.changed_cols_count}` : "",
                               d.source_is_newer ? "对方较新" : "本地较新/同步",
@@ -701,12 +712,15 @@ export function openWorkspaceMergeWizard(onMerged = null) {
                               .filter(Boolean)
                               .join(" · ") || "表对或字段数有差异";
                       const refPairText = `${d.source_table_ref || "-"} → ${d.target_table_ref || "-"}`;
+                      const refPairTitle = pairChanged
+                        ? `对方：${refPairText}\n本地：${d.local_source_table_ref || "-"} → ${d.local_target_table_ref || "-"}`
+                        : refPairText;
                       return el(
                         "tr",
                         {},
                         el("td", {}, badge(stText, stTone)),
                         el("td", { className: "mono ws-diff-col-key", style: { fontWeight: "600" }, title: d.std_table_key, text: d.std_table_key }),
-                        el("td", { className: "mono ws-diff-col-ref", title: refPairText, text: refPairText }),
+                        el("td", { className: "mono ws-diff-col-ref", title: refPairTitle, text: refPairText }),
                         el("td", { className: "mono", text: `${d.source_col_count} / ${d.local_col_count}` }),
                         el("td", { style: { color: "var(--os-text-secondary)" }, text: diffText })
                       );
@@ -838,12 +852,14 @@ export function openWorkspaceMergeWizard(onMerged = null) {
 
   const renderWizard = () => {
     const scrollBox = typeof document !== "undefined" ? document.getElementById("global-modal-body") : null;
+    const stepChanged = state.step !== state.lastRenderedStep;
     const prevScrollTop = scrollBox ? scrollBox.scrollTop : 0;
+    state.lastRenderedStep = state.step;
     const content =
       state.step === 1 ? renderStep1() : state.step === 2 ? renderStep2() : renderStep3();
     clearEl(bodyHost, renderStepHeader(), content);
     if (scrollBox) {
-      scrollBox.scrollTop = prevScrollTop;
+      scrollBox.scrollTop = stepChanged ? 0 : prevScrollTop;
     }
 
     if (state.step === 1) {

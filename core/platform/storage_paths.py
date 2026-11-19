@@ -17,9 +17,10 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 # 混淆拆分的内部派生种子（用于生成无品牌字样的确定性目录与文件名，避免明文标识）
 _S_A = (0x7B, 0x2E, 0x91, 0x4C, 0xD3, 0x18, 0xA5, 0x60)
@@ -84,11 +85,18 @@ def _apply_hidden_dir_attrs(path: str) -> None:
             import ctypes
 
             FILE_ATTRIBUTE_HIDDEN = 0x02
-            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))  # type: ignore[attr-defined]
-            if attrs != -1 and not (attrs & FILE_ATTRIBUTE_HIDDEN):
-                ctypes.windll.kernel32.SetFileAttributesW(  # type: ignore[attr-defined]
-                    str(path), attrs | FILE_ATTRIBUTE_HIDDEN
-                )
+            INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            get_attrs = kernel32.GetFileAttributesW
+            get_attrs.argtypes = [ctypes.c_wchar_p]
+            get_attrs.restype = ctypes.c_uint32
+            set_attrs = kernel32.SetFileAttributesW
+            set_attrs.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+            set_attrs.restype = ctypes.c_int
+
+            attrs = int(get_attrs(str(path)))
+            if attrs != INVALID_FILE_ATTRIBUTES and not (attrs & FILE_ATTRIBUTE_HIDDEN):
+                set_attrs(str(path), attrs | FILE_ATTRIBUTE_HIDDEN)
         except Exception:
             pass
     else:
@@ -220,3 +228,92 @@ def resolve_private_storage_layout(
     if create_dirs:
         layout.ensure_directories()
     return layout
+
+
+_INTERNAL_STORAGE_SEGMENT_RE = re.compile(
+    r"(?:(?:\\{1,2}|/)(?:ws_store|ext_drv|res_obj|rt_log|rt_tmp|\.chk))(?:(?:\\{1,2}|/)[^'\"\s,;:)\]}]+)?",
+)
+_OBFUSCATED_FILE_RE = re.compile(
+    r"\b(?:idx_[0-9a-f]{8}\.dat|s_[0-9a-f]{8,10}\.dat|m_[0-9a-f]{10}\.bin|rt_svc\.log)\b"
+)
+
+
+def _path_variants(raw_path: str) -> List[str]:
+    p = (raw_path or "").strip()
+    if not p:
+        return []
+    out: List[str] = []
+    for cand in (p, os.path.abspath(p), os.path.realpath(p)):
+        if cand and cand not in out:
+            out.append(cand)
+        if "\\" in cand:
+            fwd = cand.replace("\\", "/")
+            if fwd not in out:
+                out.append(fwd)
+            esc = cand.replace("\\", "\\\\")
+            if esc not in out:
+                out.append(esc)
+    return out
+
+
+def redact_private_storage_paths(
+    text: str,
+    *,
+    ctx: Any = None,
+    store: Any = None,
+    extra_paths: Sequence[str] = (),
+) -> str:
+    """严格脱敏文本中任何本地私有保险箱物理路径、symlink 真实路径及内部混淆文件名."""
+    msg = str(text or "")
+    if not msg:
+        return msg
+
+    eff_store = store or (getattr(ctx, "store", None) if ctx is not None else None)
+    is_split = bool(getattr(eff_store, "is_split_storage", False)) if eff_store is not None else False
+
+    markers: List[str] = []
+    # 始终收集私有库文件、工作区库文件、时钟锚点及各隔离资源子目录（同时覆盖 abspath 与 realpath，避免 macOS /private/var 绕过）
+    path_candidates: List[str] = list(extra_paths or ())
+    if eff_store is not None:
+        priv_db = str(getattr(eff_store, "private_db_path", "") or "")
+        ws_db = str(getattr(eff_store, "workspace_db_path", "") or "")
+        anchor = str(getattr(eff_store, "clock_anchor_path", "") or "")
+        path_candidates.extend([priv_db, ws_db, anchor])
+        if anchor:
+            path_candidates.append(os.path.dirname(anchor))
+        if is_split:
+            if priv_db:
+                path_candidates.append(os.path.dirname(priv_db))
+            if ws_db:
+                path_candidates.append(os.path.dirname(ws_db))
+        for fpath in (priv_db, ws_db, anchor):
+            bname = os.path.basename(fpath) if fpath else ""
+            if bname and bname not in ("dataog_state.db", "dws_migrator_state.db"):
+                markers.append(bname)
+
+    if ctx is not None:
+        if is_split:
+            data_dir = str(getattr(ctx, "data_dir", "") or "")
+            if data_dir:
+                path_candidates.append(data_dir)
+        for attr_holder, attr_name in (
+            ("driver_manager", "drivers_dir"),
+            ("asset_store", "assets_dir"),
+            ("workspace_hub", "workspaces_dir"),
+            ("workspace_hub", "tmp_dir"),
+        ):
+            holder = getattr(ctx, attr_holder, None)
+            val = str(getattr(holder, attr_name, "") or "") if holder is not None else ""
+            if val:
+                path_candidates.append(val)
+
+    for p in path_candidates:
+        markers.extend(_path_variants(p))
+
+    for marker in sorted({m for m in markers if m}, key=len, reverse=True):
+        if marker in msg:
+            msg = msg.replace(marker, "<private>")
+
+    msg = _INTERNAL_STORAGE_SEGMENT_RE.sub("/<private>", msg)
+    msg = _OBFUSCATED_FILE_RE.sub("<private>", msg)
+    return msg
