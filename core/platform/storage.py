@@ -1,12 +1,20 @@
-"""DataOG 全局状态存储与无损迁移引擎 (data/dataog_state.db).
+"""Data.O.G 三层分离状态存储与无损迁移引擎 (Private Vault + Shareable Team Workspace).
 
-核心能力：
-1. 运行时状态库统一为 `data/dataog_state.db`（WAL 模式 + 批量事务优化）；
-2. 启动时自动检测旧版 `data/dws_migrator_state.db` 并无损迁移所有历史表记录；
-3. 自动扫描旧版 `app_meta` 连接键值 (`dws_conn_saved`, `dws_connection_config`, `cross_source_conn`, `cross_target_conn`)，
-   无损升级为全局命名数据源档案 (`connection_profiles`)；
-4. 提供平台与模块级 SQLite 表幂等列自检接口 (`register_table_schema`)，保障跨分支/跨版本切换零报错；
-5. 提供全局连接档案、JDBC 驱动包索引与持久化元数据缓存表 (`meta_schemas`, `meta_tables`, `meta_columns`) 存取能力。
+核心架构（v2.7.0 三层分离）：
+1. Layer 2 本地私有保险箱 (`private_db_path`，位于混淆的 OS 用户私有目录)：
+   - 存放仅限本机/个人的敏感与运行态数据：`app_meta`（离线激活码、锁定标记、单调时钟密封、外观配置、工作区索引）、
+     `workspaces`（本地托管工作区清单）、`llm_providers`（AI API Key）、`connection_credentials`（个人数据库账号密码库，
+     支持 `connection_id` 与 `(db_type, host, port, dbname)` / `jdbc_url` 指纹双通道自动匹配）、
+     `jdbc_drivers`（自定义 `.jar` 索引）、`execution_logs`（本地执行日志）以及 `explorer_sessions`/`explorer_messages`（个人 AI 探查历史）；
+2. Layer 3 团队可共享工作区 (`workspace_db_path`，标准 `.dataog.db` 文件)：
+   - 纯静态/协同业务数据，结构上彻底不含任何密码、API Key、激活码或机器绑定信息：
+     `workspace_meta`、`connection_topology`（无 `user`/`password` 列）、`standard_dictionary`、
+     `field_standard_bindings`、`cross_table_bindings`、`cross_column_bindings`、`migration_items`、
+     `meta_schemas`、`meta_tables`、`meta_columns`；
+3. 向下兼容单库路径模式：当调用方（如历史单元测试）显式传入单个 `db_path` 且未指定 `workspace_db_path` 时，
+   自动在同一文件内承载全部表并保持 100% API 兼容；同时导出 `.dataog.db` 时始终按白名单生成零密钥纯净工作区文件；
+4. 启动无损迁移：自动检测旧版 `<exe_dir>/data/dataog_state.db` / `dws_migrator_state.db`、`assets/`、`drivers/` 及 `.sys_clock_anchor`，
+   一次幂等无损拆分迁移至私有保险箱与默认共享工作区。
 """
 
 from __future__ import annotations
@@ -16,7 +24,10 @@ import datetime
 import json
 import logging
 import os
+import re
+import shutil
 import sqlite3
+import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,319 +38,498 @@ from core.platform.models import (
     LLMProviderProfile,
     SchemaMeta,
     TableMeta,
+    compute_connection_fingerprint,
+    split_extra_props_secrets,
+)
+from core.platform.storage_paths import (
+    decode_obfuscated_anchor,
+    encode_obfuscated_anchor,
 )
 
 logger = logging.getLogger("dataog")
 
+# 明确路由至共享工作区 (workspace_meta) 的纯业务元数据键白名单；其余全部归属本地私有库 (app_meta)
+WORKSPACE_META_KEYS = frozenset(
+    {
+        "workspace_format_version",
+        "workspace_name",
+        "workspace_description",
+        "std_dict_filename",
+        "std_dict_imported_at",
+        "current_excel_name",
+        "imported_at",
+        "cross_standard_filename",
+        "cross_standard_imported_at",
+        "migrator_connection_id",
+        "cross_source_connection_id",
+        "cross_target_connection_id",
+    }
+)
+
+# 仅存在于 Layer 2 私有保险箱的表清单（严禁出现在共享工作区或被合并读取）
+PRIVATE_ONLY_TABLES: Tuple[str, ...] = (
+    "app_meta",
+    "workspaces",
+    "llm_providers",
+    "connection_credentials",
+    "jdbc_drivers",
+    "execution_logs",
+    "explorer_sessions",
+    "explorer_messages",
+)
+
+# 仅存在于 Layer 3 共享工作区的纯业务表白名单
+WORKSPACE_BUSINESS_TABLES: Tuple[str, ...] = (
+    "workspace_meta",
+    "connection_topology",
+    "standard_dictionary",
+    "field_standard_bindings",
+    "cross_table_bindings",
+    "cross_column_bindings",
+    "migration_items",
+    "meta_schemas",
+    "meta_tables",
+    "meta_columns",
+)
+
+PRIVATE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS app_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    file_name TEXT NOT NULL,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS execution_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    level TEXT NOT NULL,
+    target TEXT NOT NULL,
+    message TEXT NOT NULL,
+    sql_text TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS connection_credentials (
+    cred_id TEXT PRIMARY KEY,
+    connection_id TEXT NOT NULL DEFAULT '',
+    endpoint_fingerprint TEXT NOT NULL DEFAULT '',
+    db_type TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    port INTEGER NOT NULL DEFAULT 0,
+    dbname TEXT NOT NULL DEFAULT '',
+    jdbc_url TEXT NOT NULL DEFAULT '',
+    user TEXT NOT NULL DEFAULT '',
+    password TEXT NOT NULL DEFAULT '',
+    sslmode TEXT NOT NULL DEFAULT 'prefer',
+    auth_mode TEXT NOT NULL DEFAULT 'LDAP',
+    sqlite_path TEXT NOT NULL DEFAULT '',
+    jdbc_driver_id TEXT NOT NULL DEFAULT '',
+    extra_secrets_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_conn_cred_cid
+    ON connection_credentials (connection_id);
+CREATE INDEX IF NOT EXISTS idx_conn_cred_fp
+    ON connection_credentials (endpoint_fingerprint);
+
+CREATE TABLE IF NOT EXISTS jdbc_drivers (
+    driver_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    stored_rel_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    file_size INTEGER NOT NULL DEFAULT 0,
+    driver_class_hint TEXT NOT NULL DEFAULT '',
+    db_type_hint TEXT NOT NULL DEFAULT 'CUSTOM_JDBC',
+    uploaded_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS llm_providers (
+    provider_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    provider_type TEXT NOT NULL DEFAULT 'OPENAI_COMPATIBLE',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    base_url TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '',
+    default_model TEXT NOT NULL DEFAULT '',
+    models_json TEXT NOT NULL DEFAULT '[]',
+    is_default INTEGER NOT NULL DEFAULT 0,
+    extra_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+"""
+
+WORKSPACE_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS workspace_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS connection_topology (
+    connection_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    driver_track TEXT NOT NULL DEFAULT 'NATIVE',
+    db_type TEXT NOT NULL DEFAULT 'DWS',
+    host TEXT NOT NULL DEFAULT '',
+    port INTEGER NOT NULL DEFAULT 8000,
+    dbname TEXT NOT NULL DEFAULT '',
+    default_schema TEXT NOT NULL DEFAULT 'public',
+    sslmode TEXT NOT NULL DEFAULT 'prefer',
+    auth_mode TEXT NOT NULL DEFAULT 'LDAP',
+    sqlite_path TEXT NOT NULL DEFAULT '',
+    jdbc_driver_id TEXT NOT NULL DEFAULT '',
+    jdbc_url TEXT NOT NULL DEFAULT '',
+    jdbc_driver_class TEXT NOT NULL DEFAULT '',
+    extra_props_json TEXT NOT NULL DEFAULT '{}',
+    standard_format TEXT NOT NULL DEFAULT 'AUTO',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS meta_schemas (
+    connection_id TEXT NOT NULL,
+    schema_name TEXT NOT NULL,
+    table_count INTEGER NOT NULL DEFAULT 0,
+    view_count INTEGER NOT NULL DEFAULT 0,
+    refreshed_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (connection_id, schema_name)
+);
+
+CREATE TABLE IF NOT EXISTS meta_tables (
+    connection_id TEXT NOT NULL,
+    schema_name TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    object_type TEXT NOT NULL DEFAULT 'TABLE',
+    table_comment TEXT NOT NULL DEFAULT '',
+    orientation TEXT NOT NULL DEFAULT 'ROW',
+    with_clause TEXT NOT NULL DEFAULT '',
+    distribute_clause TEXT NOT NULL DEFAULT '',
+    distribute_keys_json TEXT NOT NULL DEFAULT '[]',
+    partition_clause TEXT NOT NULL DEFAULT '',
+    partition_keys_json TEXT NOT NULL DEFAULT '[]',
+    primary_keys_json TEXT NOT NULL DEFAULT '[]',
+    penetrated_base_tables_json TEXT NOT NULL DEFAULT '[]',
+    row_count INTEGER NOT NULL DEFAULT 0,
+    raw_ddl TEXT NOT NULL DEFAULT '',
+    view_definition TEXT NOT NULL DEFAULT '',
+    columns_cached INTEGER NOT NULL DEFAULT 0,
+    refreshed_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (connection_id, schema_name, table_name)
+);
+CREATE INDEX IF NOT EXISTS idx_meta_tables_search
+    ON meta_tables (connection_id, table_name);
+
+CREATE TABLE IF NOT EXISTS meta_columns (
+    connection_id TEXT NOT NULL,
+    schema_name TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    ordinal_position INTEGER NOT NULL,
+    column_name TEXT NOT NULL,
+    data_type TEXT NOT NULL DEFAULT '',
+    normalized_type TEXT NOT NULL DEFAULT '',
+    is_not_null INTEGER NOT NULL DEFAULT 0,
+    column_default TEXT,
+    column_comment TEXT NOT NULL DEFAULT '',
+    is_primary_key INTEGER NOT NULL DEFAULT 0,
+    index_names_json TEXT NOT NULL DEFAULT '[]',
+    lineage_source TEXT NOT NULL DEFAULT '',
+    refreshed_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (connection_id, schema_name, table_name, column_name)
+);
+CREATE INDEX IF NOT EXISTS idx_meta_columns_table
+    ON meta_columns (connection_id, schema_name, table_name, ordinal_position);
+
+CREATE TABLE IF NOT EXISTS migration_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_index INTEGER NOT NULL,
+    schema_name TEXT NOT NULL,
+    table_name TEXT NOT NULL,
+    old_col_name TEXT NOT NULL,
+    old_col_type TEXT NOT NULL DEFAULT '',
+    old_col_comment TEXT NOT NULL DEFAULT '',
+    new_col_name TEXT NOT NULL,
+    new_col_type TEXT NOT NULL,
+    new_col_comment TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'UNCHECKED',
+    strategy TEXT NOT NULL DEFAULT 'DIRECT_ALTER',
+    ordinal_position INTEGER,
+    total_columns INTEGER,
+    db_current_col_name TEXT DEFAULT '',
+    db_current_type TEXT DEFAULT '',
+    db_current_comment TEXT DEFAULT '',
+    is_distribute_key INTEGER DEFAULT 0,
+    table_orientation TEXT DEFAULT '',
+    status_detail TEXT DEFAULT '',
+    error_message TEXT DEFAULT '',
+    generated_sql TEXT DEFAULT '',
+    executed_at TEXT DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cross_table_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    std_table_key TEXT NOT NULL UNIQUE,
+    std_schema_name TEXT NOT NULL DEFAULT 'public',
+    std_table_name TEXT NOT NULL,
+    std_table_comment TEXT NOT NULL DEFAULT '',
+    source_schema TEXT NOT NULL DEFAULT '',
+    source_table TEXT NOT NULL DEFAULT '',
+    target_schema TEXT NOT NULL DEFAULT '',
+    target_table TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cross_column_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    std_table_key TEXT NOT NULL,
+    row_index INTEGER NOT NULL,
+    orig_col_name TEXT NOT NULL DEFAULT '',
+    orig_col_type TEXT NOT NULL DEFAULT '',
+    orig_col_comment TEXT NOT NULL DEFAULT '',
+    std_col_name TEXT NOT NULL,
+    std_col_type TEXT NOT NULL DEFAULT '',
+    std_col_comment TEXT NOT NULL DEFAULT '',
+    bound_source_col TEXT NOT NULL DEFAULT '',
+    bound_target_col TEXT NOT NULL DEFAULT '',
+    source_std_code TEXT NOT NULL DEFAULT '',
+    target_std_code TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cross_col_tbl_key
+    ON cross_column_bindings (std_table_key, row_index);
+
+CREATE TABLE IF NOT EXISTS standard_dictionary (
+    std_code TEXT PRIMARY KEY,
+    reg_category TEXT NOT NULL DEFAULT '',
+    cat_l1 TEXT NOT NULL DEFAULT '',
+    cat_l2 TEXT NOT NULL DEFAULT '',
+    cat_l3 TEXT NOT NULL DEFAULT '',
+    cn_name TEXT NOT NULL DEFAULT '',
+    cn_alias TEXT NOT NULL DEFAULT '',
+    en_name TEXT NOT NULL DEFAULT '',
+    en_abbr TEXT NOT NULL DEFAULT '',
+    biz_definition TEXT NOT NULL DEFAULT '',
+    scope_desc TEXT NOT NULL DEFAULT '',
+    biz_rule TEXT NOT NULL DEFAULT '',
+    max_length TEXT NOT NULL DEFAULT '',
+    min_scale TEXT NOT NULL DEFAULT '',
+    ref_code_no TEXT NOT NULL DEFAULT '',
+    ref_code_name TEXT NOT NULL DEFAULT '',
+    ref_code_detail TEXT NOT NULL DEFAULT '',
+    security_level TEXT NOT NULL DEFAULT '',
+    ref_std_no TEXT NOT NULL DEFAULT '',
+    ref_std_name TEXT NOT NULL DEFAULT '',
+    domain_name TEXT NOT NULL DEFAULT '',
+    domain_code TEXT NOT NULL DEFAULT '',
+    data_category TEXT NOT NULL DEFAULT '',
+    data_format TEXT NOT NULL DEFAULT '',
+    value_range TEXT NOT NULL DEFAULT '',
+    source_system TEXT NOT NULL DEFAULT '',
+    ddm_catalog TEXT NOT NULL DEFAULT '',
+    is_standard_dict TEXT NOT NULL DEFAULT '',
+    version_no TEXT NOT NULL DEFAULT '',
+    remark TEXT NOT NULL DEFAULT '',
+    type_dws TEXT NOT NULL DEFAULT '',
+    type_dw_mart TEXT NOT NULL DEFAULT '',
+    type_mysql TEXT NOT NULL DEFAULT '',
+    type_oracle TEXT NOT NULL DEFAULT '',
+    type_dameng TEXT NOT NULL DEFAULT '',
+    type_goldendb TEXT NOT NULL DEFAULT '',
+    type_ob_oracle TEXT NOT NULL DEFAULT '',
+    type_ob_mysql TEXT NOT NULL DEFAULT '',
+    type_argodb TEXT NOT NULL DEFAULT '',
+    type_oceanbase TEXT NOT NULL DEFAULT '',
+    extra_attrs_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_std_dict_code_nocase
+    ON standard_dictionary (std_code COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_std_dict_en_abbr
+    ON standard_dictionary (en_abbr COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_std_dict_cn_name
+    ON standard_dictionary (cn_name);
+CREATE INDEX IF NOT EXISTS idx_std_dict_cn_alias
+    ON standard_dictionary (cn_alias);
+CREATE INDEX IF NOT EXISTS idx_std_dict_reg
+    ON standard_dictionary (reg_category);
+CREATE INDEX IF NOT EXISTS idx_std_dict_data_cat
+    ON standard_dictionary (data_category);
+
+CREATE TABLE IF NOT EXISTS field_standard_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,
+    schema_name TEXT NOT NULL DEFAULT 'public',
+    table_name TEXT NOT NULL,
+    column_name TEXT NOT NULL,
+    col_key TEXT NOT NULL,
+    std_code TEXT NOT NULL DEFAULT '',
+    bind_source TEXT NOT NULL DEFAULT 'MANUAL',
+    compliance_status TEXT NOT NULL DEFAULT 'UNCHECKED',
+    compliance_detail TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(connection_id, col_key)
+);
+CREATE INDEX IF NOT EXISTS idx_fsb_conn_table
+    ON field_standard_bindings (connection_id, schema_name, table_name);
+CREATE INDEX IF NOT EXISTS idx_fsb_conn_table_nocase
+    ON field_standard_bindings (connection_id, schema_name COLLATE NOCASE, table_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_fsb_std_code
+    ON field_standard_bindings (std_code);
+"""
+
+
+def init_workspace_schema_on_conn(conn: sqlite3.Connection) -> None:
+    """在指定 SQLite 连接上幂等初始化 Layer 3 共享工作区纯净表结构（零私有/凭据表）."""
+    conn.executescript(WORKSPACE_SCHEMA_SQL)
+    PlatformStateStore._ensure_workspace_schema_columns(conn)
+
 
 class PlatformStateStore:
-    """线程安全的 DataOG 全局本地 SQLite 状态库."""
+    """线程安全的 Data.O.G 双库分离状态引擎（本地私有保险箱 + 可共享团队工作区）."""
 
-    def __init__(self, db_path: str) -> None:
-        self.db_path = os.path.abspath(db_path)
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        workspace_db_path: Optional[str] = None,
+        clock_anchor_path: Optional[str] = None,
+    ) -> None:
+        self.private_db_path = os.path.abspath(db_path)
+        self.db_path = self.private_db_path
+        self.workspace_db_path = (
+            os.path.abspath(workspace_db_path) if workspace_db_path else self.private_db_path
+        )
+        self.is_split_storage = self.private_db_path != self.workspace_db_path
+        self.clock_anchor_path = os.path.abspath(clock_anchor_path) if clock_anchor_path else None
+
+        os.makedirs(os.path.dirname(self.private_db_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self.workspace_db_path), exist_ok=True)
+
         self._lock = threading.RLock()
-        self._init_db()
+        self._registered_schemas: Dict[str, List[Tuple[str, str, List[Tuple[str, str]]]]] = {
+            "private": [],
+            "workspace": [],
+        }
+
+        self._init_private_db()
+        self._init_workspace_db()
         self._migrate_legacy_db_file_if_needed()
-        self._migrate_legacy_connections_if_needed()
+        self._migrate_legacy_connection_profiles_in_db()
+        if not self.is_split_storage or not self.get_meta("active_workspace_id", ""):
+            self._migrate_legacy_connections_if_needed()
+
+    @staticmethod
+    def _connect_sqlite(path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(path, timeout=15.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000;")
+        return conn
 
     @contextlib.contextmanager
-    def _get_conn(self):
-        conn = sqlite3.connect(self.db_path, timeout=15.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+    def _get_private_conn(self):
+        conn = self._connect_sqlite(self.private_db_path)
         try:
-            conn.execute("PRAGMA busy_timeout = 10000;")
             yield conn
         finally:
             conn.close()
+
+    @contextlib.contextmanager
+    def _get_workspace_conn(self):
+        conn = self._connect_sqlite(self.workspace_db_path)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextlib.contextmanager
+    def _get_conn(self):
+        """默认指向当前活动工作区数据库（在单库兼容模式下与私有库为同一文件）."""
+        with self._get_workspace_conn() as conn:
+            yield conn
+
+    @contextlib.contextmanager
+    def _get_both_conns(self):
+        """同时获取 (private_conn, workspace_conn)；单库兼容模式下复用同一连接避免同文件双写锁."""
+        if self.is_split_storage:
+            with self._get_private_conn() as p_conn, self._get_workspace_conn() as w_conn:
+                yield p_conn, w_conn
+        else:
+            with self._get_private_conn() as conn:
+                yield conn, conn
 
     @staticmethod
     def _now_str() -> str:
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    def _init_db(self) -> None:
-        with self._lock, self._get_conn() as conn:
+    def _init_private_db(self) -> None:
+        with self._lock, self._get_private_conn() as conn:
             try:
                 conn.execute("PRAGMA journal_mode = WAL;")
                 conn.execute("PRAGMA synchronous = NORMAL;")
             except Exception:
                 pass
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS app_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS execution_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    created_at TEXT NOT NULL,
-                    level TEXT NOT NULL,
-                    target TEXT NOT NULL,
-                    message TEXT NOT NULL,
-                    sql_text TEXT DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS connection_profiles (
-                    connection_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    driver_track TEXT NOT NULL DEFAULT 'NATIVE',
-                    db_type TEXT NOT NULL DEFAULT 'DWS',
-                    host TEXT NOT NULL DEFAULT '',
-                    port INTEGER NOT NULL DEFAULT 8000,
-                    dbname TEXT NOT NULL DEFAULT '',
-                    default_schema TEXT NOT NULL DEFAULT 'public',
-                    user TEXT NOT NULL DEFAULT '',
-                    password TEXT NOT NULL DEFAULT '',
-                    sslmode TEXT NOT NULL DEFAULT 'prefer',
-                    auth_mode TEXT NOT NULL DEFAULT 'LDAP',
-                    sqlite_path TEXT NOT NULL DEFAULT '',
-                    jdbc_driver_id TEXT NOT NULL DEFAULT '',
-                    jdbc_url TEXT NOT NULL DEFAULT '',
-                    jdbc_driver_class TEXT NOT NULL DEFAULT '',
-                    extra_props_json TEXT NOT NULL DEFAULT '{}',
-                    standard_format TEXT NOT NULL DEFAULT 'AUTO',
-                    created_at TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS jdbc_drivers (
-                    driver_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    file_name TEXT NOT NULL,
-                    stored_rel_path TEXT NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    file_size INTEGER NOT NULL DEFAULT 0,
-                    driver_class_hint TEXT NOT NULL DEFAULT '',
-                    db_type_hint TEXT NOT NULL DEFAULT 'CUSTOM_JDBC',
-                    uploaded_at TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS meta_schemas (
-                    connection_id TEXT NOT NULL,
-                    schema_name TEXT NOT NULL,
-                    table_count INTEGER NOT NULL DEFAULT 0,
-                    view_count INTEGER NOT NULL DEFAULT 0,
-                    refreshed_at TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (connection_id, schema_name)
-                );
-
-                CREATE TABLE IF NOT EXISTS meta_tables (
-                    connection_id TEXT NOT NULL,
-                    schema_name TEXT NOT NULL,
-                    table_name TEXT NOT NULL,
-                    object_type TEXT NOT NULL DEFAULT 'TABLE',
-                    table_comment TEXT NOT NULL DEFAULT '',
-                    orientation TEXT NOT NULL DEFAULT 'ROW',
-                    with_clause TEXT NOT NULL DEFAULT '',
-                    distribute_clause TEXT NOT NULL DEFAULT '',
-                    distribute_keys_json TEXT NOT NULL DEFAULT '[]',
-                    partition_clause TEXT NOT NULL DEFAULT '',
-                    partition_keys_json TEXT NOT NULL DEFAULT '[]',
-                    primary_keys_json TEXT NOT NULL DEFAULT '[]',
-                    penetrated_base_tables_json TEXT NOT NULL DEFAULT '[]',
-                    row_count INTEGER NOT NULL DEFAULT 0,
-                    raw_ddl TEXT NOT NULL DEFAULT '',
-                    view_definition TEXT NOT NULL DEFAULT '',
-                    columns_cached INTEGER NOT NULL DEFAULT 0,
-                    refreshed_at TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (connection_id, schema_name, table_name)
-                );
-                CREATE INDEX IF NOT EXISTS idx_meta_tables_search
-                    ON meta_tables (connection_id, table_name);
-
-                CREATE TABLE IF NOT EXISTS meta_columns (
-                    connection_id TEXT NOT NULL,
-                    schema_name TEXT NOT NULL,
-                    table_name TEXT NOT NULL,
-                    ordinal_position INTEGER NOT NULL,
-                    column_name TEXT NOT NULL,
-                    data_type TEXT NOT NULL DEFAULT '',
-                    normalized_type TEXT NOT NULL DEFAULT '',
-                    is_not_null INTEGER NOT NULL DEFAULT 0,
-                    column_default TEXT,
-                    column_comment TEXT NOT NULL DEFAULT '',
-                    is_primary_key INTEGER NOT NULL DEFAULT 0,
-                    index_names_json TEXT NOT NULL DEFAULT '[]',
-                    lineage_source TEXT NOT NULL DEFAULT '',
-                    refreshed_at TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (connection_id, schema_name, table_name, column_name)
-                );
-                CREATE INDEX IF NOT EXISTS idx_meta_columns_table
-                    ON meta_columns (connection_id, schema_name, table_name, ordinal_position);
-
-                CREATE TABLE IF NOT EXISTS migration_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    row_index INTEGER NOT NULL,
-                    schema_name TEXT NOT NULL,
-                    table_name TEXT NOT NULL,
-                    old_col_name TEXT NOT NULL,
-                    old_col_type TEXT NOT NULL DEFAULT '',
-                    old_col_comment TEXT NOT NULL DEFAULT '',
-                    new_col_name TEXT NOT NULL,
-                    new_col_type TEXT NOT NULL,
-                    new_col_comment TEXT NOT NULL DEFAULT '',
-                    status TEXT NOT NULL DEFAULT 'UNCHECKED',
-                    strategy TEXT NOT NULL DEFAULT 'DIRECT_ALTER',
-                    ordinal_position INTEGER,
-                    total_columns INTEGER,
-                    db_current_col_name TEXT DEFAULT '',
-                    db_current_type TEXT DEFAULT '',
-                    db_current_comment TEXT DEFAULT '',
-                    is_distribute_key INTEGER DEFAULT 0,
-                    table_orientation TEXT DEFAULT '',
-                    status_detail TEXT DEFAULT '',
-                    error_message TEXT DEFAULT '',
-                    generated_sql TEXT DEFAULT '',
-                    executed_at TEXT DEFAULT '',
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS cross_table_bindings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    std_table_key TEXT NOT NULL UNIQUE,
-                    std_schema_name TEXT NOT NULL DEFAULT 'public',
-                    std_table_name TEXT NOT NULL,
-                    std_table_comment TEXT NOT NULL DEFAULT '',
-                    source_schema TEXT NOT NULL DEFAULT '',
-                    source_table TEXT NOT NULL DEFAULT '',
-                    target_schema TEXT NOT NULL DEFAULT '',
-                    target_table TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS cross_column_bindings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    std_table_key TEXT NOT NULL,
-                    row_index INTEGER NOT NULL,
-                    orig_col_name TEXT NOT NULL DEFAULT '',
-                    orig_col_type TEXT NOT NULL DEFAULT '',
-                    orig_col_comment TEXT NOT NULL DEFAULT '',
-                    std_col_name TEXT NOT NULL,
-                    std_col_type TEXT NOT NULL DEFAULT '',
-                    std_col_comment TEXT NOT NULL DEFAULT '',
-                    bound_source_col TEXT NOT NULL DEFAULT '',
-                    bound_target_col TEXT NOT NULL DEFAULT '',
-                    source_std_code TEXT NOT NULL DEFAULT '',
-                    target_std_code TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_cross_col_tbl_key
-                    ON cross_column_bindings (std_table_key, row_index);
-
-                CREATE TABLE IF NOT EXISTS standard_dictionary (
-                    std_code TEXT PRIMARY KEY,
-                    reg_category TEXT NOT NULL DEFAULT '',
-                    cat_l1 TEXT NOT NULL DEFAULT '',
-                    cat_l2 TEXT NOT NULL DEFAULT '',
-                    cat_l3 TEXT NOT NULL DEFAULT '',
-                    cn_name TEXT NOT NULL DEFAULT '',
-                    cn_alias TEXT NOT NULL DEFAULT '',
-                    en_name TEXT NOT NULL DEFAULT '',
-                    en_abbr TEXT NOT NULL DEFAULT '',
-                    biz_definition TEXT NOT NULL DEFAULT '',
-                    scope_desc TEXT NOT NULL DEFAULT '',
-                    biz_rule TEXT NOT NULL DEFAULT '',
-                    max_length TEXT NOT NULL DEFAULT '',
-                    min_scale TEXT NOT NULL DEFAULT '',
-                    ref_code_no TEXT NOT NULL DEFAULT '',
-                    ref_code_name TEXT NOT NULL DEFAULT '',
-                    ref_code_detail TEXT NOT NULL DEFAULT '',
-                    security_level TEXT NOT NULL DEFAULT '',
-                    ref_std_no TEXT NOT NULL DEFAULT '',
-                    ref_std_name TEXT NOT NULL DEFAULT '',
-                    domain_name TEXT NOT NULL DEFAULT '',
-                    domain_code TEXT NOT NULL DEFAULT '',
-                    data_category TEXT NOT NULL DEFAULT '',
-                    data_format TEXT NOT NULL DEFAULT '',
-                    value_range TEXT NOT NULL DEFAULT '',
-                    source_system TEXT NOT NULL DEFAULT '',
-                    ddm_catalog TEXT NOT NULL DEFAULT '',
-                    is_standard_dict TEXT NOT NULL DEFAULT '',
-                    version_no TEXT NOT NULL DEFAULT '',
-                    remark TEXT NOT NULL DEFAULT '',
-                    type_dws TEXT NOT NULL DEFAULT '',
-                    type_dw_mart TEXT NOT NULL DEFAULT '',
-                    type_mysql TEXT NOT NULL DEFAULT '',
-                    type_oracle TEXT NOT NULL DEFAULT '',
-                    type_dameng TEXT NOT NULL DEFAULT '',
-                    type_goldendb TEXT NOT NULL DEFAULT '',
-                    type_ob_oracle TEXT NOT NULL DEFAULT '',
-                    type_ob_mysql TEXT NOT NULL DEFAULT '',
-                    type_argodb TEXT NOT NULL DEFAULT '',
-                    type_oceanbase TEXT NOT NULL DEFAULT '',
-                    extra_attrs_json TEXT NOT NULL DEFAULT '{}',
-                    updated_at TEXT NOT NULL DEFAULT ''
-                );
-                CREATE INDEX IF NOT EXISTS idx_std_dict_code_nocase
-                    ON standard_dictionary (std_code COLLATE NOCASE);
-                CREATE INDEX IF NOT EXISTS idx_std_dict_en_abbr
-                    ON standard_dictionary (en_abbr COLLATE NOCASE);
-                CREATE INDEX IF NOT EXISTS idx_std_dict_cn_name
-                    ON standard_dictionary (cn_name);
-                CREATE INDEX IF NOT EXISTS idx_std_dict_cn_alias
-                    ON standard_dictionary (cn_alias);
-                CREATE INDEX IF NOT EXISTS idx_std_dict_reg
-                    ON standard_dictionary (reg_category);
-                CREATE INDEX IF NOT EXISTS idx_std_dict_data_cat
-                    ON standard_dictionary (data_category);
-
-                CREATE TABLE IF NOT EXISTS field_standard_bindings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    connection_id TEXT NOT NULL,
-                    schema_name TEXT NOT NULL DEFAULT 'public',
-                    table_name TEXT NOT NULL,
-                    column_name TEXT NOT NULL,
-                    col_key TEXT NOT NULL,
-                    std_code TEXT NOT NULL DEFAULT '',
-                    bind_source TEXT NOT NULL DEFAULT 'MANUAL',
-                    compliance_status TEXT NOT NULL DEFAULT 'UNCHECKED',
-                    compliance_detail TEXT NOT NULL DEFAULT '',
-                    updated_at TEXT NOT NULL DEFAULT '',
-                    UNIQUE(connection_id, col_key)
-                );
-                CREATE INDEX IF NOT EXISTS idx_fsb_conn_table
-                    ON field_standard_bindings (connection_id, schema_name, table_name);
-                CREATE INDEX IF NOT EXISTS idx_fsb_conn_table_nocase
-                    ON field_standard_bindings (connection_id, schema_name COLLATE NOCASE, table_name COLLATE NOCASE);
-                CREATE INDEX IF NOT EXISTS idx_fsb_std_code
-                    ON field_standard_bindings (std_code);
-
-                CREATE TABLE IF NOT EXISTS llm_providers (
-                    provider_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    provider_type TEXT NOT NULL DEFAULT 'OPENAI_COMPATIBLE',
-                    enabled INTEGER NOT NULL DEFAULT 0,
-                    base_url TEXT NOT NULL DEFAULT '',
-                    api_key TEXT NOT NULL DEFAULT '',
-                    default_model TEXT NOT NULL DEFAULT '',
-                    models_json TEXT NOT NULL DEFAULT '[]',
-                    is_default INTEGER NOT NULL DEFAULT 0,
-                    extra_json TEXT NOT NULL DEFAULT '{}',
-                    updated_at TEXT NOT NULL DEFAULT ''
-                );
-                """
-            )
-            self._ensure_schema_columns(conn)
+            conn.executescript(PRIVATE_SCHEMA_SQL)
+            self._ensure_private_schema_columns(conn)
             conn.commit()
+
+    def _init_workspace_db(self) -> None:
+        os.makedirs(os.path.dirname(self.workspace_db_path), exist_ok=True)
+        with self._lock, self._get_workspace_conn() as conn:
+            try:
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA synchronous = NORMAL;")
+            except Exception:
+                pass
+            init_workspace_schema_on_conn(conn)
+            for tbl_name, create_sql, exp_cols in self._registered_schemas.get("workspace", []):
+                if create_sql.strip():
+                    conn.executescript(create_sql)
+                self._ensure_columns_for_table(conn, tbl_name, exp_cols)
+            conn.commit()
+
+    def switch_workspace_db(self, new_workspace_db_path: str) -> None:
+        """原子热切换当前活动的 Layer 3 团队共享工作区 SQLite 文件（不改动私有保险箱）."""
+        target = os.path.abspath(new_workspace_db_path)
+        with self._lock:
+            self.workspace_db_path = target
+            self.is_split_storage = self.private_db_path != self.workspace_db_path
+            self._init_workspace_db()
 
     def register_table_schema(
         self,
         table_name: str,
         create_sql: str,
         expected_columns: List[Tuple[str, str]],
+        *,
+        scope: str = "workspace",
     ) -> None:
-        """供业务插件模块幂等注册私有 SQLite 表结构并自动演进补齐新增列."""
-        with self._lock, self._get_conn() as conn:
-            if create_sql.strip():
-                conn.executescript(create_sql)
-            self._ensure_columns_for_table(conn, table_name, expected_columns)
-            conn.commit()
+        """供业务插件模块幂等注册私有/工作区 SQLite 表结构并自动演进补齐新增列."""
+        norm_scope = "private" if str(scope or "").strip().lower() == "private" else "workspace"
+        with self._lock:
+            bucket = self._registered_schemas[norm_scope]
+            if not any(t[0] == table_name for t in bucket):
+                bucket.append((table_name, create_sql, list(expected_columns)))
+            cm = self._get_private_conn() if norm_scope == "private" else self._get_workspace_conn()
+            with cm as conn:
+                if create_sql.strip():
+                    conn.executescript(create_sql)
+                self._ensure_columns_for_table(conn, table_name, expected_columns)
+                conn.commit()
 
     @contextlib.contextmanager
-    def module_db(self):
+    def module_db(self, scope: str = "workspace"):
         """供业务插件模块执行参数化 SQLite 读写事务的线程安全上下文."""
-        with self._lock, self._get_conn() as conn:
+        norm_scope = "private" if str(scope or "").strip().lower() == "private" else "workspace"
+        cm = self._get_private_conn() if norm_scope == "private" else self._get_workspace_conn()
+        with self._lock, cm as conn:
             try:
                 yield conn
                 conn.commit()
@@ -354,7 +544,7 @@ class PlatformStateStore:
         col_defs: List[Tuple[str, str]],
     ) -> None:
         existing = {
-            row["name"].lower()
+            str(row["name"] if isinstance(row, sqlite3.Row) else row[1]).lower()
             for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
         }
         if not existing:
@@ -366,12 +556,53 @@ class PlatformStateStore:
                 )
 
     @classmethod
-    def _ensure_schema_columns(cls, conn: sqlite3.Connection) -> None:
-        """幂等补齐平台表与模块表列定义，保障跨分支切换与版本回退前后向无损兼容."""
+    def _ensure_private_schema_columns(cls, conn: sqlite3.Connection) -> None:
+        """幂等补齐 Layer 2 私有库表列定义."""
         expected_columns: Dict[str, List[Tuple[str, str]]] = {
             "execution_logs": [
                 ("sql_text", "TEXT DEFAULT ''"),
             ],
+            "workspaces": [
+                ("description", "TEXT NOT NULL DEFAULT ''"),
+                ("file_name", "TEXT NOT NULL DEFAULT ''"),
+                ("is_default", "INTEGER NOT NULL DEFAULT 0"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "connection_credentials": [
+                ("connection_id", "TEXT NOT NULL DEFAULT ''"),
+                ("endpoint_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+                ("db_type", "TEXT NOT NULL DEFAULT ''"),
+                ("host", "TEXT NOT NULL DEFAULT ''"),
+                ("port", "INTEGER NOT NULL DEFAULT 0"),
+                ("dbname", "TEXT NOT NULL DEFAULT ''"),
+                ("jdbc_url", "TEXT NOT NULL DEFAULT ''"),
+                ("user", "TEXT NOT NULL DEFAULT ''"),
+                ("password", "TEXT NOT NULL DEFAULT ''"),
+                ("sslmode", "TEXT NOT NULL DEFAULT 'prefer'"),
+                ("auth_mode", "TEXT NOT NULL DEFAULT 'LDAP'"),
+                ("sqlite_path", "TEXT NOT NULL DEFAULT ''"),
+                ("jdbc_driver_id", "TEXT NOT NULL DEFAULT ''"),
+                ("extra_secrets_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "jdbc_drivers": [
+                ("driver_class_hint", "TEXT NOT NULL DEFAULT ''"),
+                ("db_type_hint", "TEXT NOT NULL DEFAULT 'CUSTOM_JDBC'"),
+                ("uploaded_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "llm_providers": [
+                ("provider_type", "TEXT NOT NULL DEFAULT 'OPENAI_COMPATIBLE'"),
+                ("enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("base_url", "TEXT NOT NULL DEFAULT ''"),
+                ("api_key", "TEXT NOT NULL DEFAULT ''"),
+                ("default_model", "TEXT NOT NULL DEFAULT ''"),
+                ("models_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("is_default", "INTEGER NOT NULL DEFAULT 0"),
+                ("extra_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            # 若为历史单库兼容文件且残留 connection_profiles，保证列完整供迁移读取
             "connection_profiles": [
                 ("driver_track", "TEXT NOT NULL DEFAULT 'NATIVE'"),
                 ("db_type", "TEXT NOT NULL DEFAULT 'DWS'"),
@@ -387,10 +618,28 @@ class PlatformStateStore:
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
-            "jdbc_drivers": [
-                ("driver_class_hint", "TEXT NOT NULL DEFAULT ''"),
-                ("db_type_hint", "TEXT NOT NULL DEFAULT 'CUSTOM_JDBC'"),
-                ("uploaded_at", "TEXT NOT NULL DEFAULT ''"),
+        }
+        for table_name, col_defs in expected_columns.items():
+            cls._ensure_columns_for_table(conn, table_name, col_defs)
+
+    @classmethod
+    def _ensure_workspace_schema_columns(cls, conn: sqlite3.Connection) -> None:
+        """幂等补齐 Layer 3 共享工作区业务表列定义，保障跨分支切换与版本回退前后向无损兼容."""
+        expected_columns: Dict[str, List[Tuple[str, str]]] = {
+            "connection_topology": [
+                ("driver_track", "TEXT NOT NULL DEFAULT 'NATIVE'"),
+                ("db_type", "TEXT NOT NULL DEFAULT 'DWS'"),
+                ("default_schema", "TEXT NOT NULL DEFAULT 'public'"),
+                ("sslmode", "TEXT NOT NULL DEFAULT 'prefer'"),
+                ("auth_mode", "TEXT NOT NULL DEFAULT 'LDAP'"),
+                ("sqlite_path", "TEXT NOT NULL DEFAULT ''"),
+                ("jdbc_driver_id", "TEXT NOT NULL DEFAULT ''"),
+                ("jdbc_url", "TEXT NOT NULL DEFAULT ''"),
+                ("jdbc_driver_class", "TEXT NOT NULL DEFAULT ''"),
+                ("extra_props_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("standard_format", "TEXT NOT NULL DEFAULT 'AUTO'"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
             "meta_tables": [
                 ("object_type", "TEXT NOT NULL DEFAULT 'TABLE'"),
@@ -504,49 +753,97 @@ class PlatformStateStore:
                 ("compliance_detail", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
-            "llm_providers": [
-                ("provider_type", "TEXT NOT NULL DEFAULT 'OPENAI_COMPATIBLE'"),
-                ("enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("base_url", "TEXT NOT NULL DEFAULT ''"),
-                ("api_key", "TEXT NOT NULL DEFAULT ''"),
-                ("default_model", "TEXT NOT NULL DEFAULT ''"),
-                ("models_json", "TEXT NOT NULL DEFAULT '[]'"),
-                ("is_default", "INTEGER NOT NULL DEFAULT 0"),
-                ("extra_json", "TEXT NOT NULL DEFAULT '{}'"),
-                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
-            ],
         }
         for table_name, col_defs in expected_columns.items():
             cls._ensure_columns_for_table(conn, table_name, col_defs)
 
     # =========================================================================
-    # 旧版状态库 (dws_migrator_state.db) 与旧版连接配置无损自动迁移
+    # 旧版状态库 (dws_migrator_state.db / connection_profiles / <exe_dir>/data) 无损迁移
     # =========================================================================
+
+    def _migrate_legacy_connection_profiles_in_db(self) -> None:
+        """单库兼容打开历史状态库时，将旧 `connection_profiles` 幂等拆分为 `connection_topology` + `connection_credentials`."""
+        if self.get_meta("legacy_conn_profiles_split_v27", False):
+            return
+        with self._lock, self._get_private_conn() as pconn:
+            has_old_tbl = pconn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='connection_profiles'"
+            ).fetchone()
+            if not has_old_tbl:
+                return
+            rows = pconn.execute("SELECT * FROM connection_profiles").fetchall()
+            if not rows:
+                pconn.execute(
+                    "INSERT INTO app_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("legacy_conn_profiles_split_v27", "true"),
+                )
+                pconn.commit()
+                return
+
+        for r in rows:
+            cid = str(r["connection_id"] or "").strip()
+            if not cid:
+                continue
+            existing = self.get_connection_profile(cid)
+            if existing is not None:
+                continue
+            rkeys = set(r.keys())
+            try:
+                extra_raw = json.loads((r["extra_props_json"] if "extra_props_json" in rkeys else "{}") or "{}")
+                if not isinstance(extra_raw, dict):
+                    extra_raw = {}
+            except Exception:
+                extra_raw = {}
+            prof = ConnectionProfile(
+                connection_id=cid,
+                name=str(r["name"] or cid),
+                driver_track=str(r["driver_track"] if "driver_track" in rkeys else "NATIVE") or "NATIVE",
+                db_type=str(r["db_type"] if "db_type" in rkeys else "DWS") or "DWS",
+                host=str(r["host"] if "host" in rkeys else "") or "",
+                port=int((r["port"] if "port" in rkeys else 0) or 0),
+                dbname=str(r["dbname"] if "dbname" in rkeys else "") or "",
+                default_schema=str(r["default_schema"] if "default_schema" in rkeys else "public") or "public",
+                user=str(r["user"] if "user" in rkeys else "") or "",
+                password=str(r["password"] if "password" in rkeys else "") or "",
+                sslmode=str(r["sslmode"] if "sslmode" in rkeys else "prefer") or "prefer",
+                auth_mode=str(r["auth_mode"] if "auth_mode" in rkeys else "LDAP") or "LDAP",
+                sqlite_path=str(r["sqlite_path"] if "sqlite_path" in rkeys else "") or "",
+                jdbc_driver_id=str(r["jdbc_driver_id"] if "jdbc_driver_id" in rkeys else "") or "",
+                jdbc_url=str(r["jdbc_url"] if "jdbc_url" in rkeys else "") or "",
+                jdbc_driver_class=str(r["jdbc_driver_class"] if "jdbc_driver_class" in rkeys else "") or "",
+                extra_props=extra_raw,
+                standard_format=str((r["standard_format"] if "standard_format" in rkeys else "AUTO") or "AUTO"),
+                created_at=str(r["created_at"] if "created_at" in rkeys else "") or "",
+                updated_at=str(r["updated_at"] if "updated_at" in rkeys else "") or "",
+            )
+            self.upsert_connection_profile(prof)
+
+        self.save_meta("legacy_conn_profiles_split_v27", True)
 
     def _migrate_legacy_db_file_if_needed(self) -> None:
         """若当前状态库为 dataog_state.db 且同目录存在旧版 dws_migrator_state.db，自动无损迁移全部历史数据."""
-        if os.path.basename(self.db_path) != "dataog_state.db":
+        if os.path.basename(self.private_db_path) != "dataog_state.db":
             return
-        legacy_path = os.path.join(os.path.dirname(self.db_path), "dws_migrator_state.db")
+        legacy_path = os.path.join(os.path.dirname(self.private_db_path), "dws_migrator_state.db")
         if not os.path.isfile(legacy_path):
             return
         if self.get_meta("legacy_db_migrated_v2", False):
             return
 
-        # 仅在新库尚未写入业务数据时迁移，防止覆盖新库已更新的状态
-        with self._lock, self._get_conn() as dst_conn:
+        with self._lock, self._get_both_conns() as (p_conn, w_conn):
             has_new_data = (
-                dst_conn.execute("SELECT COUNT(*) FROM migration_items").fetchone()[0] > 0
-                or dst_conn.execute("SELECT COUNT(*) FROM cross_table_bindings").fetchone()[0] > 0
-                or dst_conn.execute("SELECT COUNT(*) FROM connection_profiles").fetchone()[0] > 0
+                w_conn.execute("SELECT COUNT(*) FROM migration_items").fetchone()[0] > 0
+                or w_conn.execute("SELECT COUNT(*) FROM cross_table_bindings").fetchone()[0] > 0
+                or w_conn.execute("SELECT COUNT(*) FROM connection_topology").fetchone()[0] > 0
             )
             if has_new_data:
-                dst_conn.execute(
+                p_conn.execute(
                     "INSERT INTO app_meta (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     ("legacy_db_migrated_v2", "true"),
                 )
-                dst_conn.commit()
+                p_conn.commit()
                 return
 
             src_conn = sqlite3.connect(legacy_path, timeout=10.0)
@@ -558,43 +855,380 @@ class PlatformStateStore:
                         "SELECT name FROM sqlite_master WHERE type='table'"
                     ).fetchall()
                 }
-                tables_to_copy = (
-                    "app_meta",
+                private_tables = ("app_meta", "execution_logs")
+                workspace_tables = (
                     "migration_items",
-                    "execution_logs",
                     "cross_table_bindings",
                     "cross_column_bindings",
                 )
-                for tbl in tables_to_copy:
+                for tbl in private_tables:
                     if tbl not in src_tables:
                         continue
-                    dst_cols = {
-                        r["name"]
-                        for r in dst_conn.execute(f"PRAGMA table_info({tbl})").fetchall()
-                    }
-                    rows = src_conn.execute(f"SELECT * FROM {tbl}").fetchall()
-                    if not rows:
+                    self._copy_common_rows(src_conn, p_conn, tbl, tbl)
+                for tbl in workspace_tables:
+                    if tbl not in src_tables:
                         continue
-                    common_cols = [c for c in rows[0].keys() if c in dst_cols]
-                    if not common_cols:
-                        continue
-                    placeholders = ", ".join("?" for _ in common_cols)
-                    col_list_sql = ", ".join(common_cols)
-                    dst_conn.executemany(
-                        f"INSERT OR REPLACE INTO {tbl} ({col_list_sql}) VALUES ({placeholders})",
-                        [[r[c] for c in common_cols] for r in rows],
-                    )
-                dst_conn.execute(
+                    self._copy_common_rows(src_conn, w_conn, tbl, tbl)
+                if "app_meta" in src_tables:
+                    for r in src_conn.execute("SELECT key, value FROM app_meta").fetchall():
+                        if r["key"] in WORKSPACE_META_KEYS:
+                            w_conn.execute(
+                                "INSERT INTO workspace_meta (key, value) VALUES (?, ?) "
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                (r["key"], r["value"]),
+                            )
+                p_conn.execute(
                     "INSERT INTO app_meta (key, value) VALUES (?, ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                     ("legacy_db_migrated_v2", "true"),
                 )
-                dst_conn.commit()
-                logger.info("已自动从历史状态库 [%s] 无损迁移数据至 [%s]", legacy_path, self.db_path)
+                w_conn.commit()
+                p_conn.commit()
+                logger.info("已自动从历史状态库无损迁移数据")
             except Exception as exc:
-                logger.warning("迁移旧版状态库 %s 时遇到非致命异常: %s", legacy_path, exc)
+                logger.warning("迁移旧版状态库时遇到非致命异常: %s", exc)
             finally:
                 src_conn.close()
+
+    @staticmethod
+    def _copy_common_rows(
+        src_conn: sqlite3.Connection,
+        dst_conn: sqlite3.Connection,
+        src_tbl: str,
+        dst_tbl: str,
+    ) -> int:
+        dst_cols = {
+            r["name"]
+            for r in dst_conn.execute(f"PRAGMA table_info({dst_tbl})").fetchall()
+        }
+        rows = src_conn.execute(f"SELECT * FROM {src_tbl}").fetchall()
+        if not rows:
+            return 0
+        common_cols = [c for c in rows[0].keys() if c in dst_cols]
+        if not common_cols:
+            return 0
+        placeholders = ", ".join("?" for _ in common_cols)
+        col_list_sql = ", ".join(common_cols)
+        dst_conn.executemany(
+            f"INSERT OR REPLACE INTO {dst_tbl} ({col_list_sql}) VALUES ({placeholders})",
+            [[r[c] for c in common_cols] for r in rows],
+        )
+        return len(rows)
+
+    def migrate_legacy_install_dir(
+        self,
+        legacy_data_dir: str,
+        *,
+        assets_dir: str,
+        drivers_dir: str,
+        clock_anchor_path: Optional[str] = None,
+    ) -> bool:
+        """从旧版程序目录 `<app_dir>/data/` 无损拆分迁移至三层分离架构（私有库 + 默认共享工作区）.
+
+        严格保证：
+        1. 幂等单次执行（通过私有库 `legacy_v27_migrated` 标记，且仅当新库尚未写入数据时执行）；
+        2. 绝不删除旧目录原文件（保留安全备份）；
+        3. 绝不向日志输出混淆后的私有库真实路径。
+        """
+        if not legacy_data_dir or not os.path.isdir(legacy_data_dir):
+            return False
+        if self.get_meta("legacy_v27_migrated", False):
+            return False
+
+        cand_dbs = [
+            os.path.join(legacy_data_dir, "dataog_state.db"),
+            os.path.join(legacy_data_dir, "dws_migrator_state.db"),
+        ]
+        legacy_db = next((p for p in cand_dbs if os.path.isfile(p)), "")
+        if not legacy_db:
+            return False
+        if os.path.realpath(legacy_db) == os.path.realpath(self.private_db_path):
+            return False
+
+        # 若新私有库或工作区已有业务/授权数据，仅置迁移完成标志，绝不覆盖新版本已有进度
+        with self._lock, self._get_both_conns() as (p_conn, w_conn):
+            has_new_private = (
+                p_conn.execute(
+                    "SELECT COUNT(*) FROM app_meta WHERE key = 'license_activation_code'"
+                ).fetchone()[0]
+                > 0
+                or p_conn.execute(
+                    "SELECT COUNT(*) FROM llm_providers WHERE api_key != ''"
+                ).fetchone()[0]
+                > 0
+                or p_conn.execute("SELECT COUNT(*) FROM connection_credentials").fetchone()[0] > 0
+            )
+            has_new_ws = (
+                w_conn.execute("SELECT COUNT(*) FROM standard_dictionary").fetchone()[0] > 0
+                or w_conn.execute("SELECT COUNT(*) FROM field_standard_bindings").fetchone()[0] > 0
+                or w_conn.execute("SELECT COUNT(*) FROM cross_table_bindings").fetchone()[0] > 0
+                or w_conn.execute("SELECT COUNT(*) FROM migration_items").fetchone()[0] > 0
+                or w_conn.execute("SELECT COUNT(*) FROM connection_topology").fetchone()[0] > 0
+            )
+            if has_new_private or has_new_ws:
+                p_conn.execute(
+                    "INSERT INTO app_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("legacy_v27_migrated", "true"),
+                )
+                p_conn.commit()
+                return False
+
+            # 将旧版库及其可能未 checkpoint 的 WAL/SHM 旁路文件复制到可写临时目录只读快照打开：
+            # 即使旧安装目录位于只读权限路径（如 Program Files）也 100% 无损迁移，且绝不改动旧备份目录
+            with tempfile.TemporaryDirectory(prefix="rt_mig_") as stage_dir:
+                staged_legacy_db = os.path.join(stage_dir, "legacy_src.db")
+                shutil.copy2(legacy_db, staged_legacy_db)
+                for side_suffix in ("-wal", "-shm"):
+                    side_src = legacy_db + side_suffix
+                    if os.path.isfile(side_src):
+                        try:
+                            shutil.copy2(side_src, staged_legacy_db + side_suffix)
+                        except OSError:
+                            pass
+
+                src_conn = sqlite3.connect(staged_legacy_db, timeout=15.0)
+                src_conn.row_factory = sqlite3.Row
+                try:
+                    src_tables = {
+                        r["name"]
+                        for r in src_conn.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                        ).fetchall()
+                    }
+
+                    # 1. 拆分 app_meta -> 私有 app_meta + 工作区 workspace_meta
+                    if "app_meta" in src_tables:
+                        for r in src_conn.execute("SELECT key, value FROM app_meta").fetchall():
+                            k = str(r["key"] or "")
+                            v = str(r["value"] or "")
+                            if k in WORKSPACE_META_KEYS:
+                                w_conn.execute(
+                                    "INSERT INTO workspace_meta (key, value) VALUES (?, ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                    (k, v),
+                                )
+                            else:
+                                p_conn.execute(
+                                    "INSERT INTO app_meta (key, value) VALUES (?, ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                    (k, v),
+                                )
+                    if "workspace_meta" in src_tables:
+                        for r in src_conn.execute("SELECT key, value FROM workspace_meta").fetchall():
+                            k = str(r["key"] or "")
+                            v = str(r["value"] or "")
+                            if k in WORKSPACE_META_KEYS:
+                                w_conn.execute(
+                                    "INSERT INTO workspace_meta (key, value) VALUES (?, ?) "
+                                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                    (k, v),
+                                )
+
+                    # 2. 迁移私有表（AI 密钥、JDBC 驱动索引、执行日志、个人 AI 探查会话）
+                    for ptbl in ("llm_providers", "jdbc_drivers", "execution_logs"):
+                        if ptbl in src_tables:
+                            self._copy_common_rows(src_conn, p_conn, ptbl, ptbl)
+
+                    # 个人 AI 探查表由 DataExplorerService 延迟注册；若旧库存在则先建表并迁移进私有库
+                    for exp_tbl in ("explorer_sessions", "explorer_messages"):
+                        if exp_tbl in src_tables:
+                            ddl_row = src_conn.execute(
+                                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+                                (exp_tbl,),
+                            ).fetchone()
+                            if ddl_row and ddl_row["sql"]:
+                                safe_ddl = re.sub(
+                                    r"(?i)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?",
+                                    "CREATE TABLE IF NOT EXISTS ",
+                                    str(ddl_row["sql"]).strip(),
+                                    count=1,
+                                )
+                                p_conn.execute(safe_ddl)
+                                self._copy_common_rows(src_conn, p_conn, exp_tbl, exp_tbl)
+
+                    # 3. 拆分旧 connection_profiles -> 无密码 connection_topology (工作区) + 个人 connection_credentials (私有库)
+                    now = self._now_str()
+                    if "connection_profiles" in src_tables:
+                        for r in src_conn.execute("SELECT * FROM connection_profiles").fetchall():
+                            rkeys = set(r.keys())
+                            cid = str(r["connection_id"] or "").strip()
+                            if not cid:
+                                continue
+                            try:
+                                raw_extra = json.loads(
+                                    (r["extra_props_json"] if "extra_props_json" in rkeys else "{}") or "{}"
+                                )
+                                if not isinstance(raw_extra, dict):
+                                    raw_extra = {}
+                            except Exception:
+                                raw_extra = {}
+                            pub_extra, sec_extra = split_extra_props_secrets(raw_extra)
+                            driver_track = str((r["driver_track"] if "driver_track" in rkeys else "NATIVE") or "NATIVE")
+                            db_type = str((r["db_type"] if "db_type" in rkeys else "DWS") or "DWS")
+                            host = str((r["host"] if "host" in rkeys else "") or "")
+                            port = int((r["port"] if "port" in rkeys else 0) or 0)
+                            dbname = str((r["dbname"] if "dbname" in rkeys else "") or "")
+                            default_schema = str((r["default_schema"] if "default_schema" in rkeys else "public") or "public")
+                            sslmode = str((r["sslmode"] if "sslmode" in rkeys else "prefer") or "prefer")
+                            auth_mode = str((r["auth_mode"] if "auth_mode" in rkeys else "LDAP") or "LDAP")
+                            sqlite_path = str((r["sqlite_path"] if "sqlite_path" in rkeys else "") or "")
+                            jdbc_driver_id = str((r["jdbc_driver_id"] if "jdbc_driver_id" in rkeys else "") or "")
+                            jdbc_url = str((r["jdbc_url"] if "jdbc_url" in rkeys else "") or "")
+                            jdbc_driver_class = str((r["jdbc_driver_class"] if "jdbc_driver_class" in rkeys else "") or "")
+                            std_fmt = str((r["standard_format"] if "standard_format" in rkeys else "AUTO") or "AUTO")
+                            created_at = str((r["created_at"] if "created_at" in rkeys else now) or now)
+                            updated_at = str((r["updated_at"] if "updated_at" in rkeys else now) or now)
+                            user_val = str((r["user"] if "user" in rkeys else "") or "")
+                            pwd_val = str((r["password"] if "password" in rkeys else "") or "")
+
+                            w_conn.execute(
+                                """
+                                INSERT OR REPLACE INTO connection_topology (
+                                    connection_id, name, driver_track, db_type,
+                                    host, port, dbname, default_schema,
+                                    sslmode, auth_mode, sqlite_path,
+                                    jdbc_driver_id, jdbc_url, jdbc_driver_class,
+                                    extra_props_json, standard_format, created_at, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    cid,
+                                    str(r["name"] or cid),
+                                    driver_track,
+                                    db_type,
+                                    host,
+                                    port,
+                                    dbname,
+                                    default_schema,
+                                    sslmode,
+                                    auth_mode,
+                                    sqlite_path,
+                                    jdbc_driver_id,
+                                    jdbc_url,
+                                    jdbc_driver_class,
+                                    json.dumps(pub_extra, ensure_ascii=False),
+                                    std_fmt,
+                                    created_at,
+                                    updated_at,
+                                ),
+                            )
+                            fp = compute_connection_fingerprint(
+                                driver_track=driver_track,
+                                db_type=db_type,
+                                host=host,
+                                port=port,
+                                dbname=dbname,
+                                jdbc_url=jdbc_url,
+                                sqlite_path=sqlite_path,
+                            )
+                            p_conn.execute(
+                                """
+                                INSERT OR REPLACE INTO connection_credentials (
+                                    cred_id, connection_id, endpoint_fingerprint,
+                                    db_type, host, port, dbname, jdbc_url,
+                                    user, password, sslmode, auth_mode, sqlite_path,
+                                    jdbc_driver_id, extra_secrets_json, updated_at
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    f"cid:{cid}",
+                                    cid,
+                                    fp,
+                                    db_type,
+                                    host,
+                                    port,
+                                    dbname,
+                                    jdbc_url,
+                                    user_val,
+                                    pwd_val,
+                                    sslmode,
+                                    auth_mode,
+                                    sqlite_path,
+                                    jdbc_driver_id,
+                                    json.dumps(sec_extra, ensure_ascii=False),
+                                    updated_at,
+                                ),
+                            )
+                    elif "connection_topology" in src_tables:
+                        self._copy_common_rows(src_conn, w_conn, "connection_topology", "connection_topology")
+                        if "connection_credentials" in src_tables:
+                            self._copy_common_rows(src_conn, p_conn, "connection_credentials", "connection_credentials")
+
+                    # 4. 迁移共享工作区全部纯业务表
+                    for wtbl in (
+                        "standard_dictionary",
+                        "field_standard_bindings",
+                        "cross_table_bindings",
+                        "cross_column_bindings",
+                        "migration_items",
+                        "meta_schemas",
+                        "meta_tables",
+                        "meta_columns",
+                    ):
+                        if wtbl in src_tables:
+                            self._copy_common_rows(src_conn, w_conn, wtbl, wtbl)
+
+                    p_conn.execute(
+                        "INSERT INTO app_meta (key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        ("legacy_v27_migrated", "true"),
+                    )
+                    w_conn.commit()
+                    p_conn.commit()
+                except Exception as exc:
+                    logger.warning("迁移旧版程序目录数据时出现非致命异常: %s", exc)
+                    return False
+                finally:
+                    src_conn.close()
+
+        # 5. 无损复制旧版上传的壁纸/图标、JDBC 驱动包及单调时钟锚点至私有库目录
+        self._copy_dir_files_if_missing(os.path.join(legacy_data_dir, "assets"), assets_dir)
+        self._copy_dir_files_if_missing(os.path.join(legacy_data_dir, "drivers"), drivers_dir)
+        legacy_anchor = os.path.join(legacy_data_dir, ".sys_clock_anchor")
+        eff_anchor = clock_anchor_path or self.clock_anchor_path
+        if eff_anchor and os.path.isfile(legacy_anchor):
+            try:
+                with open(legacy_anchor, "r", encoding="utf-8") as fh:
+                    legacy_obj = decode_obfuscated_anchor(fh.read())
+                if legacy_obj and float(legacy_obj.get("ts", 0)) > 0:
+                    cur_ts = 0.0
+                    if os.path.isfile(eff_anchor):
+                        with open(eff_anchor, "r", encoding="utf-8") as cfh:
+                            cur_obj = decode_obfuscated_anchor(cfh.read()) or {}
+                            cur_ts = float(cur_obj.get("ts", 0))
+                    if float(legacy_obj.get("ts", 0)) > cur_ts:
+                        os.makedirs(os.path.dirname(eff_anchor), exist_ok=True)
+                        with open(eff_anchor, "w", encoding="utf-8") as wfh:
+                            wfh.write(encode_obfuscated_anchor(legacy_obj))
+            except Exception:
+                pass
+
+        # 6. 若旧库中仍有 v1.x app_meta 连接键值，同步升级为拓扑 + 凭据
+        self._migrate_legacy_connections_if_needed()
+        self.add_log(
+            "INFO",
+            "存储升级",
+            "已自动将历史本地数据无损拆分升级至本地私有保险箱与默认共享工作区",
+        )
+        return True
+
+    @staticmethod
+    def _copy_dir_files_if_missing(src_dir: str, dst_dir: str) -> None:
+        if not src_dir or not os.path.isdir(src_dir):
+            return
+        os.makedirs(dst_dir, exist_ok=True)
+        try:
+            for name in os.listdir(src_dir):
+                src_path = os.path.join(src_dir, name)
+                dst_path = os.path.join(dst_dir, name)
+                if os.path.isfile(src_path) and not os.path.exists(dst_path):
+                    try:
+                        shutil.copy2(src_path, dst_path)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
 
     def _migrate_legacy_connections_if_needed(self) -> None:
         """自动扫描 app_meta 中的旧版连接配置并无损迁移为全局命名数据源档案."""
@@ -624,6 +1258,9 @@ class PlatformStateStore:
                 "cross_target_connection_id",
             ),
         ]
+        existing_profiles = self.list_connection_profiles()
+        existing_ids = {p.connection_id for p in existing_profiles}
+        existing_fps = {p.endpoint_fingerprint() for p in existing_profiles if p.endpoint_fingerprint()}
         now = self._now_str()
         for meta_key, profile_id, default_label, binding_meta_key in legacy_specs:
             raw_cfg = self.get_meta(meta_key, None)
@@ -632,42 +1269,65 @@ class PlatformStateStore:
             host = str(raw_cfg.get("host") or "").strip()
             if not host:
                 continue
-            existing = self.get_connection_profile(profile_id)
-            if existing is None:
-                db_type = str(raw_cfg.get("db_type") or "DWS").strip().upper()
-                default_port = (
-                    10000
-                    if db_type == "INCEPTOR"
-                    else (5432 if db_type == "PGSQL" else 8000)
-                )
-                dbname = str(raw_cfg.get("dbname") or "").strip()
-                profile = ConnectionProfile(
-                    connection_id=profile_id,
-                    name=f"{default_label} [{db_type} {host}/{dbname}]" if dbname else f"{default_label} [{db_type} {host}]",
-                    driver_track="NATIVE",
-                    db_type=db_type,
-                    host=host,
-                    port=int(raw_cfg.get("port") or default_port),
-                    dbname=dbname,
-                    default_schema=str(raw_cfg.get("schema_name") or raw_cfg.get("default_schema") or ("default" if db_type == "INCEPTOR" else "public")).strip(),
-                    user=str(raw_cfg.get("user") or "").strip(),
-                    password=str(raw_cfg.get("password") or ""),
-                    sslmode=str(raw_cfg.get("sslmode") or "prefer").strip(),
-                    auth_mode=str(raw_cfg.get("auth_mode") or "LDAP").strip().upper(),
-                    created_at=now,
-                    updated_at=now,
-                )
-                self.upsert_connection_profile(profile)
+            cur_bound = str(self.get_meta(binding_meta_key, "") or "").strip()
+            if cur_bound and cur_bound in existing_ids:
+                continue
+            db_type = str(raw_cfg.get("db_type") or "DWS").strip().upper()
+            default_port = (
+                10000
+                if db_type == "INCEPTOR"
+                else (5432 if db_type == "PGSQL" else 8000)
+            )
+            port = int(raw_cfg.get("port") or default_port)
+            dbname = str(raw_cfg.get("dbname") or "").strip()
+            cand_fp = compute_connection_fingerprint(
+                driver_track="NATIVE",
+                db_type=db_type,
+                host=host,
+                port=port,
+                dbname=dbname,
+            )
+            if profile_id in existing_ids or (cand_fp and cand_fp in existing_fps):
+                continue
+            profile = ConnectionProfile(
+                connection_id=profile_id,
+                name=f"{default_label} [{db_type} {host}/{dbname}]" if dbname else f"{default_label} [{db_type} {host}]",
+                driver_track="NATIVE",
+                db_type=db_type,
+                host=host,
+                port=port,
+                dbname=dbname,
+                default_schema=str(raw_cfg.get("schema_name") or raw_cfg.get("default_schema") or ("default" if db_type == "INCEPTOR" else "public")).strip(),
+                user=str(raw_cfg.get("user") or "").strip(),
+                password=str(raw_cfg.get("password") or ""),
+                sslmode=str(raw_cfg.get("sslmode") or "prefer").strip(),
+                auth_mode=str(raw_cfg.get("auth_mode") or "LDAP").strip().upper(),
+                created_at=now,
+                updated_at=now,
+            )
+            self.upsert_connection_profile(profile)
+            existing_ids.add(profile_id)
+            if cand_fp:
+                existing_fps.add(cand_fp)
             if not self.get_meta(binding_meta_key, ""):
                 self.save_meta(binding_meta_key, profile_id)
 
     # =========================================================================
-    # 基础键值配置与日志中心
+    # 基础键值配置（按白名单自动分流至私有 app_meta 或工作区 workspace_meta）与日志中心
     # =========================================================================
 
     def save_meta(self, key: str, value: Any) -> None:
         val_str = json.dumps(value, ensure_ascii=False)
-        with self._lock, self._get_conn() as conn:
+        if key in WORKSPACE_META_KEYS:
+            with self._lock, self._get_workspace_conn() as conn:
+                conn.execute(
+                    "INSERT INTO workspace_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, val_str),
+                )
+                conn.commit()
+            return
+        with self._lock, self._get_private_conn() as conn:
             conn.execute(
                 "INSERT INTO app_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -676,7 +1336,30 @@ class PlatformStateStore:
             conn.commit()
 
     def get_meta(self, key: str, default: Any = None) -> Any:
-        with self._lock, self._get_conn() as conn:
+        if key in WORKSPACE_META_KEYS:
+            with self._lock, self._get_workspace_conn() as conn:
+                row = conn.execute(
+                    "SELECT value FROM workspace_meta WHERE key = ?", (key,)
+                ).fetchone()
+                if row:
+                    try:
+                        return json.loads(row["value"])
+                    except Exception:
+                        return default
+            # 单库兼容回退：历史文件中可能存于 app_meta
+            if not self.is_split_storage:
+                with self._lock, self._get_private_conn() as conn:
+                    row2 = conn.execute(
+                        "SELECT value FROM app_meta WHERE key = ?", (key,)
+                    ).fetchone()
+                    if row2:
+                        try:
+                            return json.loads(row2["value"])
+                        except Exception:
+                            return default
+            return default
+
+        with self._lock, self._get_private_conn() as conn:
             row = conn.execute(
                 "SELECT value FROM app_meta WHERE key = ?", (key,)
             ).fetchone()
@@ -689,7 +1372,7 @@ class PlatformStateStore:
 
     def add_log(self, level: str, target: str, message: str, sql_text: str = "") -> None:
         now = self._now_str()
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO execution_logs (created_at, level, target, message, sql_text)
@@ -708,23 +1391,120 @@ class PlatformStateStore:
             conn.commit()
 
     def list_logs(self, limit: int = 200) -> List[Dict[str, Any]]:
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM execution_logs ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
             return [dict(r) for r in rows]
 
     def clear_logs(self) -> None:
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             conn.execute("DELETE FROM execution_logs")
             conn.commit()
 
     # =========================================================================
-    # 全局连接档案 (ConnectionProfile) 与自定义 JDBC 驱动包索引
+    # 本地托管工作区注册表 (Private Vault `workspaces`)
     # =========================================================================
 
+    def list_workspace_records(self) -> List[Dict[str, Any]]:
+        with self._lock, self._get_private_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM workspaces ORDER BY is_default DESC, updated_at DESC, created_at ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_workspace_record(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+        if not workspace_id:
+            return None
+        with self._lock, self._get_private_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def upsert_workspace_record(
+        self,
+        *,
+        workspace_id: str,
+        name: str,
+        file_name: str,
+        description: str = "",
+        is_default: bool = False,
+        created_at: str = "",
+    ) -> Dict[str, Any]:
+        now = self._now_str()
+        with self._lock, self._get_private_conn() as conn:
+            existing = conn.execute(
+                "SELECT created_at FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            eff_created = created_at or (existing["created_at"] if existing else now)
+            conn.execute(
+                """
+                INSERT INTO workspaces (
+                    workspace_id, name, description, file_name, is_default, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_id) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    file_name = excluded.file_name,
+                    is_default = excluded.is_default,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    workspace_id,
+                    name,
+                    description,
+                    file_name,
+                    1 if is_default else 0,
+                    eff_created,
+                    now,
+                ),
+            )
+            conn.commit()
+        return self.get_workspace_record(workspace_id) or {}
+
+    def delete_workspace_record(self, workspace_id: str) -> bool:
+        with self._lock, self._get_private_conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    # =========================================================================
+    # 全局连接档案：工作区无密码拓扑 (connection_topology) × 私有个人凭据库 (connection_credentials)
+    # =========================================================================
+
+    def _load_credential_maps(
+        self,
+    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], set[str]]:
+        """读取私有库中的个人 DB 凭据映射（按 connection_id 与 endpoint_fingerprint 双索引）与本地驱动 ID 集合."""
+        by_cid: Dict[str, Dict[str, Any]] = {}
+        by_fp: Dict[str, Dict[str, Any]] = {}
+        driver_ids: set[str] = set()
+        with self._lock, self._get_private_conn() as pconn:
+            cred_rows = pconn.execute(
+                "SELECT * FROM connection_credentials ORDER BY updated_at DESC"
+            ).fetchall()
+            for r in cred_rows:
+                d = dict(r)
+                cid = str(d.get("connection_id") or "").strip()
+                if cid and cid not in by_cid:
+                    by_cid[cid] = d
+                fp = str(d.get("endpoint_fingerprint") or "").strip()
+                if fp and fp not in by_fp and (d.get("user") or d.get("password")):
+                    by_fp[fp] = d
+            for dr in pconn.execute("SELECT driver_id FROM jdbc_drivers").fetchall():
+                driver_ids.add(str(dr["driver_id"]))
+        return by_cid, by_fp, driver_ids
+
     @staticmethod
-    def _row_to_profile(row: sqlite3.Row) -> ConnectionProfile:
+    def _assemble_profile(
+        row: sqlite3.Row,
+        cred_by_cid: Dict[str, Dict[str, Any]],
+        cred_by_fp: Dict[str, Dict[str, Any]],
+        local_driver_ids: set[str],
+    ) -> ConnectionProfile:
         try:
             extra_props = json.loads(row["extra_props_json"] or "{}")
             if not isinstance(extra_props, dict):
@@ -733,122 +1513,275 @@ class PlatformStateStore:
             extra_props = {}
         row_keys = set(row.keys()) if hasattr(row, "keys") else set()
         raw_std_fmt = (row["standard_format"] if "standard_format" in row_keys else "AUTO") or "AUTO"
+        cid = str(row["connection_id"])
+        driver_track = str(row["driver_track"] or "NATIVE")
+        db_type = str(row["db_type"] or "DWS")
+        host = str(row["host"] or "")
+        port = int(row["port"] or 0)
+        dbname = str(row["dbname"] or "")
+        jdbc_url = str(row["jdbc_url"] or "")
+        sqlite_path = str(row["sqlite_path"] or "")
+        jdbc_driver_id = str(row["jdbc_driver_id"] or "")
+
+        fp = compute_connection_fingerprint(
+            driver_track=driver_track,
+            db_type=db_type,
+            host=host,
+            port=port,
+            dbname=dbname,
+            jdbc_url=jdbc_url,
+            sqlite_path=sqlite_path,
+        )
+
+        exact_cred = cred_by_cid.get(cid)
+        fp_cred = cred_by_fp.get(fp) if fp else None
+        chosen_cred = None
+        cred_status = "BOUND"
+
+        if db_type.upper() == "SQLITE":
+            chosen_cred = exact_cred or fp_cred
+            cred_status = "BOUND"
+        elif exact_cred and (exact_cred.get("user") or exact_cred.get("password")):
+            chosen_cred = exact_cred
+            cred_status = "BOUND"
+        elif fp_cred and (fp_cred.get("user") or fp_cred.get("password")):
+            chosen_cred = fp_cred
+            cred_status = "AUTO_MATCHED"
+        elif exact_cred:
+            chosen_cred = exact_cred
+            cred_status = "MISSING"
+        else:
+            cred_status = "MISSING"
+
+        user_val = str(chosen_cred.get("user") or "") if chosen_cred else ""
+        pwd_val = str(chosen_cred.get("password") or "") if chosen_cred else ""
+        if chosen_cred:
+            try:
+                sec_extra = json.loads(chosen_cred.get("extra_secrets_json") or "{}")
+                if isinstance(sec_extra, dict) and sec_extra:
+                    extra_props = {**extra_props, **sec_extra}
+            except Exception:
+                pass
+            # 若工作区引用的 JDBC 驱动在本机不存在，则尝试沿用本机凭据绑定的驱动 ID
+            cred_drv = str(chosen_cred.get("jdbc_driver_id") or "").strip()
+            if cred_drv and (not jdbc_driver_id or jdbc_driver_id not in local_driver_ids):
+                if cred_drv in local_driver_ids:
+                    jdbc_driver_id = cred_drv
+
         return ConnectionProfile(
-            connection_id=row["connection_id"],
+            connection_id=cid,
             name=row["name"],
-            driver_track=row["driver_track"] or "NATIVE",
-            db_type=row["db_type"] or "DWS",
-            host=row["host"] or "",
-            port=int(row["port"] or 0),
-            dbname=row["dbname"] or "",
+            driver_track=driver_track,
+            db_type=db_type,
+            host=host,
+            port=port,
+            dbname=dbname,
             default_schema=row["default_schema"] or "public",
-            user=row["user"] or "",
-            password=row["password"] or "",
+            user=user_val,
+            password=pwd_val,
             sslmode=row["sslmode"] or "prefer",
             auth_mode=row["auth_mode"] or "LDAP",
-            sqlite_path=row["sqlite_path"] or "",
-            jdbc_driver_id=row["jdbc_driver_id"] or "",
-            jdbc_url=row["jdbc_url"] or "",
+            sqlite_path=sqlite_path,
+            jdbc_driver_id=jdbc_driver_id,
+            jdbc_url=jdbc_url,
             jdbc_driver_class=row["jdbc_driver_class"] or "",
             extra_props=extra_props,
             standard_format=str(raw_std_fmt).strip() or "AUTO",
             created_at=row["created_at"] or "",
             updated_at=row["updated_at"] or "",
+            credential_status=cred_status,
         )
 
-    def list_connection_profiles(self) -> List[ConnectionProfile]:
-        with self._lock, self._get_conn() as conn:
-            rows = conn.execute(
-                "SELECT * FROM connection_profiles ORDER BY updated_at DESC, name ASC"
+    def list_connection_credentials(self) -> List[Dict[str, Any]]:
+        """列出私有库个人凭据元数据（脱敏，绝不返回明文密码）."""
+        with self._lock, self._get_private_conn() as pconn:
+            rows = pconn.execute(
+                "SELECT cred_id, connection_id, endpoint_fingerprint, db_type, host, port, dbname, "
+                "jdbc_url, user, (CASE WHEN password != '' THEN 1 ELSE 0 END) AS has_password, updated_at "
+                "FROM connection_credentials ORDER BY updated_at DESC"
             ).fetchall()
-            return [self._row_to_profile(r) for r in rows]
+            return [dict(r) for r in rows]
+
+    def list_connection_profiles(self) -> List[ConnectionProfile]:
+        with self._lock:
+            cred_by_cid, cred_by_fp, local_driver_ids = self._load_credential_maps()
+            with self._get_workspace_conn() as wconn:
+                rows = wconn.execute(
+                    "SELECT * FROM connection_topology ORDER BY updated_at DESC, name ASC"
+                ).fetchall()
+            return [
+                self._assemble_profile(r, cred_by_cid, cred_by_fp, local_driver_ids)
+                for r in rows
+            ]
 
     def get_connection_profile(self, connection_id: str) -> Optional[ConnectionProfile]:
         if not connection_id:
             return None
-        with self._lock, self._get_conn() as conn:
-            row = conn.execute(
-                "SELECT * FROM connection_profiles WHERE connection_id = ?",
-                (connection_id,),
-            ).fetchone()
-            return self._row_to_profile(row) if row else None
+        with self._lock:
+            cred_by_cid, cred_by_fp, local_driver_ids = self._load_credential_maps()
+            with self._get_workspace_conn() as wconn:
+                row = wconn.execute(
+                    "SELECT * FROM connection_topology WHERE connection_id = ?",
+                    (connection_id,),
+                ).fetchone()
+            return (
+                self._assemble_profile(row, cred_by_cid, cred_by_fp, local_driver_ids)
+                if row
+                else None
+            )
 
     def upsert_connection_profile(self, profile: ConnectionProfile) -> ConnectionProfile:
         now = self._now_str()
         created_at = profile.created_at or now
         updated_at = now
-        extra_json = json.dumps(profile.extra_props or {}, ensure_ascii=False)
+        pub_extra, sec_extra = split_extra_props_secrets(profile.extra_props or {})
+        extra_json = json.dumps(pub_extra, ensure_ascii=False)
+        sec_extra_json = json.dumps(sec_extra, ensure_ascii=False)
         standard_format = (profile.standard_format or "AUTO").strip() or "AUTO"
-        with self._lock, self._get_conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO connection_profiles (
-                    connection_id, name, driver_track, db_type,
-                    host, port, dbname, default_schema, user, password,
-                    sslmode, auth_mode, sqlite_path,
-                    jdbc_driver_id, jdbc_url, jdbc_driver_class,
-                    extra_props_json, standard_format, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(connection_id) DO UPDATE SET
-                    name = excluded.name,
-                    driver_track = excluded.driver_track,
-                    db_type = excluded.db_type,
-                    host = excluded.host,
-                    port = excluded.port,
-                    dbname = excluded.dbname,
-                    default_schema = excluded.default_schema,
-                    user = excluded.user,
-                    password = excluded.password,
-                    sslmode = excluded.sslmode,
-                    auth_mode = excluded.auth_mode,
-                    sqlite_path = excluded.sqlite_path,
-                    jdbc_driver_id = excluded.jdbc_driver_id,
-                    jdbc_url = excluded.jdbc_url,
-                    jdbc_driver_class = excluded.jdbc_driver_class,
-                    extra_props_json = excluded.extra_props_json,
-                    standard_format = excluded.standard_format,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    profile.connection_id,
-                    profile.name,
-                    profile.driver_track,
-                    profile.db_type,
-                    profile.host,
-                    int(profile.port or 0),
-                    profile.dbname,
-                    profile.default_schema,
-                    profile.user,
-                    profile.password,
-                    profile.sslmode,
-                    profile.auth_mode,
-                    profile.sqlite_path,
-                    profile.jdbc_driver_id,
-                    profile.jdbc_url,
-                    profile.jdbc_driver_class,
-                    extra_json,
-                    standard_format,
-                    created_at,
-                    updated_at,
-                ),
-            )
-            conn.commit()
+        fp = compute_connection_fingerprint(
+            driver_track=profile.driver_track,
+            db_type=profile.db_type,
+            host=profile.host,
+            port=int(profile.port or 0),
+            dbname=profile.dbname,
+            jdbc_url=profile.jdbc_url,
+            sqlite_path=profile.sqlite_path,
+        )
+        with self._lock:
+            # 1. 写入共享工作区：严格不含 user / password / 私密扩展属性
+            with self._get_workspace_conn() as wconn:
+                wconn.execute(
+                    """
+                    INSERT INTO connection_topology (
+                        connection_id, name, driver_track, db_type,
+                        host, port, dbname, default_schema,
+                        sslmode, auth_mode, sqlite_path,
+                        jdbc_driver_id, jdbc_url, jdbc_driver_class,
+                        extra_props_json, standard_format, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(connection_id) DO UPDATE SET
+                        name = excluded.name,
+                        driver_track = excluded.driver_track,
+                        db_type = excluded.db_type,
+                        host = excluded.host,
+                        port = excluded.port,
+                        dbname = excluded.dbname,
+                        default_schema = excluded.default_schema,
+                        sslmode = excluded.sslmode,
+                        auth_mode = excluded.auth_mode,
+                        sqlite_path = excluded.sqlite_path,
+                        jdbc_driver_id = excluded.jdbc_driver_id,
+                        jdbc_url = excluded.jdbc_url,
+                        jdbc_driver_class = excluded.jdbc_driver_class,
+                        extra_props_json = excluded.extra_props_json,
+                        standard_format = excluded.standard_format,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        profile.connection_id,
+                        profile.name,
+                        profile.driver_track,
+                        profile.db_type,
+                        profile.host,
+                        int(profile.port or 0),
+                        profile.dbname,
+                        profile.default_schema,
+                        profile.sslmode,
+                        profile.auth_mode,
+                        profile.sqlite_path,
+                        profile.jdbc_driver_id,
+                        profile.jdbc_url,
+                        profile.jdbc_driver_class,
+                        extra_json,
+                        standard_format,
+                        created_at,
+                        updated_at,
+                    ),
+                )
+                wconn.commit()
+
+            # 2. 写入本地私有保险箱凭据库
+            with self._get_private_conn() as pconn:
+                pconn.execute(
+                    """
+                    INSERT INTO connection_credentials (
+                        cred_id, connection_id, endpoint_fingerprint,
+                        db_type, host, port, dbname, jdbc_url,
+                        user, password, sslmode, auth_mode, sqlite_path,
+                        jdbc_driver_id, extra_secrets_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cred_id) DO UPDATE SET
+                        connection_id = excluded.connection_id,
+                        endpoint_fingerprint = excluded.endpoint_fingerprint,
+                        db_type = excluded.db_type,
+                        host = excluded.host,
+                        port = excluded.port,
+                        dbname = excluded.dbname,
+                        jdbc_url = excluded.jdbc_url,
+                        user = excluded.user,
+                        password = excluded.password,
+                        sslmode = excluded.sslmode,
+                        auth_mode = excluded.auth_mode,
+                        sqlite_path = excluded.sqlite_path,
+                        jdbc_driver_id = excluded.jdbc_driver_id,
+                        extra_secrets_json = excluded.extra_secrets_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        f"cid:{profile.connection_id}",
+                        profile.connection_id,
+                        fp,
+                        profile.db_type,
+                        profile.host,
+                        int(profile.port or 0),
+                        profile.dbname,
+                        profile.jdbc_url,
+                        profile.user,
+                        profile.password,
+                        profile.sslmode,
+                        profile.auth_mode,
+                        profile.sqlite_path,
+                        profile.jdbc_driver_id,
+                        sec_extra_json,
+                        updated_at,
+                    ),
+                )
+                pconn.commit()
         return self.get_connection_profile(profile.connection_id) or profile
 
     def delete_connection_profile(self, connection_id: str) -> bool:
-        with self._lock, self._get_conn() as conn:
-            cur = conn.execute(
-                "DELETE FROM connection_profiles WHERE connection_id = ?",
-                (connection_id,),
-            )
-            conn.execute("DELETE FROM meta_schemas WHERE connection_id = ?", (connection_id,))
-            conn.execute("DELETE FROM meta_tables WHERE connection_id = ?", (connection_id,))
-            conn.execute("DELETE FROM meta_columns WHERE connection_id = ?", (connection_id,))
-            conn.commit()
-            return cur.rowcount > 0
+        with self._lock:
+            with self._get_workspace_conn() as wconn:
+                cur = wconn.execute(
+                    "DELETE FROM connection_topology WHERE connection_id = ?",
+                    (connection_id,),
+                )
+                wconn.execute("DELETE FROM meta_schemas WHERE connection_id = ?", (connection_id,))
+                wconn.execute("DELETE FROM meta_tables WHERE connection_id = ?", (connection_id,))
+                wconn.execute("DELETE FROM meta_columns WHERE connection_id = ?", (connection_id,))
+                wconn.commit()
+                deleted = cur.rowcount > 0
+            # 三层分离模式下，Layer 2 个人凭据库跨工作区共享：从某一工作区删除拓扑时不得抹除其他工作区复用的个人密码；
+            # 仅在单库兼容模式下同步清理历史表记录
+            if not self.is_split_storage:
+                with self._get_private_conn() as pconn:
+                    pconn.execute(
+                        "DELETE FROM connection_credentials WHERE connection_id = ?",
+                        (connection_id,),
+                    )
+                    has_legacy = pconn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='connection_profiles'"
+                    ).fetchone()
+                    if has_legacy:
+                        pconn.execute(
+                            "DELETE FROM connection_profiles WHERE connection_id = ?",
+                            (connection_id,),
+                        )
+                    pconn.commit()
+            return deleted
 
     def list_jdbc_drivers(self) -> List[DriverPackage]:
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM jdbc_drivers ORDER BY uploaded_at DESC, name ASC"
             ).fetchall()
@@ -868,7 +1801,7 @@ class PlatformStateStore:
             ]
 
     def get_jdbc_driver(self, driver_id: str) -> Optional[DriverPackage]:
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             r = conn.execute(
                 "SELECT * FROM jdbc_drivers WHERE driver_id = ?",
                 (driver_id,),
@@ -889,7 +1822,7 @@ class PlatformStateStore:
 
     def upsert_jdbc_driver(self, pkg: DriverPackage) -> DriverPackage:
         now = pkg.uploaded_at or self._now_str()
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             conn.execute(
                 """
                 INSERT INTO jdbc_drivers (
@@ -925,7 +1858,7 @@ class PlatformStateStore:
         pkg = self.get_jdbc_driver(driver_id)
         if not pkg:
             return None
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             conn.execute("DELETE FROM jdbc_drivers WHERE driver_id = ?", (driver_id,))
             conn.commit()
         return pkg
@@ -2389,7 +3322,7 @@ class PlatformStateStore:
         )
 
     def list_llm_providers(self) -> List[LLMProviderProfile]:
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM llm_providers
@@ -2408,7 +3341,7 @@ class PlatformStateStore:
     def get_llm_provider(self, provider_id: str) -> Optional[LLMProviderProfile]:
         if not provider_id:
             return None
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             row = conn.execute(
                 "SELECT * FROM llm_providers WHERE provider_id = ?",
                 (provider_id,),
@@ -2419,7 +3352,7 @@ class PlatformStateStore:
         now = self._now_str()
         models_json = json.dumps(list(profile.models or []), ensure_ascii=False)
         extra_json = json.dumps(dict(profile.extra or {}), ensure_ascii=False)
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             if profile.is_default:
                 conn.execute(
                     "UPDATE llm_providers SET is_default = 0 WHERE provider_id != ?",
@@ -2462,7 +3395,7 @@ class PlatformStateStore:
         return self.get_llm_provider(profile.provider_id) or profile
 
     def delete_llm_provider(self, provider_id: str) -> bool:
-        with self._lock, self._get_conn() as conn:
+        with self._lock, self._get_private_conn() as conn:
             cur = conn.execute(
                 "DELETE FROM llm_providers WHERE provider_id = ?",
                 (provider_id,),

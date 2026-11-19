@@ -187,6 +187,7 @@ class DataExplorerService:
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
             ],
+            scope="private",
         )
         self.ctx.store.register_table_schema(
             "explorer_messages",
@@ -222,6 +223,7 @@ class DataExplorerService:
                 ("total_elapsed_ms", "REAL NOT NULL DEFAULT 0"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ],
+            scope="private",
         )
 
     @staticmethod
@@ -284,7 +286,7 @@ class DataExplorerService:
     ) -> List[Dict[str, Any]]:
         safe_limit = max(1, min(200, int(limit or 60)))
         cid = (connection_id or "").strip()
-        with self.ctx.store.module_db() as conn:
+        with self.ctx.store.module_db("private") as conn:
             if cid:
                 rows = conn.execute(
                     """
@@ -323,7 +325,7 @@ class DataExplorerService:
         eff_schema = (schema_name or profile.default_schema or "").strip()
         eff_title = (title or "").strip()[:120] or "新探查会话"
 
-        with self.ctx.store.module_db() as conn:
+        with self.ctx.store.module_db("private") as conn:
             conn.execute(
                 """
                 INSERT INTO explorer_sessions (
@@ -353,7 +355,7 @@ class DataExplorerService:
         sid = (session_id or "").strip()
         if not sid:
             return None
-        with self.ctx.store.module_db() as conn:
+        with self.ctx.store.module_db("private") as conn:
             s_row = conn.execute(
                 "SELECT * FROM explorer_sessions WHERE session_id = ?", (sid,)
             ).fetchone()
@@ -378,7 +380,7 @@ class DataExplorerService:
         sid = (session_id or "").strip()
         if not sid:
             return None
-        with self.ctx.store.module_db() as conn:
+        with self.ctx.store.module_db("private") as conn:
             existing = conn.execute(
                 "SELECT * FROM explorer_sessions WHERE session_id = ?", (sid,)
             ).fetchone()
@@ -415,7 +417,7 @@ class DataExplorerService:
         sid = (session_id or "").strip()
         if not sid:
             return False
-        with self.ctx.store.module_db() as conn:
+        with self.ctx.store.module_db("private") as conn:
             cur = conn.execute(
                 "DELETE FROM explorer_sessions WHERE session_id = ?", (sid,)
             )
@@ -1054,7 +1056,7 @@ class DataExplorerService:
 
         # 5. 原子持久化本轮用户提问与 AI 探查轨迹/结论
         _check_cancelled()
-        with self.ctx.store.module_db() as conn:
+        with self.ctx.store.module_db("private") as conn:
             conn.execute(
                 """
                 INSERT INTO explorer_messages (

@@ -36,6 +36,10 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 from fastapi import Request
 
 from core.platform.storage import PlatformStateStore
+from core.platform.storage_paths import (
+    decode_obfuscated_anchor,
+    encode_obfuscated_anchor,
+)
 
 LICENSE_VERSION = 1
 SCOPE_MACHINE = 1
@@ -929,6 +933,7 @@ class LicenseHub:
         verifier_pubkey: Optional[bytes] = None,
         clock_fn: Optional[Callable[[], float]] = None,
         device_probe_fn: Optional[Callable[[], Dict[str, Any]]] = None,
+        anchor_file: Optional[str] = None,
     ) -> None:
         self.store = store
         self._lock = threading.RLock()
@@ -952,8 +957,13 @@ class LicenseHub:
         self._cached_device_ts: float = 0.0
         self._failed_attempts: Deque[float] = deque()
 
-        data_dir = os.path.dirname(os.path.abspath(self.store.db_path))
-        self._anchor_file = os.path.join(data_dir, ".sys_clock_anchor")
+        if anchor_file:
+            self._anchor_file = os.path.abspath(anchor_file)
+        elif getattr(self.store, "clock_anchor_path", None):
+            self._anchor_file = os.path.abspath(str(self.store.clock_anchor_path))
+        else:
+            data_dir = os.path.dirname(os.path.abspath(self.store.private_db_path))
+            self._anchor_file = os.path.join(data_dir, ".chk", "m_anchor.bin")
 
     def _bind_test_pubkey(self, pubkey: bytes) -> None:
         """仅供自动化单元测试在进程内注入临时测试公钥，不对外暴露任何外部配置或环境变量."""
@@ -1034,17 +1044,18 @@ class LicenseHub:
         if os.path.isfile(self._anchor_file):
             try:
                 with open(self._anchor_file, "r", encoding="utf-8") as fh:
-                    obj = json.loads(fh.read())
+                    obj = decode_obfuscated_anchor(fh.read()) or {}
                 ts_val = float(obj.get("ts", 0))
                 sig = str(obj.get("sig", ""))
                 if ts_val > 0 and hmac.compare_digest(sig, self._clock_seal_hmac(ts_val, machine_code)):
                     candidates.append(ts_val)
             except Exception:
                 pass
-        # 仅在系统真实运行态参考状态库 mtime 防同时删库锚点，但测试传入自定义 clock_fn 时不受真实文件时间戳干扰
-        if self._clock_fn is time.time and os.path.isfile(self.store.db_path):
+        # 仅在系统真实运行态参考私有状态库 mtime 防同时删库锚点，但测试传入自定义 clock_fn 时不受真实文件时间戳干扰
+        priv_db = getattr(self.store, "private_db_path", self.store.db_path)
+        if self._clock_fn is time.time and os.path.isfile(priv_db):
             try:
-                candidates.append(float(os.path.getmtime(self.store.db_path)))
+                candidates.append(float(os.path.getmtime(priv_db)))
             except OSError:
                 pass
         return max(candidates) if candidates else None
@@ -1058,8 +1069,11 @@ class LicenseHub:
         }
         self.store.save_meta("license_clock_seal", seal_obj)
         try:
+            anchor_dir = os.path.dirname(self._anchor_file)
+            if anchor_dir:
+                os.makedirs(anchor_dir, exist_ok=True)
             with open(self._anchor_file, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(seal_obj))
+                fh.write(encode_obfuscated_anchor(seal_obj))
         except OSError:
             pass
 
