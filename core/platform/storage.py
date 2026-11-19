@@ -21,12 +21,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import sqlite3
+import stat
 import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,11 +41,13 @@ from core.platform.models import (
     SchemaMeta,
     TableMeta,
     compute_connection_fingerprint,
+    sanitize_jdbc_url,
     split_extra_props_secrets,
 )
 from core.platform.storage_paths import (
     decode_obfuscated_anchor,
     encode_obfuscated_anchor,
+    redact_private_storage_paths,
 )
 
 logger = logging.getLogger("dataog")
@@ -886,7 +890,10 @@ class PlatformStateStore:
                 p_conn.commit()
                 logger.info("已自动从历史状态库无损迁移数据")
             except Exception as exc:
-                logger.warning("迁移旧版状态库时遇到非致命异常: %s", exc)
+                logger.warning(
+                    "迁移旧版状态库时遇到非致命异常: %s",
+                    redact_private_storage_paths(str(exc), store=self),
+                )
             finally:
                 src_conn.close()
 
@@ -974,16 +981,25 @@ class PlatformStateStore:
                 p_conn.commit()
                 return False
 
-            # 将旧版库及其可能未 checkpoint 的 WAL/SHM 旁路文件复制到可写临时目录只读快照打开：
-            # 即使旧安装目录位于只读权限路径（如 Program Files）也 100% 无损迁移，且绝不改动旧备份目录
+            # 将旧版库及其可能未 checkpoint 的 WAL/SHM 旁路文件复制到可写临时目录打开：
+            # 使用 copyfile + 0o600 确保即使旧目录/旧文件为只读属性（如 Program Files 0o444），临时副本仍可正常恢复 WAL 并安全清理
             with tempfile.TemporaryDirectory(prefix="rt_mig_") as stage_dir:
                 staged_legacy_db = os.path.join(stage_dir, "legacy_src.db")
-                shutil.copy2(legacy_db, staged_legacy_db)
+                shutil.copyfile(legacy_db, staged_legacy_db)
+                try:
+                    os.chmod(staged_legacy_db, stat.S_IRUSR | stat.S_IWUSR)
+                except OSError:
+                    pass
                 for side_suffix in ("-wal", "-shm"):
                     side_src = legacy_db + side_suffix
                     if os.path.isfile(side_src):
                         try:
-                            shutil.copy2(side_src, staged_legacy_db + side_suffix)
+                            side_dst = staged_legacy_db + side_suffix
+                            shutil.copyfile(side_src, side_dst)
+                            try:
+                                os.chmod(side_dst, stat.S_IRUSR | stat.S_IWUSR)
+                            except OSError:
+                                pass
                         except OSError:
                             pass
 
@@ -1074,13 +1090,14 @@ class PlatformStateStore:
                             auth_mode = str((r["auth_mode"] if "auth_mode" in rkeys else "LDAP") or "LDAP")
                             sqlite_path = str((r["sqlite_path"] if "sqlite_path" in rkeys else "") or "")
                             jdbc_driver_id = str((r["jdbc_driver_id"] if "jdbc_driver_id" in rkeys else "") or "")
-                            jdbc_url = str((r["jdbc_url"] if "jdbc_url" in rkeys else "") or "")
+                            raw_jdbc_url = str((r["jdbc_url"] if "jdbc_url" in rkeys else "") or "")
+                            jdbc_url, jdbc_user, jdbc_pwd = sanitize_jdbc_url(raw_jdbc_url)
                             jdbc_driver_class = str((r["jdbc_driver_class"] if "jdbc_driver_class" in rkeys else "") or "")
                             std_fmt = str((r["standard_format"] if "standard_format" in rkeys else "AUTO") or "AUTO")
                             created_at = str((r["created_at"] if "created_at" in rkeys else now) or now)
                             updated_at = str((r["updated_at"] if "updated_at" in rkeys else now) or now)
-                            user_val = str((r["user"] if "user" in rkeys else "") or "")
-                            pwd_val = str((r["password"] if "password" in rkeys else "") or "")
+                            user_val = str((r["user"] if "user" in rkeys else "") or "") or jdbc_user
+                            pwd_val = str((r["password"] if "password" in rkeys else "") or "") or jdbc_pwd
 
                             w_conn.execute(
                                 """
@@ -1132,7 +1149,7 @@ class PlatformStateStore:
                                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """,
                                 (
-                                    f"cid:{cid}",
+                                    self._credential_row_id(cid, fp),
                                     cid,
                                     fp,
                                     db_type,
@@ -1177,7 +1194,18 @@ class PlatformStateStore:
                     w_conn.commit()
                     p_conn.commit()
                 except Exception as exc:
-                    logger.warning("迁移旧版程序目录数据时出现非致命异常: %s", exc)
+                    try:
+                        w_conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        p_conn.rollback()
+                    except Exception:
+                        pass
+                    logger.warning(
+                        "迁移旧版程序目录数据时出现非致命异常: %s",
+                        redact_private_storage_paths(str(exc), store=self, extra_paths=(assets_dir, drivers_dir)),
+                    )
                     return False
                 finally:
                     src_conn.close()
@@ -1475,11 +1503,64 @@ class PlatformStateStore:
     # 全局连接档案：工作区无密码拓扑 (connection_topology) × 私有个人凭据库 (connection_credentials)
     # =========================================================================
 
+    @staticmethod
+    def _credential_row_id(connection_id: str, endpoint_fingerprint: str) -> str:
+        """为 (connection_id, endpoint_fingerprint) 派生独立凭据主键，彻底防止不同工作区同 ID 指向不同库时互相覆盖凭据."""
+        cid = (connection_id or "").strip()
+        fp = (endpoint_fingerprint or "").strip()
+        if fp:
+            fp_tag = hashlib.sha256(fp.encode("utf-8")).hexdigest()[:12]
+            return f"cid:{cid}|fp:{fp_tag}"
+        return f"cid:{cid}"
+
+    @staticmethod
+    def _resolve_credential_for_topology(
+        cred_by_cid_rows: Dict[str, List[Dict[str, Any]]],
+        cred_by_fp: Dict[str, Dict[str, Any]],
+        *,
+        connection_id: str,
+        endpoint_fingerprint: str,
+        db_type: str = "",
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """按严格端点兼容语义解析本机个人凭据，杜绝同 connection_id 指向不同数据库时误绑旧凭据."""
+        cid = (connection_id or "").strip()
+        fp = (endpoint_fingerprint or "").strip()
+        candidates = cred_by_cid_rows.get(cid, [])
+
+        exact_cred: Optional[Dict[str, Any]] = None
+        if fp:
+            # 1. 优先匹配 (connection_id, endpoint_fingerprint) 完全一致且含有效凭据的记录
+            for row in candidates:
+                rfp = str(row.get("endpoint_fingerprint") or "").strip()
+                if rfp == fp and (row.get("user") or row.get("password")):
+                    exact_cred = row
+                    break
+            # 2. 次选同 connection_id + 同指纹（或历史未记录指纹的兼容记录），绝不匹配指向另一端点的凭据
+            if exact_cred is None:
+                for row in candidates:
+                    rfp = str(row.get("endpoint_fingerprint") or "").strip()
+                    if rfp == fp or not rfp:
+                        exact_cred = row
+                        break
+        elif candidates:
+            exact_cred = candidates[0]
+
+        fp_cred = cred_by_fp.get(fp) if fp else None
+        if (db_type or "").strip().upper() == "SQLITE":
+            return (exact_cred or fp_cred), "BOUND"
+        if exact_cred and (exact_cred.get("user") or exact_cred.get("password")):
+            return exact_cred, "BOUND"
+        if fp_cred and (fp_cred.get("user") or fp_cred.get("password")):
+            return fp_cred, "AUTO_MATCHED"
+        if exact_cred:
+            return exact_cred, "MISSING"
+        return None, "MISSING"
+
     def _load_credential_maps(
         self,
-    ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]], set[str]]:
-        """读取私有库中的个人 DB 凭据映射（按 connection_id 与 endpoint_fingerprint 双索引）与本地驱动 ID 集合."""
-        by_cid: Dict[str, Dict[str, Any]] = {}
+    ) -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[str, Dict[str, Any]], set[str]]:
+        """读取私有库中的个人 DB 凭据映射（按 connection_id 列表与 endpoint_fingerprint 双索引）与本地驱动 ID 集合."""
+        by_cid_rows: Dict[str, List[Dict[str, Any]]] = {}
         by_fp: Dict[str, Dict[str, Any]] = {}
         driver_ids: set[str] = set()
         with self._lock, self._get_private_conn() as pconn:
@@ -1489,19 +1570,19 @@ class PlatformStateStore:
             for r in cred_rows:
                 d = dict(r)
                 cid = str(d.get("connection_id") or "").strip()
-                if cid and cid not in by_cid:
-                    by_cid[cid] = d
+                if cid:
+                    by_cid_rows.setdefault(cid, []).append(d)
                 fp = str(d.get("endpoint_fingerprint") or "").strip()
                 if fp and fp not in by_fp and (d.get("user") or d.get("password")):
                     by_fp[fp] = d
             for dr in pconn.execute("SELECT driver_id FROM jdbc_drivers").fetchall():
                 driver_ids.add(str(dr["driver_id"]))
-        return by_cid, by_fp, driver_ids
+        return by_cid_rows, by_fp, driver_ids
 
     @staticmethod
     def _assemble_profile(
         row: sqlite3.Row,
-        cred_by_cid: Dict[str, Dict[str, Any]],
+        cred_by_cid_rows: Dict[str, List[Dict[str, Any]]],
         cred_by_fp: Dict[str, Dict[str, Any]],
         local_driver_ids: set[str],
     ) -> ConnectionProfile:
@@ -1519,7 +1600,7 @@ class PlatformStateStore:
         host = str(row["host"] or "")
         port = int(row["port"] or 0)
         dbname = str(row["dbname"] or "")
-        jdbc_url = str(row["jdbc_url"] or "")
+        jdbc_url = sanitize_jdbc_url(str(row["jdbc_url"] or ""))[0]
         sqlite_path = str(row["sqlite_path"] or "")
         jdbc_driver_id = str(row["jdbc_driver_id"] or "")
 
@@ -1533,25 +1614,13 @@ class PlatformStateStore:
             sqlite_path=sqlite_path,
         )
 
-        exact_cred = cred_by_cid.get(cid)
-        fp_cred = cred_by_fp.get(fp) if fp else None
-        chosen_cred = None
-        cred_status = "BOUND"
-
-        if db_type.upper() == "SQLITE":
-            chosen_cred = exact_cred or fp_cred
-            cred_status = "BOUND"
-        elif exact_cred and (exact_cred.get("user") or exact_cred.get("password")):
-            chosen_cred = exact_cred
-            cred_status = "BOUND"
-        elif fp_cred and (fp_cred.get("user") or fp_cred.get("password")):
-            chosen_cred = fp_cred
-            cred_status = "AUTO_MATCHED"
-        elif exact_cred:
-            chosen_cred = exact_cred
-            cred_status = "MISSING"
-        else:
-            cred_status = "MISSING"
+        chosen_cred, cred_status = PlatformStateStore._resolve_credential_for_topology(
+            cred_by_cid_rows,
+            cred_by_fp,
+            connection_id=cid,
+            endpoint_fingerprint=fp,
+            db_type=db_type,
+        )
 
         user_val = str(chosen_cred.get("user") or "") if chosen_cred else ""
         pwd_val = str(chosen_cred.get("password") or "") if chosen_cred else ""
@@ -1638,17 +1707,21 @@ class PlatformStateStore:
         extra_json = json.dumps(pub_extra, ensure_ascii=False)
         sec_extra_json = json.dumps(sec_extra, ensure_ascii=False)
         standard_format = (profile.standard_format or "AUTO").strip() or "AUTO"
+        clean_jdbc_url, jdbc_user, jdbc_pwd = sanitize_jdbc_url(profile.jdbc_url or "")
+        eff_user = (profile.user or "").strip() or jdbc_user
+        eff_password = profile.password if profile.password else jdbc_pwd
         fp = compute_connection_fingerprint(
             driver_track=profile.driver_track,
             db_type=profile.db_type,
             host=profile.host,
             port=int(profile.port or 0),
             dbname=profile.dbname,
-            jdbc_url=profile.jdbc_url,
+            jdbc_url=clean_jdbc_url,
             sqlite_path=profile.sqlite_path,
         )
+        cred_id = self._credential_row_id(profile.connection_id, fp)
         with self._lock:
-            # 1. 写入共享工作区：严格不含 user / password / 私密扩展属性
+            # 1. 写入共享工作区：严格不含 user / password / 私密扩展属性及 JDBC URL 内嵌凭据
             with self._get_workspace_conn() as wconn:
                 wconn.execute(
                     """
@@ -1690,7 +1763,7 @@ class PlatformStateStore:
                         profile.auth_mode,
                         profile.sqlite_path,
                         profile.jdbc_driver_id,
-                        profile.jdbc_url,
+                        clean_jdbc_url,
                         profile.jdbc_driver_class,
                         extra_json,
                         standard_format,
@@ -1700,8 +1773,14 @@ class PlatformStateStore:
                 )
                 wconn.commit()
 
-            # 2. 写入本地私有保险箱凭据库
+            # 2. 写入本地私有保险箱凭据库（按 (connection_id, endpoint_fingerprint) 独立主键隔离，跨工作区同 ID 绝不互相覆盖）
             with self._get_private_conn() as pconn:
+                legacy_cred_id = f"cid:{profile.connection_id}"
+                if cred_id != legacy_cred_id:
+                    pconn.execute(
+                        "DELETE FROM connection_credentials WHERE cred_id = ? AND (endpoint_fingerprint = ? OR endpoint_fingerprint = '')",
+                        (legacy_cred_id, fp),
+                    )
                 pconn.execute(
                     """
                     INSERT INTO connection_credentials (
@@ -1728,16 +1807,16 @@ class PlatformStateStore:
                         updated_at = excluded.updated_at
                     """,
                     (
-                        f"cid:{profile.connection_id}",
+                        cred_id,
                         profile.connection_id,
                         fp,
                         profile.db_type,
                         profile.host,
                         int(profile.port or 0),
                         profile.dbname,
-                        profile.jdbc_url,
-                        profile.user,
-                        profile.password,
+                        clean_jdbc_url,
+                        eff_user,
+                        eff_password,
                         profile.sslmode,
                         profile.auth_mode,
                         profile.sqlite_path,

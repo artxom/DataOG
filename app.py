@@ -139,6 +139,7 @@ try:
     from core.platform.context import PlatformContext
     from core.platform.license_hub import AUTH_PUBLIC_EXEMPT_PREFIXES
     from core.platform.router import router as platform_router
+    from core.platform.storage_paths import redact_private_storage_paths
     from modules.cross_comparator.router import router as cross_comparator_router
     from modules.data_explorer.router import router as data_explorer_router
     from modules.ddl_translator.router import router as ddl_translator_router
@@ -358,6 +359,35 @@ def create_app(
                 )
 
         response = await call_next(request)
+        # 全平台错误响应兜底脱敏：确保任意平台/模块路由报错均绝不向前端暴露本地私有保险箱物理路径或内部文件名
+        if (
+            req_path.startswith("/api/")
+            and response.status_code >= 400
+            and "application/json" in (response.headers.get("content-type") or "").lower()
+        ):
+            try:
+                raw_chunks: List[bytes] = []
+                if hasattr(response, "body_iterator") and response.body_iterator is not None:
+                    async for chunk in response.body_iterator:
+                        raw_chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
+                    raw_body = b"".join(raw_chunks)
+                else:
+                    raw_body = bytes(getattr(response, "body", b"") or b"")
+                raw_text = raw_body.decode("utf-8", errors="replace")
+                redacted_text = redact_private_storage_paths(raw_text, ctx=ctx)
+                passthrough_headers = {
+                    k: v
+                    for k, v in response.headers.items()
+                    if k.lower() not in ("content-length", "content-type")
+                }
+                response = Response(
+                    content=redacted_text.encode("utf-8"),
+                    status_code=response.status_code,
+                    headers=passthrough_headers,
+                    media_type="application/json",
+                )
+            except Exception:
+                pass
         return _apply_security_headers(response)
 
     # 注册平台公共底座路由与四大独立插件模块路由
@@ -372,6 +402,39 @@ def create_app(
     # =========================================================================
 
     def _safe_legacy_conn_info() -> Dict[str, Any]:
+        if store.is_split_storage:
+            active_cid = str(store.get_meta("migrator_connection_id", "") or "")
+            prof = ctx.connection_hub.get_profile(active_cid) if active_cid else None
+            if prof and prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host:
+                has_pwd = bool(prof.password)
+                return {
+                    "configured": bool(prof.host and prof.dbname and prof.user),
+                    "host": prof.host,
+                    "port": int(prof.port or (5432 if prof.db_type == "PGSQL" else 8000)),
+                    "dbname": prof.dbname,
+                    "user": prof.user,
+                    "sslmode": prof.sslmode or "prefer",
+                    "current_schema": prof.default_schema or "public",
+                    "schemas": [],
+                    "discovered_table_count": 0,
+                    "discovered_tables": [],
+                    "has_saved_password": has_pwd,
+                    "password_masked": "******" if has_pwd else "",
+                }
+            return {
+                "configured": False,
+                "host": "",
+                "port": 8000,
+                "dbname": "",
+                "user": "",
+                "sslmode": "prefer",
+                "current_schema": "public",
+                "schemas": [],
+                "discovered_table_count": 0,
+                "discovered_tables": [],
+                "has_saved_password": False,
+                "password_masked": "",
+            }
         info = dict(engine.get_public_conn_info())
         has_pwd = bool(info.pop("password", ""))
         info["has_saved_password"] = has_pwd

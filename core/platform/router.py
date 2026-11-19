@@ -16,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
 from core.platform.import_progress import ImportProgressHub
+from core.platform.storage_paths import redact_private_storage_paths
 from core.platform.schemas import (
     AppearanceResetPayload,
     AppearanceUpdatePayload,
@@ -1075,21 +1076,7 @@ def _safe_workspace_err(
         return _err("工作区文件损坏、结构异常或无法读取，请确认上传了有效的 .dataog.db / .db 文件", status_code)
     if isinstance(exc, OSError):
         return _err("本地工作区存储读写异常，请检查磁盘空间或文件权限后重试", status_code)
-    msg = str(exc or "操作失败")
-    priv_db = getattr(ctx.store, "private_db_path", "") or ""
-    ws_db = getattr(ctx.store, "workspace_db_path", "") or ""
-    raw_markers = [
-        priv_db,
-        ws_db,
-        os.path.dirname(priv_db),
-        os.path.dirname(ws_db),
-        getattr(ctx, "data_dir", "") or "",
-        os.path.basename(priv_db),
-        os.path.basename(ws_db),
-    ]
-    for marker in sorted({m for m in raw_markers if m}, key=len, reverse=True):
-        if marker in msg:
-            msg = msg.replace(marker, "<private>")
+    msg = redact_private_storage_paths(str(exc or "操作失败"), ctx=ctx)
     return _err(msg, status_code)
 
 
