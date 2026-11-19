@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+---
+
+## [2.5.2] - 2026-11-19
+
 ### Added
 - **跨库字段长度/精度包络与类型转换双维诊断引擎**：
   - 在平台方言层（`core/platform/dialects/types.py`）新增 `parse_sql_type_spec` 与 `analyze_cross_column_compatibility`，并在前端新增零依赖实时镜像 `static/js/core/type_compat.js` (`analyzeCrossColumnCompat`)，覆盖字符宽度（含无界 `STRING`/`TEXT` 转有界 `VARCHAR`、UTF-8 跨库边界）、定点数精度与小数位（`DECIMAL(p, s)` 独立校验整数位 `p-s` 与小数位 `s`）、整数位宽（自动忽略 MySQL `INT(11)` 显示宽度，识别 `BIGINT`/`INT`/`SMALLINT`/`TINYINT` 真实字节位宽）、浮点数与时间小数秒精度，输出 `capacity_status`（`CONTAINED` / `INSUFFICIENT` / `RISK` / `N/A`）与 `type_conv_status`（`NONE` / `SAFE_CAST` / `CAST_REQUIRED` / `N/A`，例如 `VARCHAR(20) → DATE` 标记为需显式类型转换）。
@@ -15,6 +19,9 @@
   - 优化 `PlatformStateStore.list_cross_tables()` SQL，通过 `GROUP_CONCAT(DISTINCT ...)` 单次聚合来源/目标/标准字段与注释文本，并在 `modules/cross_comparator/router.py` 新增 `GET /api/modules/cross_comparator/pairs/search` 接口（联合检索 `cross_table_bindings`、`cross_column_bindings`、`meta_columns` 与 `field_standard_bindings`）。
   - 在 `CrossComparatorView` `.mac-subbar` 左上角落地自定义可搜索选择器 `.cross-pair-picker`，支持本地 0ms 即时过滤 + 120ms 防抖后端精确/字段检索、键盘上下切换及高亮匹配字段上下文，彻底不丢失焦点与中文输入法合成状态。
 - **自动化测试覆盖增强**：新增 `test_cross_column_capacity_and_type_conversion_matrix` 与 `test_cross_compat_pair_search_and_report_columns`（含离线 HTML 内嵌 JS `.xlsx` 24 列 Node.js 往返验证），全量自动化测试扩展至 44 项。
+
+### Changed
+- **正式发布 `Data.O.G v2.5.2`**：同步升级 `app.py` 与 `PlatformContext` 版本号至 `2.5.2`，并触发 GitHub Actions 自动构建发布 `DataOG-Windows-x64-v2.5.2.zip`（内含 `DataOG.exe`）。
 
 ---
 
