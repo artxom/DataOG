@@ -2730,6 +2730,8 @@ dialog::backdrop {
 }
 
 .cross-pair-input {
+  -webkit-appearance: none;
+  appearance: none;
   flex: 1;
   min-width: 0;
   height: 23px;
@@ -2738,6 +2740,14 @@ dialog::backdrop {
   background: transparent !important;
   box-shadow: none !important;
   font-size: 11.5px;
+  text-overflow: ellipsis;
+}
+
+.cross-pair-input::-webkit-search-cancel-button,
+.cross-pair-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
 }
 
 .cross-pair-input.has-selection {
@@ -2994,6 +3004,8 @@ dialog::backdrop {
 }
 
 .cross-matrix-search-input {
+  -webkit-appearance: none;
+  appearance: none;
   flex: 1;
   min-width: 0;
   height: 21px;
@@ -3003,6 +3015,14 @@ dialog::backdrop {
   box-shadow: none !important;
   font-size: 11.5px;
   color: var(--os-text);
+  text-overflow: ellipsis;
+}
+
+.cross-matrix-search-input::-webkit-search-decoration,
+.cross-cand-search-input::-webkit-search-decoration,
+.cross-table-search-input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
 }
 
 /* macOS 对称双端数据源配置甲板 (Source <-> Target Endpoint Deck) */
@@ -3019,11 +3039,16 @@ dialog::backdrop {
   flex-shrink: 0;
 }
 
+.cross-env-strip.has-open-picker,
+.cross-env-strip:has(.is-picker-open) {
+  z-index: 55;
+}
+
 .cross-endpoint-card {
   position: relative;
   display: flex;
   flex-direction: column;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 4px;
   min-width: 0;
   padding: 5px 9px;
@@ -3195,6 +3220,7 @@ dialog::backdrop {
   font-family: var(--font-mono);
   font-size: 11.5px;
   min-width: 0;
+  text-overflow: ellipsis;
 }
 
 .cross-ep-schema-input {
@@ -3304,6 +3330,8 @@ dialog::backdrop {
 }
 
 .cross-table-search-input {
+  -webkit-appearance: none;
+  appearance: none;
   flex: 1;
   min-width: 0;
   height: 20px;
@@ -3313,6 +3341,7 @@ dialog::backdrop {
   box-shadow: none !important;
   font-size: 11.5px;
   color: var(--os-text);
+  text-overflow: ellipsis;
 }
 
 .cross-table-popover-meta {
@@ -3652,6 +3681,8 @@ dialog::backdrop {
 }
 
 .cross-cand-search-input {
+  -webkit-appearance: none;
+  appearance: none;
   flex: 1;
   min-width: 0;
   height: 21px;
@@ -3661,6 +3692,7 @@ dialog::backdrop {
   box-shadow: none !important;
   font-size: 11.5px;
   color: var(--os-text);
+  text-overflow: ellipsis;
 }
 
 /* 待选字段滚动区：采用 Grid max-content 杜绝一切纵向挤压与卡片重叠 */
@@ -4300,7 +4332,27 @@ dialog::backdrop {
   color: var(--os-text-secondary);
   background: color-mix(in srgb, var(--cross-card-bg) 72%, transparent);
   cursor: pointer;
-  transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease;
+  transition: border-color 0.14s ease, background 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.cross-matrix-row.is-dropzone-row.is-active-dropzone,
+.cross-five-workspace.is-field-dragging .cross-matrix-row.is-dropzone-row {
+  position: sticky;
+  bottom: 8px;
+  z-index: 7;
+  pointer-events: none;
+}
+
+.cross-matrix-row.is-dropzone-row.is-active-dropzone .cross-new-std-dropzone,
+.cross-five-workspace.is-field-dragging .cross-matrix-row.is-dropzone-row .cross-new-std-dropzone {
+  pointer-events: auto;
+  border-style: solid;
+  border-color: var(--os-accent);
+  color: var(--os-accent);
+  background: color-mix(in srgb, var(--os-drawer-bg) 88%, var(--cross-card-bg));
+  backdrop-filter: blur(18px) saturate(180%);
+  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18), 0 0 0 0.5px color-mix(in srgb, var(--os-accent) 30%, transparent);
 }
 
 .cross-new-std-dropzone:hover,
@@ -4309,6 +4361,12 @@ dialog::backdrop {
   border-color: var(--os-accent);
   color: var(--os-accent);
   background: var(--os-select);
+}
+
+.cross-matrix-row.is-dropzone-row.is-active-dropzone .cross-new-std-dropzone:hover,
+.cross-matrix-row.is-dropzone-row.is-active-dropzone .cross-new-std-dropzone.is-drop-target,
+.cross-five-workspace.is-field-dragging .cross-matrix-row.is-dropzone-row .cross-new-std-dropzone.is-drop-target {
+  background: color-mix(in srgb, var(--os-accent) 16%, var(--cross-card-bg));
 }
 
 .cross-filter-empty {
