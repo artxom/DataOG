@@ -65,15 +65,15 @@
    - **推送、发版与分支清理**：合并回 `main` 后推送至 `origin`；里程碑发版按 SemVer（如 `v2.0.0`、`v2.1.0`）创建附注标签（`git tag -a vX.Y.Z -m "..."`）并推送标签以触发 `.github/workflows/ci.yml` 自动测试与 Windows `.exe` Release 发布；合并完成后及时删除已使命终结的临时本地与远端工作分支，保持 GitHub 仓库分支树整洁，并确认远端 GitHub Actions CI 状态全绿。
 
 ## 5. 当前代码基线快照（供下次会话快速定位）
-- **当前主干里程碑版本**：`v2.6.0`（官方品牌名 `Data.O.G`，离线非对称激活码登录拦截、C 原生防反编译护盾与零依赖独立生成器版，`main` 分支与 `v2.6.0` 标签同步至 `origin`）。
+- **当前主干里程碑版本**：`v2.6.1`（官方品牌名 `Data.O.G`，macOS Sequoia 跨环境比对防重叠工作台、Windows `_license_shield.dll` 多编译器静态构建与 GitHub Release 自动发布版，`main` 分支与 `v2.6.1` 标签同步至 `origin`）。
 - **微内核入口与构建脚本**：
-  - `app.py`：FastAPI `2.6.0` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 与 Gate 1 全量 `/api/*` 激活码授权拦截中间件、挂载平台路由与四大插件模块路由，保留 `/api/bootstrap` 脱敏兼容探针且受 Gate 2 鉴权）。
+  - `app.py`：FastAPI `2.6.1` 微内核入口（`create_app`、动态 `/favicon.ico`、UTF-8 流保护、Windows 防挂起、高频进度/任务轮询 `200` 日志降噪过滤器、安全头/CSRF 与 Gate 1 全量 `/api/*` 激活码授权拦截中间件、挂载平台路由与四大插件模块路由，保留 `/api/bootstrap` 脱敏兼容探针且受 Gate 2 鉴权）。
   - `requirements.txt`：保持 8 项纯运行时核心依赖（`fastapi`、`pydantic`、`uvicorn`、`psycopg2-binary`、`PyMySQL`、`JPype1`、`openpyxl`、`python-multipart`），零新增第三方依赖。
-  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：自动执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（编译内嵌 `_license_shield` 原生护盾、内置 `--icon=static/dataog.ico` 多尺寸 `.exe` 品牌图标、排除 `tools` 等非运行时包与测试子模块外多余元数据，保障冻结态 `--test` 自检）。
-  - `tools/keygen_src/keygen.c` & `tools/build_keygen.py`：本地零环境依赖独立 C 激活码生成器构建器，读取本地 `.keygen_secrets/master_ed25519.key` 编译产出 `./keygen/DataOG_Keygen`（或 Windows `.exe`），支持自动采集本机 IP/机器码、粘贴远端设备申请码 (`REQ1-...`) 签发与全局通用码签发（严格 `.gitignore` 隔离不入库）。
+  - `build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`：先预检编译 `_license_shield` 原生护盾（规避 Windows 下 `ctypes` 预先映射旧 DLL 导致文件锁）再执行单测门禁后轻量化打包 `dist/DataOG/DataOG.exe`（内置 `--icon=static/dataog.ico` 多尺寸 `.exe` 品牌图标、校验产物中 `_license_shield` 存在性、排除 `tools` 等非运行时包与测试子模块外多余元数据，保障冻结态 `--test` 自检与 `v*` 标签自动发布 GitHub Releases）。
+  - `tools/keygen_src/keygen.c` & `tools/build_keygen.py`：本地零环境依赖独立 C 激活码生成器构建器，兼容 MinGW `gcc` 静态运行时、LLVM `clang` (`libcmt`) 与 MSVC `cl` (`/MT`)，读取本地 `.keygen_secrets/master_ed25519.key` 编译产出 `./keygen/DataOG_Keygen`（或 Windows `.exe`），支持自动采集本机 IP/机器码、粘贴远端设备申请码 (`REQ1-...`) 签发与全局通用码签发（严格 `.gitignore` 隔离不入库）。
 - **全局共享底座 (`core/platform/`) — 挂载前缀 `/api/platform`**：
   - `context.py` (`PlatformContext`，同时暴露 `task_progress = import_progress`；`get_platform_context` 内置 Gate 2 请求级动态 HMAC 能力令牌复核) / `router.py`（含 `/auth/status`、`/auth/activate`、`/auth/lock` 免拦截认证路由） / `schemas.py` / `models.py`
-  - `license_hub.py` & `_license_native_src/`（`license_core.h` + `license_shield.c`）：RFC 8032 Ed25519 确定性非对称签名校验、混淆拆分公钥查找表、C 原生动态库 64 位随机挑战-应答 MAC 防补丁桥接、跨平台物理机器码与本机 IPv4 探测、防爆破限流、双位置硬件密封单调时钟防回拨水印（`app_meta['license_clock_seal']` + `data/.sys_clock_anchor`）。
+  - `license_hub.py` & `_license_native_src/`（`license_core.h` + `license_shield.c`）：RFC 8032 Ed25519 确定性非对称签名校验、混淆拆分公钥查找表、C 原生动态库 64 位随机挑战-应答 MAC 防补丁桥接（编译期自动验证动态库可加载性并通过 `_ctypes` 立即释放句柄、Windows 注册表采用全版本兼容 `RegOpenKeyExA + KEY_WOW64_64KEY` 且优先排序物理网卡 IP 兼顾云服务器 Hyper-V/VMware 主网卡识别）、防爆破限流、双位置硬件密封单调时钟防回拨水印（`app_meta['license_clock_seal']` + `data/.sys_clock_anchor`）。
   - `storage.py` (`PlatformStateStore`，SQLite WAL 状态库 `data/dataog_state.db`，暴露线程安全 `module_db()` 上下文、`count_cross_columns()`、`list_cross_tables()`（含字段文本 `GROUP_CONCAT` 聚合）与批量元数据缓存读写，核心与模块表：`app_meta`、`connection_profiles`、`jdbc_drivers`、`llm_providers`、`standard_dictionary`、`field_standard_bindings`、`meta_schemas`、`meta_tables`、`meta_columns`、`migration_items`、`cross_table_bindings`、`cross_column_bindings`、`explorer_sessions`、`explorer_messages`、`execution_logs`)
   - `standard_catalog.py` (`StandardCatalog`，管理全局 46 列标准字典 Upsert/Replace 导入与导出、脱敏系统模板生成、多库物理格式智能解析、三级落标判定、`bulk_save_field_bindings` 单事务分块绑定持久化、B-Tree 半开区间精确清理与 `match_standard_candidates_batch` 批量候选匹配，挂载 `/standards*`)
   - `offline_report.py`（库级单 Sheet `.xlsx` 与零外部依赖离线交互 `.html` 生成引擎：`build_single_db_excel_bytes`、`build_cross_env_excel_bytes`、`build_single_db_html_bytes`、`build_cross_env_html_bytes`，跨环境报告输出含「目标长度/精度包络」「是否涉及类型转换」的 24 列体系、KPI/胶囊/下拉筛选、内嵌纯 JS 单 Sheet OOXML `.xlsx` 导出器、XSS 安全 JSON 嵌入与 Excel 公式防注入清洗）
@@ -98,11 +98,11 @@
     - **数据探查**：`sql_console_view.js` + `explorer_ai_pane.js`（`SQL 查询` | `AI 探查`，共用左侧 DataGrip 四级数据库清单、实时任务微日志并支持探查 SQL 一键同步至主编辑器）
     - **数据标准**：`standard_view.js` + `standard_dict_view.js` + `standard_migrator_view.js`（含左侧按库设定标准格式卡片与统一库级报告导出） + `cross_comparator_view.js`（macOS Sequoia 五虚拟列防重叠工作台 + 吸顶毛玻璃三列表头分隔与平静分段筛选栏/IME 安全检索 + 拖拽边缘自动滚屏与吸底 `+ 绑定新标准` 投放区 + 持久化双端 macOS 弹出选单与防遮挡向上翻转缓存表浮层 + `.mac-subbar` 可搜索表名/字段级 `.cross-pair-picker` + 按需紧凑长度包络/类型转换诊断底栏 + `TaskActivityBar` 秒切预热 + 统一库级报告导出）（`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`）
     - **多邻国**：`ddl_translator_view.js`（智能命名 | 方言翻译）
-- **全量自动化测试套件 (`tests/`，当前共 51 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
+- **全量自动化测试套件 (`tests/`，当前共 52 项测试全绿，内置标准库内存 ASGI 测试客户端免 `httpx` 依赖)**：
   - `tests/test_core.py`（14 项）：验证单库保序重建、拓扑改名、分区继承、三栏比对、跨库长度/精度包络与类型转换双维判定全矩阵（`test_cross_column_capacity_and_type_conversion_matrix`）、DDL 互译与四层视图穿透核心引擎。
   - `tests/test_platform.py`（15 项）：验证旧版状态库无损迁移、数据源 `standard_format` 幂等迁移与持久化、`TaskProgressHub` 缩略微日志与 SSE、`ConnectionHub.probe_session` 60s 温连接复用、`MetadataHub` 120s 负缓存与单连接视图穿透、双轨驱动 `.jar` 安全校验与无 Java 降级、`MetadataHub` 缓存检索与单会话多表批量探查（含 DWS/PG 会话级锁等待超时降级与逐表异常熔断）、`StandardCatalog` 46 列导入与多库格式解析及 B-Tree 区间绑定清理、Excel 公式最终结果求值与 `#N/A` 置空清洗、`QueryEngine` 安全截断、`AssetStore` 光栅魔数头与路径穿越防护、`LLMHub` 标准库 HTTP 回环与密钥脱敏、`ReadOnlySqlGuard` 红队绕过拦截矩阵及跨驱动硬件只读回滚防线。
   - `tests/test_modules_and_api.py`（16 项）：验证 FastAPI 全路由契约、macOS 底部 Dock 与三步式数据标准（标准字典 -> 按库设标与落标绑定核验 -> 跨环境五虚拟列防重叠网格、吸顶表头对齐、筛选态 `realIdx` 完整性、Schema 隔离与 `.mac-subbar` 顶栏防遮蔽闭环）、跨库长度/精度包络与类型转换判定、`/pairs/search` 表及字段级检索与 24 列报告导出（`test_cross_compat_pair_search_and_report_columns`）、`/compare-pair` 轻量切表与 `/prefetch-pairs` 批量预热及跨模块 `X-Task-Id` 缩略微日志、单库与跨环境库级离线交互 `.html` / 单 Sheet `.xlsx` 报告（空目录先采再出、推荐同名未保存表不预比对、Node.js 内嵌纯 JS `.xlsx` 24 列闭环与搜索框 DOM 稳定性校验）、4631 行×160 表批量绑标压测与离线探查熔断保护、全流程系统模板下载、外观与自定义图标端到端流转、多邻国智能命名与 `AST+AI` 方言适配、AI 只读数据探查多步采样与幻觉写语句实时拦截保护、插件模块零互引（AST/字节码双模）及前端零 `innerHTML` 安全红线。
-  - `tests/test_license_auth.py`（6 项）：验证 RFC 8032 Ed25519 标准向量、C 原生护盾 64 位挑战-应答 MAC 防补丁桥接与闰年日历对拍、生产混淆公钥预签发向量核验、Gate 1 + Gate 2 双重未激活 `401` 拦截、确定性设备专属码（多网卡适配、异机/异 IP 拷贝状态库拦截、篡改状态库拦截）、全局通用码/过期/防时钟回拨水位线/手动锁定/账号模式禁用与独立零依赖 C 生成器编译与 CLI 全链路闭环。
+  - `tests/test_license_auth.py`（7 项）：验证 RFC 8032 Ed25519 标准向量、C 原生护盾 64 位挑战-应答 MAC 防补丁桥接与闰年日历对拍、生产混淆公钥预签发向量核验、Gate 1 + Gate 2 双重未激活 `401` 拦截、确定性设备专属码（多网卡适配、异机/异 IP 拷贝状态库拦截、篡改状态库拦截）、全局通用码/过期/防时钟回拨水位线/手动锁定/账号模式禁用、独立零依赖 C 生成器编译与 CLI 闭环，以及 Windows 多编译器静态命令矩阵与 `_WIN32` C11 头文件严格语法回归校验。
 
 ## 6. AI 只读探查硬隔离铁律与后续演进守则
 - **绝对只读四道硬防线（后续任何涉及 AI 自动查询的功能均须严格复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束）**：

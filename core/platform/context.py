@@ -84,7 +84,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.6.0",
+            "version": "2.6.1",
             "license": self.license_hub.get_auth_status(),
             "appearance": self.asset_store.get_public_appearance(),
             "connections": connections,

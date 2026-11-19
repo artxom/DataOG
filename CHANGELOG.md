@@ -6,13 +6,21 @@
 
 ## [Unreleased]
 
+---
+
+## [2.6.1] - 2026-11-19
+
 ### Changed
+- **正式发布 `Data.O.G v2.6.1`**：同步升级 `app.py` 与 `PlatformContext` 版本号至 `2.6.1`，整合离线非对称激活码防反编译护盾、「3. 跨环境比对」macOS Sequoia 防重叠重构与 Windows 云端独立 `.exe` 自动化发布流水线，全量自动化单元测试扩展至 **52 项**。
 - **整体重新设计「3. 跨环境比对」为原生 macOS Sequoia 视觉与五虚拟列工作台 (`static/js/views/cross_comparator_view.js`, `static/css/workbench.css`, `static/css/tokens.css`, `static/js/core/dom.js`)**：
   - 重构顶部控制栏与对称双端数据源配置甲板（`来源库` ⇄ `标准对齐` ⇄ `目标库`，`< 920px` 窄窗自动纵向叠放）：将所有 `<select>` 升级为明暗双主题原生感 macOS `NSPopUpButton` 上下箭头弹出按钮，将双端 `Schema` / `表名` 输入框升级为持久化防失焦节点（支持粘贴 `schema.table` 自动拆分覆盖旧模式名），并将 `选表 (N) ▾` 升级为支持关键字实时检索、中文输入法组合态 (`isComposing`) 防误触、键盘上下选表、`150` 项截断保护、一键目录刷新及矮屏自适应翻转钳高 (`.is-flip-up`) 的 macOS 毛玻璃浮层。
   - 在中栏吸顶毛玻璃表头（`position: sticky` + `backdrop-filter`，含三列标题徽标聚拢与竖向列分隔线）下集成单行定高对齐的平静中性 macOS 状态筛选栏（`全部` / `一致` / `差异` / `单侧` / `待贯标` / `位长/精度不足` / `类型转换`，消除未选中红橙边框噪音、支持滚轮横向滑动与柔化边缘渐隐，并配合响应式五栏轨道保障 `1024px`/`840px` 五列同屏完整可见且零生硬截字）与 IME 安全的实时搜索框，支持在筛选态下基于真实行索引 (`realIdx`) 精准增删改配对、绑定新标自动揭示隐藏行且全量保存绝不丢失隐藏行。
   - 将中栏对标卡片升级为纯粹中性的明暗双主题 macOS 卡片 + 水平连接桥线与左侧风险色条（彻底移除一致态整卡绿框与红绿撞色噪音，异标三键统一为无歧义的 `采用源标` / `采用目标` / `拆为两行`）；正常兼容行自动收敛为紧凑双行卡片（省去冗余 `可包住` / `无转换` 底栏，`1440×900` 同屏清晰容纳 9+ 行），修复长物理类型胶囊（如 `TIMESTAMP(6) WITHOUT TIME ZONE`）块级省略号截断，并补齐四套明暗主题细滚动条令牌避免经典白色滚动条突兀展示。
 
 ### Fixed
+- **修复 Windows 云端打包 `_license_shield.dll` 与独立生成器编译兼容问题 (`core/platform/_license_native_src/license_core.h`, `core/platform/license_hub.py`, `tools/build_keygen.py`, `tools/keygen_src/keygen.c`, `build_exe.py`, `tests/test_license_auth.py`)**：
+  - 移除 `license_core.h` 在 `_WIN32_WINNT < 0x0A00` 时未声明的 Windows 10 专属宏 `RRF_SUBKEY_WOW6464KEY`，改为全版本 Windows SDK / MinGW-w64 / MSVC 通用的 `RegOpenKeyExA(..., KEY_READ | KEY_WOW64_64KEY, ...)` + `RegQueryValueExA`（与 Python `winreg` 100% 对齐），补齐 DLL 内部 `WSAStartup` 自初始化，并优化网卡排序策略（物理网卡优先同时保留 Hyper-V / Azure / VMware 云主机主网卡与 UDP 路由回退，防止云端与企业虚拟机被误判为 `127.0.0.1`）。
+  - 升级 `compile_native_license_shield` 与 `build_keygen` 支持 Windows 多编译器静态运行时构建矩阵（MinGW `gcc` `-static -static-libgcc -fno-stack-protector` 零外部 MinGW DLL 依赖、LLVM `clang` `--dependent-lib=libcmt`、MSVC `cl` `/MT`），编译至临时目录并通过 `ctypes` 加载自检 + `_ctypes.FreeLibrary` 立即释放句柄；调整 `build_exe.py` 在运行单测前先行编译原生护盾并校验打包产物完整性，彻底消除 Windows 进程内存映射 DLL 文件锁冲突，新增第 52 项跨平台 `_WIN32` C11 严格语法回归单测。
 - **彻底根除「3. 跨环境比对」多字段行纵向挤压互相叠加、滚动位置丢失与表头裁切错位问题 (`static/css/workbench.css`, `static/js/views/cross_comparator_view.js`, `tests/test_modules_and_api.py`)**：
   - 修复原 `.cross-matrix-pane` 采用 `display: flex; flex-direction: column` 配合 `.cross-matrix-row { min-height: 52px }`（未声明 `flex-shrink: 0`）导致字段数较多时每行被强制压缩至 `52px`、内部 3 行卡片内容向下溢出并互相叠加覆盖的严重布局缺陷；改用纯块级滚动容器 + `display: grid; grid-auto-rows: max-content; align-content: start` 与 `flex-shrink: 0` 双重防挤压机制，确保任意行数与内容高度自适应零重叠。
   - 将五栏滚动容器改为持久化 DOM 实例挂载，彻底解决点击待选卡片、解绑、绑标或统一异标时重渲染导致三栏 `scrollTop` 跳回顶部（`0`）的问题，支持 `Escape` 取消已选待选字段、长表拖拽上下边缘自动滚屏（`dragover` auto-scroll）及点选/拖拽态下吸底悬浮 `+ 绑定新标准` 投放栏（任意滚动位置零翻页直达绑标）。
