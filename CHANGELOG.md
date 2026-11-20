@@ -6,11 +6,17 @@
 
 ## [Unreleased]
 
+---
+
+## [2.7.1] - 2026-11-20
+
 ### Added
 - **「启明商业银行」信创数仓治理混合演示沙箱套件 (`demo_sandbox/`)**：
   - 提供独立容器编排与运维脚本 (`docker-compose.yml`、`sandbox_ctl.py`、`sandbox.sh`)：以 PostgreSQL 16 (`15432`) 仿真华为 GaussDB(DWS)、Spark 3.5.5 HiveThriftServer2 (`11000`) 仿真星环 Inceptor、MySQL 8.0 (`13306`) 扮演核心交易源库，并支持 `--registry-prefix` 镜像加速、`reset` 8 秒不重启容器极速复原及 `bootstrap-demo-home` 隔离预装。
   - 构建 164 条金融数据标准资产 (`banking_catalog.py`)，支持导出 46 列多库物理格式标准字典 Excel 与批量绑标示范模板；构建确定性造数引擎 (`live_seeder.py`)，灌入约 3 万行客户/账户/合同/借据/流水/押品/授信样本，精准注入 5 大金融业务暗雷（7 笔负余额不良 `-1,680万`、12 笔逾期 >180 天错标正常 `1.48亿`、48 笔 `4.95~4.99万` 反洗钱拆单 `238.92万`、核心 MySQL vs DWS `3,650万` 授信对账差额、5 笔 `>=1000万` 零利率无押品放款 `9,000万`）及 `DIRECT_ALTER` / `TABLE_REBUILD` 现场真改表靶表、四层级联视图。
   - 构建双零密钥 `.dataog.db` 工作区生成器 (`workspace_builder.py`)，产出活库现场工作区与 156 星环表×162 DWS 表超大规模压测兜底工作区，配套高层演示剧本 (`DEMO_PLAYBOOK.md`)；同步更新 `build_exe.py` 与 `.gitignore` 严格隔离生成产物与安装包。
+- **每次变更强制升版打 Tag 与 CI 自动发版闭环规范 (`.agents/skills/release-and-ship/SKILL.md`, `AGENTS.md`, `tests/test_workspace_separation.py`)**：
+  - 在 `AGENTS.md` 第 4 节固化「任何代码/前端/打包/运行变更合入 `main` 后必须同步 SemVer 版本号、归并 `CHANGELOG.md` 正式版本并创建推送 `vX.Y.Z` 附注标签触发 GitHub Actions Windows `DataOG.exe` 自动编译与 Release 发布」铁律，配套新建 `.agents/skills/release-and-ship/SKILL.md` 标准化发版 SOP（含防误改 `WORKSPACE_FORMAT_VERSION` 护栏），将 `AGENTS.md` 精简至 `< 24 KB` 消除上下文截断，并将 `/api/platform/bootstrap` 版本单测改为与 `app.version` 动态对齐。
 - **全量自动化测试扩充至 67 项 (`tests/test_demo_sandbox.py`, `tests/test_core.py`, `tests/test_platform.py`, `tests/test_modules_and_api.py`)**：新增标准 PostgreSQL 无 DWS 系统函数安全降级单测、Spark/新版 Inceptor `DESCRIBE FORMATTED` 解析单测、零 Docker 银行沙箱全链路闭环单测、仅注释差异 SQL 生成与多方言预览单测（`test_comment_only_migration_sql_and_multi_dialect_preview`）以及全局跨表/跨库持久化贯标队列与前端防重绘收敛端到端单测（`test_global_persistent_migration_queue_perf_and_sql_preview`）。
 
 ### Changed
@@ -24,8 +30,6 @@
   - 明确单库落标绑定、入队生成与贯标 SQL 生成 100% 由本地确定性规则/方言引擎完成（未调用大模型 API）；精准定位真实慢因并完成四层优化：① 消除 `stage-migration` 每次同步全队列触发远端数据库连接与全库统计扫描，改为利用本地元数据与标准规范全内存预计算 DDL 与执行策略；② `LicenseHub` 新增 60 秒热验签缓存、`get_meta_batch` 单次读库、60 秒真实时钟水印落盘节流与 Gate 2 30 秒 HMAC 能力令牌快速复核（消除每请求重复 Ed25519 + 双倍 IO）；③ `StandardCatalog.purge_invalid_error_bindings` 按 `(workspace_db_path, connection_id)` 会话级幂等缓存去重（导入场景 `force=True`）；④ `DataGrid` / `DatabaseTree` 勾选与点选改为 `DocumentFragment` + 原位 DOM 类名同步（彻底消除全表重建重绘），搜索输入防抖 `120ms`，收敛 CSS 重度 `backdrop-filter` 模糊半径并为表格/目录树补齐 `contain: layout style` 与纯合成器 `taskPulse`。
 - **修复「仅注释差异」场景生成错误重构/冗余 DDL 问题 (`core/platform/dialects/types.py`, `core/dws_engine.py`, `modules/standard_migrator/service.py`, `static/js/views/standard_migrator_view.js`)**：
   - 新增 `analyze_item_changes` 与 `item_requires_table_rebuild`，严格识别并保留仅注释差异列（兼容大小写与 `VARCHAR2`/`DEC`/`DOUBLE`/`DATETIME`/`STRING` 同义词）：即使处于 DWS 列存表或分布键/分区键上也绝不误触发整表重建（`TABLE_REBUILD`），`DIRECT_ALTER` 原地仅输出干净的 `COMMENT ON COLUMN`（不改原字段名大小写、零差异时不生成空 `BEGIN; COMMIT;`），整表重建顺带透传时跳过多余 `CAST`/`AS`；队列 `SQL` 按钮改为按任务直达多方言单条 SQL 预览弹窗（`openItemSqlPreviewModal`），对真实需重建项再引导打开保序重建脚本预览。
-
-### Fixed
 - **修复 `DWSMigratorEngine` 在标准 PostgreSQL 上探查 DWS 专有函数失败触发 `InFailedSqlTransaction` 问题 (`core/dws_engine.py`)**：将只读探查与执行路径中的 `with self._open_dws_connection() as conn:` 统一改为 `contextlib.closing(...)` 以确保 `conn.autocommit = True` 真正生效并在退出时释放连接，同时在各降级 `except` 分支补充 `_rollback_if_needed(conn)` 保护。
 - **增强 `MetadataHub._probe_inceptor_table` 对 Spark Thrift / 新版 Inceptor `DESCRIBE FORMATTED` 的兼容解析 (`core/platform/metadata_hub.py`)**：支持 `Type=VIEW`、`View Text` 与 `Comment` 在首两列的详情提取。
 
