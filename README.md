@@ -80,7 +80,8 @@ DataOG/
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
 │   └── js/                       # main.js（登录门禁联动、底部 Dock 与窗口管理器）、core/（含 type_compat.js）、ui/（含 AuthGate / TaskActivityBar / ExportReportModal）、views/（四大模块视图）
 ├── tools/                        # 独立零环境依赖 C 激活码生成器源码与构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
-├── tests/                        # 61 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 模块隔离与零 XSS 守卫）
+├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
+├── tests/                        # 65 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 演示沙箱资产闭环 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -118,7 +119,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（61 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（65 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、演示沙箱闭环、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检
@@ -128,7 +129,21 @@ python3 app.py --test
 python3 app.py
 ```
 
-### 2. 在 Windows 下打包为独立免安装程序 (`DataOG.exe`)
+### 2. 本地银行信创演示沙箱（无甲方集群高保真全链路演练）
+需要向管理层或客户现场演示**华为 DWS / 星环 Inceptor / 核心 MySQL** 全链路治理与 AI 探查能力时，可使用内置独立演示套件 [demo_sandbox/README.md](./demo_sandbox/README.md) 与剧本 [DEMO_PLAYBOOK.md](./demo_sandbox/DEMO_PLAYBOOK.md)：
+```bash
+# 一键启动三引擎同源容器（PG16 演 DWS + Spark Thrift 演 Inceptor + MySQL8）并灌入 3 万+ 行含 5 大业务暗雷的金融样本
+./demo_sandbox/sandbox.sh up
+
+# 向隔离演示目录预装双工作区（活库工作区 + 150 表大中台压测工作区）与连接凭据后启动演示桌面
+./demo_sandbox/sandbox.sh bootstrap-demo-home
+DATAOG_HOME="./demo_sandbox/.demo_home" python3 app.py
+
+# 演练改表后 10 秒不重启容器极速复原现场
+./demo_sandbox/sandbox.sh reset
+```
+
+### 3. 在 Windows 下打包为独立免安装程序 (`DataOG.exe`)
 ```bash
 # 安装打包器后直接执行打包脚本（或双击 build_windows.bat，产出于 dist/DataOG/DataOG.exe）
 python -m pip install "pyinstaller>=6.10.0"
