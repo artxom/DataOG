@@ -1,0 +1,100 @@
+name: dataog-demo
+
+services:
+  qiming-dws:
+    image: ${DOCKER_REGISTRY_PREFIX:-}${DEMO_PG_IMAGE:-postgres:16-alpine}
+    container_name: qiming-dws
+    environment:
+      POSTGRES_DB: qiming_dws
+      POSTGRES_USER: dws_admin
+      POSTGRES_PASSWORD: ${DEMO_DWS_PASSWORD:-DemoDws@2026}
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dws_admin -d qiming_dws"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    mem_limit: 512m
+    networks:
+      - qiming-net
+
+  qiming-inceptor:
+    image: ${DOCKER_REGISTRY_PREFIX:-}${DEMO_SPARK_IMAGE:-apache/spark:3.5.5}
+    container_name: qiming-inceptor
+    environment:
+      TZ: Asia/Shanghai
+      HOME: /tmp
+    command:
+      - /opt/spark/bin/spark-submit
+      - --class
+      - org.apache.spark.sql.hive.thriftserver.HiveThriftServer2
+      - --master
+      - local[2]
+      - --driver-memory
+      - 768m
+      - --conf
+      - spark.sql.catalogImplementation=hive
+      - --conf
+      - spark.sql.warehouse.dir=/tmp/spark-warehouse
+      - --conf
+      - spark.hadoop.javax.jdo.option.ConnectionURL=jdbc:derby:;databaseName=/tmp/metastore_db;create=true
+      - --conf
+      - spark.hadoop.hive.server2.thrift.port=10000
+      - --conf
+      - spark.hadoop.hive.server2.thrift.bind.host=0.0.0.0
+      - --conf
+      - spark.hadoop.hive.server2.authentication=NONE
+      - --conf
+      - spark.ui.enabled=false
+      - spark-internal
+    ports:
+      - "127.0.0.1:11000:10000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -c 'exec 3<>/dev/tcp/127.0.0.1/10000 && exec 3>&-' || python3 -c 'import socket; s=socket.create_connection((\"127.0.0.1\", 10000), 2); s.close()'",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    mem_limit: 1536m
+    networks:
+      - qiming-net
+
+  qiming-mysql:
+    image: ${DOCKER_REGISTRY_PREFIX:-}${DEMO_MYSQL_IMAGE:-mysql:8.0}
+    container_name: qiming-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DEMO_MYSQL_PASSWORD:-DemoMysql@2026}
+      MYSQL_DATABASE: core_bank_ods
+      MYSQL_USER: core_reader
+      MYSQL_PASSWORD: ${DEMO_MYSQL_PASSWORD:-DemoMysql@2026}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --innodb-buffer-pool-size=128M
+    ports:
+      - "127.0.0.1:13306:3306"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mysqladmin ping -h 127.0.0.1 -u root -p\"${DEMO_MYSQL_PASSWORD:-DemoMysql@2026}\"",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 25
+      start_period: 10s
+    mem_limit: 640m
+    networks:
+      - qiming-net
+
+networks:
+  qiming-net:
+    driver: bridge
