@@ -164,7 +164,7 @@ class TestWorkspaceThreeTierSeparation(unittest.TestCase):
                     )
 
             boot = client.get("/api/platform/bootstrap").json()
-            self.assertEqual(boot["version"], "2.7.0")
+            self.assertEqual(boot["version"], app.version)
             self.assertEqual(boot["storage_mode"], "SEPARATED")
             self.assertEqual(boot["active_workspace"]["workspace_id"], "ws-default")
 
