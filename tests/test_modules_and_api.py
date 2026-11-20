@@ -4210,6 +4210,208 @@ view.destroy();
 """
                 self._run_node_probe(node_bin, tmp, "cross_macos_probe.mjs", probe_mjs)
 
+    def test_global_persistent_migration_queue_perf_and_sql_preview(self) -> None:
+        """端到端验证全局多表/多连接贯标队列累积、零远端重连、单行移除、单条 SQL 预览及前端防重绘收敛."""
+        from core.platform.models import ColumnMeta, TableMeta
+        from modules.standard_migrator.service import StandardMigratorService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_state = os.path.join(tmp, "global_queue.db")
+            sqlite1 = os.path.join(tmp, "db_one.sqlite")
+            sqlite2 = os.path.join(tmp, "db_two.sqlite")
+            for p in (sqlite1, sqlite2):
+                with contextlib.closing(sqlite3.connect(p)) as conn:
+                    conn.execute("CREATE TABLE t_init (id INTEGER)")
+                    conn.commit()
+
+            app = create_app(db_path=db_state)
+            client = TestClient(app)
+            ctx = app.state.platform_ctx
+
+            ctx.connection_hub.save_profile(
+                {"connection_id": "c1", "name": "核心库一", "db_type": "SQLITE", "sqlite_path": sqlite1}
+            )
+            ctx.connection_hub.save_profile(
+                {"connection_id": "c2", "name": "集市库二", "db_type": "MYSQL", "host": "127.0.0.1", "dbname": "dw_mart", "user": "u"}
+            )
+            ctx.store.save_table_meta(
+                "c1",
+                TableMeta(
+                    schema_name="main",
+                    table_name="t_a",
+                    columns=[
+                        ColumnMeta(1, "old_c1", "VARCHAR(32)", column_comment="旧注释1"),
+                        ColumnMeta(2, "cust_name", "VARCHAR(64)", column_comment="旧客户名称"),
+                    ],
+                ),
+            )
+            ctx.store.save_table_meta(
+                "c1",
+                TableMeta(
+                    schema_name="main",
+                    table_name="t_b",
+                    columns=[ColumnMeta(1, "acct_no", "VARCHAR(16)", column_comment="旧账号")],
+                ),
+            )
+            ctx.store.save_table_meta(
+                "c2",
+                TableMeta(
+                    schema_name="dw_mart",
+                    table_name="t_c",
+                    columns=[ColumnMeta(1, "amt_val", "DECIMAL(18,2)", column_comment="旧金额")],
+                ),
+            )
+
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "STD_RENAME",
+                    "cn_name": "标准客户编码",
+                    "en_abbr": "std_c1",
+                    "type_dws": "VARCHAR(64)",
+                    "type_mysql": "VARCHAR(64)",
+                }
+            )
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "STD_COMMENT",
+                    "cn_name": "客户姓名",
+                    "en_abbr": "cust_name",
+                    "type_dws": "VARCHAR(64)",
+                    "type_mysql": "VARCHAR(64)",
+                }
+            )
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "STD_ACCT",
+                    "cn_name": "标准账号",
+                    "en_abbr": "acct_id",
+                    "type_dws": "VARCHAR(32)",
+                }
+            )
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "STD_AMT",
+                    "cn_name": "交易金额",
+                    "en_abbr": "amt_val",
+                    "type_dws": "DECIMAL(18,2)",
+                    "type_mysql": "DECIMAL(18,2)",
+                }
+            )
+
+            ctx.standard_catalog.bulk_save_field_bindings(
+                "c1",
+                [
+                    {"schema_name": "main", "table_name": "t_a", "column_name": "old_c1", "std_code": "STD_RENAME"},
+                    {"schema_name": "main", "table_name": "t_a", "column_name": "cust_name", "std_code": "STD_COMMENT"},
+                    {"schema_name": "main", "table_name": "t_b", "column_name": "acct_no", "std_code": "STD_ACCT"},
+                ],
+            )
+            ctx.standard_catalog.bulk_save_field_bindings(
+                "c2",
+                [
+                    {"schema_name": "dw_mart", "table_name": "t_c", "column_name": "amt_val", "std_code": "STD_AMT"},
+                ],
+            )
+
+            # 1) stage-migration 严禁调用 sync_items 打开远端连接，且默认 append=True 跨表/跨库累积
+            with mock.patch.object(
+                StandardMigratorService,
+                "sync_items",
+                side_effect=AssertionError("stage-migration must not call sync_items"),
+            ):
+                r_a = client.post(
+                    "/api/modules/standard_migrator/bindings/stage-migration",
+                    json={"connection_id": "c1", "schema_name": "main", "table_name": "t_a"},
+                )
+                self.assertEqual(r_a.status_code, 200, r_a.text)
+                self.assertEqual(len(r_a.json()["items"]), 2)
+
+                r_b = client.post(
+                    "/api/modules/standard_migrator/bindings/stage-migration",
+                    json={"connection_id": "c1", "schema_name": "main", "table_name": "t_b"},
+                )
+                self.assertEqual(r_b.status_code, 200, r_b.text)
+                self.assertEqual(len(r_b.json()["items"]), 3)
+
+                r_c = client.post(
+                    "/api/modules/standard_migrator/bindings/stage-migration",
+                    json={"connection_id": "c2", "schema_name": "dw_mart", "table_name": "t_c"},
+                )
+                self.assertEqual(r_c.status_code, 200, r_c.text)
+                items_after_c = r_c.json()["items"]
+                self.assertEqual(len(items_after_c), 4)
+                self.assertEqual(
+                    {(it["connection_id"], it["table_name"], it["old_col_name"]) for it in items_after_c},
+                    {
+                        ("c1", "t_a", "old_c1"),
+                        ("c1", "t_a", "cust_name"),
+                        ("c1", "t_b", "acct_no"),
+                        ("c2", "t_c", "amt_val"),
+                    },
+                )
+
+                # 2) 同一表重复纳入幂等更新而非重复追加
+                r_dup = client.post(
+                    "/api/modules/standard_migrator/bindings/stage-migration",
+                    json={"connection_id": "c1", "schema_name": "main", "table_name": "t_a"},
+                )
+                self.assertEqual(r_dup.status_code, 200, r_dup.text)
+                self.assertEqual(len(r_dup.json()["items"]), 4)
+
+            # 3) 单条 SQL 预览：仅注释差异返回干净注释 DDL 且 needs_rebuild=False；MySQL 仅注释差异返回 MODIFY COLUMN
+            comment_it = next(
+                it for it in r_dup.json()["items"] if it["table_name"] == "t_a" and it["old_col_name"] == "cust_name"
+            )
+            sql_res = client.get(f"/api/modules/standard_migrator/items/{comment_it['id']}/sql")
+            self.assertEqual(sql_res.status_code, 200, sql_res.text)
+            sq_j = sql_res.json()
+            self.assertTrue(sq_j["is_comment_only"])
+            self.assertFalse(sq_j["needs_rebuild"])
+            self.assertEqual(sq_j["strategy"], "DIRECT_ALTER")
+            self.assertNotIn("RENAME COLUMN", sq_j["sql_preview"])
+
+            mysql_it = next(it for it in r_dup.json()["items"] if it["connection_id"] == "c2")
+            ms_res = client.get(f"/api/modules/standard_migrator/items/{mysql_it['id']}/sql")
+            self.assertEqual(ms_res.status_code, 200, ms_res.text)
+            ms_j = ms_res.json()
+            self.assertEqual(ms_j["dialect"], "MYSQL")
+            self.assertTrue(ms_j["is_comment_only"])
+            self.assertIn("MODIFY COLUMN `amt_val`", ms_j["sql_preview"])
+            self.assertIn("COMMENT '交易金额'", ms_j["sql_preview"])
+
+            # 4) delete-items 精准移出单条队列项，不影响其他表/连接任务
+            del_res = client.post(
+                "/api/modules/standard_migrator/checklist/delete-items",
+                json={"item_ids": [comment_it["id"]]},
+            )
+            self.assertEqual(del_res.status_code, 200, del_res.text)
+            del_j = del_res.json()
+            self.assertEqual(del_j["deleted_count"], 1)
+            remaining_ids = {it["id"] for it in del_j["items"]}
+            self.assertEqual(len(remaining_ids), 3)
+            self.assertNotIn(comment_it["id"], remaining_ids)
+
+            # 5) 静态前端 UX 收敛与防整表重绘守卫
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            with open(os.path.join(repo_root, "static", "js", "views", "standard_migrator_view.js"), "r", encoding="utf-8") as f:
+                sm_js = f.read()
+            self.assertIn("纳入贯标", sm_js)
+            self.assertIn("openItemSqlPreviewModal", sm_js)
+            self.assertNotIn("重建贯标", sm_js)
+            self.assertNotIn("生成贯标", sm_js)
+
+            with open(os.path.join(repo_root, "static", "js", "ui", "data_grid.js"), "r", encoding="utf-8") as f:
+                dg_js = f.read()
+            self.assertIn("_syncSelectionDom", dg_js)
+            # 确保全文件 this.render() 仅出现在 constructor / setData / 列头排序 onClick 中，复选框 onChange 不整表重绘
+            self.assertEqual(dg_js.count("this.render()"), 3)
+            master_blk = dg_js.split("masterCb = el(", 1)[1].split("this._masterCb = masterCb", 1)[0]
+            self.assertIn("this._syncSelectionDom()", master_blk)
+            self.assertNotIn("this.render()", master_blk)
+            row_blk = dg_js.split("rowCb = el(", 1)[1].split("cells.push(el(\"td\", {}, rowCb))", 1)[0]
+            self.assertIn("this._syncSelectionDom()", row_blk)
+            self.assertNotIn("this.render()", row_blk)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,7 +31,9 @@ import sqlite3
 import stat
 import tempfile
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from core.platform.dialects import item_requires_table_rebuild
 
 from core.platform.models import (
     ColumnMeta,
@@ -254,6 +256,7 @@ CREATE INDEX IF NOT EXISTS idx_meta_columns_table
 CREATE TABLE IF NOT EXISTS migration_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     row_index INTEGER NOT NULL,
+    connection_id TEXT NOT NULL DEFAULT '',
     schema_name TEXT NOT NULL,
     table_name TEXT NOT NULL,
     old_col_name TEXT NOT NULL,
@@ -671,6 +674,7 @@ class PlatformStateStore:
                 ("lineage_source", "TEXT NOT NULL DEFAULT ''"),
             ],
             "migration_items": [
+                ("connection_id", "TEXT NOT NULL DEFAULT ''"),
                 ("old_col_type", "TEXT NOT NULL DEFAULT ''"),
                 ("old_col_comment", "TEXT NOT NULL DEFAULT ''"),
                 ("new_col_comment", "TEXT NOT NULL DEFAULT ''"),
@@ -1397,6 +1401,51 @@ class PlatformStateStore:
                 return json.loads(row["value"])
             except Exception:
                 return default
+
+    def get_meta_batch(self, keys: Iterable[str]) -> Dict[str, Any]:
+        """单次事务/连接按路由批量读取 app_meta 与 workspace_meta 键值."""
+        uniq_keys = list(dict.fromkeys(str(k) for k in keys if str(k)))
+        if not uniq_keys:
+            return {}
+        ws_keys = [k for k in uniq_keys if k in WORKSPACE_META_KEYS]
+        priv_keys = [k for k in uniq_keys if k not in WORKSPACE_META_KEYS]
+        out: Dict[str, Any] = {}
+        with self._lock:
+            if priv_keys:
+                ph = ",".join("?" for _ in priv_keys)
+                with self._get_private_conn() as pconn:
+                    for row in pconn.execute(
+                        f"SELECT key, value FROM app_meta WHERE key IN ({ph})",
+                        priv_keys,
+                    ).fetchall():
+                        try:
+                            out[str(row["key"])] = json.loads(row["value"])
+                        except Exception:
+                            pass
+            if ws_keys:
+                ph = ",".join("?" for _ in ws_keys)
+                with self._get_workspace_conn() as wconn:
+                    for row in wconn.execute(
+                        f"SELECT key, value FROM workspace_meta WHERE key IN ({ph})",
+                        ws_keys,
+                    ).fetchall():
+                        try:
+                            out[str(row["key"])] = json.loads(row["value"])
+                        except Exception:
+                            pass
+                missing_ws = [k for k in ws_keys if k not in out]
+                if missing_ws and not self.is_split_storage:
+                    ph2 = ",".join("?" for _ in missing_ws)
+                    with self._get_private_conn() as pconn:
+                        for row in pconn.execute(
+                            f"SELECT key, value FROM app_meta WHERE key IN ({ph2})",
+                            missing_ws,
+                        ).fetchall():
+                            try:
+                                out[str(row["key"])] = json.loads(row["value"])
+                            except Exception:
+                                pass
+        return out
 
     def add_log(self, level: str, target: str, message: str, sql_text: str = "") -> None:
         now = self._now_str()
@@ -2504,6 +2553,107 @@ class PlatformStateStore:
     # 单库批量贯标模块 (standard_migrator) 状态接口
     # =========================================================================
 
+    @staticmethod
+    def _normalize_migration_item_payload(
+        item: Dict[str, Any],
+        prev: Optional[Dict[str, Any]] = None,
+        *,
+        default_connection_id: str = "",
+        preserve_prev_errors: bool = True,
+    ) -> Dict[str, Any]:
+        quote_chars = '"\'“”‘’`「」『』 \t\r\n\u200b\u3000\ufeff'
+        schema_name = str(item.get("schema_name", "")).strip(quote_chars) or "public"
+        table_name = str(item.get("table_name", "")).strip(quote_chars)
+        old_col_name = str(item.get("old_col_name", "")).strip(quote_chars)
+        old_col_type = str(item.get("old_col_type", "")).strip()
+        old_col_comment = str(item.get("old_col_comment", "")).strip()
+        new_col_name = str(item.get("new_col_name", "")).strip(quote_chars) or old_col_name
+        new_col_type = str(item.get("new_col_type", "")).strip() or old_col_type
+        new_col_comment = str(item.get("new_col_comment", "")).strip()
+        conn_id = str(
+            item.get("connection_id")
+            or (prev.get("connection_id") if prev else "")
+            or default_connection_id
+            or ""
+        ).strip()
+
+        status = item.get("status") or (prev["status"] if prev else "UNCHECKED")
+        strategy = str(
+            item.get("strategy") or (prev.get("strategy") if prev else "DIRECT_ALTER") or "DIRECT_ALTER"
+        )
+        status_detail = item.get("status_detail") or (
+            prev["status_detail"]
+            if prev
+            else "已导入清单，等待连接数据库同步元数据状态"
+        )
+        if preserve_prev_errors:
+            error_message = (
+                str(item.get("error_message"))
+                if item.get("error_message") is not None
+                else (prev["error_message"] if prev else "")
+            )
+            executed_at = (
+                str(item.get("executed_at"))
+                if item.get("executed_at") is not None
+                else (prev["executed_at"] if prev else "")
+            )
+        else:
+            error_message = str(item.get("error_message") or "")
+            executed_at = str(item.get("executed_at") or "")
+
+        ordinal_pos = item.get("ordinal_position")
+        if ordinal_pos is None and prev:
+            ordinal_pos = prev["ordinal_position"]
+        total_cols = item.get("total_columns")
+        if total_cols is None and prev:
+            total_cols = prev["total_columns"]
+        db_col = item.get("db_current_col_name") or (
+            prev["db_current_col_name"] if prev else ""
+        )
+        db_type = item.get("db_current_type") or (
+            prev["db_current_type"] if prev else ""
+        )
+        db_comment = (
+            item.get("db_current_comment")
+            if "db_current_comment" in item and item.get("db_current_comment") is not None
+            else (prev["db_current_comment"] if prev else "")
+        )
+        is_dist = (
+            1
+            if item.get("is_distribute_key")
+            else (int(prev["is_distribute_key"] or 0) if (preserve_prev_errors and prev) else 0)
+        )
+        orientation = item.get("table_orientation") or (
+            prev["table_orientation"] if prev else ""
+        )
+        generated_sql = str(
+            item.get("generated_sql") or (prev.get("generated_sql") if prev else "") or ""
+        )
+        return {
+            "connection_id": conn_id,
+            "schema_name": schema_name,
+            "table_name": table_name,
+            "old_col_name": old_col_name,
+            "old_col_type": old_col_type,
+            "old_col_comment": old_col_comment,
+            "new_col_name": new_col_name,
+            "new_col_type": new_col_type,
+            "new_col_comment": new_col_comment,
+            "status": status,
+            "strategy": strategy,
+            "ordinal_position": ordinal_pos,
+            "total_columns": total_cols,
+            "db_current_col_name": db_col,
+            "db_current_type": db_type,
+            "db_current_comment": db_comment,
+            "is_distribute_key": is_dist,
+            "table_orientation": orientation,
+            "status_detail": status_detail,
+            "error_message": error_message,
+            "generated_sql": generated_sql,
+            "executed_at": executed_at,
+        }
+
     def replace_all_items(
         self,
         items: List[Dict[str, Any]],
@@ -2516,80 +2666,52 @@ class PlatformStateStore:
             if preserve_history:
                 existing_rows = conn.execute("SELECT * FROM migration_items").fetchall()
                 for r in existing_rows:
-                    key = f"{r['schema_name']}.{r['table_name']}.{r['old_col_name']}->{r['new_col_name']}".lower()
-                    history_map[key] = dict(r)
+                    rd = dict(r)
+                    rcid = str(rd.get("connection_id") or "").strip().lower()
+                    base_k = f"{rd['schema_name']}.{rd['table_name']}.{rd['old_col_name']}->{rd['new_col_name']}".lower()
+                    history_map[f"{rcid}::{base_k}"] = rd
+                    history_map.setdefault(base_k, rd)
 
             conn.execute("DELETE FROM migration_items")
             rows_to_insert = []
-            quote_chars = '"\'“”‘’`「」『』 \t\r\n\u200b\u3000\ufeff'
             for idx, item in enumerate(items, start=1):
-                schema_name = str(item.get("schema_name", "")).strip(quote_chars) or "public"
-                table_name = str(item.get("table_name", "")).strip(quote_chars)
-                old_col_name = str(item.get("old_col_name", "")).strip(quote_chars)
-                old_col_type = str(item.get("old_col_type", "")).strip()
-                old_col_comment = str(item.get("old_col_comment", "")).strip()
-                new_col_name = str(item.get("new_col_name", "")).strip(quote_chars) or old_col_name
-                new_col_type = str(item.get("new_col_type", "")).strip() or old_col_type
-                new_col_comment = str(item.get("new_col_comment", "")).strip()
+                quote_chars = '"\'“”‘’`「」『』 \t\r\n\u200b\u3000\ufeff'
+                s_n = str(item.get("schema_name", "")).strip(quote_chars) or "public"
+                t_n = str(item.get("table_name", "")).strip(quote_chars)
+                o_n = str(item.get("old_col_name", "")).strip(quote_chars)
+                n_n = str(item.get("new_col_name", "")).strip(quote_chars) or o_n
+                c_n = str(item.get("connection_id") or "").strip().lower()
+                base_k = f"{s_n}.{t_n}.{o_n}->{n_n}".lower()
+                prev = history_map.get(f"{c_n}::{base_k}") or history_map.get(base_k)
 
-                key = f"{schema_name}.{table_name}.{old_col_name}->{new_col_name}".lower()
-                prev = history_map.get(key)
-
-                status = item.get("status") or (prev["status"] if prev else "UNCHECKED")
-                status_detail = item.get("status_detail") or (
-                    prev["status_detail"]
-                    if prev
-                    else "已导入清单，等待连接数据库同步元数据状态"
+                norm = self._normalize_migration_item_payload(
+                    item, prev=prev, preserve_prev_errors=True
                 )
-                error_message = prev["error_message"] if prev else ""
-                executed_at = prev["executed_at"] if prev else ""
-                ordinal_pos = item.get("ordinal_position") or (
-                    prev["ordinal_position"] if prev else None
-                )
-                total_cols = item.get("total_columns") or (
-                    prev["total_columns"] if prev else None
-                )
-                db_col = item.get("db_current_col_name") or (
-                    prev["db_current_col_name"] if prev else ""
-                )
-                db_type = item.get("db_current_type") or (
-                    prev["db_current_type"] if prev else ""
-                )
-                db_comment = item.get("db_current_comment") or (
-                    prev["db_current_comment"] if prev else ""
-                )
-                is_dist = (
-                    1
-                    if item.get("is_distribute_key")
-                    else (prev["is_distribute_key"] if prev else 0)
-                )
-                orientation = item.get("table_orientation") or (
-                    prev["table_orientation"] if prev else ""
-                )
-
                 rows_to_insert.append(
                     (
                         item.get("row_index", idx),
-                        schema_name,
-                        table_name,
-                        old_col_name,
-                        old_col_type,
-                        old_col_comment,
-                        new_col_name,
-                        new_col_type,
-                        new_col_comment,
-                        status,
-                        "DIRECT_ALTER",
-                        ordinal_pos,
-                        total_cols,
-                        db_col,
-                        db_type,
-                        db_comment,
-                        is_dist,
-                        orientation,
-                        status_detail,
-                        error_message,
-                        executed_at,
+                        norm["connection_id"],
+                        norm["schema_name"],
+                        norm["table_name"],
+                        norm["old_col_name"],
+                        norm["old_col_type"],
+                        norm["old_col_comment"],
+                        norm["new_col_name"],
+                        norm["new_col_type"],
+                        norm["new_col_comment"],
+                        norm["status"],
+                        norm["strategy"],
+                        norm["ordinal_position"],
+                        norm["total_columns"],
+                        norm["db_current_col_name"],
+                        norm["db_current_type"],
+                        norm["db_current_comment"],
+                        norm["is_distribute_key"],
+                        norm["table_orientation"],
+                        norm["status_detail"],
+                        norm["error_message"],
+                        norm["generated_sql"],
+                        norm["executed_at"],
                         now,
                     )
                 )
@@ -2597,14 +2719,14 @@ class PlatformStateStore:
             conn.executemany(
                 """
                 INSERT INTO migration_items (
-                    row_index, schema_name, table_name,
+                    row_index, connection_id, schema_name, table_name,
                     old_col_name, old_col_type, old_col_comment,
                     new_col_name, new_col_type, new_col_comment,
                     status, strategy, ordinal_position, total_columns,
                     db_current_col_name, db_current_type, db_current_comment,
                     is_distribute_key, table_orientation,
-                    status_detail, error_message, executed_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status_detail, error_message, generated_sql, executed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows_to_insert,
             )
@@ -2617,6 +2739,203 @@ class PlatformStateStore:
             f"成功载入清单 [{source_filename}]，共 {len(items)} 条字段规则。",
         )
         return self.list_items()
+
+    def upsert_migration_items(
+        self,
+        items: List[Dict[str, Any]],
+        source_label: str,
+        connection_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        """将字段贯标任务幂等追加或原位更新至全局队列，不删除已有其他表/字段任务."""
+        if not items:
+            return self.list_items()
+        now = self._now_str()
+        def_cid = str(connection_id or "").strip()
+        active_cid = str(self.get_meta("migrator_connection_id", "") or "").strip()
+        with self._lock, self._get_conn() as conn:
+            existing_rows = [
+                dict(r)
+                for r in conn.execute(
+                    "SELECT * FROM migration_items ORDER BY row_index ASC, id ASC"
+                ).fetchall()
+            ]
+            max_row_idx = max((int(r.get("row_index") or 0) for r in existing_rows), default=0)
+            existing_by_key: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+            for r in existing_rows:
+                r_cid = str(r.get("connection_id") or active_cid or "").strip().lower()
+                k = (
+                    r_cid,
+                    str(r.get("schema_name") or "").strip().lower(),
+                    str(r.get("table_name") or "").strip().lower(),
+                    str(r.get("old_col_name") or "").strip().lower(),
+                )
+                existing_by_key[k] = r
+                if not str(r.get("connection_id") or "").strip() and def_cid:
+                    # 兼容历史未标记 connection_id 的队列项
+                    existing_by_key.setdefault(
+                        (
+                            def_cid.lower(),
+                            k[1],
+                            k[2],
+                            k[3],
+                        ),
+                        r,
+                    )
+
+            to_insert: List[Tuple[Any, ...]] = []
+            to_update: List[Tuple[Any, ...]] = []
+
+            for item in items:
+                norm = self._normalize_migration_item_payload(
+                    item,
+                    prev=None,
+                    default_connection_id=def_cid or active_cid,
+                    preserve_prev_errors=False,
+                )
+                eff_cid = str(norm["connection_id"] or def_cid or active_cid).strip().lower()
+                k = (
+                    eff_cid,
+                    norm["schema_name"].lower(),
+                    norm["table_name"].lower(),
+                    norm["old_col_name"].lower(),
+                )
+                hit = existing_by_key.get(k)
+                if hit is not None:
+                    to_update.append(
+                        (
+                            norm["connection_id"],
+                            norm["old_col_type"],
+                            norm["old_col_comment"],
+                            norm["new_col_name"],
+                            norm["new_col_type"],
+                            norm["new_col_comment"],
+                            norm["status"],
+                            norm["strategy"],
+                            norm["ordinal_position"],
+                            norm["total_columns"],
+                            norm["db_current_col_name"],
+                            norm["db_current_type"],
+                            norm["db_current_comment"],
+                            norm["is_distribute_key"],
+                            norm["table_orientation"],
+                            norm["status_detail"],
+                            norm["error_message"],
+                            norm["generated_sql"],
+                            now,
+                            int(hit["id"]),
+                        )
+                    )
+                    existing_by_key[k] = {**hit, **norm, "id": hit["id"]}
+                else:
+                    max_row_idx += 1
+                    to_insert.append(
+                        (
+                            max_row_idx,
+                            norm["connection_id"],
+                            norm["schema_name"],
+                            norm["table_name"],
+                            norm["old_col_name"],
+                            norm["old_col_type"],
+                            norm["old_col_comment"],
+                            norm["new_col_name"],
+                            norm["new_col_type"],
+                            norm["new_col_comment"],
+                            norm["status"],
+                            norm["strategy"],
+                            norm["ordinal_position"],
+                            norm["total_columns"],
+                            norm["db_current_col_name"],
+                            norm["db_current_type"],
+                            norm["db_current_comment"],
+                            norm["is_distribute_key"],
+                            norm["table_orientation"],
+                            norm["status_detail"],
+                            norm["error_message"],
+                            norm["generated_sql"],
+                            norm["executed_at"],
+                            now,
+                        )
+                    )
+                    existing_by_key[k] = {**norm, "row_index": max_row_idx}
+
+            if to_update:
+                conn.executemany(
+                    """
+                    UPDATE migration_items
+                    SET connection_id = ?,
+                        old_col_type = ?,
+                        old_col_comment = ?,
+                        new_col_name = ?,
+                        new_col_type = ?,
+                        new_col_comment = ?,
+                        status = ?,
+                        strategy = ?,
+                        ordinal_position = ?,
+                        total_columns = ?,
+                        db_current_col_name = ?,
+                        db_current_type = ?,
+                        db_current_comment = ?,
+                        is_distribute_key = ?,
+                        table_orientation = ?,
+                        status_detail = ?,
+                        error_message = ?,
+                        generated_sql = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    to_update,
+                )
+            if to_insert:
+                conn.executemany(
+                    """
+                    INSERT INTO migration_items (
+                        row_index, connection_id, schema_name, table_name,
+                        old_col_name, old_col_type, old_col_comment,
+                        new_col_name, new_col_type, new_col_comment,
+                        status, strategy, ordinal_position, total_columns,
+                        db_current_col_name, db_current_type, db_current_comment,
+                        is_distribute_key, table_orientation,
+                        status_detail, error_message, generated_sql, executed_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    to_insert,
+                )
+            conn.commit()
+        self.save_meta("current_excel_name", source_label)
+        self.save_meta("imported_at", now)
+        self.add_log(
+            "INFO",
+            "队列更新",
+            f"已将 [{source_label}] 共 {len(items)} 条字段规则纳入全局贯标队列（新增 {len(to_insert)} / 更新 {len(to_update)}）。",
+        )
+        return self.list_items()
+
+    def delete_migration_items(self, item_ids: List[int]) -> int:
+        """按 ID 从全局贯标队列中移除指定任务（不影响已绑定的数据标准）."""
+        clean_ids: List[int] = []
+        seen = set()
+        for raw_id in item_ids or []:
+            try:
+                iid = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if iid > 0 and iid not in seen:
+                seen.add(iid)
+                clean_ids.append(iid)
+        if not clean_ids:
+            return 0
+        deleted = 0
+        with self._lock, self._get_conn() as conn:
+            for idx in range(0, len(clean_ids), 500):
+                chunk = clean_ids[idx : idx + 500]
+                ph = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"DELETE FROM migration_items WHERE id IN ({ph})",
+                    chunk,
+                )
+                deleted += max(0, int(cur.rowcount or 0))
+            conn.commit()
+        return deleted
 
     def list_items(self) -> List[Dict[str, Any]]:
         with self._lock, self._get_conn() as conn:
@@ -2688,6 +3007,7 @@ class PlatformStateStore:
                 is_dist = 1 if u.get("is_distribute_key") else 0
                 table_orientation = u.get("table_orientation", "")
                 generated_sql = u.get("generated_sql", "")
+                strategy = str(u.get("strategy") or "").strip()
                 clear_error = bool(u.get("clear_error", False))
                 schema_name = u.get("schema_name")
                 table_name = u.get("schema_table_override") or u.get("table_name")
@@ -2699,6 +3019,7 @@ class PlatformStateStore:
                         SET schema_name = ?,
                             table_name = ?,
                             status = ?,
+                            strategy = CASE WHEN ? != '' THEN ? ELSE strategy END,
                             status_detail = ?,
                             ordinal_position = ?,
                             total_columns = ?,
@@ -2716,6 +3037,8 @@ class PlatformStateStore:
                             schema_name,
                             table_name,
                             status,
+                            strategy,
+                            strategy,
                             status_detail,
                             ordinal_position,
                             total_columns,
@@ -2735,6 +3058,7 @@ class PlatformStateStore:
                         """
                         UPDATE migration_items
                         SET status = ?,
+                            strategy = CASE WHEN ? != '' THEN ? ELSE strategy END,
                             status_detail = ?,
                             ordinal_position = ?,
                             total_columns = ?,
@@ -2750,6 +3074,8 @@ class PlatformStateStore:
                         """,
                         (
                             status,
+                            strategy,
+                            strategy,
                             status_detail,
                             ordinal_position,
                             total_columns,
@@ -2827,8 +3153,11 @@ class PlatformStateStore:
         self.save_meta("current_excel_name", "未导入")
         self.save_meta("imported_at", "")
 
-    def get_summary(self) -> Dict[str, int]:
-        items = self.list_items()
+    def get_summary(
+        self, items: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, int]:
+        if items is None:
+            items = self.list_items()
         summary = {
             "total": len(items),
             "completed": 0,
@@ -2853,11 +3182,7 @@ class PlatformStateStore:
                 summary["missing"] += 1
             else:
                 summary["unchecked"] += 1
-            if st != "COMPLETED" and (
-                item.get("strategy") == "TABLE_REBUILD"
-                or bool(item.get("is_distribute_key"))
-                or str(item.get("table_orientation") or "").upper() == "COLUMN"
-            ):
+            if st != "COMPLETED" and item_requires_table_rebuild(item):
                 summary["rebuild_required"] += 1
         return summary
 

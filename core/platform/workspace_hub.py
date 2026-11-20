@@ -1096,7 +1096,7 @@ class WorkspaceManager:
                         cross_info, table_diffs = self._inspect_cross_mappings(sconn, src_tables, lconn)
 
                         # 4. migration_items diff
-                        mig_info = self._inspect_migration_items(sconn, src_tables, lconn)
+                        mig_info = self._inspect_migration_items(sconn, src_tables, lconn, conn_id_map)
 
                         # 5. connection_topology summary
                         topo_new = sum(1 for c in conn_preview if c["action"] == "ADD")
@@ -1384,27 +1384,39 @@ class WorkspaceManager:
 
     @staticmethod
     def _inspect_migration_items(
-        sconn: sqlite3.Connection, src_tables: Set[str], lconn: sqlite3.Connection
+        sconn: sqlite3.Connection,
+        src_tables: Set[str],
+        lconn: sqlite3.Connection,
+        conn_id_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, int]:
-        def _mkey(r: Any) -> Tuple[str, str, str, str]:
+        def _mkey(r: Any, cid_map: Optional[Dict[str, str]] = None) -> Tuple[str, str, str, str, str]:
+            keys = set(r.keys()) if hasattr(r, "keys") else set(r)
+            raw_cid = str(r["connection_id"] or "").strip() if "connection_id" in keys else ""
+            eff_cid = (cid_map or {}).get(raw_cid, raw_cid).lower() if raw_cid else ""
             return (
+                eff_cid,
                 str(r["schema_name"] or "").lower(),
                 str(r["table_name"] or "").lower(),
                 str(r["old_col_name"] or "").lower(),
                 str(r["new_col_name"] or "").lower(),
             )
 
-        local_map = {
-            _mkey(r): dict(r)
-            for r in lconn.execute("SELECT * FROM migration_items").fetchall()
-        }
+        local_map: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+        local_fallback_map: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        for r in lconn.execute("SELECT * FROM migration_items").fetchall():
+            rd = dict(r)
+            k = _mkey(r)
+            local_map[k] = rd
+            local_fallback_map.setdefault(k[1:], rd)
         if "migration_items" not in src_tables:
             return {"source_count": 0, "local_count": len(local_map), "new_count": 0, "conflict_count": 0, "same_count": 0, "newer_in_source_count": 0}
         srows = sconn.execute("SELECT * FROM migration_items").fetchall()
         new_cnt = conf_cnt = same_cnt = newer_cnt = 0
         for r in srows:
-            k = _mkey(r)
+            k = _mkey(r, conn_id_map)
             loc = local_map.get(k)
+            if loc is None and not k[0]:
+                loc = local_fallback_map.get(k[1:])
             if loc is None:
                 new_cnt += 1
                 continue
@@ -1531,7 +1543,7 @@ class WorkspaceManager:
 
                         if "migration_items" in chosen_set and "migration_items" in src_tables:
                             details["migration_items"] = self._merge_migration_items(
-                                sconn, lconn, eff_strategy
+                                sconn, lconn, eff_strategy, conn_id_map
                             )
 
                         if "metadata_cache" in chosen_set:
@@ -2118,12 +2130,18 @@ class WorkspaceManager:
 
     @staticmethod
     def _merge_migration_items(
-        sconn: sqlite3.Connection, lconn: sqlite3.Connection, strategy: str
+        sconn: sqlite3.Connection,
+        lconn: sqlite3.Connection,
+        strategy: str,
+        conn_id_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, int]:
         added = updated = skipped = 0
 
-        def _mkey(r: Any) -> Tuple[str, str, str, str]:
+        def _mkey(r: Any, cid_map: Optional[Dict[str, str]] = None) -> Tuple[str, str, str, str, str]:
+            raw_cid = str(r.get("connection_id") or "").strip()
+            eff_cid = (cid_map or {}).get(raw_cid, raw_cid).lower() if raw_cid else ""
             return (
+                eff_cid,
                 str(r["schema_name"] or "").lower(),
                 str(r["table_name"] or "").lower(),
                 str(r["old_col_name"] or "").lower(),
@@ -2131,29 +2149,39 @@ class WorkspaceManager:
             )
 
         local_rows = [dict(r) for r in lconn.execute("SELECT * FROM migration_items").fetchall()]
-        local_map = {_mkey(r): r for r in local_rows}
+        local_map: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
+        local_fallback_map: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+        for r in local_rows:
+            k = _mkey(r)
+            local_map[k] = r
+            local_fallback_map.setdefault(k[1:], r)
         next_row_idx = max((int(r.get("row_index") or 0) for r in local_rows), default=0) + 1
         now = _now_str()
 
         for srow in sconn.execute("SELECT * FROM migration_items ORDER BY row_index ASC, id ASC").fetchall():
             sr = dict(srow)
-            k = _mkey(sr)
+            raw_cid = str(sr.get("connection_id") or "").strip()
+            mapped_cid = (conn_id_map or {}).get(raw_cid, raw_cid) if raw_cid else ""
+            k = _mkey(sr, conn_id_map)
             loc = local_map.get(k)
+            if loc is None and not k[0]:
+                loc = local_fallback_map.get(k[1:])
             if loc is None:
                 cur = lconn.execute(
                     """
                     INSERT INTO migration_items (
-                        row_index, schema_name, table_name,
+                        row_index, connection_id, schema_name, table_name,
                         old_col_name, old_col_type, old_col_comment,
                         new_col_name, new_col_type, new_col_comment,
                         status, strategy, ordinal_position, total_columns,
                         db_current_col_name, db_current_type, db_current_comment,
                         is_distribute_key, table_orientation,
                         status_detail, error_message, generated_sql, executed_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         next_row_idx,
+                        mapped_cid,
                         str(sr.get("schema_name") or "public"),
                         str(sr.get("table_name") or ""),
                         str(sr.get("old_col_name") or ""),
@@ -2178,7 +2206,7 @@ class WorkspaceManager:
                         str(sr.get("updated_at") or now),
                     ),
                 )
-                local_map[k] = {**sr, "id": cur.lastrowid}
+                local_map[k] = {**sr, "connection_id": mapped_cid, "id": cur.lastrowid}
                 next_row_idx += 1
                 added += 1
                 continue
@@ -2199,11 +2227,14 @@ class WorkspaceManager:
                 lconn.execute(
                     """
                     UPDATE migration_items
-                    SET old_col_type = ?, old_col_comment = ?, new_col_type = ?, new_col_comment = ?,
+                    SET connection_id = CASE WHEN ? != '' THEN ? ELSE connection_id END,
+                        old_col_type = ?, old_col_comment = ?, new_col_type = ?, new_col_comment = ?,
                         status = ?, strategy = ?, status_detail = ?, generated_sql = ?, updated_at = ?
                     WHERE id = ?
                     """,
                     (
+                        mapped_cid,
+                        mapped_cid,
                         str(sr.get("old_col_type") or ""),
                         str(sr.get("old_col_comment") or ""),
                         str(sr.get("new_col_type") or ""),

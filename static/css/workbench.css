@@ -106,8 +106,8 @@ html, body {
   align-items: center;
   justify-content: space-between;
   background: var(--os-menubar);
-  backdrop-filter: blur(22px) saturate(180%);
-  -webkit-backdrop-filter: blur(22px) saturate(180%);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
   border-bottom: 0.5px solid var(--os-border);
   user-select: none;
 }
@@ -509,8 +509,8 @@ html, body {
   border-radius: 20px;
   background: var(--dock-bg);
   border: 0.5px solid var(--dock-border);
-  backdrop-filter: blur(26px) saturate(190%);
-  -webkit-backdrop-filter: blur(26px) saturate(190%);
+  backdrop-filter: blur(14px) saturate(150%);
+  -webkit-backdrop-filter: blur(14px) saturate(150%);
   box-shadow: var(--dock-shadow);
   user-select: none;
   transition: transform 0.24s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.2s ease;
@@ -574,8 +574,6 @@ html, body {
   border-radius: 7px;
   background: var(--os-drawer-bg);
   border: 0.5px solid var(--os-border-strong);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
   color: var(--os-text);
   font-size: 11.5px;
   font-weight: 600;
@@ -1214,6 +1212,7 @@ select.input-xs {
   flex: 1;
   overflow-y: auto;
   padding: 6px;
+  contain: layout style;
 }
 
 .tree-conn-card {
@@ -1285,6 +1284,7 @@ select.input-xs {
   min-height: 0;
   overflow: auto;
   background: var(--os-win-bg);
+  contain: layout style;
 }
 
 .data-grid-table {
@@ -1322,6 +1322,10 @@ select.input-xs {
   border-bottom: 1px solid var(--os-border);
   color: var(--os-text);
   vertical-align: middle;
+}
+
+.data-grid-table tbody tr {
+  contain: layout style;
 }
 
 .data-grid-table tbody tr:hover {
@@ -1705,8 +1709,8 @@ dialog::backdrop {
   padding: 6px 12px 6px 14px;
   border-radius: 999px;
   background: var(--os-drawer-bg);
-  backdrop-filter: blur(18px) saturate(180%);
-  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
   border: 0.5px solid var(--os-border-strong);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
   color: var(--os-text);
@@ -2881,8 +2885,8 @@ dialog::backdrop {
   border-radius: 11px;
   border: 0.5px solid var(--os-border-strong);
   background: color-mix(in srgb, var(--os-drawer-bg) 82%, var(--os-win-bg));
-  backdrop-filter: blur(26px) saturate(190%);
-  -webkit-backdrop-filter: blur(26px) saturate(190%);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
   box-shadow: var(--os-win-shadow);
   z-index: 80;
   overflow: hidden;
@@ -3384,8 +3388,8 @@ dialog::backdrop {
   border-radius: 10px;
   border: 1px solid var(--os-border-strong);
   background: color-mix(in srgb, var(--os-drawer-bg) 82%, var(--os-win-bg));
-  backdrop-filter: blur(26px) saturate(190%);
-  -webkit-backdrop-filter: blur(26px) saturate(190%);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
   box-shadow: var(--os-win-shadow), inset 0 0.5px 0 rgba(255, 255, 255, 0.1);
   z-index: 88;
   overflow: hidden;
@@ -3952,9 +3956,7 @@ dialog::backdrop {
   position: sticky;
   top: 0;
   z-index: 8;
-  background: color-mix(in srgb, var(--os-toolbar-bg) 94%, var(--os-win-bg));
-  backdrop-filter: blur(20px) saturate(185%);
-  -webkit-backdrop-filter: blur(20px) saturate(185%);
+  background: color-mix(in srgb, var(--os-toolbar-bg) 97%, var(--os-win-bg));
 }
 
 .cross-center-col-headers {
@@ -4451,8 +4453,8 @@ dialog::backdrop {
   border-color: var(--os-accent);
   color: var(--os-accent);
   background: color-mix(in srgb, var(--os-drawer-bg) 88%, var(--cross-card-bg));
-  backdrop-filter: blur(18px) saturate(180%);
-  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18), 0 0 0 0.5px color-mix(in srgb, var(--os-accent) 30%, transparent);
 }
 
@@ -4578,8 +4580,8 @@ dialog::backdrop {
   border-radius: 9px;
   border: 1px solid var(--os-border-strong);
   background: var(--os-drawer-bg);
-  backdrop-filter: blur(18px) saturate(180%);
-  -webkit-backdrop-filter: blur(18px) saturate(180%);
+  backdrop-filter: blur(12px) saturate(140%);
+  -webkit-backdrop-filter: blur(12px) saturate(140%);
   box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.18);
   overflow: visible;
   z-index: 35;
@@ -4592,6 +4594,11 @@ dialog::backdrop {
 
 .task-activity-bar.is-hidden {
   display: none;
+}
+
+.task-activity-bar.is-hidden .task-activity-pulse,
+.task-activity-bar.is-hidden .task-activity-fill {
+  animation: none;
 }
 
 .task-activity-bar.is-compact {
@@ -4676,7 +4683,7 @@ dialog::backdrop {
   border-radius: 999px;
   flex-shrink: 0;
   background: var(--os-accent);
-  box-shadow: 0 0 0 0 color-mix(in srgb, var(--os-accent) 45%, transparent);
+  will-change: transform, opacity;
   animation: taskPulse 1.5s ease-in-out infinite;
 }
 
@@ -4805,8 +4812,8 @@ dialog::backdrop {
   border-radius: 10px;
   border: 1px solid var(--os-border-strong);
   background: var(--os-drawer-bg);
-  backdrop-filter: blur(22px) saturate(185%);
-  -webkit-backdrop-filter: blur(22px) saturate(185%);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
   box-shadow: 0 14px 36px rgba(15, 23, 42, 0.18), 0 0 0 0.5px var(--os-border);
   z-index: 65;
   overflow: hidden;
@@ -4895,12 +4902,10 @@ dialog::backdrop {
   100% {
     transform: scale(1);
     opacity: 1;
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--os-accent) 45%, transparent);
   }
   50% {
-    transform: scale(1.16);
-    opacity: 0.78;
-    box-shadow: 0 0 0 4px color-mix(in srgb, var(--os-accent) 0%, transparent);
+    transform: scale(1.22);
+    opacity: 0.62;
   }
 }
 
@@ -5054,8 +5059,8 @@ dialog::backdrop {
   justify-content: center;
   padding: 20px;
   background: rgba(15, 23, 42, 0.22);
-  backdrop-filter: blur(22px) saturate(160%);
-  -webkit-backdrop-filter: blur(22px) saturate(160%);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
   overflow-y: auto;
 }
 
@@ -5070,8 +5075,8 @@ dialog::backdrop {
   background: var(--os-drawer-bg);
   border: 0.5px solid var(--os-border-strong);
   box-shadow: var(--os-win-shadow);
-  backdrop-filter: blur(28px) saturate(180%);
-  -webkit-backdrop-filter: blur(28px) saturate(180%);
+  backdrop-filter: blur(14px) saturate(145%);
+  -webkit-backdrop-filter: blur(14px) saturate(145%);
   display: flex;
   flex-direction: column;
   gap: 14px;

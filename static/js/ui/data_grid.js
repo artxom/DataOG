@@ -36,6 +36,9 @@ export class DataGrid {
 
     this.sortKey = "";
     this.sortAsc = true;
+    this._masterCb = null;
+    this._rowDomMap = new Map();
+    this._renderedKeys = [];
 
     this.root = el("div", {
       className: "table-wrapper",
@@ -73,32 +76,60 @@ export class DataGrid {
     });
   }
 
+  _syncSelectionDom() {
+    let selectedCount = 0;
+    for (const [rk, entry] of this._rowDomMap.entries()) {
+      const checked = this.selectedKeys.has(rk);
+      if (checked) selectedCount += 1;
+      if (entry.cb && entry.cb.checked !== checked) {
+        entry.cb.checked = checked;
+      }
+      if (entry.tr) {
+        entry.tr.classList.toggle("is-selected", checked);
+      }
+    }
+    if (this._masterCb) {
+      const total = this._rowDomMap.size;
+      this._masterCb.checked = total > 0 && selectedCount === total;
+      this._masterCb.indeterminate = selectedCount > 0 && selectedCount < total;
+    }
+  }
+
   render() {
+    this._masterCb = null;
+    this._rowDomMap = new Map();
+    this._renderedKeys = [];
+
     if (!this.columns.length || !this.rows.length) {
       clearEl(this.root, el("div", { className: "grid-empty", text: this.emptyText }));
       return;
     }
 
     const sortedRows = this._getSortedRows();
+    const rowKeys = sortedRows.map((r, i) => this._getKey(r, i));
+    this._renderedKeys = rowKeys;
     const headerCells = [];
 
     if (this.selectable) {
-      const allSelected = sortedRows.length > 0 && sortedRows.every((r, i) => this.selectedKeys.has(this._getKey(r, i)));
+      const selectedCount = rowKeys.filter((k) => this.selectedKeys.has(k)).length;
+      const allSelected = rowKeys.length > 0 && selectedCount === rowKeys.length;
+      const partialSelected = selectedCount > 0 && selectedCount < rowKeys.length;
       const masterCb = el("input", {
         type: "checkbox",
         checked: allSelected,
+        indeterminate: partialSelected,
         "aria-label": "全选当前表格行",
         onChange: (e) => {
           const checked = e.target.checked;
-          sortedRows.forEach((r, i) => {
-            const k = this._getKey(r, i);
+          for (const k of this._renderedKeys) {
             if (checked) this.selectedKeys.add(k);
             else this.selectedKeys.delete(k);
-          });
+          }
+          this._syncSelectionDom();
           this.onSelectionChange?.(this.selectedKeys);
-          this.render();
         },
       });
+      this._masterCb = masterCb;
       headerCells.push(el("th", { style: { width: "34px" } }, masterCb));
     }
 
@@ -123,13 +154,20 @@ export class DataGrid {
       headerCells.push(th);
     }
 
-    const tbodyRows = sortedRows.map((row, idx) => {
-      const rk = this._getKey(row, idx);
+    const tbody = el("tbody", {});
+    const frag =
+      typeof document.createDocumentFragment === "function"
+        ? document.createDocumentFragment()
+        : null;
+
+    sortedRows.forEach((row, idx) => {
+      const rk = rowKeys[idx];
       const isSel = this.selectedKeys.has(rk);
       const cells = [];
+      let rowCb = null;
 
       if (this.selectable) {
-        const cb = el("input", {
+        rowCb = el("input", {
           type: "checkbox",
           checked: isSel,
           "aria-label": `选择第 ${idx + 1} 行`,
@@ -137,11 +175,11 @@ export class DataGrid {
           onChange: (e) => {
             if (e.target.checked) this.selectedKeys.add(rk);
             else this.selectedKeys.delete(rk);
+            this._syncSelectionDom();
             this.onSelectionChange?.(this.selectedKeys);
-            this.render();
           },
         });
-        cells.push(el("td", {}, cb));
+        cells.push(el("td", {}, rowCb));
       }
 
       for (const col of this.columns) {
@@ -163,7 +201,7 @@ export class DataGrid {
         );
       }
 
-      return el(
+      const tr = el(
         "tr",
         {
           className: isSel ? "is-selected" : "",
@@ -172,13 +210,18 @@ export class DataGrid {
         },
         cells
       );
+      this._rowDomMap.set(rk, { tr, cb: rowCb });
+      if (frag) frag.appendChild(tr);
+      else tbody.appendChild(tr);
     });
+
+    if (frag) tbody.appendChild(frag);
 
     const table = el(
       "table",
       { className: "data-grid-table" },
       el("thead", {}, el("tr", {}, headerCells)),
-      el("tbody", {}, tbodyRows)
+      tbody
     );
     clearEl(this.root, table);
   }

@@ -25,6 +25,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg2
 from psycopg2 import sql as pg_sql
 
+from core.platform.dialects import (
+    analyze_item_changes,
+    item_requires_table_rebuild,
+    normalize_dws_type,
+    quote_backtick_str,
+)
 from core.platform.storage import PlatformStateStore as StateStore
 
 logger = logging.getLogger("dws_migrator")
@@ -109,46 +115,6 @@ def quote_literal_str(text: str) -> str:
     """将文本转义为单引号字符串."""
     val = (text or "").replace("'", "''")
     return f"'{val}'"
-
-
-def normalize_dws_type(raw_type: str) -> str:
-    """将华为 DWS / PostgreSQL / Oracle 兼容模式的各种数据类型同义写法归一化，确保比对准确."""
-    if not raw_type:
-        return ""
-    t = clean_sql_type_input(raw_type).lower()
-    t = re.sub(r"\(\s*", "(", t)
-    t = re.sub(r"\s*,\s*", ",", t)
-    t = re.sub(r"\s+(?:byte|char)\s*\)", ")", t)
-    t = re.sub(r"\s*\)", ")", t)
-
-    t = re.sub(r"^character varying\b", "varchar", t)
-    t = re.sub(r"^varchar2\b", "varchar", t)
-    t = re.sub(r"^nvarchar2\b", "varchar", t)
-    t = re.sub(r"^nvarchar\b", "varchar", t)
-    t = re.sub(r"^character\b", "char", t)
-    t = re.sub(r"^bpchar\b", "char", t)
-    t = re.sub(r"^nchar\b", "char", t)
-    t = re.sub(r"^decimal\b", "numeric", t)
-    t = re.sub(r"^number\b", "numeric", t)
-    t = re.sub(r"^int4\b", "integer", t)
-    t = re.sub(r"^int\b", "integer", t)
-    t = re.sub(r"^int8\b", "bigint", t)
-    t = re.sub(r"^int2\b", "smallint", t)
-    t = re.sub(r"^int1\b", "tinyint", t)
-    t = re.sub(r"^float8\b", "double precision", t)
-    t = re.sub(r"^float4\b", "real", t)
-    t = re.sub(r"^bool\b", "boolean", t)
-    t = re.sub(r"^timestamp without time zone\b", "timestamp", t)
-    t = re.sub(r"^timestamp with time zone\b", "timestamptz", t)
-    t = re.sub(r"^timestamp\(\d+\) without time zone\b", "timestamp", t)
-    t = re.sub(r"^timestamp\(\d+\) with time zone\b", "timestamptz", t)
-    t = re.sub(r"^timestamp\(\d+\)$", "timestamp", t)
-    t = re.sub(r"^time without time zone\b", "time", t)
-    t = re.sub(r"^time with time zone\b", "timetz", t)
-    t = re.sub(r"^time\(\d+\) without time zone\b", "time", t)
-    t = re.sub(r"^time\(\d+\) with time zone\b", "timetz", t)
-    t = re.sub(r"^time\(\d+\)$", "time", t)
-    return t
 
 
 def format_reloptions_with_clause(raw_reloptions: Any) -> str:
@@ -1183,9 +1149,14 @@ class DWSMigratorEngine:
 
         return result
 
-    def sync_all_items_with_db(self) -> Dict[str, Any]:
+    def sync_all_items_with_db(
+        self,
+        items_subset: Optional[List[Dict[str, Any]]] = None,
+        *,
+        dialect: str = "DWS",
+    ) -> Dict[str, Any]:
         """将当前导入的清单与华为 DWS 数据库元数据做全量批量实时比对."""
-        items = self.store.list_items()
+        items = list(items_subset) if items_subset is not None else self.store.list_items()
         if not items:
             return {"summary": self.store.get_summary(), "items": []}
 
@@ -1224,7 +1195,10 @@ class DWSMigratorEngine:
             }
             for item in group_items:
                 upd = self._build_single_item_sync_update(
-                    item, table_meta, claimed_old_names=claimed_old_names
+                    item,
+                    table_meta,
+                    claimed_old_names=claimed_old_names,
+                    dialect=dialect,
                 )
                 batch_updates.append(upd)
 
@@ -1244,6 +1218,8 @@ class DWSMigratorEngine:
         item: Dict[str, Any],
         table_meta: TableMeta,
         claimed_old_names: Optional[set[str]] = None,
+        *,
+        dialect: str = "DWS",
     ) -> Dict[str, Any]:
         item_id = item["id"]
         if not table_meta.exists:
@@ -1254,6 +1230,7 @@ class DWSMigratorEngine:
             return {
                 "item_id": item_id,
                 "status": "MISSING_TABLE",
+                "strategy": "DIRECT_ALTER",
                 "status_detail": f"数据库中未找到表 {table_meta.schema_name}.{table_meta.table_name} {schema_hint}".strip(),
                 "ordinal_position": None,
                 "total_columns": 0,
@@ -1297,6 +1274,7 @@ class DWSMigratorEngine:
                 "schema_name": actual_schema,
                 "table_name": actual_table,
                 "status": "MISSING_COLUMN",
+                "strategy": "DIRECT_ALTER",
                 "status_detail": (
                     f"表 {actual_schema}.{actual_table} 共 {total_cols} 列 ({sample_cols}{more_hint})，"
                     f"未找到原字段 [{old_name}] 或新字段 [{new_name}]"
@@ -1323,8 +1301,20 @@ class DWSMigratorEngine:
         item_with_actual_tbl = dict(item)
         item_with_actual_tbl["schema_name"] = actual_schema
         item_with_actual_tbl["table_name"] = actual_table
+        item_with_actual_tbl["is_distribute_key"] = is_dist
+        item_with_actual_tbl["table_orientation"] = table_meta.orientation
+        # 先按当前实库现状判定策略（不继承旧滞后 strategy）
+        item_with_actual_tbl["strategy"] = "DIRECT_ALTER"
+        needs_rebuild = item_requires_table_rebuild(
+            item_with_actual_tbl, matched_col=matched_col, table_meta=table_meta
+        )
+        eff_strategy = "TABLE_REBUILD" if needs_rebuild else "DIRECT_ALTER"
+
         sql_preview = self.build_direct_alter_sql_preview(
-            item=item_with_actual_tbl, matched_col=matched_col, table_meta=table_meta
+            item=item_with_actual_tbl,
+            matched_col=matched_col,
+            table_meta=table_meta,
+            dialect=dialect,
         )
 
         if name_matches_new and type_matches_new and comment_matches_new:
@@ -1333,6 +1323,7 @@ class DWSMigratorEngine:
                 "schema_name": actual_schema,
                 "table_name": actual_table,
                 "status": "COMPLETED",
+                "strategy": "DIRECT_ALTER",
                 "status_detail": (
                     f"已贯标完成（固定在第 {matched_col.ordinal_position}/{total_cols} 列，顺序一致）"
                 ),
@@ -1358,11 +1349,20 @@ class DWSMigratorEngine:
                 diffs.append(
                     f"当前注释 [{matched_col.column_comment or '空'}] -> 目标 [{new_comment}]"
                 )
-            detail_msg = f"字段名已是 [{matched_col.column_name}]，待更新: " + "；".join(diffs)
+            rebuild_hint = (
+                "（注意：该列需采用原序重建表）" if needs_rebuild else ""
+            )
+            detail_msg = (
+                f"字段名已是 [{matched_col.column_name}]，待更新: "
+                + "；".join(diffs)
+                + rebuild_hint
+            )
             new_status = "FAILED" if (prev_status == "FAILED" and prev_error) else "PARTIAL"
         else:
             dist_hint = (
-                "（注意：该列为分布列，直接修改类型受限，建议使用原序重建表）" if is_dist else ""
+                "（注意：该列为分布列，直接修改类型受限，建议使用原序重建表）"
+                if needs_rebuild
+                else ""
             )
             detail_msg = (
                 f"待贯标：位于表内第 {matched_col.ordinal_position}/{total_cols} 列{dist_hint}"
@@ -1374,6 +1374,7 @@ class DWSMigratorEngine:
             "schema_name": actual_schema,
             "table_name": actual_table,
             "status": new_status,
+            "strategy": eff_strategy,
             "status_detail": detail_msg,
             "ordinal_position": matched_col.ordinal_position,
             "total_columns": total_cols,
@@ -1391,63 +1392,130 @@ class DWSMigratorEngine:
         item: Dict[str, Any],
         matched_col: Optional[ColumnMeta] = None,
         table_meta: Optional[TableMeta] = None,
+        dialect: str = "DWS",
     ) -> str:
-        """生成保证字段顺序不变的原生 DWS ALTER TABLE SQL 预览语句."""
+        """生成保证字段顺序不变、按真实变更项与目标方言精准裁剪的原生 DDL 预览语句."""
         schema_q = quote_ident_str(item["schema_name"])
         table_q = quote_ident_str(item["table_name"])
         full_table = f"{schema_q}.{table_q}"
 
-        current_name = (
-            matched_col.column_name
-            if matched_col is not None
-            else (item.get("db_current_col_name") or clean_identifier_input(item["old_col_name"]))
-        )
-        current_type = (
-            matched_col.data_type
-            if matched_col is not None
-            else (item.get("db_current_type") or item["old_col_type"] or "varchar(64)")
-        )
-        current_comment = (
-            matched_col.column_comment
-            if matched_col is not None
-            else (item.get("db_current_comment") or item["old_col_comment"])
-        )
+        changes = analyze_item_changes(item, matched_col=matched_col, table_meta=table_meta)
+        current_name = changes["cur_name"]
+        current_type = changes["cur_type"] or "varchar(64)"
+        current_comment = changes["cur_comment"]
+        new_name = changes["new_name"]
+        new_type = clean_sql_type_input(changes["new_type"] or current_type) or current_type
+        new_comment = changes["new_comment"]
 
-        new_name = clean_identifier_input(item["new_col_name"]) or clean_identifier_input(current_name)
-        new_type = clean_sql_type_input(item["new_col_type"] or current_type) or current_type
-        new_comment = item["new_col_comment"].strip()
+        name_changed = changes["name_changed"]
+        type_changed = changes["type_changed"]
+        comment_changed = changes["comment_changed"]
+        is_comment_only = changes["is_comment_only"]
+        has_any_change = changes["has_any_change"]
 
         cur_col_q = format_existing_db_ident(current_name)
         new_col_q = quote_ident_str(new_name)
+        target_col_q = new_col_q if name_changed else cur_col_q
 
         pos_info = (
             f"第 {matched_col.ordinal_position}/{len(table_meta.columns)} 列"
             if (matched_col and table_meta)
             else "原位置"
         )
+        tgt_d = (dialect or "DWS").strip().upper()
+        if tgt_d in ("SQLITE",) and not has_any_change:
+            return f"-- 目标表: {table_q}.{cur_col_q} | 字段名、物理类型与注释均已符合数据标准，无需执行 DDL 变更"
+        if not has_any_change:
+            return f"-- 目标表: {full_table}.{cur_col_q} | 字段名、物理类型与注释均已符合数据标准，无需执行 DDL 变更"
+
+        eff_type = new_type if type_changed else current_type
+        eff_comment = new_comment if comment_changed else current_comment
+
+        if tgt_d in ("MYSQL", "MARIADB", "OCEANBASE", "DORIS", "STARROCKS", "TIDB"):
+            bt_full = f"{quote_backtick_str(item['schema_name'])}.{quote_backtick_str(item['table_name'])}"
+            bt_cur = quote_backtick_str(current_name)
+            bt_tgt = quote_backtick_str(new_name) if name_changed else bt_cur
+            nn_sql = " NOT NULL" if (matched_col is not None and getattr(matched_col, "is_not_null", False)) else ""
+            comm_sql = f" COMMENT {quote_literal_str(eff_comment)}" if eff_comment else ""
+            hdr = (
+                f"-- [原地更新字段注释] 目标表: {bt_full} | 字段位置: {pos_info}（仅注释差异，保留原字段名与类型）"
+                if is_comment_only
+                else f"-- [原地字段变更] 目标表: {bt_full} | 字段位置: {pos_info}"
+            )
+            if name_changed:
+                stmt = f"ALTER TABLE {bt_full} CHANGE COLUMN {bt_cur} {bt_tgt} {eff_type}{nn_sql}{comm_sql};"
+            else:
+                stmt = f"ALTER TABLE {bt_full} MODIFY COLUMN {bt_cur} {eff_type}{nn_sql}{comm_sql};"
+            return f"{hdr}\n{stmt}"
+
+        if tgt_d == "INCEPTOR":
+            comm_sql = f" COMMENT {quote_literal_str(eff_comment)}" if eff_comment else ""
+            hdr = (
+                f"-- [原地更新字段注释] 目标表: {full_table} | 字段位置: {pos_info}"
+                if is_comment_only
+                else f"-- [原地字段变更] 目标表: {full_table} | 字段位置: {pos_info}"
+            )
+            stmt = f"ALTER TABLE {full_table} CHANGE COLUMN {cur_col_q} {target_col_q} {eff_type}{comm_sql};"
+            return f"{hdr}\n{stmt}"
+
+        if tgt_d == "SQLITE":
+            lines = [f"-- [SQLite 字段调整] 目标表: {table_q} | 字段位置: {pos_info}"]
+            if name_changed:
+                lines.append(f"ALTER TABLE {table_q} RENAME COLUMN {cur_col_q} TO {new_col_q};")
+            if type_changed:
+                lines.append(
+                    f"-- SQLite 不支持原生 ALTER COLUMN TYPE（目标类型: {new_type}），如需改类型请按新结构重建表。"
+                )
+            if comment_changed:
+                lines.append(
+                    f"-- SQLite 原生 DDL 不支持 COMMENT ON COLUMN（建议目标注释: {new_comment}）。"
+                )
+            return "\n".join(lines)
+
+        if tgt_d in ("ORACLE", "DM8"):
+            lines = [
+                f"-- [{'原地更新字段注释' if is_comment_only else '原生 ALTER'}] 目标表: {full_table} | 字段位置: {pos_info}",
+            ]
+            if name_changed:
+                lines.append(
+                    f"ALTER TABLE {full_table} RENAME COLUMN {cur_col_q} TO {new_col_q};"
+                )
+            if type_changed:
+                lines.append(
+                    f"ALTER TABLE {full_table} MODIFY ({target_col_q} {new_type});"
+                )
+            if comment_changed:
+                lines.append(
+                    f"COMMENT ON COLUMN {full_table}.{target_col_q} IS {quote_literal_str(new_comment)};"
+                )
+            return "\n".join(lines)
+
+        # DWS / PGSQL / KINGBASE 默认原生事务块
+        if is_comment_only:
+            lines = [
+                f"-- [模式1: 原地更新字段注释] 目标表: {full_table} | 字段固定位置: {pos_info}（仅注释差异，不改动字段名与物理类型）",
+                "BEGIN;",
+                f"COMMENT ON COLUMN {full_table}.{cur_col_q} IS {quote_literal_str(new_comment)};",
+                "COMMIT;",
+            ]
+            return "\n".join(lines)
+
         lines = [
             f"-- [模式1: 原生无损 ALTER] 目标表: {full_table} | 字段固定位置: {pos_info} (attnum 保持不变)",
             "BEGIN;",
         ]
-
-        if (
-            current_name.lower() != new_name.lower()
-            or current_name != clean_identifier_input(current_name)
-        ):
+        if name_changed:
             lines.append(
                 f"ALTER TABLE {full_table} RENAME COLUMN {cur_col_q} TO {new_col_q};"
             )
-
-        if normalize_dws_type(current_type) != normalize_dws_type(new_type):
+        if type_changed:
             lines.append(
-                f"ALTER TABLE {full_table} ALTER COLUMN {new_col_q} TYPE {new_type} USING {new_col_q}::{new_type};"
+                f"ALTER TABLE {full_table} ALTER COLUMN {target_col_q} TYPE {new_type} USING {target_col_q}::{new_type};"
             )
-
-        if new_comment != "" and current_comment != new_comment:
+        if comment_changed:
             lines.append(
-                f"COMMENT ON COLUMN {full_table}.{new_col_q} IS {quote_literal_str(new_comment)};"
+                f"COMMENT ON COLUMN {full_table}.{target_col_q} IS {quote_literal_str(new_comment)};"
             )
-
         lines.append("COMMIT;")
         return "\n".join(lines)
 
@@ -1667,32 +1735,43 @@ class DWSMigratorEngine:
             src_col_q = format_existing_db_ident(col.column_name)
             orig_clean = clean_identifier_input(col.column_name) or col.column_name
             if matched_item:
-                target_name = (
-                    clean_identifier_input(matched_item["new_col_name"])
-                    or orig_clean
+                changes = analyze_item_changes(
+                    matched_item, matched_col=col, table_meta=table_meta
                 )
-                target_type = validate_sql_type(
-                    matched_item["new_col_type"].strip() or col.data_type
+                name_changed = changes["name_changed"]
+                type_changed = changes["type_changed"]
+                target_name = changes["new_name"] if name_changed else orig_clean
+                target_type = (
+                    validate_sql_type(changes["new_type"] or col.data_type)
+                    if type_changed
+                    else col.data_type
                 )
                 target_comment = (
-                    matched_item["new_col_comment"].strip()
-                    if matched_item.get("new_col_comment", "").strip() != ""
+                    changes["new_comment"]
+                    if changes["new_comment"] != ""
                     else col.column_comment
                 )
                 not_null_sql = " NOT NULL" if col.is_not_null else ""
                 default_sql = f" DEFAULT {col.column_default}" if col.column_default else ""
+                tag_note = (
+                    " (仅更新注释)"
+                    if (not name_changed and not type_changed)
+                    else " (已转换)"
+                )
                 col_defs.append(
-                    f"    {quote_ident_str(target_name)} {target_type}{default_sql}{not_null_sql} /* 第{col.ordinal_position}列 (已转换) */"
+                    f"    {quote_ident_str(target_name)} {target_type}{default_sql}{not_null_sql} /* 第{col.ordinal_position}列{tag_note} */"
                 )
                 insert_cols.append(quote_ident_str(target_name))
-                if normalize_dws_type(col.data_type) != normalize_dws_type(target_type):
+                if type_changed:
                     select_exprs.append(
                         f"CAST({src_col_q} AS {target_type}) AS {quote_ident_str(target_name)}"
                     )
-                else:
+                elif name_changed:
                     select_exprs.append(
                         f"{src_col_q} AS {quote_ident_str(target_name)}"
                     )
+                else:
+                    select_exprs.append(src_col_q)
                 if target_comment:
                     comment_stmts.append((target_name, target_comment))
 
@@ -1886,15 +1965,25 @@ class DWSMigratorEngine:
             self.store.add_log("ERROR", target_label, err)
             return self.store.get_item(item_id)
 
+        changes = analyze_item_changes(item, matched_col=matched_col, table_meta=table_meta)
         new_type = validate_sql_type(
-            item["new_col_type"] or item["old_col_type"] or matched_col.data_type
+            changes["new_type"] or matched_col.data_type
         )
-        new_comment = item["new_col_comment"].strip()
+        new_comment = changes["new_comment"]
+        eff_col_name = (
+            new_name
+            if changes["name_changed"]
+            else (clean_identifier_input(matched_col.column_name) or matched_col.column_name)
+        )
 
         before_ordinal = matched_col.ordinal_position
         sql_preview = self.build_direct_alter_sql_preview(item, matched_col, table_meta)
 
-        start_msg = f"开始执行 [原生 ALTER] {target_label} (位于第 {before_ordinal}/{len(table_meta.columns)} 列)..."
+        start_msg = (
+            f"开始执行 [原地更新注释] {actual_schema}.{actual_table}.{matched_col.column_name}..."
+            if changes["is_comment_only"]
+            else f"开始执行 [原生 ALTER] {target_label} (位于第 {before_ordinal}/{len(table_meta.columns)} 列)..."
+        )
         logger.info(start_msg)
         self.store.add_log("INFO", target_label, start_msg)
         try:
@@ -1904,16 +1993,22 @@ class DWSMigratorEngine:
                 current_col_name=matched_col.column_name,
                 current_col_type=matched_col.data_type,
                 current_col_comment=matched_col.column_comment,
-                new_col_name=new_name,
+                new_col_name=eff_col_name,
                 new_col_type=new_type,
                 new_col_comment=new_comment,
                 expected_ordinal=before_ordinal,
             )
 
-            success_msg = (
-                f"执行成功！字段已转换为 [{new_name} {new_type}]，"
-                f"物理顺序保持在第 {after_ordinal}/{len(table_meta.columns)} 列不变"
-            )
+            if changes["is_comment_only"]:
+                success_msg = (
+                    f"执行成功！已原地更新字段 [{matched_col.column_name}] 注释，"
+                    f"物理顺序保持在第 {after_ordinal}/{len(table_meta.columns)} 列不变"
+                )
+            else:
+                success_msg = (
+                    f"执行成功！字段已转换为 [{eff_col_name} {new_type}]，"
+                    f"物理顺序保持在第 {after_ordinal}/{len(table_meta.columns)} 列不变"
+                )
             logger.info(success_msg)
             self.store.update_item_execution(
                 item_id,
@@ -1923,7 +2018,7 @@ class DWSMigratorEngine:
                 error_message="",
                 generated_sql=sql_preview,
                 ordinal_position=after_ordinal,
-                db_current_col_name=new_name,
+                db_current_col_name=eff_col_name,
                 db_current_type=after_type,
                 db_current_comment=after_comment,
             )
@@ -1962,26 +2057,31 @@ class DWSMigratorEngine:
             try:
                 with conn.cursor() as cur:
                     full_table = f"{quote_ident_str(schema_name)}.{quote_ident_str(table_name)}"
-                    natural_new_col = quote_ident_str(new_col_name)
-
-                    if (
+                    name_changed = (
                         current_col_name.lower() != new_col_name.lower()
                         or current_col_name != clean_identifier_input(current_col_name)
-                    ):
+                    )
+                    target_col_ident = (
+                        quote_ident_str(new_col_name)
+                        if name_changed
+                        else format_existing_db_ident(current_col_name)
+                    )
+
+                    if name_changed:
                         cur_col_ident = format_existing_db_ident(current_col_name)
                         cur.execute(
-                            f"ALTER TABLE {full_table} RENAME COLUMN {cur_col_ident} TO {natural_new_col};"
+                            f"ALTER TABLE {full_table} RENAME COLUMN {cur_col_ident} TO {target_col_ident};"
                         )
 
                     if normalize_dws_type(current_col_type) != normalize_dws_type(new_col_type):
                         safe_type = validate_sql_type(new_col_type)
                         cur.execute(
-                            f"ALTER TABLE {full_table} ALTER COLUMN {natural_new_col} TYPE {safe_type} USING {natural_new_col}::{safe_type};"
+                            f"ALTER TABLE {full_table} ALTER COLUMN {target_col_ident} TYPE {safe_type} USING {target_col_ident}::{safe_type};"
                         )
 
                     if new_col_comment != "" and current_col_comment != new_col_comment:
                         cur.execute(
-                            f"COMMENT ON COLUMN {full_table}.{natural_new_col} IS %s;",
+                            f"COMMENT ON COLUMN {full_table}.{target_col_ident} IS %s;",
                             (new_col_comment,),
                         )
 
@@ -2246,6 +2346,7 @@ class DWSMigratorEngine:
                 col_map[c.column_name.lower()] = c
 
             rebuild_reasons: List[str] = []
+            is_col_store = str(table_meta.orientation or "").upper() == "COLUMN"
             for it in group_items:
                 old_c = clean_identifier_input(it["old_col_name"])
                 new_c = clean_identifier_input(it["new_col_name"]) or old_c
@@ -2255,6 +2356,12 @@ class DWSMigratorEngine:
                     or col_map.get(new_c.lower())
                     or (col_map.get(cur_c.lower()) if cur_c else None)
                 )
+                changes = analyze_item_changes(
+                    it, matched_col=matched_col, table_meta=table_meta
+                )
+                # 仅差注释或无列名/类型结构变更：绝不触发整表重建（即使位于分布键、分区键或列存表）
+                if not changes["name_changed"] and not changes["type_changed"]:
+                    continue
                 is_dist_or_part = (
                     bool(it.get("is_distribute_key"))
                     or old_c.lower() in dist_keys_lower
@@ -2271,29 +2378,9 @@ class DWSMigratorEngine:
                     or ("partition" in (it.get("error_message") or "").lower())
                 )
                 if is_dist_or_part:
-                    if matched_col is None:
-                        needs_col_alter = True
-                    else:
-                        eff_new_type = (
-                            it["new_col_type"].strip()
-                            or it["old_col_type"].strip()
-                            or matched_col.data_type
-                        )
-                        name_changed = (
-                            matched_col.column_name.lower() != new_c.lower()
-                            or matched_col.column_name
-                            != clean_identifier_input(matched_col.column_name)
-                        )
-                        type_changed = normalize_dws_type(
-                            matched_col.data_type
-                        ) != normalize_dws_type(eff_new_type)
-                        needs_col_alter = (
-                            name_changed
-                            or type_changed
-                            or it.get("status") == "FAILED"
-                        )
-                    if needs_col_alter:
-                        rebuild_reasons.append(f"分布键/分区键字段 {old_c}")
+                    rebuild_reasons.append(f"分布键/分区键字段 {old_c}")
+                elif is_col_store and changes["type_changed"]:
+                    rebuild_reasons.append(f"列存表字段类型变更 {old_c}")
 
             if col_plan["has_rename_cycle"]:
                 rebuild_reasons.append("字段互换改名环路")
@@ -2496,18 +2583,26 @@ class DWSMigratorEngine:
             src_col_q = format_existing_db_ident(col.column_name)
             orig_clean = clean_identifier_input(col.column_name) or col.column_name
             if m:
-                t_name = validate_identifier(m["new_col_name"] or orig_clean, "新字段名")
-                t_type = validate_sql_type(m["new_col_type"] or col.data_type)
+                changes = analyze_item_changes(m, matched_col=col, table_meta=table_meta)
+                t_name = validate_identifier(
+                    changes["new_name"] if changes["name_changed"] else orig_clean,
+                    "新字段名",
+                )
+                t_type = (
+                    validate_sql_type(changes["new_type"] or col.data_type)
+                    if changes["type_changed"]
+                    else col.data_type
+                )
                 t_comment = (
-                    m["new_col_comment"].strip()
-                    if m.get("new_col_comment", "").strip() != ""
+                    changes["new_comment"]
+                    if changes["new_comment"] != ""
                     else col.column_comment
                 )
                 not_null_sql = " NOT NULL" if col.is_not_null else ""
                 default_sql = f" DEFAULT {col.column_default}" if col.column_default else ""
                 col_defs.append(f"{quote_ident_str(t_name)} {t_type}{default_sql}{not_null_sql}")
                 insert_cols.append(quote_ident_str(t_name))
-                if normalize_dws_type(col.data_type) != normalize_dws_type(t_type):
+                if changes["type_changed"]:
                     select_exprs.append(
                         f"CAST({src_col_q} AS {t_type})"
                     )

@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.platform.dialects.identifiers import clean_identifier_input
+
 SUPPORTED_DIALECTS = (
     "DWS",
     "PGSQL",
@@ -53,6 +55,7 @@ def normalize_dws_type(raw_type: str) -> str:
     t = re.sub(r"^bpchar\b", "char", t)
     t = re.sub(r"^nchar\b", "char", t)
     t = re.sub(r"^decimal\b", "numeric", t)
+    t = re.sub(r"^dec\b", "numeric", t)
     t = re.sub(r"^number\b", "numeric", t)
     t = re.sub(r"^int4\b", "integer", t)
     t = re.sub(r"^int\b", "integer", t)
@@ -60,8 +63,11 @@ def normalize_dws_type(raw_type: str) -> str:
     t = re.sub(r"^int2\b", "smallint", t)
     t = re.sub(r"^int1\b", "tinyint", t)
     t = re.sub(r"^float8\b", "double precision", t)
+    t = re.sub(r"^double$", "double precision", t)
     t = re.sub(r"^float4\b", "real", t)
     t = re.sub(r"^bool\b", "boolean", t)
+    t = re.sub(r"^datetime$", "timestamp", t)
+    t = re.sub(r"^string$", "varchar", t)
     t = re.sub(r"^timestamp without time zone\b", "timestamp", t)
     t = re.sub(r"^timestamp with time zone\b", "timestamptz", t)
     t = re.sub(r"^timestamp\(\d+\) without time zone\b", "timestamp", t)
@@ -1440,3 +1446,121 @@ def analyze_cross_column_compatibility(
         conv_short=f"转: {src['family_cn']}→{tgt['family_cn']}",
         conv_detail=f"跨语义族映射 ({src['raw']} → {tgt['raw']})，涉及强制类型转换",
     )
+
+
+def analyze_item_changes(
+    item: Dict[str, Any],
+    matched_col: Optional[Any] = None,
+    table_meta: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """统一判定单个贯标任务在列名、物理类型与注释三维度上的真实差异."""
+    del table_meta  # 保留参数签名一致性
+    if matched_col is not None:
+        cur_name = str(getattr(matched_col, "column_name", "") or "")
+        cur_type = str(getattr(matched_col, "data_type", "") or "")
+        cur_comment = str(getattr(matched_col, "column_comment", "") or "").strip()
+    else:
+        has_db_snapshot = bool(
+            str(item.get("db_current_col_name") or item.get("current_db_col_name") or "").strip()
+            or str(item.get("db_current_type") or item.get("current_db_col_type") or "").strip()
+        )
+        cur_name = str(
+            item.get("db_current_col_name")
+            or item.get("current_db_col_name")
+            or clean_identifier_input(str(item.get("old_col_name") or ""))
+        )
+        cur_type = str(
+            item.get("db_current_type")
+            or item.get("current_db_col_type")
+            or item.get("old_col_type")
+            or ""
+        )
+        cur_comment = (
+            str(item.get("db_current_comment") or "").strip()
+            if has_db_snapshot
+            else str(item.get("old_col_comment") or "").strip()
+        )
+
+    new_name = (
+        clean_identifier_input(str(item.get("new_col_name") or ""))
+        or clean_identifier_input(cur_name)
+        or cur_name
+    )
+    new_type = clean_sql_type_input(str(item.get("new_col_type") or "") or cur_type) or cur_type
+    new_comment = str(item.get("new_col_comment") or "").strip()
+
+    cur_name_clean = clean_identifier_input(cur_name)
+    name_changed = (cur_name.lower() != new_name.lower()) or (cur_name != cur_name_clean)
+    type_changed = bool(new_type) and (
+        normalize_dws_type(cur_type) != normalize_dws_type(new_type)
+    )
+    comment_changed = (new_comment != "") and (cur_comment != new_comment)
+    is_comment_only = (not name_changed) and (not type_changed) and comment_changed
+    has_any_change = name_changed or type_changed or comment_changed
+
+    return {
+        "cur_name": cur_name,
+        "cur_type": cur_type,
+        "cur_comment": cur_comment,
+        "new_name": new_name,
+        "new_type": new_type,
+        "new_comment": new_comment,
+        "name_changed": name_changed,
+        "type_changed": type_changed,
+        "comment_changed": comment_changed,
+        "is_comment_only": is_comment_only,
+        "has_any_change": has_any_change,
+    }
+
+
+def item_requires_table_rebuild(
+    item: Dict[str, Any],
+    matched_col: Optional[Any] = None,
+    table_meta: Optional[Any] = None,
+) -> bool:
+    """严格判定字段贯标是否必须采用整表保序重建 (TABLE_REBUILD).
+
+    铁律：若仅差注释（列名与物理类型均未变更）或无任何结构变化，绝不触发整表重建。
+    """
+    changes = analyze_item_changes(item, matched_col=matched_col, table_meta=table_meta)
+    if not changes["name_changed"] and not changes["type_changed"]:
+        return False
+
+    dist_keys_lower: set[str] = set()
+    part_keys_lower: set[str] = set()
+    orientation = str(item.get("table_orientation") or "").upper()
+    if table_meta is not None:
+        dist_keys_lower = {
+            clean_identifier_input(str(k)).lower()
+            for k in (getattr(table_meta, "distribute_keys", None) or [])
+            if clean_identifier_input(str(k))
+        }
+        part_keys_lower = {
+            clean_identifier_input(str(k)).lower()
+            for k in (getattr(table_meta, "partition_keys", None) or [])
+            if clean_identifier_input(str(k))
+        }
+        orientation = str(getattr(table_meta, "orientation", "") or orientation).upper()
+
+    key_set = dist_keys_lower | part_keys_lower
+    cur_lower = clean_identifier_input(changes["cur_name"]).lower()
+    old_lower = clean_identifier_input(str(item.get("old_col_name") or "")).lower()
+    new_lower = clean_identifier_input(changes["new_name"]).lower()
+
+    if table_meta is not None:
+        is_dist_or_part = bool(key_set) and (
+            cur_lower in key_set or old_lower in key_set or new_lower in key_set
+        )
+        if is_dist_or_part:
+            return True
+        if orientation == "COLUMN" and changes["type_changed"]:
+            return True
+        return False
+
+    if bool(item.get("is_distribute_key")):
+        return True
+    if orientation == "COLUMN" and changes["type_changed"]:
+        return True
+    if str(item.get("strategy") or "").upper() == "TABLE_REBUILD":
+        return True
+    return False
