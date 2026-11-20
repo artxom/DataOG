@@ -9,7 +9,8 @@ import os
 import sys
 import tempfile
 import unittest
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
+from unittest import mock
 
 import openpyxl
 
@@ -1251,6 +1252,91 @@ ENABLE ROW MOVEMENT;"""
         date_to_ts = analyze_cross_column_compatibility("DATE", "TIMESTAMP")
         self.assertEqual(date_to_ts["type_conv_status"], "SAFE_CAST")
         self.assertEqual(date_to_ts["capacity_status"], "CONTAINED")
+
+    def test_dws_engine_metadata_batch_graceful_degradation_on_standard_pg(self) -> None:
+        """验证 DWSMigratorEngine 在标准 PostgreSQL (无 getdistributekey/pg_get_tabledef/pg_partition) 上安全降级且无 InFailedSqlTransaction."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = StateStore(os.path.join(tmpdir, "pg_compat.db"))
+            engine = DWSMigratorEngine(store)
+            engine._conn_config = {
+                "configured": True,
+                "host": "127.0.0.1",
+                "port": 15432,
+                "dbname": "qiming_dws",
+                "user": "dws_admin",
+                "password": "secret",
+                "sslmode": "disable",
+            }
+
+            class _FakeStandardPgCur:
+                def __init__(self, conn_obj: Any) -> None:
+                    self._conn = conn_obj
+                    self._rows: List[Any] = []
+
+                def __enter__(self) -> "_FakeStandardPgCur":
+                    return self
+
+                def __exit__(self, *args: Any) -> None:
+                    return None
+
+                def execute(self, sql: str, params: Any = None) -> None:
+                    if self._conn.in_error:
+                        raise RuntimeError("InFailedSqlTransaction")
+                    low = sql.lower()
+                    if "current_schema" in low:
+                        self._rows = [("dwd_bank",)]
+                    elif "getdistributekey" in low or "pg_get_tabledef" in low or "pg_partition" in low:
+                        if not self._conn.autocommit:
+                            self._conn.in_error = True
+                        raise RuntimeError("function/relation does not exist on standard PG")
+                    elif "from pg_catalog.pg_class" in low and "lower(c.relname)" in low:
+                        self._rows = [(1001, "dwd_bank", "dwd_loan_contract", "合同表", "")]
+                    elif "from pg_catalog.pg_attribute" in low:
+                        self._rows = [(1001, 1, "htbh", "character varying(24)", True, None, "合同号")]
+                    else:
+                        self._rows = []
+
+                def fetchone(self) -> Any:
+                    return self._rows[0] if self._rows else None
+
+                def fetchall(self) -> List[Any]:
+                    return list(self._rows)
+
+            class _FakeStandardPgConn:
+                def __init__(self) -> None:
+                    self.autocommit = False
+                    self.in_error = False
+                    self.closed = False
+                    self.rollbacks = 0
+
+                def cursor(self) -> _FakeStandardPgCur:
+                    return _FakeStandardPgCur(self)
+
+                def rollback(self) -> None:
+                    self.in_error = False
+                    self.rollbacks += 1
+
+                def close(self) -> None:
+                    self.closed = True
+
+            fake_conn = _FakeStandardPgConn()
+            with mock.patch.object(engine, "_open_dws_connection", return_value=fake_conn):
+                meta_map = engine._fetch_real_tables_metadata_batch([("dwd_bank", "dwd_loan_contract")])
+
+            self.assertTrue(fake_conn.autocommit)
+            self.assertTrue(fake_conn.closed)
+            tmeta = meta_map[("dwd_bank", "dwd_loan_contract")]
+            self.assertTrue(tmeta.exists)
+            self.assertEqual(tmeta.table_comment, "合同表")
+            self.assertEqual(len(tmeta.columns), 1)
+            self.assertEqual(tmeta.columns[0].column_name, "htbh")
+
+            # 非 autocommit 驱动场景：_rollback_if_needed 必须清理 INERROR 状态
+            fake_non_auto = _FakeStandardPgConn()
+            fake_non_auto.in_error = True
+            engine._rollback_if_needed(fake_non_auto)
+            self.assertFalse(fake_non_auto.in_error)
+            self.assertEqual(fake_non_auto.rollbacks, 1)
 
 
 if __name__ == "__main__":

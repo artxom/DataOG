@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextlib
 import copy
 import datetime
 import hashlib
@@ -590,7 +591,7 @@ class DWSMigratorEngine:
                 clean_db,
                 clean_user,
             )
-            with self._open_dws_connection() as conn:
+            with contextlib.closing(self._open_dws_connection()) as conn:
                 conn.autocommit = True
                 with conn.cursor() as cur:
                     cur.execute("SELECT version();")
@@ -648,6 +649,17 @@ class DWSMigratorEngine:
             except Exception:
                 pass
         return conn
+
+    @staticmethod
+    def _rollback_if_needed(conn: Any) -> None:
+        """确保只读探查兼容降级报错后不会遗留处于 INERROR 状态的事务."""
+        if getattr(conn, "autocommit", False):
+            return
+        try:
+            if hasattr(conn, "rollback"):
+                conn.rollback()
+        except Exception:
+            pass
 
     def _query_dws_catalog_on_cursor(self, cur: Any) -> Dict[str, Any]:
         """在已打开的 DWS 游标上快速读取当前库的默认 Schema、所有业务 Schema 与表清单."""
@@ -734,7 +746,7 @@ class DWSMigratorEngine:
 
     def discover_database_catalog(self) -> Dict[str, Any]:
         """主动刷新并返回当前连接华为 DWS 数据库中的 Schema 与表结构列表."""
-        with self._open_dws_connection() as conn:
+        with contextlib.closing(self._open_dws_connection()) as conn:
             conn.autocommit = True
             with conn.cursor() as cur:
                 self._catalog_cache = self._query_dws_catalog_on_cursor(cur)
@@ -748,7 +760,7 @@ class DWSMigratorEngine:
         max_tables: int = 30,
     ) -> int:
         """直接从华为 DWS 数据库中读取真实表结构并加载到工作台清单中."""
-        with self._open_dws_connection() as conn:
+        with contextlib.closing(self._open_dws_connection()) as conn:
             conn.autocommit = True
             with conn.cursor() as cur:
                 params: List[Any] = [SYSTEM_SCHEMAS]
@@ -850,7 +862,7 @@ class DWSMigratorEngine:
         if not lower_table_names:
             return result
 
-        with self._open_dws_connection() as conn:
+        with contextlib.closing(self._open_dws_connection()) as conn:
             conn.autocommit = True
             with conn.cursor() as cur:
                 current_schema = "public"
@@ -860,7 +872,7 @@ class DWSMigratorEngine:
                     if cs_row and cs_row[0]:
                         current_schema = str(cs_row[0])
                 except Exception:
-                    pass
+                    self._rollback_if_needed(conn)
 
                 # 1. 一次性查出所有同名候选表（忽略大小写）
                 cur.execute(
@@ -955,7 +967,7 @@ class DWSMigratorEngine:
                             ]
                             dist_by_oid[oid_val] = keys
                 except Exception:
-                    pass
+                    self._rollback_if_needed(conn)
 
                 # 3. 批量查询所有匹配表的字段列表（严格按 attnum 升序）
                 cur.execute(
@@ -1012,6 +1024,7 @@ class DWSMigratorEngine:
                         if raw_def:
                             tabledef_by_oid[oid_val] = str(raw_def)
                 except Exception:
+                    self._rollback_if_needed(conn)
                     for oid_val in matched_oids:
                         try:
                             cur.execute(
@@ -1022,7 +1035,7 @@ class DWSMigratorEngine:
                             if one_def and one_def[0]:
                                 tabledef_by_oid[oid_val] = str(one_def[0])
                         except Exception:
-                            pass
+                            self._rollback_if_needed(conn)
 
                 # 5. 兜底查询 pg_catalog.pg_partition，防止 pg_get_tabledef 不可用或仅输出 period 未输出起始分区边界
                 part_catalog_by_oid: Dict[Any, Tuple[str, List[str]]] = {}
@@ -1116,7 +1129,7 @@ class DWSMigratorEngine:
                             )
                             part_catalog_by_oid[p_parent] = (reconstructed_clause, key_names)
                     except Exception:
-                        pass
+                        self._rollback_if_needed(conn)
 
                 meta_by_oid: Dict[Any, TableMeta] = {}
                 for oid_val, tbl_row in matched_oid_to_row.items():
@@ -1944,7 +1957,7 @@ class DWSMigratorEngine:
         expected_ordinal: int,
     ) -> Tuple[int, str, str]:
         """在真实华为 DWS 事务内执行 RENAME / ALTER TYPE / COMMENT 并校验字段顺序."""
-        with self._open_dws_connection() as conn:
+        with contextlib.closing(self._open_dws_connection()) as conn:
             conn.autocommit = False
             try:
                 with conn.cursor() as cur:
@@ -2547,7 +2560,7 @@ class DWSMigratorEngine:
             f"SELECT {', '.join(select_exprs)} FROM {full_orig};"
         )
 
-        with self._open_dws_connection() as conn:
+        with contextlib.closing(self._open_dws_connection()) as conn:
             conn.autocommit = False
             try:
                 with conn.cursor() as cur:

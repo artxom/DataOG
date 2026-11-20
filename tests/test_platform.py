@@ -2353,6 +2353,55 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
 
             ctx.connection_hub.close_warm_connections()
 
+    def test_probe_inceptor_table_spark_describe_formatted_view_and_comment(self) -> None:
+        """验证 MetadataHub._probe_inceptor_table 兼容 Spark Thrift / 新版 Inceptor DESCRIBE FORMATTED 视图与注释格式."""
+        from core.platform.context import PlatformContext
+        from core.platform.inceptor_client import InceptorThriftClient
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            prof = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "conn_spark_inceptor",
+                    "name": "SparkInceptor",
+                    "db_type": "INCEPTOR",
+                    "host": "127.0.0.1",
+                    "port": 11000,
+                    "dbname": "bank_inceptor",
+                    "default_schema": "bank_inceptor",
+                }
+            )
+
+            class _FakeSparkClient(InceptorThriftClient):
+                def __init__(self) -> None:
+                    super().__init__("127.0.0.1", 11000, "bank_inceptor", "hive", "", "NOSASL")
+
+                def execute_query(self, sql: str, max_rows: int = 5000) -> List[List[Any]]:
+                    up = sql.upper()
+                    if "DESCRIBE FORMATTED BANK_INCEPTOR.V_TEST" in up:
+                        return [
+                            ["loan_receipt_no", "string", "借据号"],
+                            ["loan_bal_amt", "decimal(18,2)", "余额"],
+                            ["# Detailed Table Information", "", ""],
+                            ["Database", "bank_inceptor", ""],
+                            ["Table", "v_test", ""],
+                            ["Type", "VIEW", ""],
+                            ["Comment", "监管视图注释", ""],
+                            ["View Text", "SELECT loan_receipt_no, loan_bal_amt FROM bank_inceptor.dwd_loan_receipt", ""],
+                        ]
+                    if "SHOW CREATE TABLE BANK_INCEPTOR.V_TEST" in up:
+                        return [["CREATE VIEW bank_inceptor.v_test AS SELECT loan_receipt_no, loan_bal_amt FROM bank_inceptor.dwd_loan_receipt"]]
+                    return []
+
+            meta = ctx.metadata_hub._probe_inceptor_table(
+                _FakeSparkClient(), prof, "bank_inceptor", "v_test"
+            )
+            self.assertTrue(meta.exists)
+            self.assertEqual(meta.object_type, "VIEW")
+            self.assertEqual(meta.table_comment, "监管视图注释")
+            self.assertIn("SELECT loan_receipt_no", meta.view_definition)
+            self.assertEqual([c.column_name for c in meta.columns], ["loan_receipt_no", "loan_bal_amt"])
+
 
 if __name__ == "__main__":
     unittest.main()
