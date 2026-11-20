@@ -86,6 +86,12 @@ export class StandardMigratorView {
     this.bindingFilter = "ALL"; // ALL | COMPLIANT | COMMENT_ONLY | NON_COMPLIANT | UNBOUND
     this.bindingKeyword = "";
     this.selectedBindCols = new Set();
+    this._stagingInFlight = false;
+    this._bindingSearchTimer = null;
+    this._queueSearchTimer = null;
+    this._bindingStageBtn = null;
+    this._queueExecBatchBtn = null;
+    this._queueRemoveBtn = null;
 
     // 贯标改造执行队列状态
     this.ws = null;
@@ -176,7 +182,10 @@ export class StandardMigratorView {
       style: { width: "200px" },
       onInput: (e) => {
         this.bindingKeyword = e.target.value;
-        this._renderBindingsView();
+        clearTimeout(this._bindingSearchTimer);
+        this._bindingSearchTimer = setTimeout(() => {
+          if (!this._destroyed) this._renderBindingsView();
+        }, 120);
       },
     });
 
@@ -191,7 +200,10 @@ export class StandardMigratorView {
       style: { width: "200px" },
       onInput: (e) => {
         this.searchKeyword = e.target.value;
-        this._renderQueueView();
+        clearTimeout(this._queueSearchTimer);
+        this._queueSearchTimer = setTimeout(() => {
+          if (!this._destroyed) this._renderQueueView();
+        }, 120);
       },
     });
 
@@ -210,6 +222,8 @@ export class StandardMigratorView {
 
   destroy() {
     this._destroyed = true;
+    clearTimeout(this._bindingSearchTimer);
+    clearTimeout(this._queueSearchTimer);
     this._unsubStore?.();
     this._unsubStore = null;
     this.activityBar?.destroy();
@@ -228,13 +242,55 @@ export class StandardMigratorView {
     );
   }
 
+  _isCommentOnlyItem(it) {
+    const oldN = String(it?.db_current_col_name || it?.current_db_col_name || it?.old_col_name || "")
+      .trim()
+      .toLowerCase();
+    const newN = String(it?.new_col_name || oldN)
+      .trim()
+      .toLowerCase();
+    const oldT = String(it?.db_current_type || it?.current_db_col_type || it?.old_col_type || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+    const newT = String(it?.new_col_type || oldT)
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+    const oldC = String(it?.db_current_comment ?? it?.old_col_comment ?? "").trim();
+    const newC = String(it?.new_col_comment || "").trim();
+    return Boolean(oldN && newN && oldN === newN && oldT && newT && oldT === newT && newC && newC !== oldC);
+  }
+
   _isRebuildItem(it) {
+    const strategy = String(it?.strategy || "").toUpperCase();
+    if (strategy === "TABLE_REBUILD") return true;
+    if (strategy === "DIRECT_ALTER") return false;
+    if (this._isCommentOnlyItem(it)) return false;
     return (
-      it?.strategy === "TABLE_REBUILD" ||
       it?.migration_mode === "TABLE_REBUILD" ||
       Boolean(it?.is_distribute_key) ||
       String(it?.table_orientation || "").toUpperCase() === "COLUMN"
     );
+  }
+
+  _isColumnInQueue(connId, schemaName, tableName, colName) {
+    const items = this.ws?.items || [];
+    if (!items.length) return false;
+    const sLower = String(schemaName || "").trim().toLowerCase();
+    const tLower = String(tableName || "").trim().toLowerCase();
+    const cLower = String(colName || "").trim().toLowerCase();
+    const cid = String(connId || "").trim();
+    return items.some((it) => {
+      const itCid = String(it.connection_id || "").trim();
+      if (itCid && cid && itCid !== cid) return false;
+      if (String(it.schema_name || "").trim().toLowerCase() !== sLower) return false;
+      if (String(it.table_name || "").trim().toLowerCase() !== tLower) return false;
+      const oldN = String(it.old_col_name || "").trim().toLowerCase();
+      const newN = String(it.new_col_name || "").trim().toLowerCase();
+      const dbN = String(it.db_current_col_name || "").trim().toLowerCase();
+      return oldN === cLower || newN === cLower || dbN === cLower;
+    });
   }
 
   async ensureLoaded(force = false) {
@@ -796,12 +852,15 @@ export class StandardMigratorView {
     }
   }
 
-  async stageSelectedToQueue(explicitCols = null) {
+  async stageSelectedToQueue(explicitCols = null, { stayInBindings = true } = {}) {
+    if (this._stagingInFlight) return;
     if (!this.activeConnId || !this.activeTable) {
       Toast.warn("请先在左侧选择目标库表");
       return;
     }
     const cols = explicitCols || [...this.selectedBindCols];
+    this._stagingInFlight = true;
+    if (this._bindingStageBtn) this._bindingStageBtn.disabled = true;
     try {
       const res = await migratorApi.stageMigration({
         connection_id: this.activeConnId,
@@ -809,13 +868,24 @@ export class StandardMigratorView {
         table_name: this.activeTable,
         column_names: cols,
         format_profile: this.formatProfile,
-        append: false,
+        append: true,
       });
-      this.selectedBindCols.clear();
-      this.subMode = "queue";
+      if (!explicitCols) {
+        this.selectedBindCols.clear();
+      } else {
+        for (const c of explicitCols) {
+          this.selectedBindCols.delete(c);
+        }
+      }
+      if (!stayInBindings) {
+        this.subMode = "queue";
+      }
       this._applyStateResponse(res);
     } catch (err) {
       Toast.error(err.message);
+    } finally {
+      this._stagingInFlight = false;
+      if (this._bindingStageBtn) this._bindingStageBtn.disabled = false;
     }
   }
 
@@ -866,6 +936,12 @@ export class StandardMigratorView {
     );
 
     if (this.subMode === "queue") {
+      this._queueExecBatchBtn = el("button", {
+        type: "button",
+        className: "mac-btn mac-btn-sm mac-btn-primary",
+        text: `执行 (${this.selectedIds.size})`,
+        onClick: () => this.executeSelectedBatch(),
+      });
       return el(
         "div",
         { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
@@ -888,14 +964,11 @@ export class StandardMigratorView {
           text: "实时核验",
           onClick: () => this.runSyncItems(),
         }),
-        el("button", {
-          type: "button",
-          className: "mac-btn mac-btn-sm mac-btn-primary",
-          text: `执行 (${this.selectedIds.size})`,
-          onClick: () => this.executeSelectedBatch(),
-        })
+        this._queueExecBatchBtn
       );
     }
+
+    this._queueExecBatchBtn = null;
 
     return el(
       "div",
@@ -1029,11 +1102,134 @@ export class StandardMigratorView {
     });
   }
 
-  async openRebuildPreviewModal(schemaName, tableName) {
+  async removeQueueItems(itemIds, { skipConfirm = false } = {}) {
+    const ids = [...new Set((itemIds || []).map((x) => Number(x)).filter((n) => n > 0))];
+    if (!ids.length) {
+      Toast.warn("请先勾选要移出队列的任务");
+      return;
+    }
+    if (!skipConfirm) {
+      const ok = await Modal.confirm({
+        title: "移出贯标队列",
+        message: `确定从全局贯标执行队列中移出选中的 ${ids.length} 条任务吗？（不会影响已绑定的字段数据标准）`,
+        confirmText: "移出",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    try {
+      const res = await migratorApi.deleteItems(ids);
+      for (const id of ids) {
+        this.selectedIds.delete(String(id));
+      }
+      this._applyStateResponse(res);
+    } catch (err) {
+      Toast.error(err.message);
+    }
+  }
+
+  async openItemSqlPreviewModal(itemRow) {
+    if (!itemRow?.id) return;
+    try {
+      const preview = await migratorApi.previewItemSql(itemRow.id);
+      const tblFull = `${preview.schema_name}.${preview.table_name}`;
+      const colLabel =
+        preview.old_col_name && preview.new_col_name && preview.old_col_name.toLowerCase() !== preview.new_col_name.toLowerCase()
+          ? `${preview.old_col_name} → ${preview.new_col_name}`
+          : preview.old_col_name || preview.new_col_name || `#${preview.item_id}`;
+
+      const sqlBox = new SqlCodeBox({
+        title: `${tblFull}.${colLabel}`,
+        value: preview.sql_preview || "-- 暂无可执行 SQL",
+        readOnly: true,
+        minHeight: "220px",
+        filename: `migrate_${preview.schema_name}_${preview.table_name}_${preview.old_col_name || preview.item_id}.sql`,
+      });
+
+      const ch = preview.changes || {};
+      const strategyBadge = preview.needs_rebuild
+        ? badge("需整表保序重建", "warn")
+        : preview.is_comment_only
+        ? badge("仅更新字段注释", "info")
+        : badge("原地无损 ALTER", "neutral");
+
+      const diffPills = [];
+      if (ch.name_changed) {
+        diffPills.push(badge(`字段名: ${ch.cur_name} → ${ch.new_name}`, "info"));
+      }
+      if (ch.type_changed) {
+        diffPills.push(badge(`物理类型: ${ch.cur_type} → ${ch.new_type}`, "info"));
+      }
+      if (ch.comment_changed) {
+        diffPills.push(badge(`注释: ${ch.cur_comment || "空"} → ${ch.new_comment}`, "info"));
+      }
+
+      const body = el(
+        "div",
+        { style: { display: "flex", flexDirection: "column", gap: "10px" } },
+        el(
+          "div",
+          { style: { display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" } },
+          preview.connection_name ? badge(preview.connection_name, "neutral") : null,
+          badge(preview.dialect || "DWS", "info"),
+          strategyBadge,
+          ...diffPills
+        ),
+        sqlBox.root
+      );
+
+      const footer = [
+        el("button", { type: "button", className: "mac-btn", text: "关闭", onClick: () => Modal.close() }),
+      ];
+
+      if (preview.needs_rebuild) {
+        footer.push(
+          el("button", {
+            type: "button",
+            className: "mac-btn mac-btn-primary",
+            text: "预览整表保序重建 SQL",
+            onClick: () => {
+              Modal.close();
+              this.openRebuildPreviewModal(
+                preview.schema_name,
+                preview.table_name,
+                preview.connection_id || ""
+              );
+            },
+          })
+        );
+      } else if (preview.can_execute_online && itemRow.status !== "COMPLETED") {
+        footer.push(
+          el("button", {
+            type: "button",
+            className: "mac-btn mac-btn-primary",
+            text: "立即执行该字段 SQL",
+            onClick: async () => {
+              Modal.close();
+              await this.executeSingleItem(itemRow);
+            },
+          })
+        );
+      }
+
+      Modal.open({
+        title: `贯标 SQL 预览 · ${tblFull}.${colLabel}`,
+        width: "min(760px, 92vw)",
+        body,
+        footer,
+      });
+    } catch (err) {
+      Toast.error(err.message);
+    }
+  }
+
+  async openRebuildPreviewModal(schemaName, tableName, connectionId = "") {
+    const connId = connectionId || "";
     try {
       const preview = await migratorApi.previewRebuild({
         schema_name: schemaName,
         table_name: tableName,
+        connection_id: connId,
         keep_backup: this.keepBackup,
       });
       const sqlBox = new SqlCodeBox({
@@ -1083,6 +1279,7 @@ export class StandardMigratorView {
                   {
                     schema_name: schemaName,
                     table_name: tableName,
+                    connection_id: preview.connection_id || connId,
                     keep_backup: this.keepBackup,
                   },
                   { taskId, signal }
@@ -1157,6 +1354,33 @@ export class StandardMigratorView {
     });
   }
 
+  async _saveColumnBinding(colRow, pickedItem) {
+    try {
+      const res = await migratorApi.saveBindings({
+        connection_id: this.activeConnId,
+        format_profile: this.formatProfile,
+        active_schema: this.activeSchema,
+        active_table: this.activeTable,
+        bindings: [
+          {
+            schema_name: this.activeSchema,
+            table_name: this.activeTable,
+            column_name: colRow.column_name,
+            std_code: pickedItem ? pickedItem.std_code : "",
+          },
+        ],
+      });
+      this.tableCheck = res;
+      if (res.table_stats) this.tableStats = res.table_stats;
+      Toast.success(pickedItem ? `已绑定 [${pickedItem.std_code} · ${pickedItem.cn_name}]` : "已解除绑定");
+      this.tree.renderTreeBody();
+      this.render();
+      this.onStateUpdate?.();
+    } catch (err) {
+      Toast.error(err.message);
+    }
+  }
+
   _openPickerForColumn(colRow) {
     openStandardPickerModal({
       title: `为字段 ${this.activeSchema}.${this.activeTable}.${colRow.column_name} 绑定数据标准`,
@@ -1164,28 +1388,7 @@ export class StandardMigratorView {
       currentStdCode: colRow.std_code || "",
       dbType: this._activeDbType(),
       formatProfile: this.formatProfile,
-      onSelect: async (pickedItem) => {
-        const res = await migratorApi.saveBindings({
-          connection_id: this.activeConnId,
-          format_profile: this.formatProfile,
-          active_schema: this.activeSchema,
-          active_table: this.activeTable,
-          bindings: [
-            {
-              schema_name: this.activeSchema,
-              table_name: this.activeTable,
-              column_name: colRow.column_name,
-              std_code: pickedItem ? pickedItem.std_code : "",
-            },
-          ],
-        });
-        this.tableCheck = res;
-        if (res.table_stats) this.tableStats = res.table_stats;
-        Toast.success(pickedItem ? `已绑定 [${pickedItem.std_code} · ${pickedItem.cn_name}]` : "已解除绑定");
-        this.tree.renderTreeBody();
-        this.render();
-        this.onStateUpdate?.();
-      },
+      onSelect: (pickedItem) => this._saveColumnBinding(colRow, pickedItem),
     });
   }
 
@@ -1291,16 +1494,16 @@ export class StandardMigratorView {
         { className: "mac-subbar-group" },
         tc ? el("search", {}, this.bindingSearchInput) : null,
         tc
-          ? el("button", {
+          ? (this._bindingStageBtn = el("button", {
               type: "button",
               className: "btn btn-xs mac-btn-primary",
               text:
                 this.selectedBindCols.size > 0
-                  ? `生成贯标任务 (${this.selectedBindCols.size})`
-                  : "生成待改贯标任务",
+                  ? `纳入贯标任务 (${this.selectedBindCols.size})`
+                  : "纳入本表待改字段",
               onClick: () => this.stageSelectedToQueue(),
-            })
-          : null,
+            }))
+          : (this._bindingStageBtn = null),
         el("button", {
           type: "button",
           className: "btn btn-xs",
@@ -1353,7 +1556,12 @@ export class StandardMigratorView {
       ariaLabel: "表字段落标核验清单",
       selectable: true,
       selectedKeys: this.selectedBindCols,
-      onSelectionChange: () => this._renderBindingsView(),
+      onSelectionChange: (sel) => {
+        if (this._bindingStageBtn) {
+          this._bindingStageBtn.textContent =
+            sel.size > 0 ? `纳入贯标任务 (${sel.size})` : "纳入本表待改字段";
+        }
+      },
       rowKey: "column_name",
       rows,
       emptyText: "当前筛选条件下无字段",
@@ -1451,8 +1659,19 @@ export class StandardMigratorView {
           key: "actions",
           label: "操作",
           sortable: false,
-          render: (r) =>
-            el(
+          render: (r) => {
+            const canStage = Boolean(
+              r.std_code && r.compliance_status !== "COMPLIANT" && r.compliance_status !== "STD_MISSING"
+            );
+            const inQueue = canStage
+              ? this._isColumnInQueue(
+                  this.activeConnId,
+                  tMeta.schema_name || this.activeSchema,
+                  tMeta.table_name || this.activeTable,
+                  r.column_name
+                )
+              : false;
+            return el(
               "div",
               { style: { display: "flex", gap: "4px" } },
               el("button", {
@@ -1464,18 +1683,31 @@ export class StandardMigratorView {
                   this._openPickerForColumn(r);
                 },
               }),
-              r.std_code && r.compliance_status !== "COMPLIANT" && r.compliance_status !== "STD_MISSING"
+              r.std_code
                 ? el("button", {
                     type: "button",
-                    className: "btn btn-xs",
-                    text: r.needs_rebuild ? "重建贯标" : "生成贯标",
+                    className: "btn btn-xs btn-ghost",
+                    text: "解绑",
+                    onClick: (e) => {
+                      e.stopPropagation();
+                      this._saveColumnBinding(r, null);
+                    },
+                  })
+                : null,
+              canStage
+                ? el("button", {
+                    type: "button",
+                    className: inQueue ? "btn btn-xs btn-ghost" : "btn btn-xs",
+                    text: inQueue ? "已入队" : "纳入贯标",
+                    title: inQueue ? "已在全局贯标队列中，点击可按当前标准重新同步" : "加入全局贯标改造执行队列",
                     onClick: (e) => {
                       e.stopPropagation();
                       this.stageSelectedToQueue([r.column_name]);
                     },
                   })
                 : null
-            ),
+            );
+          },
         },
       ],
     });
@@ -1541,6 +1773,16 @@ export class StandardMigratorView {
           text: "导出报告",
           onClick: () => this.openExportDialog(),
         }),
+        (this._queueRemoveBtn = el("button", {
+          type: "button",
+          className: "btn btn-xs",
+          text: `移除所选 (${this.selectedIds.size})`,
+          disabled: this.selectedIds.size === 0,
+          onClick: () =>
+            this.removeQueueItems(
+              [...this.selectedIds].map((x) => Number(x)).filter((n) => n > 0)
+            ),
+        })),
         el("button", {
           type: "button",
           className: "btn btn-xs btn-danger",
@@ -1548,7 +1790,7 @@ export class StandardMigratorView {
           onClick: async () => {
             const ok = await Modal.confirm({
               title: "清空贯标队列",
-              message: "确定清空当前贯标改造队列吗？（不会删除已绑定的字段数据标准）",
+              message: "确定清空当前全部全局贯标改造队列吗？（不会删除已绑定的字段数据标准）",
               confirmText: "清空",
               danger: true,
             });
@@ -1566,38 +1808,88 @@ export class StandardMigratorView {
       ariaLabel: "贯标字段队列",
       selectable: true,
       selectedKeys: this.selectedIds,
-      onSelectionChange: () => this.onStateUpdate?.(),
+      onSelectionChange: (sel) => {
+        if (this._queueExecBatchBtn) {
+          this._queueExecBatchBtn.textContent = `执行 (${sel.size})`;
+        }
+        if (this._queueRemoveBtn) {
+          this._queueRemoveBtn.textContent = `移除所选 (${sel.size})`;
+          this._queueRemoveBtn.disabled = sel.size === 0;
+        }
+      },
       rowKey: "id",
       rows,
-      emptyText: "当前贯标改造队列为空，可在「字段落标绑定与核验」勾选未达标字段生成，或点击右上角「导入改造清单」",
+      emptyText: "当前全局贯标队列为空，可在「字段落标绑定与核验」勾选字段后点击「纳入贯标」，或点击右上角「导入改造清单」",
       columns: [
-        { key: "table_name", label: "库表", render: (r) => el("span", { className: "mono", text: `${r.schema_name}.${r.table_name}` }) },
+        {
+          key: "table_name",
+          label: "库表",
+          render: (r) => {
+            const srcConn = r.connection_id ? this._findConnection(r.connection_id) : null;
+            return el(
+              "div",
+              { style: { display: "flex", flexDirection: "column", gap: "2px" } },
+              el("span", { className: "mono", text: `${r.schema_name}.${r.table_name}` }),
+              srcConn
+                ? el("span", { style: { fontSize: "10.5px", color: "var(--os-muted)" }, text: `${srcConn.name} (${srcConn.db_type})` })
+                : null
+            );
+          },
+        },
         { key: "ordinal_position", label: "#", render: (r) => (r.ordinal_position ? String(r.ordinal_position) : "-") },
         {
           key: "old_col_name",
           label: "原字段 → 标准字段",
-          render: (r) =>
-            el(
+          render: (r) => {
+            const curN = r.db_current_col_name || r.current_db_col_name || r.old_col_name;
+            const tgtN = r.new_col_name || curN;
+            const curT = r.db_current_type || r.current_db_col_type || r.old_col_type || "?";
+            const tgtT = r.new_col_type || curT;
+            const nameText =
+              String(curN).toLowerCase() === String(tgtN).toLowerCase()
+                ? String(curN)
+                : `${curN} → ${tgtN}`;
+            const typeText =
+              String(curT).trim().toLowerCase() === String(tgtT).trim().toLowerCase()
+                ? String(curT)
+                : `${curT} → ${tgtT}`;
+            return el(
               "div",
               {},
               el("div", {
                 className: "mono",
                 style: { fontWeight: "600" },
-                text: `${r.db_current_col_name || r.current_db_col_name || r.old_col_name} → ${r.new_col_name}`,
+                text: nameText,
               }),
               el("div", {
                 className: "mono",
                 style: { fontSize: "11px", color: "var(--os-muted)" },
-                text: `${r.db_current_type || r.current_db_col_type || r.old_col_type || "?"} → ${r.new_col_type}`,
+                text: typeText,
               })
-            ),
+            );
+          },
         },
-        { key: "new_col_comment", label: "注释", render: (r) => r.new_col_comment || r.old_col_comment || "-" },
+        {
+          key: "new_col_comment",
+          label: "注释",
+          render: (r) => {
+            const oldC = String(r.db_current_comment ?? r.old_col_comment ?? "").trim();
+            const newC = String(r.new_col_comment || "").trim();
+            if (newC && oldC && oldC !== newC) {
+              return `${oldC} → ${newC}`;
+            }
+            return newC || oldC || "-";
+          },
+        },
         {
           key: "strategy",
           label: "策略",
           render: (r) =>
-            this._isRebuildItem(r) ? badge("保序重建", "warn") : badge("原地修改", "neutral"),
+            this._isRebuildItem(r)
+              ? badge("保序重建", "warn")
+              : this._isCommentOnlyItem(r)
+              ? badge("仅更新注释", "info")
+              : badge("原地 ALTER", "neutral"),
         },
         {
           key: "status",
@@ -1627,7 +1919,11 @@ export class StandardMigratorView {
                 onClick: async (e) => {
                   e.stopPropagation();
                   if (this._isRebuildItem(r)) {
-                    await this.openRebuildPreviewModal(r.schema_name, r.table_name);
+                    await this.openRebuildPreviewModal(
+                      r.schema_name,
+                      r.table_name,
+                      r.connection_id || ""
+                    );
                     return;
                   }
                   await this.executeSingleItem(r);
@@ -1639,7 +1935,17 @@ export class StandardMigratorView {
                 text: "SQL",
                 onClick: (e) => {
                   e.stopPropagation();
-                  this.openRebuildPreviewModal(r.schema_name, r.table_name);
+                  this.openItemSqlPreviewModal(r);
+                },
+              }),
+              el("button", {
+                type: "button",
+                className: "btn btn-xs btn-ghost",
+                text: "移出",
+                title: "从贯标队列移除",
+                onClick: (e) => {
+                  e.stopPropagation();
+                  this.removeQueueItems([r.id], { skipConfirm: true });
                 },
               })
             ),

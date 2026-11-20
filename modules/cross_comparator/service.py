@@ -2708,6 +2708,11 @@ class CrossComparatorService:
         )
         src_conn_info = self.get_role_connection_brief("source")
         tgt_conn_info = self.get_role_connection_brief("target")
+        tgt_cid = str(
+            self.ctx.store.get_meta("cross_target_connection_id", "")
+            or tgt_conn_info.get("connection_id")
+            or ""
+        )
         tgt_db_type = str(tgt_conn_info.get("db_type") or "DWS")
         eff_tgt_fmt = self._resolve_side_format_profile(
             tgt_conn_info, target_format_profile, format_profile
@@ -2783,6 +2788,7 @@ class CrossComparatorService:
                 items_to_push.append(
                     {
                         "row_index": row_idx,
+                        "connection_id": tgt_cid,
                         "schema_name": tgt_schema,
                         "table_name": tgt_table,
                         "old_col_name": old_c,
@@ -2833,6 +2839,7 @@ class CrossComparatorService:
                 items_to_push.append(
                     {
                         "row_index": row_idx,
+                        "connection_id": tgt_cid,
                         "schema_name": tgt_schema,
                         "table_name": tgt_table,
                         "old_col_name": old_c,
@@ -2865,10 +2872,9 @@ class CrossComparatorService:
             len(items_to_push),
         )
         fn = self.ctx.store.get_meta("cross_standard_filename", "跨环境数标推送清单.xlsx")
-        self.ctx.store.replace_all_items(items_to_push, fn, preserve_history=True)
+        self.ctx.store.upsert_migration_items(items_to_push, fn, connection_id=tgt_cid)
 
         # 若已绑定目标库，将贯标执行台的激活连接同步指向该目标库
-        tgt_cid = str(self.ctx.store.get_meta("cross_target_connection_id", "") or "")
         if tgt_cid:
             self.ctx.store.save_meta("migrator_connection_id", tgt_cid)
 

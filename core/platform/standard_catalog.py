@@ -270,6 +270,7 @@ class StandardCatalog:
 
     def __init__(self, store: PlatformStateStore) -> None:
         self.store = store
+        self._purged_scope: set[Tuple[str, str]] = set()
 
     @staticmethod
     def _now_str() -> str:
@@ -1403,8 +1404,12 @@ class StandardCatalog:
             out.setdefault((s_low, t_low), {})[ck] = d
         return out
 
-    def purge_invalid_error_bindings(self, connection_id: str = "") -> int:
+    def purge_invalid_error_bindings(self, connection_id: str = "", *, force: bool = False) -> int:
         """清理历史残留的 Excel 错误值与空占位符绑定（如旧版误入库的 #N/A、'#N/A、全角 ＃N/A、#REF! 等）."""
+        db_key = str(getattr(self.store, "workspace_db_path", "") or getattr(self.store, "db_path", ""))
+        scope = (db_key, connection_id or "*")
+        if not force and (scope in self._purged_scope or (db_key, "*") in self._purged_scope):
+            return 0
         err_list = sorted(EXCEL_ERROR_TOKENS)
         placeholders = ",".join("?" for _ in err_list)
         deleted_total = 0
@@ -1456,6 +1461,7 @@ class StandardCatalog:
                         "UPDATE cross_column_bindings SET source_std_code = ?, target_std_code = ? WHERE id = ?",
                         (s_clean, t_clean, int(cr["id"])),
                     )
+        self._purged_scope.add(scope)
         return deleted_total
 
     def bulk_save_field_bindings(

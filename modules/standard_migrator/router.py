@@ -15,6 +15,7 @@ from modules.standard_migrator.schemas import (
     AutoMatchBindingsPayload,
     BindMigratorConnectionPayload,
     CheckCompliancePayload,
+    DeleteMigrationItemsPayload,
     ExecuteBatchPayload,
     LoadDbTablesPayload,
     SaveFieldBindingsPayload,
@@ -178,6 +179,28 @@ def api_migrator_clear(ctx: PlatformContext = Depends(get_platform_context)):
     return StandardMigratorService(ctx).clear_items()
 
 
+@router.post("/checklist/delete-items")
+def api_migrator_delete_items(
+    payload: DeleteMigrationItemsPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return StandardMigratorService(ctx).delete_items(payload.item_ids)
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
+@router.get("/items/{item_id}/sql")
+def api_migrator_item_sql(
+    item_id: int,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return StandardMigratorService(ctx).preview_item_sql(item_id)
+    except Exception as exc:
+        return _err(str(exc), 400)
+
+
 @router.get("/checklist/template.xlsx")
 def api_migrator_template():
     content = StandardMigratorService.generate_template_bytes()
@@ -262,6 +285,7 @@ def api_migrator_rebuild_preview(
             payload.table_name,
             item_ids=payload.item_ids,
             keep_backup=payload.keep_backup,
+            connection_id=payload.connection_id,
         )
     except Exception as exc:
         return _err(str(exc), 400)
@@ -285,6 +309,7 @@ async def api_migrator_rebuild_execute(
         kwargs={
             "item_ids": payload.item_ids,
             "keep_backup": payload.keep_backup,
+            "connection_id": payload.connection_id,
         },
         default_detail="整表保序重建完成",
         count_fn=lambda r: (

@@ -337,7 +337,20 @@ export class DatabaseTree {
     const key = `${connId}::${schemaName}::${tableName}`;
     this.activeConnectionId = connId;
     this.selectedTableKey = key;
-    this.renderTreeBody();
+    if (this.treeBody && typeof this.treeBody.querySelectorAll === "function") {
+      const nodes = this.treeBody.querySelectorAll("[data-table-key]");
+      let matched = false;
+      for (const n of nodes) {
+        const isSel = n.dataset?.tableKey === key;
+        n.classList.toggle("is-selected", isSel);
+        if (isSel) matched = true;
+      }
+      if (!matched) {
+        this.renderTreeBody();
+      }
+    } else {
+      this.renderTreeBody();
+    }
     if (typeof this.onPreviewTable === "function") {
       this.onPreviewTable({
         connectionId: connId,
@@ -622,6 +635,12 @@ export class DatabaseTree {
       return el("div", { className: "tree-conn-card" }, connRow, childrenNodes);
     });
 
-    clearEl(this.treeBody, cards);
+    if (typeof document.createDocumentFragment === "function") {
+      const frag = document.createDocumentFragment();
+      for (const card of cards) frag.appendChild(card);
+      clearEl(this.treeBody, frag);
+    } else {
+      clearEl(this.treeBody, cards);
+    }
   }
 }

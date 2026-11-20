@@ -913,6 +913,9 @@ class NativeLicenseShield:
 # =========================================================================
 
 
+_UNSET = object()
+
+
 class LicenseHub:
     """Data.O.G 离线授权验证、防时钟回拨、登录拦截与会话能力令牌中枢."""
 
@@ -956,6 +959,11 @@ class LicenseHub:
         self._cached_device: Optional[Dict[str, Any]] = None
         self._cached_device_ts: float = 0.0
         self._failed_attempts: Deque[float] = deque()
+        self._verify_cache: Optional[
+            Tuple[Tuple[Any, ...], Tuple[str, int, int, int, str], float]
+        ] = None
+        self._last_watermark_write_ts: float = 0.0
+        self._max_watermark_mem: float = 0.0
 
         if anchor_file:
             self._anchor_file = os.path.abspath(anchor_file)
@@ -972,6 +980,7 @@ class LicenseHub:
         with self._lock:
             self._verifier_pubkey = bytes(pubkey)
             self._using_custom_pubkey = True
+            self._verify_cache = None
 
     def _now_ts(self) -> float:
         return float(self._clock_fn())
@@ -1030,9 +1039,17 @@ class LicenseHub:
         key = hashlib.sha256(b"DataOG-ClockSeal-v1:" + self._verifier_pubkey).digest()
         return hmac.new(key, msg, hashlib.sha256).hexdigest()
 
-    def _read_clock_watermark(self, machine_code: str) -> Optional[float]:
+    def _read_clock_watermark(
+        self, machine_code: str, *, preloaded_seal: Any = _UNSET
+    ) -> Optional[float]:
         candidates: List[float] = []
-        raw_meta = self.store.get_meta("license_clock_seal", None)
+        if self._max_watermark_mem > 0.0:
+            candidates.append(self._max_watermark_mem)
+        raw_meta = (
+            preloaded_seal
+            if preloaded_seal is not _UNSET
+            else self.store.get_meta("license_clock_seal", None)
+        )
         if isinstance(raw_meta, dict):
             try:
                 ts_val = float(raw_meta.get("ts", 0))
@@ -1060,22 +1077,43 @@ class LicenseHub:
                 pass
         return max(candidates) if candidates else None
 
-    def _advance_clock_watermark(self, now_ts: float, machine_code: str) -> None:
-        existing = self._read_clock_watermark(machine_code) or 0.0
-        target_ts = max(existing, now_ts)
-        seal_obj = {
-            "ts": int(target_ts),
-            "sig": self._clock_seal_hmac(target_ts, machine_code),
-        }
-        self.store.save_meta("license_clock_seal", seal_obj)
-        try:
-            anchor_dir = os.path.dirname(self._anchor_file)
-            if anchor_dir:
-                os.makedirs(anchor_dir, exist_ok=True)
-            with open(self._anchor_file, "w", encoding="utf-8") as fh:
-                fh.write(encode_obfuscated_anchor(seal_obj))
-        except OSError:
-            pass
+    def _advance_clock_watermark(
+        self,
+        now_ts: float,
+        machine_code: str,
+        *,
+        existing_watermark: Optional[float] = None,
+        force_persist: bool = False,
+    ) -> None:
+        with self._lock:
+            self._max_watermark_mem = max(self._max_watermark_mem, now_ts)
+            if (
+                self._clock_fn is time.time
+                and not force_persist
+                and self._last_watermark_write_ts > 0.0
+                and 0.0 <= (now_ts - self._last_watermark_write_ts) < 60.0
+            ):
+                return
+            existing = (
+                existing_watermark
+                if existing_watermark is not None
+                else (self._read_clock_watermark(machine_code) or 0.0)
+            )
+            target_ts = max(existing, now_ts)
+            seal_obj = {
+                "ts": int(target_ts),
+                "sig": self._clock_seal_hmac(target_ts, machine_code),
+            }
+            self.store.save_meta("license_clock_seal", seal_obj)
+            try:
+                anchor_dir = os.path.dirname(self._anchor_file)
+                if anchor_dir:
+                    os.makedirs(anchor_dir, exist_ok=True)
+                with open(self._anchor_file, "w", encoding="utf-8") as fh:
+                    fh.write(encode_obfuscated_anchor(seal_obj))
+            except OSError:
+                pass
+            self._last_watermark_write_ts = now_ts
 
     @staticmethod
     def _mask_activation_code(code_str: str) -> str:
@@ -1089,8 +1127,28 @@ class LicenseHub:
         code_str: str,
         device: Dict[str, Any],
         today: datetime.date,
+        *,
+        use_cache: bool = True,
     ) -> Tuple[str, int, int, int, str]:
         """返回 `(status_code, scope, duration_days, expiry_day, error_message)`."""
+        today_day = date_to_epoch_day(today)
+        cache_key = (
+            code_str,
+            self._verifier_pubkey,
+            today_day,
+            device["machine_code"],
+            tuple(device.get("all_ips") or ()),
+        )
+        if use_cache:
+            with self._lock:
+                cached = self._verify_cache
+                if (
+                    cached is not None
+                    and cached[0] == cache_key
+                    and (time.monotonic() - cached[2]) < 60.0
+                ):
+                    return cached[1]
+
         try:
             payload, sig, ver, scope, duration_days, expiry_day = decode_activation_token(code_str)
         except ValueError as exc:
@@ -1101,7 +1159,6 @@ class LicenseHub:
         if scope not in (SCOPE_MACHINE, SCOPE_GLOBAL):
             return "INVALID", 0, 0, 0, "未知的激活码授权类型"
 
-        today_day = date_to_epoch_day(today)
         py_sig_ok = ed25519_verify(_SIG_DOMAIN + payload, sig, self._verifier_pubkey)
 
         shield_res = self._shield.verify_with_challenge(
@@ -1183,17 +1240,25 @@ class LicenseHub:
                 "检测到当前系统日期早于激活码签发有效期，请校准系统时间",
             )
 
-        return "ACTIVE", scope, duration_days, expiry_day, ""
+        result = ("ACTIVE", scope, duration_days, expiry_day, "")
+        with self._lock:
+            self._verify_cache = (cache_key, result, time.monotonic())
+        return result
 
     def get_auth_status(self, *, force_refresh_ip: bool = False) -> Dict[str, Any]:
         device = self.get_device_info(force_refresh=force_refresh_ip)
         now_ts = self._now_ts()
         today = self._today_date()
 
-        saved_code = str(self.store.get_meta("license_activation_code", "") or "").strip()
-        is_locked = str(self.store.get_meta("license_locked", "0") or "0") == "1"
+        meta_vals = self.store.get_meta_batch(
+            ("license_activation_code", "license_locked", "license_clock_seal")
+        )
+        saved_code = str(meta_vals.get("license_activation_code") or "").strip()
+        is_locked = str(meta_vals.get("license_locked") or "0") == "1"
 
-        watermark = self._read_clock_watermark(device["machine_code"])
+        watermark = self._read_clock_watermark(
+            device["machine_code"], preloaded_seal=meta_vals.get("license_clock_seal")
+        )
         clock_rollback = watermark is not None and (now_ts + CLOCK_ROLLBACK_TOLERANCE_SEC) < watermark
 
         status = "UNACTIVATED"
@@ -1217,23 +1282,31 @@ class LicenseHub:
                 status = "CLOCK_ROLLBACK"
                 status_message = "检测到本机系统时间被大幅回调，请校准系统日期时间后再激活或解锁。"
             elif st != "ACTIVE":
-                self._advance_clock_watermark(now_ts, device["machine_code"])
+                self._advance_clock_watermark(
+                    now_ts, device["machine_code"], existing_watermark=watermark
+                )
                 status = st
                 status_message = err_msg
             elif is_locked:
-                self._advance_clock_watermark(now_ts, device["machine_code"])
+                self._advance_clock_watermark(
+                    now_ts, device["machine_code"], existing_watermark=watermark
+                )
                 status = "LOCKED"
                 status_message = "工作台已手动锁定，请重新输入有效激活码解锁进入。"
             else:
                 status = "ACTIVE"
                 authorized = True
-                self._advance_clock_watermark(now_ts, device["machine_code"])
+                self._advance_clock_watermark(
+                    now_ts, device["machine_code"], existing_watermark=watermark
+                )
                 status_message = f"当前激活码可用日期至 {expires_date}"
         elif clock_rollback:
             status = "CLOCK_ROLLBACK"
             status_message = "检测到本机系统时间异常回调，请校准系统时间。"
         else:
-            self._advance_clock_watermark(now_ts, device["machine_code"])
+            self._advance_clock_watermark(
+                now_ts, device["machine_code"], existing_watermark=watermark
+            )
 
         scope_label = (
             "全局通用激活码（不限机器与 IP）"
@@ -1298,7 +1371,7 @@ class LicenseHub:
             raise ValueError("检测到本机系统时间异常回拨，请校准系统日期时间后再激活")
 
         st, scope, duration_days, expiry_day, err_msg = self._verify_token_raw(
-            cleaned_code, device, today
+            cleaned_code, device, today, use_cache=False
         )
         if st != "ACTIVE":
             with self._lock:
@@ -1307,9 +1380,12 @@ class LicenseHub:
 
         with self._lock:
             self._failed_attempts.clear()
+            self._verify_cache = None
             self.store.save_meta("license_activation_code", cleaned_code)
             self.store.save_meta("license_locked", "0")
-            self._advance_clock_watermark(now_ts, device["machine_code"])
+            self._advance_clock_watermark(
+                now_ts, device["machine_code"], existing_watermark=watermark, force_persist=True
+            )
             self._session_epoch = secrets.token_hex(8)
 
         exp_date = epoch_day_to_date(expiry_day).isoformat()
@@ -1323,6 +1399,7 @@ class LicenseHub:
 
     def lock(self) -> Dict[str, Any]:
         with self._lock:
+            self._verify_cache = None
             self.store.save_meta("license_locked", "1")
             self._session_epoch = secrets.token_hex(8)
         self.store.add_log("INFO", "安全授权", "用户主动锁定工作台并退回登录页")
@@ -1361,12 +1438,13 @@ class LicenseHub:
             return False, auth
         nonce = secrets.token_hex(12)
         path = request.url.path
+        stamp_mono = time.monotonic()
         mac = hmac.new(
             self._runtime_secret,
-            f"{self._session_epoch}:{nonce}:{path}".encode("utf-8"),
+            f"{self._session_epoch}:{nonce}:{path}:{stamp_mono:.3f}".encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
-        request.state.license_cap = (nonce, path, mac)
+        request.state.license_cap = (nonce, path, stamp_mono, mac)
         return True, auth
 
     def verify_request_capability(self, request: Request) -> Tuple[bool, Dict[str, Any]]:
@@ -1375,17 +1453,19 @@ class LicenseHub:
         if any(path.startswith(pref) for pref in AUTH_PUBLIC_EXEMPT_PREFIXES):
             return True, {}
         cap = getattr(request.state, "license_cap", None)
-        if not isinstance(cap, tuple) or len(cap) != 3:
+        if not isinstance(cap, tuple) or len(cap) != 4:
             return False, self.get_auth_status()
-        nonce, cap_path, mac = cap
-        if cap_path != path:
+        nonce, cap_path, stamp_mono, mac = cap
+        if cap_path != path or not isinstance(stamp_mono, float):
+            return False, self.get_auth_status()
+        age = time.monotonic() - stamp_mono
+        if age < 0.0 or age > 30.0:
             return False, self.get_auth_status()
         expected = hmac.new(
             self._runtime_secret,
-            f"{self._session_epoch}:{nonce}:{cap_path}".encode("utf-8"),
+            f"{self._session_epoch}:{nonce}:{cap_path}:{stamp_mono:.3f}".encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
         if not hmac.compare_digest(mac, expected):
             return False, self.get_auth_status()
-        auth = self.get_auth_status()
-        return bool(auth["authorized"]), auth
+        return True, {}

@@ -457,6 +457,16 @@ export const migratorApi = {
       withRequestOpts({ method: "POST", body: payload }, opts)
     ),
   clearItems: () => requestJson("/api/modules/standard_migrator/checklist/clear", { method: "POST" }),
+  deleteItems: (itemIds, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/checklist/delete-items",
+      withRequestOpts({ method: "POST", body: { item_ids: itemIds } }, opts)
+    ),
+  previewItemSql: (itemId, opts = {}) =>
+    requestJson(
+      `/api/modules/standard_migrator/items/${encodeURIComponent(itemId)}/sql`,
+      withRequestOpts({}, opts)
+    ),
   downloadTemplate: () =>
     downloadApiFile("/api/modules/standard_migrator/checklist/template.xlsx", {
       fallbackName: "Data.O.G_字段贯标模板.xlsx",
@@ -480,12 +490,30 @@ export const migratorApi = {
   previewRebuild: (payload, opts = {}) =>
     requestJson(
       "/api/modules/standard_migrator/rebuild/preview",
-      withRequestOpts({ method: "POST", body: payload }, opts)
+      withRequestOpts(
+        {
+          method: "POST",
+          body: {
+            ...payload,
+            connection_id: payload?.connection_id || payload?.connectionId || "",
+          },
+        },
+        opts
+      )
     ),
   executeRebuild: (payload, opts = {}) =>
     requestJson(
       "/api/modules/standard_migrator/rebuild/execute",
-      withRequestOpts({ method: "POST", body: payload }, opts)
+      withRequestOpts(
+        {
+          method: "POST",
+          body: {
+            ...payload,
+            connection_id: payload?.connection_id || payload?.connectionId || "",
+          },
+        },
+        opts
+      )
     ),
 
   // 第 2 步：字段绑标 + 落标核验 + 对照模板

@@ -1338,6 +1338,165 @@ ENABLE ROW MOVEMENT;"""
             self.assertFalse(fake_non_auto.in_error)
             self.assertEqual(fake_non_auto.rollbacks, 1)
 
+    def test_comment_only_migration_sql_and_multi_dialect_preview(self) -> None:
+        """验证仅注释差异时严禁误触发整表重建、不生成多余 RENAME/ALTER，且支持多方言干净预览."""
+        from core.platform.dialects import analyze_item_changes, item_requires_table_rebuild
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(db_path=os.path.join(tmp, "comment_sql.db"))
+            engine = DWSMigratorEngine(store)
+
+            # 1) 华为 DWS 列存 + 分布键 + 分区键场景，但仅注释不一致（且存在大小写/varchar2同义词）
+            tmeta = TableMeta(
+                schema_name="dwd",
+                table_name="dwd_cust_info",
+                exists=True,
+                orientation="COLUMN",
+                with_clause="orientation=column, compression=low",
+                distribute_clause="DISTRIBUTE BY HASH (cust_id)",
+                distribute_keys=["cust_id"],
+                partition_keys=["biz_dt"],
+                columns=[
+                    ColumnMeta(1, "Cust_Id", "character varying(32)", True, None, "旧客户号注释"),
+                    ColumnMeta(2, "biz_dt", "character varying(8)", True, None, "业务日期"),
+                    ColumnMeta(3, "remark", "character varying(128)", False, None, "旧备注"),
+                ],
+            )
+            comment_only_item = {
+                "id": 101,
+                "schema_name": "dwd",
+                "table_name": "dwd_cust_info",
+                "old_col_name": "Cust_Id",
+                "old_col_type": "VARCHAR2(32)",
+                "old_col_comment": "旧客户号注释",
+                "new_col_name": "cust_id",
+                "new_col_type": "VARCHAR(32)",
+                "new_col_comment": "统一客户编号",
+                "status": "PARTIAL",
+                "strategy": "TABLE_REBUILD",  # 即便旧快照曾误标 TABLE_REBUILD，实库核验也应纠正
+                "is_distribute_key": 1,
+                "table_orientation": "COLUMN",
+            }
+            ch = analyze_item_changes(comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta)
+            self.assertFalse(ch["name_changed"])
+            self.assertFalse(ch["type_changed"])
+            self.assertTrue(ch["comment_changed"])
+            self.assertTrue(ch["is_comment_only"])
+            self.assertFalse(
+                item_requires_table_rebuild(
+                    comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta
+                )
+            )
+
+            upd = engine._build_single_item_sync_update(comment_only_item, tmeta, dialect="DWS")
+            self.assertEqual(upd["strategy"], "DIRECT_ALTER")
+            self.assertNotIn("原序重建表", upd["status_detail"])
+            sql_dws = upd["generated_sql"]
+            self.assertIn("COMMENT ON COLUMN", sql_dws)
+            self.assertIn("Cust_Id", sql_dws)  # 保留库内真实字段名大小写，不强改大小写
+            self.assertIn("统一客户编号", sql_dws)
+            self.assertNotIn("RENAME COLUMN", sql_dws)
+            self.assertNotIn("ALTER COLUMN", sql_dws)
+
+            # 2) 完全一致（零差异）项不得吐出空 BEGIN; COMMIT;
+            noop_item = dict(comment_only_item, new_col_comment="旧客户号注释")
+            noop_sql = engine.build_direct_alter_sql_preview(
+                noop_item, matched_col=tmeta.columns[0], table_meta=tmeta, dialect="DWS"
+            )
+            self.assertIn("无需执行 DDL 变更", noop_sql)
+            self.assertNotIn("BEGIN;", noop_sql)
+
+            # 3) execute_batch_items 对分布键+列存表上的仅改注释项必须走 DIRECT_ALTER 而非重建表
+            store.replace_all_items([comment_only_item], "comment_only.xlsx")
+            engine._conn_config["configured"] = True
+            with (
+                mock.patch.object(engine, "inspect_table_metadata", return_value=tmeta),
+                mock.patch.object(
+                    engine,
+                    "_run_real_direct_alter",
+                    return_value=(1, "character varying(32)", "统一客户编号"),
+                ) as mock_direct,
+                mock.patch.object(
+                    engine,
+                    "execute_table_rebuild_migration",
+                    side_effect=AssertionError("comment-only item must NOT trigger table rebuild"),
+                ),
+            ):
+                batch_res = engine.execute_batch_items(item_ids=[1])
+            self.assertEqual(batch_res["rebuild_table_count"], 0)
+            self.assertEqual(batch_res["direct_table_count"], 1)
+            self.assertEqual(batch_res["success_count"], 1)
+            self.assertEqual(mock_direct.call_count, 1)
+
+            # 4) 当同表因另一列(如分布键类型变化)必须整表重建时，顺带仅改注释的列直接透传列名、不生成多余 CAST/AS
+            rebuild_cust = {
+                "id": 201,
+                "schema_name": "dwd",
+                "table_name": "dwd_cust_info",
+                "old_col_name": "Cust_Id",
+                "old_col_type": "character varying(32)",
+                "old_col_comment": "旧客户号注释",
+                "new_col_name": "cust_id",
+                "new_col_type": "varchar(64)",
+                "new_col_comment": "统一客户编号",
+            }
+            comment_remark = {
+                "id": 202,
+                "schema_name": "dwd",
+                "table_name": "dwd_cust_info",
+                "old_col_name": "remark",
+                "old_col_type": "varchar2(128)",
+                "old_col_comment": "旧备注",
+                "new_col_name": "remark",
+                "new_col_type": "VARCHAR(128)",
+                "new_col_comment": "补充备注说明",
+            }
+            reb_plan = engine.build_table_rebuild_sql_preview(
+                "dwd",
+                "dwd_cust_info",
+                [rebuild_cust, comment_remark],
+                table_meta_override=tmeta,
+            )
+            reb_sql = reb_plan["sql_preview"]
+            self.assertIn("CAST(Cust_Id AS varchar(64)) AS Cust_Id", reb_sql)
+            self.assertIn("/* 第3列 (仅更新注释) */", reb_sql)
+            self.assertNotIn("CAST(remark", reb_sql)
+            self.assertNotIn("remark AS remark", reb_sql)
+            self.assertIn(
+                f"COMMENT ON COLUMN dwd.{reb_plan['tmp_table_name']}.remark IS '补充备注说明';",
+                reb_sql,
+            )
+
+            # 5) 多方言预览 (MySQL / Inceptor / Oracle / DM8 / SQLite)
+            mysql_sql = engine.build_direct_alter_sql_preview(
+                comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta, dialect="MYSQL"
+            )
+            self.assertIn("MODIFY COLUMN `Cust_Id`", mysql_sql)
+            self.assertIn("COMMENT '统一客户编号'", mysql_sql)
+            self.assertNotIn("CHANGE COLUMN", mysql_sql)
+
+            inc_sql = engine.build_direct_alter_sql_preview(
+                comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta, dialect="INCEPTOR"
+            )
+            self.assertIn("CHANGE COLUMN Cust_Id Cust_Id", inc_sql)
+            self.assertIn("COMMENT '统一客户编号'", inc_sql)
+
+            ora_sql = engine.build_direct_alter_sql_preview(
+                comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta, dialect="ORACLE"
+            )
+            self.assertIn("COMMENT ON COLUMN dwd.dwd_cust_info.Cust_Id IS '统一客户编号';", ora_sql)
+            self.assertNotIn("RENAME COLUMN", ora_sql)
+
+            dm_sql = engine.build_direct_alter_sql_preview(
+                comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta, dialect="DM8"
+            )
+            self.assertIn("COMMENT ON COLUMN dwd.dwd_cust_info.Cust_Id IS '统一客户编号';", dm_sql)
+
+            sq_sql = engine.build_direct_alter_sql_preview(
+                comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta, dialect="SQLITE"
+            )
+            self.assertIn("SQLite 原生 DDL 不支持 COMMENT ON COLUMN", sq_sql)
+
 
 if __name__ == "__main__":
     unittest.main()

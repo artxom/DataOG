@@ -28,8 +28,13 @@ class ExecuteBatchPayload(BaseModel):
 class TableRebuildPayload(BaseModel):
     schema_name: str
     table_name: str
+    connection_id: str = ""
     item_ids: Optional[List[int]] = None
     keep_backup: bool = True
+
+
+class DeleteMigrationItemsPayload(BaseModel):
+    item_ids: List[int] = Field(default_factory=list)
 
 
 class SaveFieldBindingsPayload(BaseModel):
@@ -61,4 +66,4 @@ class StageMigrationFromBindingsPayload(BaseModel):
     table_name: str
     column_names: List[str] = Field(default_factory=list)
     format_profile: str = "AUTO"
-    append: bool = False
+    append: bool = True

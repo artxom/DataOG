@@ -16,7 +16,13 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from core.dws_engine import DWSMigratorEngine
+from core.dws_engine import (
+    ColumnMeta as EngineColumnMeta,
+    DWSMigratorEngine,
+    TableMeta as EngineTableMeta,
+    analyze_item_changes,
+    item_requires_table_rebuild,
+)
 from core.platform.context import PlatformContext
 from core.platform.dialects import clean_identifier_input
 from core.platform.excel_io import (
@@ -74,7 +80,64 @@ class StandardMigratorService:
                 self.engine._conn_config["configured"] = False
         return prof
 
-    def get_workspace_state(self) -> Dict[str, Any]:
+    def _resolve_item_connection_id(self, item: Optional[Dict[str, Any]]) -> str:
+        cid = str((item or {}).get("connection_id") or "").strip()
+        if cid and self.ctx.connection_hub.get_profile(cid):
+            return cid
+        return self.get_active_connection_id()
+
+    def _get_engine_for_connection(
+        self, connection_id: str
+    ) -> Tuple[DWSMigratorEngine, Optional[Any]]:
+        active_cid = self.get_active_connection_id()
+        eff_cid = (connection_id or "").strip() or active_cid
+        if not eff_cid:
+            self._sync_engine_with_active_profile()
+            return self.engine, None
+        prof = self.ctx.connection_hub.get_profile(eff_cid)
+        if eff_cid == active_cid or not active_cid:
+            if prof and prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host:
+                self.engine._apply_profile_to_conn_config(prof)
+            elif getattr(self.ctx.store, "is_split_storage", False):
+                with self.engine._conn_lock:
+                    self.engine._conn_config["configured"] = False
+            return self.engine, prof
+        eng = DWSMigratorEngine(self.ctx.store)
+        if prof and prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host:
+            eng._apply_profile_to_conn_config(prof)
+        return eng, prof
+
+    @staticmethod
+    def _to_engine_table_meta(t_meta: Any) -> EngineTableMeta:
+        return EngineTableMeta(
+            schema_name=t_meta.schema_name,
+            table_name=t_meta.table_name,
+            exists=bool(t_meta.exists),
+            table_comment=str(t_meta.table_comment or ""),
+            orientation=str(t_meta.orientation or "ROW"),
+            with_clause=str(t_meta.with_clause or ""),
+            distribute_clause=str(t_meta.distribute_clause or ""),
+            distribute_keys=list(t_meta.distribute_keys or []),
+            partition_clause=str(t_meta.partition_clause or ""),
+            partition_keys=list(t_meta.partition_keys or []),
+            columns=[
+                EngineColumnMeta(
+                    ordinal_position=int(c.ordinal_position),
+                    column_name=str(c.column_name),
+                    data_type=str(c.data_type or ""),
+                    is_not_null=bool(c.is_not_null),
+                    column_default=c.column_default,
+                    column_comment=str(c.column_comment or ""),
+                    lineage_source=str(getattr(c, "lineage_source", "") or ""),
+                )
+                for c in (t_meta.columns or [])
+            ],
+            object_type=str(t_meta.object_type or "TABLE"),
+            view_definition=str(t_meta.view_definition or ""),
+            penetrated_base_tables=list(getattr(t_meta, "penetrated_base_tables", None) or []),
+        )
+
+    def get_workspace_state(self, *, include_catalog: bool = False) -> Dict[str, Any]:
         prof = self._sync_engine_with_active_profile()
         cid = prof.connection_id if prof else ""
         conn_public = prof.to_public_dict() if prof else None
@@ -82,9 +145,10 @@ class StandardMigratorService:
             self.ctx.standard_catalog.purge_invalid_error_bindings(cid)
         catalog_tree = (
             self.ctx.metadata_hub.get_catalog_tree(cid, auto_refresh=False)
-            if cid
+            if (include_catalog and cid)
             else {"schemas": [], "tables": []}
         )
+        items = self.ctx.store.list_items()
         return {
             "ok": True,
             "active_connection_id": cid,
@@ -93,8 +157,8 @@ class StandardMigratorService:
             "catalog": catalog_tree,
             "excel_name": self.ctx.store.get_meta("current_excel_name", "未导入"),
             "imported_at": self.ctx.store.get_meta("imported_at", ""),
-            "summary": self.ctx.store.get_summary(),
-            "items": self.ctx.store.list_items(),
+            "summary": self.ctx.store.get_summary(items=items),
+            "items": items,
             "logs": self.ctx.store.list_logs(limit=150),
         }
 
@@ -166,88 +230,135 @@ class StandardMigratorService:
         progress_start_pct: float = 20.0,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
-        prof = self._sync_engine_with_active_profile()
-        if not prof:
-            raise ValueError("尚未绑定贯标目标数据源连接，请先在顶部选择连接档案")
-
         items = self.ctx.store.list_items()
         if not items:
+            self._sync_engine_with_active_profile()
             report(95.0, "核验目标库状态", "当前贯标队列为空，无需比对", 0, 0)
             return self.get_workspace_state()
 
+        # 按所属连接分组，支持跨多表/多数据源的全局队列实时比对
+        conn_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for it in items:
+            cid = self._resolve_item_connection_id(it)
+            conn_groups.setdefault(cid, []).append(it)
+
+        resolved_groups: List[Tuple[str, DWSMigratorEngine, Any, List[Dict[str, Any]]]] = []
+        for cid, grp in conn_groups.items():
+            eng, prof = self._get_engine_for_connection(cid)
+            if prof is not None:
+                resolved_groups.append((cid, eng, prof, grp))
+
+        if not resolved_groups:
+            raise ValueError("尚未绑定贯标目标数据源连接，请先在顶部选择连接档案")
+
         start_pct = max(12.0, min(85.0, float(progress_start_pct)))
-        unique_targets = list(
-            dict.fromkeys((str(it["schema_name"]), str(it["table_name"])) for it in items)
+        all_targets = list(
+            dict.fromkeys(
+                (str(it.get("connection_id") or ""), str(it["schema_name"]), str(it["table_name"]))
+                for it in items
+            )
         )
+        total_tables = max(1, len(all_targets))
         report(
             start_pct,
             "核验目标库状态",
-            f"准备与 [{prof.name}] 核验 {len(items)} 条规则（涉及 {len(unique_targets)} 张表）...",
+            f"准备核验全局队列 {len(items)} 条规则（涉及 {len(resolved_groups)} 个数据源 / {total_tables} 张表）...",
             0,
-            len(unique_targets),
+            total_tables,
         )
 
-        if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host and prof.driver_track == "NATIVE":
-            mid_pct = start_pct + (92.0 - start_pct) * 0.35
-            report(
-                mid_pct,
-                "核验目标库状态",
-                f"正在从 [{prof.name}] 批量拉取 {len(unique_targets)} 张表系统目录与列序...",
-                0,
-                len(unique_targets),
+        done_items = 0
+        total_items = len(items)
+        for _cid, eng, prof, conn_items in resolved_groups:
+            grp_start = start_pct + (92.0 - start_pct) * (done_items / max(1, total_items))
+            grp_end = start_pct + (92.0 - start_pct) * (
+                (done_items + len(conn_items)) / max(1, total_items)
             )
-            self.engine.sync_all_items_with_db()
-            report(
-                95.0,
-                "同步核验结果",
-                f"已完成 {len(items)} 条字段规则的库内元数据实时比对",
-                len(items),
-                len(items),
+            conn_targets = list(
+                dict.fromkeys((str(it["schema_name"]), str(it["table_name"])) for it in conn_items)
             )
-        else:
-            # 跨任意驱动（含 SQLite / MySQL / 自定义 JDBC）单会话批量获取元数据并核验
-            probe_start = start_pct + 2.0
-            probe_end = start_pct + (92.0 - start_pct) * 0.68
-            meta_cache, _, _ = self.ctx.metadata_hub.get_tables_metadata_batch(
-                prof.connection_id,
-                unique_targets,
-                force_refresh=True,
-                on_progress=lambda done_c, tot_c, cs, ct: report(
-                    probe_start
-                    + (probe_end - probe_start) * (min(done_c, max(1, tot_c)) / max(1, tot_c)),
+            if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host and prof.driver_track == "NATIVE":
+                mid_pct = grp_start + (grp_end - grp_start) * 0.35
+                report(
+                    mid_pct,
                     "核验目标库状态",
-                    f"正在读取库表结构 ({min(done_c + 1, tot_c)}/{tot_c}): {cs}.{ct}",
-                    done_c,
-                    tot_c,
-                ),
-            )
-            def_sch = prof.effective_default_schema().lower()
-            updates: List[Dict[str, Any]] = []
-            tot_items = len(items)
-            for idx, it in enumerate(items, start=1):
-                key = (str(it["schema_name"]).lower(), str(it["table_name"]).lower())
-                t_meta = meta_cache.get(key) or meta_cache.get((def_sch, key[1]))
-                if t_meta is None:
-                    t_meta = self.ctx.metadata_hub.get_table_metadata(
-                        prof.connection_id,
-                        schema_name=it["schema_name"],
-                        table_name=it["table_name"],
-                        force_refresh=False,
-                    )
-                    meta_cache[key] = t_meta
-                upd = self.engine._build_single_item_sync_update(it, t_meta)
-                updates.append(upd)
-                if idx == 1 or idx % 100 == 0 or idx == tot_items:
-                    pct = probe_end + (95.0 - probe_end) * (idx / max(1, tot_items))
-                    report(
-                        pct,
-                        "同步核验结果",
-                        f"正在比对字段规格 ({idx}/{tot_items}): {it['schema_name']}.{it['table_name']}.{it['old_col_name']}",
-                        idx,
-                        tot_items,
-                    )
-            self.ctx.store.batch_update_items_sync(updates)
+                    f"正在从 [{prof.name}] 批量拉取 {len(conn_targets)} 张表系统目录与列序...",
+                    done_items,
+                    total_items,
+                )
+                eng.sync_all_items_with_db(items_subset=conn_items, dialect=prof.db_type)
+                done_items += len(conn_items)
+            else:
+                # 跨任意驱动（含 SQLite / MySQL / 自定义 JDBC）单会话批量获取元数据并核验
+                probe_start = grp_start + 1.0
+                probe_end = grp_start + (grp_end - grp_start) * 0.68
+                meta_cache, _, _ = self.ctx.metadata_hub.get_tables_metadata_batch(
+                    prof.connection_id,
+                    conn_targets,
+                    force_refresh=True,
+                    on_progress=lambda done_c, tot_c, cs, ct, ps=probe_start, pe=probe_end, pname=prof.name: report(
+                        ps + (pe - ps) * (min(done_c, max(1, tot_c)) / max(1, tot_c)),
+                        "核验目标库状态",
+                        f"正在读取 [{pname}] 表结构 ({min(done_c + 1, tot_c)}/{tot_c}): {cs}.{ct}",
+                        done_c,
+                        tot_c,
+                    ),
+                )
+                def_sch = prof.effective_default_schema().lower()
+                tbl_items_map: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+                tbl_meta_map: Dict[Tuple[str, str], EngineTableMeta] = {}
+                for it in conn_items:
+                    key = (str(it["schema_name"]).lower(), str(it["table_name"]).lower())
+                    tbl_items_map.setdefault(key, []).append(it)
+                    if key not in tbl_meta_map:
+                        raw_meta = meta_cache.get(key) or meta_cache.get((def_sch, key[1]))
+                        if raw_meta is None:
+                            raw_meta = self.ctx.metadata_hub.get_table_metadata(
+                                prof.connection_id,
+                                schema_name=it["schema_name"],
+                                table_name=it["table_name"],
+                                force_refresh=False,
+                            )
+                            meta_cache[key] = raw_meta
+                        tbl_meta_map[key] = self._to_engine_table_meta(raw_meta)
 
+                updates: List[Dict[str, Any]] = []
+                for key, grp in tbl_items_map.items():
+                    eng_meta = tbl_meta_map[key]
+                    claimed_old_names = {
+                        clean_identifier_input(str(x.get("old_col_name") or "")).lower()
+                        for x in grp
+                        if x.get("status") != "COMPLETED"
+                    }
+                    for it in grp:
+                        upd = eng._build_single_item_sync_update(
+                            it,
+                            eng_meta,
+                            claimed_old_names=claimed_old_names,
+                            dialect=prof.db_type,
+                        )
+                        updates.append(upd)
+                        done_items += 1
+                        if done_items == 1 or done_items % 100 == 0 or done_items == total_items:
+                            pct = probe_end + (grp_end - probe_end) * (
+                                done_items / max(1, total_items)
+                            )
+                            report(
+                                pct,
+                                "同步核验结果",
+                                f"正在比对字段规格 ({done_items}/{total_items}): {it['schema_name']}.{it['table_name']}.{it['old_col_name']}",
+                                done_items,
+                                total_items,
+                            )
+                self.ctx.store.batch_update_items_sync(updates)
+
+        report(
+            95.0,
+            "同步核验结果",
+            f"已完成 {len(items)} 条字段规则的库内元数据实时比对",
+            total_items,
+            total_items,
+        )
         state = self.get_workspace_state()
         state["message"] = f"已完成 {len(items)} 条字段规则的库内元数据实时比对核验"
         return state
@@ -434,8 +545,17 @@ class StandardMigratorService:
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
         report(20.0, "准备执行贯标", f"正在加载字段任务 #{item_id} 与目标库连接...", 0, 1)
-        self._sync_engine_with_active_profile()
         item_before = self.ctx.store.get_item(item_id)
+        conn_id = self._resolve_item_connection_id(item_before) if item_before else ""
+        eng, prof = self._get_engine_for_connection(conn_id)
+        if prof is not None and not (
+            prof.db_type in ("DWS", "PGSQL", "KINGBASE")
+            and prof.host
+            and prof.driver_track == "NATIVE"
+        ):
+            raise ValueError(
+                f"数据源 [{prof.name}]（{prof.db_type}）暂不支持在线直连执行贯标 DDL，请点击「SQL」复制标准语句后在目标库执行"
+            )
         item_label = (
             f"{item_before['schema_name']}.{item_before['table_name']}.{item_before['old_col_name']}"
             if item_before
@@ -448,7 +568,7 @@ class StandardMigratorService:
             0,
             1,
         )
-        item = self.engine.execute_single_item_direct(item_id)
+        item = eng.execute_single_item_direct(item_id)
         report(
             92.0,
             "刷新执行台状态",
@@ -491,13 +611,32 @@ class StandardMigratorService:
             state["message"] = batch_res.get("message", "批量贯标任务执行完毕")
             return state
 
-        table_groups: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-        table_labels: Dict[Tuple[str, str], str] = {}
+        conn_pending_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for it in pending_items:
+            cid = self._resolve_item_connection_id(it)
+            conn_pending_groups.setdefault(cid, []).append(it)
+
+        conn_engines: Dict[str, DWSMigratorEngine] = {}
+        for cid in conn_pending_groups:
+            eng, prof = self._get_engine_for_connection(cid)
+            if prof is not None and not (
+                prof.db_type in ("DWS", "PGSQL", "KINGBASE")
+                and prof.host
+                and prof.driver_track == "NATIVE"
+            ):
+                raise ValueError(
+                    f"数据源 [{prof.name}]（{prof.db_type}）暂不支持在线直连批量执行，请取消勾选该数据源任务或点击「SQL」复制语句手工执行"
+                )
+            conn_engines[cid] = eng
+
+        table_groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+        table_labels: Dict[Tuple[str, str, str], str] = {}
         orig_item_state: Dict[int, Tuple[str, str, str, str, str]] = {}
         for it in pending_items:
+            cid = self._resolve_item_connection_id(it)
             sch_clean = clean_identifier_input(it["schema_name"]) or str(it["schema_name"])
             tbl_clean = clean_identifier_input(it["table_name"]) or str(it["table_name"])
-            k = (sch_clean.lower(), tbl_clean.lower())
+            k = (cid, sch_clean.lower(), tbl_clean.lower())
             table_groups.setdefault(k, []).append(it)
             table_labels.setdefault(k, f"{sch_clean}.{tbl_clean}")
             orig_item_state[it["id"]] = (
@@ -518,7 +657,7 @@ class StandardMigratorService:
             total_tables,
         )
 
-        reported_tables: Set[Tuple[str, str]] = set()
+        reported_tables: Set[Tuple[str, str, str]] = set()
         report_lock = threading.Lock()
         stop_evt = threading.Event()
 
@@ -581,9 +720,40 @@ class StandardMigratorService:
             watcher.start()
 
         try:
-            batch_res = self.engine.execute_batch_items(
-                item_ids=item_ids, max_workers=max_workers, keep_backup=keep_backup
-            )
+            if len(conn_pending_groups) == 1:
+                only_cid = next(iter(conn_pending_groups.keys()))
+                batch_res = conn_engines[only_cid].execute_batch_items(
+                    item_ids=item_ids, max_workers=max_workers, keep_backup=keep_backup
+                )
+            else:
+                agg_executed = 0
+                agg_success = 0
+                agg_failed = 0
+                agg_rebuild_tables = 0
+                agg_direct_tables = 0
+                for cid, grp_items in conn_pending_groups.items():
+                    sub_res = conn_engines[cid].execute_batch_items(
+                        item_ids=[it["id"] for it in grp_items],
+                        max_workers=max_workers,
+                        keep_backup=keep_backup,
+                    )
+                    agg_executed += int(sub_res.get("executed_count") or 0)
+                    agg_success += int(sub_res.get("success_count") or 0)
+                    agg_failed += int(sub_res.get("failed_count") or 0)
+                    agg_rebuild_tables += int(sub_res.get("rebuild_table_count") or 0)
+                    agg_direct_tables += int(sub_res.get("direct_table_count") or 0)
+                batch_res = {
+                    "executed_count": agg_executed,
+                    "success_count": agg_success,
+                    "failed_count": agg_failed,
+                    "rebuild_table_count": agg_rebuild_tables,
+                    "direct_table_count": agg_direct_tables,
+                    "message": (
+                        f"批量并发执行完毕（跨 {len(conn_pending_groups)} 个数据源）：共处理 {total_tables} 张表"
+                        f"（原序重建 {agg_rebuild_tables} 张、原生 ALTER {agg_direct_tables} 张），"
+                        f"成功 {agg_success} 个字段，失败 {agg_failed} 个字段。"
+                    ),
+                }
         finally:
             stop_evt.set()
             if watcher is not None:
@@ -611,12 +781,15 @@ class StandardMigratorService:
         table_name: str,
         item_ids: Optional[List[int]] = None,
         keep_backup: bool = True,
+        connection_id: str = "",
     ) -> Dict[str, Any]:
-        prof = self._sync_engine_with_active_profile()
+        eff_cid = (connection_id or "").strip()
         all_items = self.ctx.store.list_items()
         if item_ids:
             id_set = {int(x) for x in item_ids}
             tbl_items = [it for it in all_items if it["id"] in id_set]
+            if not eff_cid and tbl_items:
+                eff_cid = self._resolve_item_connection_id(tbl_items[0])
         else:
             tbl_items = [
                 it
@@ -624,7 +797,12 @@ class StandardMigratorService:
                 if it["schema_name"].lower() == schema_name.lower()
                 and it["table_name"].lower() == table_name.lower()
                 and it["status"] != "COMPLETED"
+                and (not eff_cid or self._resolve_item_connection_id(it) == eff_cid)
             ]
+            if not eff_cid and tbl_items:
+                eff_cid = self._resolve_item_connection_id(tbl_items[0])
+
+        eng, prof = self._get_engine_for_connection(eff_cid)
 
         meta_override = None
         if prof and not (
@@ -639,7 +817,7 @@ class StandardMigratorService:
                 force_refresh=False,
             )
 
-        plan = self.engine.build_table_rebuild_sql_preview(
+        plan = eng.build_table_rebuild_sql_preview(
             schema_name,
             table_name,
             tbl_items,
@@ -649,6 +827,7 @@ class StandardMigratorService:
         t_meta_info = plan.get("table_meta") or {}
         return {
             "ok": True,
+            "connection_id": prof.connection_id if prof else eff_cid,
             "schema_name": plan["schema_name"],
             "table_name": plan["table_name"],
             "tmp_table_name": plan["tmp_table_name"],
@@ -667,10 +846,40 @@ class StandardMigratorService:
         table_name: str,
         item_ids: Optional[List[int]] = None,
         keep_backup: bool = True,
+        connection_id: str = "",
         progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
-        self._sync_engine_with_active_profile()
+        eff_cid = (connection_id or "").strip()
+        all_items = self.ctx.store.list_items()
+        if item_ids is not None:
+            id_set = {int(x) for x in item_ids}
+            tbl_items = [it for it in all_items if it["id"] in id_set]
+            if not eff_cid and tbl_items:
+                eff_cid = self._resolve_item_connection_id(tbl_items[0])
+            scoped_item_ids: Optional[List[int]] = item_ids
+        else:
+            tbl_items = [
+                it
+                for it in all_items
+                if it["schema_name"].lower() == schema_name.lower()
+                and it["table_name"].lower() == table_name.lower()
+                and it["status"] != "COMPLETED"
+                and (not eff_cid or self._resolve_item_connection_id(it) == eff_cid)
+            ]
+            if not eff_cid and tbl_items:
+                eff_cid = self._resolve_item_connection_id(tbl_items[0])
+            scoped_item_ids = [it["id"] for it in tbl_items] or None
+
+        eng, prof = self._get_engine_for_connection(eff_cid)
+        if prof is not None and not (
+            prof.db_type in ("DWS", "PGSQL", "KINGBASE")
+            and prof.host
+            and prof.driver_track == "NATIVE"
+        ):
+            raise ValueError(
+                f"数据源 [{prof.name}]（{prof.db_type}）暂不支持在线直连保序重建，请复制 SQL 手工执行"
+            )
 
         tbl_label = f"{schema_name}.{table_name}"
         report(
@@ -720,8 +929,8 @@ class StandardMigratorService:
             watcher.start()
 
         try:
-            res = self.engine.execute_table_rebuild_migration(
-                schema_name, table_name, item_ids=item_ids, keep_backup=keep_backup
+            res = eng.execute_table_rebuild_migration(
+                schema_name, table_name, item_ids=scoped_item_ids, keep_backup=keep_backup
             )
         finally:
             stop_evt.set()
@@ -761,6 +970,80 @@ class StandardMigratorService:
     def clear_items(self) -> Dict[str, Any]:
         self.ctx.store.clear_items()
         return self.get_workspace_state()
+
+    def delete_items(self, item_ids: List[int]) -> Dict[str, Any]:
+        deleted = self.ctx.store.delete_migration_items(item_ids)
+        state = self.get_workspace_state()
+        state["deleted_count"] = deleted
+        state["message"] = f"已从贯标队列移除 {deleted} 条任务"
+        return state
+
+    def preview_item_sql(self, item_id: int) -> Dict[str, Any]:
+        item = self.ctx.store.get_item(item_id)
+        if not item:
+            raise ValueError("未找到指定贯标任务")
+        conn_id = self._resolve_item_connection_id(item)
+        eng, prof = self._get_engine_for_connection(conn_id)
+        dialect = prof.db_type if prof else "DWS"
+
+        eng_meta: Optional[EngineTableMeta] = None
+        if prof is not None:
+            t_meta = self.ctx.metadata_hub.get_table_metadata(
+                prof.connection_id,
+                schema_name=item["schema_name"],
+                table_name=item["table_name"],
+                force_refresh=False,
+            )
+            if t_meta and t_meta.exists:
+                eng_meta = self._to_engine_table_meta(t_meta)
+
+        matched_col: Optional[EngineColumnMeta] = None
+        if eng_meta is not None:
+            col_by_lower = {
+                clean_identifier_input(c.column_name).lower(): c for c in eng_meta.columns
+            }
+            for cand_raw in (
+                item.get("db_current_col_name") or item.get("current_db_col_name"),
+                item.get("old_col_name"),
+                item.get("new_col_name"),
+            ):
+                c_clean = clean_identifier_input(str(cand_raw or "")).lower()
+                if c_clean and c_clean in col_by_lower:
+                    matched_col = col_by_lower[c_clean]
+                    break
+
+        changes = analyze_item_changes(item, matched_col=matched_col, table_meta=eng_meta)
+        needs_rebuild = item_requires_table_rebuild(
+            item, matched_col=matched_col, table_meta=eng_meta
+        )
+        sql_preview = eng.build_direct_alter_sql_preview(
+            item, matched_col=matched_col, table_meta=eng_meta, dialect=dialect
+        )
+        can_execute_online = bool(
+            prof
+            and prof.db_type in ("DWS", "PGSQL", "KINGBASE")
+            and prof.host
+            and prof.driver_track == "NATIVE"
+        )
+        strategy = "TABLE_REBUILD" if needs_rebuild else "DIRECT_ALTER"
+        return {
+            "ok": True,
+            "item_id": item["id"],
+            "connection_id": prof.connection_id if prof else conn_id,
+            "connection_name": prof.name if prof else "",
+            "dialect": dialect,
+            "schema_name": item["schema_name"],
+            "table_name": item["table_name"],
+            "old_col_name": item["old_col_name"],
+            "new_col_name": item["new_col_name"],
+            "strategy": strategy,
+            "needs_rebuild": needs_rebuild,
+            "is_comment_only": bool(changes["is_comment_only"]),
+            "has_any_change": bool(changes["has_any_change"]),
+            "changes": changes,
+            "sql_preview": sql_preview,
+            "can_execute_online": can_execute_online,
+        }
 
     @staticmethod
     def generate_template_bytes() -> bytes:
@@ -835,6 +1118,8 @@ class StandardMigratorService:
         self,
         connection_id: str = "",
         format_profile: str = "AUTO",
+        *,
+        include_catalog: bool = False,
     ) -> Dict[str, Any]:
         prof = self._resolve_binding_profile(connection_id)
         cid = prof.connection_id if prof else ""
@@ -848,7 +1133,7 @@ class StandardMigratorService:
             self.ctx.standard_catalog.purge_invalid_error_bindings(cid)
         catalog_tree = (
             self.ctx.metadata_hub.get_catalog_tree(cid, auto_refresh=False)
-            if cid
+            if (include_catalog and cid)
             else {"schemas": [], "tables": []}
         )
         return {
@@ -941,8 +1226,9 @@ class StandardMigratorService:
             is_part = col_lower in part_set
             is_pk = bool(col.is_primary_key) or (col_lower in pk_set)
             needs_rebuild = bool(
-                (is_dist or is_part or is_col_store)
+                st == "NON_COMPLIANT"
                 and prof.db_type in ("DWS", "PGSQL", "KINGBASE")
+                and ((is_dist or is_part) or (is_col_store and not ev["type_ok"]))
             )
 
             columns_out.append(
@@ -1003,7 +1289,7 @@ class StandardMigratorService:
         }
         return res_dict, compliance_updates
 
-    def get_table_compliance(
+    def _get_table_compliance_with_meta(
         self,
         connection_id: str,
         schema_name: str,
@@ -1014,7 +1300,7 @@ class StandardMigratorService:
         include_table_stats: bool = True,
         purge_errors: bool = True,
         progress_cb: ProgressCallback = noop_progress,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], Any]:
         report = progress_cb or noop_progress
         prof = self.ctx.connection_hub.require_profile(connection_id)
         eff_format = self._resolve_format_profile(prof, format_profile)
@@ -1113,6 +1399,30 @@ class StandardMigratorService:
             f"已完成 {actual_schema}.{actual_table} 落标判定（已落标 {res_dict['summary']['compliant_cols']}/{col_total}）",
             col_total,
             col_total,
+        )
+        return res_dict, t_meta
+
+    def get_table_compliance(
+        self,
+        connection_id: str,
+        schema_name: str,
+        table_name: str,
+        *,
+        format_profile: str = "AUTO",
+        force_refresh: bool = False,
+        include_table_stats: bool = True,
+        purge_errors: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
+    ) -> Dict[str, Any]:
+        res_dict, _ = self._get_table_compliance_with_meta(
+            connection_id,
+            schema_name,
+            table_name,
+            format_profile=format_profile,
+            force_refresh=force_refresh,
+            include_table_stats=include_table_stats,
+            purge_errors=purge_errors,
+            progress_cb=progress_cb,
         )
         return res_dict
 
@@ -1826,7 +2136,7 @@ class StandardMigratorService:
         validate_xlsx_bytes(filename, content)
 
         # 自动清理历史遗留的 #N/A 等错误占位绑定，确保增量合并后状态干净准确
-        self.ctx.standard_catalog.purge_invalid_error_bindings(prof.connection_id)
+        self.ctx.standard_catalog.purge_invalid_error_bindings(prof.connection_id, force=True)
 
         def _norm(v: Any) -> str:
             return (
@@ -2265,20 +2575,19 @@ class StandardMigratorService:
         mig_conn_id = str(self.ctx.store.get_meta("migrator_connection_id", "") or "")
         raw_mig = self.ctx.store.list_items()
         target_key_set = {(s.lower(), t.lower()) for s, t in targets}
-        if mig_conn_id == prof.connection_id:
-            mig_items = list(raw_mig)
-        elif not mig_conn_id:
-            mig_items = [
-                it
-                for it in raw_mig
-                if (
+        mig_items = []
+        for it in raw_mig:
+            item_cid = str(it.get("connection_id") or "")
+            if item_cid == prof.connection_id:
+                mig_items.append(it)
+            elif not item_cid:
+                if mig_conn_id == prof.connection_id:
+                    mig_items.append(it)
+                elif not mig_conn_id and (
                     str(it.get("schema_name") or "").lower(),
                     str(it.get("table_name") or "").lower(),
-                )
-                in target_key_set
-            ]
-        else:
-            mig_items = []
+                ) in target_key_set:
+                    mig_items.append(it)
 
         queue_by_col: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for it in mig_items:
@@ -2371,12 +2680,9 @@ class StandardMigratorService:
                 )
                 if q_it:
                     c_copy["queue_status"] = str(q_it.get("status") or "")
-                    is_reb = (
-                        q_it.get("strategy") == "TABLE_REBUILD"
-                        or bool(q_it.get("is_distribute_key"))
-                        or str(q_it.get("table_orientation") or "").upper() == "COLUMN"
+                    c_copy["queue_strategy"] = (
+                        "TABLE_REBUILD" if item_requires_table_rebuild(q_it) else "DIRECT_ALTER"
                     )
-                    c_copy["queue_strategy"] = "TABLE_REBUILD" if is_reb else "DIRECT_ALTER"
                     c_copy["queue_item_id"] = q_it.get("id")
                 cols_out.append(c_copy)
 
@@ -2482,17 +2788,19 @@ class StandardMigratorService:
         table_name: str,
         column_names: Optional[List[str]] = None,
         format_profile: str = "AUTO",
-        append: bool = False,
+        append: bool = True,
     ) -> Dict[str, Any]:
-        """将已绑定数标的未达标字段生成贯标改造项，无缝衔接单条 ALTER 或 TABLE_REBUILD 保序重建."""
+        """将已绑定数标的未达标字段纳入全局贯标队列，全内存生成 DDL 与策略判定（零远端库重连）."""
         prof = self.ctx.connection_hub.require_profile(connection_id)
         eff_format = self._resolve_format_profile(prof, format_profile)
-        comp = self.get_table_compliance(
+        comp, t_meta = self._get_table_compliance_with_meta(
             connection_id,
             schema_name,
             table_name,
             format_profile=eff_format,
             force_refresh=False,
+            include_table_stats=False,
+            purge_errors=False,
         )
         t_info = comp["table"]
         actual_sch = t_info["schema_name"]
@@ -2511,58 +2819,82 @@ class StandardMigratorService:
             elif col["compliance_status"] == "COMPLIANT":
                 continue
 
+            target_name = (
+                col["column_name"] if col.get("name_ok") else (col["std_en_abbr"] or col["column_name"])
+            )
+            target_type = (
+                col["data_type"] if col.get("type_ok") else (col["std_target_type"] or col["data_type"])
+            )
+            target_comment = col["std_cn_name"] or col["column_comment"]
+
             new_items.append(
                 {
                     "row_index": len(new_items) + 1,
+                    "connection_id": prof.connection_id,
                     "schema_name": actual_sch,
                     "table_name": actual_tbl,
                     "old_col_name": col["column_name"],
                     "old_col_type": col["data_type"],
                     "old_col_comment": col["column_comment"],
-                    "new_col_name": col["std_en_abbr"] or col["column_name"],
-                    "new_col_type": col["std_target_type"] or col["data_type"],
-                    "new_col_comment": col["std_cn_name"] or col["column_comment"],
+                    "new_col_name": target_name,
+                    "new_col_type": target_type,
+                    "new_col_comment": target_comment,
                 }
             )
 
         if not new_items:
             raise ValueError("所选字段暂无需要贯标改造的已绑标条目（或均已达标）")
 
-        self.ctx.store.save_meta("migrator_connection_id", connection_id)
-        self._sync_engine_with_active_profile()
-
-        merged_items = list(new_items)
-        if append:
-            existing = self.ctx.store.list_items()
-            kept = [
-                {
-                    "schema_name": it["schema_name"],
-                    "table_name": it["table_name"],
-                    "old_col_name": it["old_col_name"],
-                    "old_col_type": it["old_col_type"],
-                    "old_col_comment": it["old_col_comment"],
-                    "new_col_name": it["new_col_name"],
-                    "new_col_type": it["new_col_type"],
-                    "new_col_comment": it["new_col_comment"],
-                }
-                for it in existing
-                if not (
-                    it["schema_name"].lower() == actual_sch.lower()
-                    and it["table_name"].lower() == actual_tbl.lower()
+        eng, _ = self._get_engine_for_connection(prof.connection_id)
+        eng_meta = self._to_engine_table_meta(t_meta) if t_meta is not None else None
+        if eng_meta is not None:
+            claimed_old_names = {
+                clean_identifier_input(str(x.get("old_col_name") or "")).lower()
+                for x in new_items
+            }
+            for idx, it in enumerate(new_items):
+                tmp_item = dict(it)
+                tmp_item["id"] = idx + 1
+                upd = eng._build_single_item_sync_update(
+                    tmp_item,
+                    eng_meta,
+                    claimed_old_names=claimed_old_names,
+                    dialect=prof.db_type,
                 )
-            ]
-            merged_items = kept + new_items
+                for k in (
+                    "status",
+                    "strategy",
+                    "status_detail",
+                    "ordinal_position",
+                    "total_columns",
+                    "db_current_col_name",
+                    "db_current_type",
+                    "db_current_comment",
+                    "is_distribute_key",
+                    "table_orientation",
+                    "generated_sql",
+                ):
+                    if k in upd:
+                        it[k] = upd[k]
 
-        for idx, it in enumerate(merged_items, start=1):
-            it["row_index"] = idx
+        if not self.ctx.store.get_meta("migrator_connection_id", ""):
+            self.ctx.store.save_meta("migrator_connection_id", prof.connection_id)
 
         label = f"数标落标生成 [{actual_sch}.{actual_tbl}]"
-        self.ctx.store.replace_all_items(merged_items, label, preserve_history=True)
-        self.sync_items()
+        if append:
+            self.ctx.store.upsert_migration_items(
+                new_items, label, connection_id=prof.connection_id
+            )
+        else:
+            for idx, it in enumerate(new_items, start=1):
+                it["row_index"] = idx
+            self.ctx.store.replace_all_items(new_items, label, preserve_history=True)
 
         state = self.get_workspace_state()
         state["staged_count"] = len(new_items)
-        state["message"] = f"已为 {actual_sch}.{actual_tbl} 生成 {len(new_items)} 条贯标改造任务，可执行 ALTER 或预览保序重建"
+        state["message"] = (
+            f"已将 {actual_sch}.{actual_tbl} 的 {len(new_items)} 个字段纳入全局贯标队列（当前共 {len(state['items'])} 条）"
+        )
         return state
 
 
