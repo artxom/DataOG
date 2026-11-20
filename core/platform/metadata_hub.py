@@ -1604,11 +1604,11 @@ class MetadataHub:
 
             if section == "DETAILED":
                 low_c0 = c0.lower().rstrip(":")
-                if low_c0 == "table type":
+                if low_c0 in ("table type", "type"):
                     if "view" in c1.lower():
                         obj_type = "VIEW"
                     capturing_view_text = False
-                elif low_c0 in ("view expanded text", "view original text"):
+                elif low_c0 in ("view expanded text", "view original text", "view text"):
                     obj_type = "VIEW"
                     capturing_view_text = True
                     if c1:
@@ -1637,6 +1637,8 @@ class MetadataHub:
 
                 if c1.lower() == "comment" and c2:
                     tbl_comment = c2
+                elif low_c0 == "comment" and c1:
+                    tbl_comment = c1
                 continue
 
             if not c0:

@@ -6,6 +6,17 @@
 
 ## [Unreleased]
 
+### Added
+- **「启明商业银行」信创数仓治理混合演示沙箱套件 (`demo_sandbox/`)**：
+  - 提供独立容器编排与运维脚本 (`docker-compose.yml`、`sandbox_ctl.py`、`sandbox.sh`)：以 PostgreSQL 16 (`15432`) 仿真华为 GaussDB(DWS)、Spark 3.5.5 HiveThriftServer2 (`11000`) 仿真星环 Inceptor、MySQL 8.0 (`13306`) 扮演核心交易源库，并支持 `--registry-prefix` 镜像加速、`reset` 8 秒不重启容器极速复原及 `bootstrap-demo-home` 隔离预装。
+  - 构建 164 条金融数据标准资产 (`banking_catalog.py`)，支持导出 46 列多库物理格式标准字典 Excel 与批量绑标示范模板；构建确定性造数引擎 (`live_seeder.py`)，灌入约 3 万行客户/账户/合同/借据/流水/押品/授信样本，精准注入 5 大金融业务暗雷（7 笔负余额不良 `-1,680万`、12 笔逾期 >180 天错标正常 `1.48亿`、48 笔 `4.95~4.99万` 反洗钱拆单 `238.92万`、核心 MySQL vs DWS `3,650万` 授信对账差额、5 笔 `>=1000万` 零利率无押品放款 `9,000万`）及 `DIRECT_ALTER` / `TABLE_REBUILD` 现场真改表靶表、四层级联视图。
+  - 构建双零密钥 `.dataog.db` 工作区生成器 (`workspace_builder.py`)，产出活库现场工作区与 156 星环表×162 DWS 表超大规模压测兜底工作区，配套高层演示剧本 (`DEMO_PLAYBOOK.md`)；同步更新 `build_exe.py` 与 `.gitignore` 严格隔离生成产物与安装包。
+- **全量自动化测试扩充至 65 项 (`tests/test_demo_sandbox.py`, `tests/test_core.py`, `tests/test_platform.py`)**：新增标准 PostgreSQL 无 DWS 系统函数安全降级单测、Spark/新版 Inceptor `DESCRIBE FORMATTED` 解析单测及零 Docker 银行沙箱全链路闭环单测。
+
+### Fixed
+- **修复 `DWSMigratorEngine` 在标准 PostgreSQL 上探查 DWS 专有函数失败触发 `InFailedSqlTransaction` 问题 (`core/dws_engine.py`)**：将只读探查与执行路径中的 `with self._open_dws_connection() as conn:` 统一改为 `contextlib.closing(...)` 以确保 `conn.autocommit = True` 真正生效并在退出时释放连接，同时在各降级 `except` 分支补充 `_rollback_if_needed(conn)` 保护。
+- **增强 `MetadataHub._probe_inceptor_table` 对 Spark Thrift / 新版 Inceptor `DESCRIBE FORMATTED` 的兼容解析 (`core/platform/metadata_hub.py`)**：支持 `Type=VIEW`、`View Text` 与 `Comment` 在首两列的详情提取。
+
 ---
 
 ## [2.7.0] - 2026-11-19

@@ -228,8 +228,9 @@ def build_executable() -> None:
         "uvicorn.protocols.websockets",
         "anyio._backends._trio",
         "anyio.pytest_plugin",
-        # 严禁将激活码生成器构建工具打入客户版安装包
+        # 严禁将激活码生成器构建工具与本地演示沙箱打入客户版安装包
         "tools",
+        "demo_sandbox",
     ]
 
     pyinstaller_args = [
