@@ -48,14 +48,15 @@
    - **分支清理**：合并与打标推送完成后及时删除已使命终结的临时工作分支，确认远端 `main` 与新标签就位。
 
 ## 5. 当前代码基线快照
-- **当前主干最新正式版本**：**`v2.7.1`**（三层分离存储、全球持久化贯标队列、全链路性能优化、仅注释差异 SQL 修复、启明银行演示沙箱及自动化发版闭环）。
+- **当前主干最新正式版本**：**`v2.8.0`**（三层分离存储、全局持久化贯标队列、仅注释差异 SQL 修复、启明银行演示沙箱及本地可视化管理员总控台）。
 - **核心入口、脚本与工具**：
-  - `app.py`（FastAPI `2.7.1` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`--test` 独立自检）、`build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`（先预编译 `_license_shield` 再单测打包无状态 `DataOG.exe`）、`requirements.txt`（8 项纯运行时依赖）。
+  - `app.py`（FastAPI `2.8.0` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`--test` 独立自检）、`build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`（先预编译 `_license_shield` 再单测打包无状态 `DataOG.exe`）、`requirements.txt`（8 项纯运行时依赖）。
+  - `tools/admin_console/` & `DataOG_Console.command`：本地可视化管理员总控台（`127.0.0.1:18090`，PBKDF2 认证存储于 `.keygen_secrets/admin_console_auth.json`、`HttpOnly` 会话 + 429 限流、一键启动全套演示/工作台启停/Keygen 可视化签发激活/DBeaver 连接与 AI 剧本复制，打包严格排除）。
   - `tools/keygen_src/` & `tools/build_keygen.py`：零依赖独立 C 激活码生成器构建器（`.keygen_secrets/` 与 `keygen/` 严格 `.gitignore`）。
   - `demo_sandbox/`：启明商业银行信创三引擎演示沙箱（PG16 演 DWS `15432` + Spark Thrift 演 Inceptor `11000` + MySQL `13306`、164 条标准、5 大暗雷及 150 表压测 `.dataog.db`，打包严格排除）。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
   - `storage_paths.py`（混淆 OS 私有路径、时钟锚点编解码、`DATAOG_HOME` 隔离）、`storage.py`（双库 WAL、`migration_items.connection_id` + `upsert_migration_items`/`delete_migration_items`、旧版 `<exe_dir>/data/` 无损拆分迁移、表结构幂等演进）、`workspace_hub.py`（`/workspaces*`、零密钥 `.dataog.db` 导出与三步引导式增量合并，维持协议版 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）。
-  - `context.py`（`version="2.7.1"`、Gate 2 HMAC 能力令牌复核）、`router.py` / `schemas.py` / `models.py`、`license_hub.py` & `_license_native_src/`（60s 热验签缓存、壁钟水印节流、Gate 2 快验、`get_meta_batch`）。
+  - `context.py`（`version="2.8.0"`、Gate 2 HMAC 能力令牌复核）、`router.py` / `schemas.py` / `models.py`、`license_hub.py` & `_license_native_src/`（60s 热验签缓存、壁钟水印节流、Gate 2 快验、`get_meta_batch`）。
   - `standard_catalog.py`（46 列字典、多库格式解析、会级幂等清理缓存、B-Tree 区间绑定清理）、`offline_report.py`（库级 `.html`/单 Sheet `.xlsx`）、`import_progress.py`（SSE/微日志/取消）、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`asset_store.py`、`llm_hub.py`、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`（`analyze_item_changes`、`item_requires_table_rebuild`、`analyze_cross_column_compatibility`、DDL 翻译与四层视图穿透）、`core/dws_engine.py`。
 - **四大独立插件模块 (`modules/`, 严格零互引)**：
   - `modules/standard_migrator/`（按库设定标准格式、绑标/模板/三维落标、全局持久化跨表跨库贯标队列 `stage-migration` 零远端重连全内存预生成、`/checklist/delete-items`、`/items/{id}/sql` 多方言预览、`DIRECT_ALTER`/`TABLE_REBUILD` 并发执行与库级报告）。
@@ -63,7 +64,7 @@
   - `modules/ddl_translator/`（智能命名 170+ 词根 + 跨方言互译/四层穿透 + AST/AI 适配） & `modules/data_explorer/`（目标驱动只读多轮探查，会话存储路由至 `scope="private"`）。
 - **前端 ES Modules 工作台 (`static/`)**：
   - `index.html`、`css/tokens.css` & `workbench.css`（轻量化毛玻璃、`contain: layout style` 与纯合成器动画）、`js/core/` (`api.js`/`dom.js`/`state.js`/`type_compat.js`)、`js/ui/` (`auth_gate.js`/`data_grid.js` 原位勾选/`database_tree.js`/`task_activity_bar.js`/`modal.js` 等)、`js/views/`（四大桌面视图；`standard_migrator_view.js` 收敛为单一「纳入贯标」与单条 SQL 预览弹窗）。
-- **自动化测试套件 (`tests/`，共 67 项全绿)**：`test_core.py` (16)、`test_platform.py` (16)、`test_modules_and_api.py` (17)、`test_workspace_separation.py` (9，含动态版本一致性校验与 Node DOM 契约)、`test_license_auth.py` (7)、`test_demo_sandbox.py` (2)。
+- **自动化测试套件 (`tests/`，共 70 项全绿)**：`test_core.py` (16)、`test_platform.py` (16)、`test_modules_and_api.py` (17)、`test_workspace_separation.py` (9，含动态版本一致性校验与 Node DOM 契约)、`test_license_auth.py` (7)、`test_demo_sandbox.py` (2)、`test_admin_console.py` (3)。
 
 ## 6. AI 只读探查四道硬隔离铁律
 涉及 AI 自动查询必须复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束：

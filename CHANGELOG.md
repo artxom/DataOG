@@ -8,6 +8,19 @@
 
 ---
 
+## [2.8.0] - 2026-11-22
+
+### Added
+- **可视化本地管理员总控台 (`tools/admin_console/`, `DataOG_Console.command`, `tools/start_admin_console.sh`, `tools/start_admin_console.bat`)**：
+  - 新增独立浏览器端桌面化总控台（默认监听 `127.0.0.1:18090`，严格由 `build_exe.py` `excluded_modules` 排除于客户端发行包之外），提供双击启动器 `DataOG_Console.command` 与 `python3 -m tools.admin_console` 一键入口，无需记忆任何命令行参数。
+  - **认证与安全隔离 (`tools/admin_console/auth.py`, `server.py`)**：内置管理员账号密码登录门禁（`PBKDF2-HMAC-SHA256` 60 万次加盐哈希落盘至 `.keygen_secrets/admin_console_auth.json`、`0o600` 权限且严格 `.gitignore`），配套 `HttpOnly` + `SameSite=Strict` 会话 Cookie、60 秒 5 次错误 429 暴力破解限流、`Sec-Fetch-Site` CSRF 防护、严格 CSP（零内联脚本与样式）及前端零 `innerHTML`/零阻塞弹窗安全 DOM 工厂 (`static/console.js`)。
+  - **总览与一键编排 (`tools/admin_console/service.py`)**：点击「一键启动全套演示环境」后台流式编排拉起启明银行三引擎 Docker 沙箱并灌入 3 万+ 行样本、幂等装配隔离演示目录（双工作区与三引擎本机凭据）、调用本地 `DataOG_Keygen` 自动签发并激活演示版工作台；支持独立启停与实时查看「演示隔离版 (`18081`)」与「日常正式版 (`18080`)」Data.O.G 进程与日志。
+  - **离线激活码签发中心**：集成设备指纹展示、客户 `REQ1-...` 申请码可视化解码预览、四种模式（本机专属/申请码/手工机器码+IP/全局通用）与 8 档有效时长签发、本地加密台账 (`.keygen_secrets/admin_issue_history.json`)、一键编译器编译 `DataOG_Keygen` 以及签发后一键直接激活本机演示版或正式版 Data.O.G（实时刷新运行中进程缓存）。
+  - **演示沙箱控制、DBeaver JDBC 速查与 AI 剧本复制**：提供 Docker 三引擎启停/5 秒极速重置 DWS/全量重置/5 大业务暗雷精确核验面板，完整呈现华为 DWS (PG16 `15432`)、星环 Inceptor (Spark Thrift `11000`)、核心 MySQL (`13306`) 的 DBeaver JDBC URL 与驱动配置避坑说明（含一键复制），并内置 5 个高层演示 AI 探查提问词与 4 道只读硬防线钓鱼测试复制卡片。
+- **管理员总控台安全性与功能自动化测试 (`tests/test_admin_console.py`)**：新增 3 项完整回归测试，覆盖首次初始化封禁、401/429/403 安全防线、密码轮换、`REQ1-...` 解码与参数校验、激活码签发台账及目标激活、DBeaver URL 契约、5 大暗雷剧本校验以及客户端零引用/前端零 XSS 静态扫描（全套单元测试增至 70 项）。
+
+---
+
 ## [2.7.1] - 2026-11-20
 
 ### Added
