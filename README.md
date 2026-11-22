@@ -1,4 +1,4 @@
-# Data.O.G v2.8.1 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.8.2 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -49,7 +49,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.8.1 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.8.2 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、路由装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── storage_paths.py      # 三层分离混淆私有路径解析器（OS 用户隐藏目录、时钟锚点混淆编码与 DATAOG_HOME 隔离）
@@ -81,7 +81,7 @@ DataOG/
 │   └── js/                       # main.js（登录门禁联动、底部 Dock 与窗口管理器）、core/（含 type_compat.js）、ui/（含 AuthGate / TaskActivityBar / ExportReportModal）、views/（四大模块视图）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 71 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
+├── tests/                        # 73 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -111,7 +111,8 @@ DataOG/
 | **`v2.7.0`** | `feat/three-tier-storage-v2.7` → `main` | **三层分离存储架构（无状态程序包 + 混淆本地私有库 + 团队共享工作区 `.dataog.db`）与引导式增量合并**：彻底分离个人机密（激活码、AI API Key、个人 DB 凭据、外观、驱动、AI 探查会话）与团队共建业务数据（标准字典、绑标、跨环境映射、贯标队列、无密码连接拓扑、元数据缓存）；覆盖安装升级零丢数；新增系统配置「工作区协作」与三步引导式增量合并向导（含跨环境表对差异预览、端点指纹自动匹配个人凭据与旧版 `<exe_dir>/data/` 无损自动迁移） |
 | **`v2.7.1`** | `fix/migrator-global-queue-perf-sql` & `chore/release-v2.7.1-and-auto-release-rule` → `main` | **全局持久化贯标队列、全链路响应优化、仅注释差异 SQL 修复与银行演示沙箱**：新增 `migration_items.connection_id` 跨表/跨库累加与单条多方言 SQL 预览；移除入队冗余远端重连并叠加 `LicenseHub` 热缓存/Gate 2 HMAC 快验与 `DataGrid` 原位勾选优化；精确隔离仅注释差异防误触发整表重建；随附「启明商业银行」Docker 三引擎混合演示沙箱与每次变更强制升版自动发版闭环规范 |
 | **`v2.8.0`** | `feat/admin-console` → `main` | **本地可视化管理员总控台 (`tools/admin_console/` & `DataOG_Console.command`)**：新增带 PBKDF2 加盐登录认证、`HttpOnly`+`SameSite=Strict` 会话、429 暴力破解限流与严格 CSP 零 XSS 前端的总控台，支持一键全套拉起三引擎演示沙箱并自动激活启动 `Data.O.G`、可视化解析 `REQ1` 申请码与签发/一键写入离线激活码、双工作台启停日志监控，以及三库 DBeaver JDBC URL 与 5 大暗雷 AI 提问一键复制 |
-| **`v2.8.1`**（当前正式版） | `fix/llm-tls-ca-fallback` → `main` | **跨平台 AI HTTPS TLS 根证书多级自动解析修复**：修复 macOS Python.org 等默认空白 CA 仓环境直连 DeepSeek 等官方 HTTPS AI 接口报 `self-signed certificate in certificate chain` 问题，在严格保留全量 TLS 校验的前提下实现 `SSL_CERT_FILE` / `truststore` / `/etc/ssl/cert.pem` / `certifi` / 钥匙串多级 CA 自动加载与清晰代理提示 |
+| **`v2.8.1`** | `fix/llm-tls-ca-fallback` → `main` | **跨平台 AI HTTPS TLS 根证书多级自动解析修复**：修复 macOS Python.org 等默认空白 CA 仓环境直连 DeepSeek 等官方 HTTPS AI 接口报 `self-signed certificate in certificate chain` 问题，在严格保留全量 TLS 校验的前提下实现 `SSL_CERT_FILE` / `truststore` / `/etc/ssl/cert.pem` / `certifi` / 钥匙串多级 CA 自动加载与清晰代理提示 |
+| **`v2.8.2`**（当前正式版） | `fix/binding-stats-and-rename-sync` → `main` | **改名贯标字段绑定自动迁移与落标统计 `6/8` 僵尸绑标修复**：在执行单条/批量/保序重建后单事务原子迁移旧字段绑标并强制重刷元数据；核验期间自动裁剪无效物理列残留绑定；`get_connection_binding_stats()` 关联 `meta_columns` 过滤历史僵尸行并附带真实表总列数；前端执行完毕即时同步左树徽标并自动刷新绑标清单 |
 
 ---
 
@@ -122,7 +123,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（71 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、演示沙箱闭环、管理员总控台安全与功能回归、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（73 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、演示沙箱闭环、管理员总控台安全与功能回归、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检

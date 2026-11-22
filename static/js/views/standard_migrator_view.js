@@ -87,6 +87,7 @@ export class StandardMigratorView {
     this.bindingKeyword = "";
     this.selectedBindCols = new Set();
     this._stagingInFlight = false;
+    this._bindingsDirtyAfterMigration = false;
     this._bindingSearchTimer = null;
     this._queueSearchTimer = null;
     this._bindingStageBtn = null;
@@ -167,7 +168,10 @@ export class StandardMigratorView {
             : st.compliant_count >= st.bound_count
             ? "success"
             : "info";
-        return badge(`${st.compliant_count}/${st.bound_count}`, tone);
+        const bEl = badge(`${st.compliant_count}/${st.bound_count}`, tone);
+        const totalHint = st.total_cols ? `（物理表共 ${st.total_cols} 列）` : "";
+        bEl.title = `已落标 ${st.compliant_count} / 已绑标 ${st.bound_count}${totalHint}`;
+        return bEl;
       },
     });
 
@@ -483,6 +487,19 @@ export class StandardMigratorView {
   _applyStateResponse(res) {
     this.ws = res;
     if (res.logs) store.updateLogs(res.logs);
+    if (res.table_stats_by_conn && this.activeConnId && res.table_stats_by_conn[this.activeConnId]) {
+      this.tableStats = res.table_stats_by_conn[this.activeConnId];
+      this.tree?.render();
+    } else if (
+      res.table_stats &&
+      (!res.table_stats_connection_id || res.table_stats_connection_id === this.activeConnId)
+    ) {
+      this.tableStats = res.table_stats;
+      this.tree?.render();
+    }
+    if (Array.isArray(res.migrated_tables) && res.migrated_tables.length > 0) {
+      this._bindingsDirtyAfterMigration = true;
+    }
     if (res.warning) Toast.warn(res.warning);
     else if (res.message) Toast.success(res.message);
     this.render();
@@ -1410,6 +1427,16 @@ export class StandardMigratorView {
           text: t.label,
           onClick: () => {
             this.subMode = t.id;
+            if (
+              t.id === "bindings" &&
+              this._bindingsDirtyAfterMigration &&
+              this.activeConnId &&
+              this.activeTable
+            ) {
+              this._bindingsDirtyAfterMigration = false;
+              this.loadTableCompliance(false);
+              return;
+            }
             this.render();
             this.onStateUpdate?.();
           },

@@ -2469,6 +2469,148 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             self.assertIn("SELECT loan_receipt_no", meta.view_definition)
             self.assertEqual([c.column_name for c in meta.columns], ["loan_receipt_no", "loan_bal_amt"])
 
+    def test_binding_rename_migration_stale_pruning_and_live_stats_filtering(self) -> None:
+        """验证链式/互换改名后原子迁移字段绑标、僵尸绑标精准清理及 get_connection_binding_stats 自动按实有物理字段过滤（杜绝 6/8 虚高）."""
+        from core.platform.context import PlatformContext
+        from core.platform.models import ColumnMeta, TableMeta
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            prof = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "conn_stats_test",
+                    "name": "StatsTest",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 15432,
+                    "dbname": "qiming_dws",
+                    "default_schema": "dwd_bank",
+                }
+            )
+            cat = ctx.standard_catalog
+            cid = prof.connection_id
+
+            # 1. 构造与 dwd_acct_swap_demo 一致的 6 个实有物理列缓存，但绑定表里混入 2 条改名前遗留的僵尸绑标（共 8 条）
+            ctx.store.save_table_meta(
+                cid,
+                TableMeta(
+                    schema_name="dwd_bank",
+                    table_name="dwd_acct_swap_demo",
+                    columns=[
+                        ColumnMeta(column_name="acct_no", data_type="character varying(32)", ordinal_position=1),
+                        ColumnMeta(column_name="acct_legacy_no", data_type="character varying(32)", ordinal_position=2),
+                        ColumnMeta(column_name="cust_id", data_type="character varying(32)", ordinal_position=3),
+                        ColumnMeta(column_name="acct_bal_amt", data_type="numeric(18,2)", ordinal_position=4),
+                        ColumnMeta(column_name="open_dt", data_type="date", ordinal_position=5),
+                        ColumnMeta(column_name="branch_id", data_type="character varying(16)", ordinal_position=6),
+                    ],
+                ),
+            )
+            bindings_with_ghosts = [
+                ("acct_no", "QM_ACCT_001", "COMPLIANT"),
+                ("acct_legacy_no", "QM_ACCT_002", "COMPLIANT"),
+                ("cust_id", "QM_CUST_001", "COMPLIANT"),
+                ("acct_bal_amt", "QM_ACCT_008", "COMPLIANT"),
+                ("open_dt", "QM_ACCT_006", "COMPLIANT"),
+                ("branch_id", "QM_ORG_001", "COMPLIANT"),
+                # 改名前残留的 2 条僵尸行
+                ("acct_code", "QM_ACCT_001", "NON_COMPLIANT"),
+                ("open_dt_txt", "QM_ACCT_006", "NON_COMPLIANT"),
+            ]
+            cat.upsert_field_bindings(
+                cid,
+                [
+                    {
+                        "schema_name": "dwd_bank",
+                        "table_name": "dwd_acct_swap_demo",
+                        "column_name": col,
+                        "std_code": code,
+                    }
+                    for col, code, _st in bindings_with_ghosts
+                ],
+            )
+            cat.update_binding_compliance_batch(
+                cid,
+                [
+                    {
+                        "schema_name": "dwd_bank",
+                        "table_name": "dwd_acct_swap_demo",
+                        "column_name": col,
+                        "compliance_status": st,
+                        "compliance_detail": st,
+                    }
+                    for col, _code, st in bindings_with_ghosts
+                ],
+            )
+            # 未曾采集进 meta_columns 的表仍应正常保留其预绑统计
+            cat.upsert_field_bindings(
+                cid,
+                [
+                    {
+                        "schema_name": "dwd_bank",
+                        "table_name": "uncached_table",
+                        "column_name": "col_x",
+                        "std_code": "QM_CUST_001",
+                    }
+                ],
+            )
+
+            stats = cat.get_connection_binding_stats(cid)
+            swap_st = stats["dwd_bank.dwd_acct_swap_demo"]
+            self.assertEqual(swap_st["bound_count"], 6)
+            self.assertEqual(swap_st["compliant_count"], 6)
+            self.assertEqual(swap_st["non_compliant_count"], 0)
+            self.assertEqual(swap_st["total_cols"], 6)
+            self.assertIn("dwd_bank.uncached_table", stats)
+            self.assertEqual(stats["dwd_bank.uncached_table"]["bound_count"], 1)
+
+            # 2. prune_stale_table_bindings 安全防误删（空列集返回0）并精准清理 2 条僵尸绑标
+            self.assertEqual(
+                cat.prune_stale_table_bindings(cid, "dwd_bank", "dwd_acct_swap_demo", []),
+                0,
+            )
+            pruned = cat.prune_stale_table_bindings(
+                cid,
+                "dwd_bank",
+                "dwd_acct_swap_demo",
+                ["acct_no", "acct_legacy_no", "cust_id", "acct_bal_amt", "open_dt", "branch_id"],
+            )
+            self.assertEqual(pruned, 2)
+            kept = cat.get_table_field_bindings(cid, "dwd_bank", "dwd_acct_swap_demo")
+            self.assertEqual(
+                set(kept.keys()),
+                {"acct_no", "acct_legacy_no", "cust_id", "acct_bal_amt", "open_dt", "branch_id"},
+            )
+
+            # 3. 链式改名 + 双方互换原子迁移测试
+            cat.upsert_field_bindings(
+                cid,
+                [
+                    {"schema_name": "dwd_bank", "table_name": "swap_chain_tbl", "column_name": "acct_code", "std_code": "QM_ACCT_001"},
+                    {"schema_name": "dwd_bank", "table_name": "swap_chain_tbl", "column_name": "acct_no", "std_code": "QM_ACCT_002"},
+                    {"schema_name": "dwd_bank", "table_name": "swap_chain_tbl", "column_name": "col_a", "std_code": "QM_SWAP_A"},
+                    {"schema_name": "dwd_bank", "table_name": "swap_chain_tbl", "column_name": "col_b", "std_code": "QM_SWAP_B"},
+                ],
+            )
+            moved = cat.migrate_renamed_column_bindings(
+                cid,
+                "dwd_bank",
+                "swap_chain_tbl",
+                [
+                    ("acct_no", "acct_legacy_no"),
+                    ("acct_code", "acct_no"),
+                    ("col_a", "col_b"),
+                    ("col_b", "col_a"),
+                ],
+            )
+            self.assertEqual(moved, 4)
+            after_swap = cat.get_table_field_bindings(cid, "dwd_bank", "swap_chain_tbl")
+            self.assertEqual(set(after_swap.keys()), {"acct_legacy_no", "acct_no", "col_b", "col_a"})
+            self.assertEqual(after_swap["acct_no"]["std_code"], "QM_ACCT_001")
+            self.assertEqual(after_swap["acct_legacy_no"]["std_code"], "QM_ACCT_002")
+            self.assertEqual(after_swap["col_b"]["std_code"], "QM_SWAP_A")
+            self.assertEqual(after_swap["col_a"]["std_code"], "QM_SWAP_B")
+
 
 if __name__ == "__main__":
     unittest.main()

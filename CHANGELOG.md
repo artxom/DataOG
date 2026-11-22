@@ -8,6 +8,20 @@
 
 ---
 
+## [2.8.2] - 2026-11-23
+
+### Fixed
+- **彻底修复字段改名/删改贯标后落标统计出现「`6/8` 僵尸绑标虚高」缺陷 (`core/platform/standard_catalog.py`, `modules/standard_migrator/service.py`, `static/js/views/standard_migrator_view.js`, `tests/test_platform.py`, `tests/test_modules_and_api.py`)**：
+  - **根因**：执行单条 `execute_single`、批量 `execute_batch` 或保序重建 `execute_rebuild` 完成字段改名（如 `acct_no -> acct_legacy_no`、`acct_code -> acct_no`、`open_dt_txt -> open_dt`）后未将 `field_standard_bindings` 迁移至新列名；手工重绑新列后，改名前遗留的 `acct_code`/`open_dt_txt` 僵尸行继续停留在工作区表中并计入 `get_connection_binding_stats()`，导致 6 列物理表被统计为 `6/8`。
+  - **四重修复**：
+    1. 在 `StandardCatalog` 新增单事务原子改名迁移 `migrate_renamed_column_bindings()`（完整兼容链式改名与双方互换而不触发 `UNIQUE` 冲突）与安全物理列裁剪 `prune_stale_table_bindings()`（空列集防误删）；
+    2. 在 `StandardCatalog.get_connection_binding_stats()` 关联已缓存的 `meta_columns`，自动剔除物理表已不存在的僵尸绑标（同时完整保留尚未探查缓存表的预绑统计），并附带返回 `total_cols`；
+    3. 在 `StandardMigratorService` 的 `execute_single`/`execute_batch`/`execute_rebuild` 执行成功后自动调用 `_post_migration_sync_bindings_and_metadata()` 迁移绑定并强刷目标表元数据与实时落标状态，且在 `_get_table_compliance_with_meta()` 与 `batch_check_compliance()` 期间自动清理孤儿绑定；
+    4. 前端 `StandardMigratorView` 贯标后即时同步目录树徽标（附带物理表总列数悬浮提示）并在切回绑定视图时自动刷新新列名列表。
+  - 新增 `test_binding_rename_migration_stale_pruning_and_live_stats_filtering` 与 `test_migrator_execution_migrates_bindings_and_prunes_stale_stats` 回归测试（全套单元测试增至 73 项）。
+
+---
+
 ## [2.8.1] - 2026-11-23
 
 ### Fixed

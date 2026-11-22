@@ -1728,6 +1728,167 @@ class StandardCatalog:
                 )
         return moved
 
+    def migrate_renamed_column_bindings(
+        self,
+        connection_id: str,
+        schema_name: str,
+        table_name: str,
+        rename_pairs: Sequence[Tuple[str, str]],
+    ) -> int:
+        """在改名/保序重建完成后单事务原子迁移旧字段绑标至新字段名（完整支持链式改名与字段名互换）."""
+        if not connection_id or not table_name or not rename_pairs:
+            return 0
+
+        eff_schema = clean_identifier_input(schema_name or "") or "public"
+        eff_table = clean_identifier_input(table_name or "")
+        if not eff_table:
+            return 0
+
+        dedup_pairs: List[Tuple[str, str]] = []
+        seen_old: set[str] = set()
+        for old_raw, new_raw in rename_pairs:
+            old_c = clean_identifier_input(old_raw or "")
+            new_c = clean_identifier_input(new_raw or "")
+            if not old_c or not new_c or old_c.lower() == new_c.lower():
+                continue
+            if old_c.lower() in seen_old:
+                continue
+            seen_old.add(old_c.lower())
+            dedup_pairs.append((old_c, new_c))
+        if not dedup_pairs:
+            return 0
+
+        now = self._now_str()
+        upsert_sql = """
+            INSERT INTO field_standard_bindings (
+                connection_id, schema_name, table_name, column_name, col_key,
+                std_code, bind_source, compliance_status, compliance_detail, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connection_id, col_key) DO UPDATE SET
+                schema_name = excluded.schema_name,
+                table_name = excluded.table_name,
+                column_name = excluded.column_name,
+                std_code = excluded.std_code,
+                bind_source = excluded.bind_source,
+                compliance_status = excluded.compliance_status,
+                compliance_detail = excluded.compliance_detail,
+                updated_at = excluded.updated_at
+        """
+
+        with self.store.module_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM field_standard_bindings
+                WHERE connection_id = ?
+                  AND schema_name = ? COLLATE NOCASE
+                  AND table_name = ? COLLATE NOCASE
+                ORDER BY id ASC
+                """,
+                (connection_id, eff_schema, eff_table),
+            ).fetchall()
+            if not rows:
+                return 0
+
+            existing_by_col: Dict[str, Any] = {}
+            for r in rows:
+                ck = (clean_identifier_input(str(r["column_name"] or "")) or "").lower()
+                if ck:
+                    existing_by_col[ck] = r
+
+            source_old_keys = {old_c.lower() for old_c, _new_c in dedup_pairs}
+            moved: Dict[str, Tuple[str, Any]] = {}
+            for old_c, new_c in dedup_pairs:
+                src_row = existing_by_col.get(old_c.lower())
+                if src_row is not None and str(src_row["std_code"] or "").strip():
+                    moved[new_c.lower()] = (new_c, src_row)
+
+            delete_ids = [
+                int(r["id"])
+                for r in rows
+                if ((clean_identifier_input(str(r["column_name"] or "")) or "").lower() in source_old_keys)
+                or ((clean_identifier_input(str(r["column_name"] or "")) or "").lower() in moved)
+            ]
+            if not delete_ids and not moved:
+                return 0
+
+            if delete_ids:
+                ph = ",".join("?" for _ in delete_ids)
+                conn.execute(
+                    f"DELETE FROM field_standard_bindings WHERE id IN ({ph})",
+                    tuple(delete_ids),
+                )
+
+            if moved:
+                up_batch = []
+                for new_c, src_row in moved.values():
+                    row_sch = clean_identifier_input(str(src_row["schema_name"] or "")) or eff_schema
+                    row_tbl = clean_identifier_input(str(src_row["table_name"] or "")) or eff_table
+                    up_batch.append(
+                        (
+                            connection_id,
+                            row_sch,
+                            row_tbl,
+                            new_c,
+                            self.make_col_key(row_sch, row_tbl, new_c),
+                            str(src_row["std_code"] or ""),
+                            str(src_row["bind_source"] or "MANUAL") or "MANUAL",
+                            "UNCHECKED",
+                            "",
+                            now,
+                        )
+                    )
+                conn.executemany(upsert_sql, up_batch)
+
+            return len(moved) if moved else len(delete_ids)
+
+    def prune_stale_table_bindings(
+        self,
+        connection_id: str,
+        schema_name: str,
+        table_name: str,
+        valid_columns: Iterable[str],
+    ) -> int:
+        """按表当前真实存在的物理字段集合清理已改名/已删除的残留僵尸绑标."""
+        if not connection_id or not table_name:
+            return 0
+        eff_schema = clean_identifier_input(schema_name or "") or "public"
+        eff_table = clean_identifier_input(table_name or "")
+        if not eff_table:
+            return 0
+
+        valid_lower = {
+            (clean_identifier_input(str(c or "")) or "").lower()
+            for c in (valid_columns or [])
+        }
+        valid_lower.discard("")
+        if not valid_lower:
+            return 0
+
+        with self.store.module_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, column_name
+                FROM field_standard_bindings
+                WHERE connection_id = ?
+                  AND schema_name = ? COLLATE NOCASE
+                  AND table_name = ? COLLATE NOCASE
+                """,
+                (connection_id, eff_schema, eff_table),
+            ).fetchall()
+            stale_ids = [
+                int(r["id"])
+                for r in rows
+                if ((clean_identifier_input(str(r["column_name"] or "")) or "").lower() not in valid_lower)
+            ]
+            if not stale_ids:
+                return 0
+            ph = ",".join("?" for _ in stale_ids)
+            conn.execute(
+                f"DELETE FROM field_standard_bindings WHERE id IN ({ph})",
+                tuple(stale_ids),
+            )
+            return len(stale_ids)
+
     def upsert_field_bindings(
         self,
         connection_id: str,
@@ -1793,23 +1954,58 @@ class StandardCatalog:
             )
 
     def get_connection_binding_stats(self, connection_id: str) -> Dict[str, Dict[str, int]]:
-        """返回指定数据源下按 lowercase `schema.table` 聚合的绑标/落标计数."""
+        """返回指定数据源下按 lowercase `schema.table` 聚合的有效绑标/落标计数（自动剔除不存在于 meta_columns 的僵尸绑标）."""
         if not connection_id:
             return {}
         with self.store.module_db() as conn:
             rows = conn.execute(
                 """
+                WITH cached_tables AS (
+                    SELECT DISTINCT
+                        LOWER(TRIM(schema_name)) AS s_key,
+                        LOWER(TRIM(table_name)) AS t_key
+                    FROM meta_columns
+                    WHERE connection_id = ?
+                ),
+                live_cols AS (
+                    SELECT DISTINCT
+                        LOWER(TRIM(schema_name)) AS s_key,
+                        LOWER(TRIM(table_name)) AS t_key,
+                        LOWER(TRIM(column_name)) AS c_key
+                    FROM meta_columns
+                    WHERE connection_id = ?
+                ),
+                table_totals AS (
+                    SELECT
+                        LOWER(TRIM(schema_name)) || '.' || LOWER(TRIM(table_name)) AS tbl_key,
+                        COUNT(DISTINCT LOWER(TRIM(column_name))) AS total_cols
+                    FROM meta_columns
+                    WHERE connection_id = ?
+                    GROUP BY LOWER(TRIM(schema_name)), LOWER(TRIM(table_name))
+                )
                 SELECT
-                    LOWER(schema_name) || '.' || LOWER(table_name) AS tbl_key,
+                    LOWER(TRIM(fb.schema_name)) || '.' || LOWER(TRIM(fb.table_name)) AS tbl_key,
                     COUNT(*) AS bound_count,
-                    SUM(CASE WHEN compliance_status = 'COMPLIANT' THEN 1 ELSE 0 END) AS compliant_count,
-                    SUM(CASE WHEN compliance_status = 'COMMENT_ONLY' THEN 1 ELSE 0 END) AS comment_only_count,
-                    SUM(CASE WHEN compliance_status IN ('NON_COMPLIANT', 'STD_MISSING') THEN 1 ELSE 0 END) AS non_compliant_count
-                FROM field_standard_bindings
-                WHERE connection_id = ? AND std_code != ''
-                GROUP BY LOWER(schema_name), LOWER(table_name)
+                    SUM(CASE WHEN fb.compliance_status = 'COMPLIANT' THEN 1 ELSE 0 END) AS compliant_count,
+                    SUM(CASE WHEN fb.compliance_status = 'COMMENT_ONLY' THEN 1 ELSE 0 END) AS comment_only_count,
+                    SUM(CASE WHEN fb.compliance_status IN ('NON_COMPLIANT', 'STD_MISSING') THEN 1 ELSE 0 END) AS non_compliant_count,
+                    COALESCE(tt.total_cols, 0) AS total_cols
+                FROM field_standard_bindings fb
+                LEFT JOIN cached_tables ct
+                    ON ct.s_key = LOWER(TRIM(fb.schema_name))
+                   AND ct.t_key = LOWER(TRIM(fb.table_name))
+                LEFT JOIN live_cols lc
+                    ON lc.s_key = LOWER(TRIM(fb.schema_name))
+                   AND lc.t_key = LOWER(TRIM(fb.table_name))
+                   AND lc.c_key = LOWER(TRIM(fb.column_name))
+                LEFT JOIN table_totals tt
+                    ON tt.tbl_key = LOWER(TRIM(fb.schema_name)) || '.' || LOWER(TRIM(fb.table_name))
+                WHERE fb.connection_id = ?
+                  AND fb.std_code != ''
+                  AND (ct.t_key IS NULL OR lc.c_key IS NOT NULL)
+                GROUP BY LOWER(TRIM(fb.schema_name)), LOWER(TRIM(fb.table_name))
                 """,
-                (connection_id,),
+                (connection_id, connection_id, connection_id, connection_id),
             ).fetchall()
         return {
             r["tbl_key"]: {
@@ -1817,6 +2013,7 @@ class StandardCatalog:
                 "compliant_count": int(r["compliant_count"] or 0),
                 "comment_only_count": int(r["comment_only_count"] or 0),
                 "non_compliant_count": int(r["non_compliant_count"] or 0),
+                "total_cols": int(r["total_cols"] or 0),
             }
             for r in rows
         }

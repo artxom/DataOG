@@ -538,6 +538,82 @@ class StandardMigratorService:
         )
         return state
 
+    def _post_migration_sync_bindings_and_metadata(
+        self, completed_items: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """DDL 贯标执行成功后，同步迁移字段绑定、刷新表元数据及实时落标状态，杜绝改名后统计出现 6/8 等僵尸绑标."""
+        grouped: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for it in completed_items or []:
+            if str(it.get("status") or "").upper() != "COMPLETED":
+                continue
+            cid = self._resolve_item_connection_id(it)
+            sch = clean_identifier_input(str(it.get("schema_name") or "")) or "public"
+            tbl = clean_identifier_input(str(it.get("table_name") or ""))
+            if not cid or not tbl:
+                continue
+            gk = (cid, sch.lower(), tbl.lower())
+            grp = grouped.setdefault(
+                gk, {"connection_id": cid, "schema_name": sch, "table_name": tbl, "renames": []}
+            )
+            old_c = clean_identifier_input(str(it.get("old_col_name") or ""))
+            new_c = clean_identifier_input(str(it.get("new_col_name") or ""))
+            if old_c and new_c and old_c.lower() != new_c.lower():
+                grp["renames"].append((old_c, new_c))
+
+        migrated_tables: List[Dict[str, str]] = []
+        touched_cids: List[str] = []
+        for grp in grouped.values():
+            cid = str(grp["connection_id"])
+            sch = str(grp["schema_name"])
+            tbl = str(grp["table_name"])
+            if cid not in touched_cids:
+                touched_cids.append(cid)
+            migrated_tables.append(
+                {"connection_id": cid, "schema_name": sch, "table_name": tbl}
+            )
+            if grp["renames"]:
+                try:
+                    self.ctx.standard_catalog.migrate_renamed_column_bindings(
+                        cid, sch, tbl, grp["renames"]
+                    )
+                except Exception:
+                    pass
+            try:
+                self.get_table_compliance(
+                    cid,
+                    sch,
+                    tbl,
+                    force_refresh=True,
+                    include_table_stats=False,
+                    purge_errors=False,
+                )
+            except Exception:
+                pass
+
+        table_stats_by_conn = {
+            cid: self.ctx.standard_catalog.get_connection_binding_stats(cid)
+            for cid in touched_cids
+            if cid
+        }
+        return {
+            "table_stats_by_conn": table_stats_by_conn,
+            "migrated_tables": migrated_tables,
+        }
+
+    @staticmethod
+    def _attach_post_migration_sync_state(
+        state: Dict[str, Any], sync_meta: Dict[str, Any], fallback_cid: str = ""
+    ) -> None:
+        stats_by_conn = sync_meta.get("table_stats_by_conn") or {}
+        if stats_by_conn:
+            state["table_stats_by_conn"] = stats_by_conn
+            active_cid = str(state.get("active_connection_id") or fallback_cid or "")
+            if active_cid in stats_by_conn:
+                state["table_stats"] = stats_by_conn[active_cid]
+                state["table_stats_connection_id"] = active_cid
+        if sync_meta.get("migrated_tables"):
+            state["migrated_tables"] = sync_meta["migrated_tables"]
+
     def execute_single(
         self,
         item_id: int,
@@ -569,6 +645,16 @@ class StandardMigratorService:
             1,
         )
         item = eng.execute_single_item_direct(item_id)
+        sync_meta: Dict[str, Any] = {"table_stats_by_conn": {}, "migrated_tables": []}
+        if item.get("status") == "COMPLETED":
+            report(
+                86.0,
+                "同步字段绑标与元数据",
+                f"正在同步 {item_label} 改名后绑定关系与落标统计...",
+                1,
+                1,
+            )
+            sync_meta = self._post_migration_sync_bindings_and_metadata([item])
         report(
             92.0,
             "刷新执行台状态",
@@ -578,6 +664,7 @@ class StandardMigratorService:
         )
         state = self.get_workspace_state()
         state["item"] = item
+        self._attach_post_migration_sync_state(state, sync_meta, fallback_cid=conn_id)
         if item.get("status") in ("FAILED", "MISSING_TABLE", "MISSING_COLUMN"):
             state["warning"] = (
                 item.get("error_message") or item.get("status_detail") or f"{item_label} 贯标执行未通过"
@@ -760,6 +847,22 @@ class StandardMigratorService:
                 watcher.join(timeout=1.5)
 
         _scan_finished_tables(force_all=True)
+        pending_id_set = {int(it["id"]) for it in pending_items}
+        latest_completed = [
+            it
+            for it in self.ctx.store.list_items()
+            if it["id"] in pending_id_set and it.get("status") == "COMPLETED"
+        ]
+        sync_meta: Dict[str, Any] = {"table_stats_by_conn": {}, "migrated_tables": []}
+        if latest_completed:
+            report(
+                94.0,
+                "同步字段绑标与元数据",
+                "正在同步已完成表的新列绑定关系与落标统计...",
+                total_tables,
+                total_tables,
+            )
+            sync_meta = self._post_migration_sync_bindings_and_metadata(latest_completed)
         report(
             96.0,
             "汇总批量结果",
@@ -771,6 +874,7 @@ class StandardMigratorService:
         state = self.get_workspace_state()
         state["batch_result"] = batch_res
         state["message"] = batch_res.get("message", "批量贯标任务执行完毕")
+        self._attach_post_migration_sync_state(state, sync_meta)
         if int(batch_res.get("failed_count", 0) or 0) > 0:
             state["warning"] = state["message"]
         return state
@@ -951,13 +1055,30 @@ class StandardMigratorService:
         report(
             85.0,
             "切换表名与恢复索引",
-            f"正在切换 {tbl_label} 表名、恢复注释与结构校验...",
+            f"正在切换 {tbl_label} 表名、同步字段绑定与结构校验...",
             2,
             3,
         )
+        tbl_id_set = {int(it["id"]) for it in tbl_items}
+        latest_completed = [
+            it
+            for it in self.ctx.store.list_items()
+            if it.get("status") == "COMPLETED"
+            and (
+                (tbl_id_set and it["id"] in tbl_id_set)
+                or (
+                    not tbl_id_set
+                    and it["schema_name"].lower() == schema_name.lower()
+                    and it["table_name"].lower() == table_name.lower()
+                    and (not eff_cid or self._resolve_item_connection_id(it) == eff_cid)
+                )
+            )
+        ]
+        sync_meta = self._post_migration_sync_bindings_and_metadata(latest_completed)
         state = self.get_workspace_state()
         state["rebuild_result"] = res
         state["message"] = res.get("message", "整表保序重建完成")
+        self._attach_post_migration_sync_state(state, sync_meta, fallback_cid=eff_cid)
         report(
             96.0,
             "切换表名与恢复索引",
@@ -1335,6 +1456,16 @@ class StandardMigratorService:
         actual_schema = t_meta.schema_name or eff_schema
         actual_table = t_meta.table_name or eff_table
         col_total = len(t_meta.columns)
+
+        if t_meta.exists and t_meta.columns:
+            live_col_names = [c.column_name for c in t_meta.columns if c.column_name]
+            self.ctx.standard_catalog.prune_stale_table_bindings(
+                prof.connection_id, actual_schema, actual_table, live_col_names
+            )
+            if eff_schema.lower() != actual_schema.lower():
+                self.ctx.standard_catalog.prune_stale_table_bindings(
+                    prof.connection_id, eff_schema, actual_table, live_col_names
+                )
 
         report(
             74.0,
@@ -1726,6 +1857,7 @@ class StandardMigratorService:
         table_results: List[Dict[str, Any]] = []
         all_compliance_updates: List[Dict[str, Any]] = []
         schema_realignments: List[Tuple[str, str, str]] = []
+        prune_targets: List[Tuple[str, str, List[str]]] = []
         agg = {
             "checked_tables": 0,
             "total_cols": 0,
@@ -1777,6 +1909,10 @@ class StandardMigratorService:
 
             actual_s = t_meta.schema_name or sch
             actual_t = t_meta.table_name or tbl
+            if t_meta.exists and t_meta.columns:
+                prune_targets.append(
+                    (actual_s, actual_t, [c.column_name for c in t_meta.columns if c.column_name])
+                )
             should_realign = bool(
                 unqualified_tables
                 and req_k in unqualified_tables
@@ -1831,6 +1967,11 @@ class StandardMigratorService:
                 prof.connection_id,
                 schema_realignments,
                 replace_mode=realign_replace_mode,
+            )
+
+        for p_sch, p_tbl, p_cols in prune_targets:
+            self.ctx.standard_catalog.prune_stale_table_bindings(
+                prof.connection_id, p_sch, p_tbl, p_cols
             )
 
         if all_compliance_updates:
