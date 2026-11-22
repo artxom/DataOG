@@ -8,6 +8,16 @@
 
 ---
 
+## [2.8.1] - 2026-11-23
+
+### Fixed
+- **跨平台 AI HTTPS TLS 根证书多级自动解析与 macOS 空白 CA 仓修复 (`core/platform/llm_hub.py`, `tests/test_platform.py`)**：
+  - 根因：macOS 官方 Python.org 安装包默认 `ssl.create_default_context()` 加载 `0` 张根证书，调用 `https://api.deepseek.com` 等公网 HTTPS AI 接口时即便对方证书链完整且 API Key 正确，也会在 TLS 握手期触发误导性的 `[SSL: CERTIFICATE_VERIFY_FAILED] self-signed certificate in certificate chain` 报错。
+  - 修复：新增 `build_llm_ssl_context()`，严格保持完整 TLS 证书链与主机名校验前提下，按优先级支持 `SSL_CERT_FILE`/`SSL_CERT_DIR` 环境变量覆写、系统信任库 `truststore`（自动信任 macOS 钥匙串系统根与企业代理根证书）、系统常见 CA Bundle（`/etc/ssl/cert.pem` 等）、可选 `certifi` 与 macOS `/usr/bin/security` 系统根导出兜底；并在真实 `SSLCertVerificationError` 时给出包含 `SSL_CERT_FILE` 配置指引的中文报错提示。
+  - 同步新增 `test_llm_hub_tls_ssl_context_fallback_and_cert_error_hint` 单元测试（全套单元测试增至 71 项）。
+
+---
+
 ## [2.8.0] - 2026-11-22
 
 ### Added
