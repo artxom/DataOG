@@ -4412,6 +4412,145 @@ view.destroy();
             self.assertIn("this._syncSelectionDom()", row_blk)
             self.assertNotIn("this.render()", row_blk)
 
+    def test_migrator_execution_migrates_bindings_and_prunes_stale_stats(self) -> None:
+        """验证 StandardMigratorService 执行改名贯标后自动迁移字段绑标、重刷元信息并消除残留僵尸 6/8 统计."""
+        from core.platform.models import ColumnMeta, TableMeta
+        from modules.standard_migrator.service import StandardMigratorService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            prof = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "conn_dws_exec",
+                    "name": "DemoDWS",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 15432,
+                    "dbname": "qiming_dws",
+                    "default_schema": "dwd_bank",
+                }
+            )
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "QM_ACCT_001",
+                    "cn_name": "新主账号",
+                    "en_abbr": "acct_no",
+                    "type_dws": "VARCHAR(32)",
+                }
+            )
+            ctx.standard_catalog.upsert_item(
+                {
+                    "std_code": "QM_ACCT_002",
+                    "cn_name": "历史老账号",
+                    "en_abbr": "acct_legacy_no",
+                    "type_dws": "VARCHAR(32)",
+                }
+            )
+
+            # 改名前物理列与绑定
+            ctx.store.save_table_meta(
+                prof.connection_id,
+                TableMeta(
+                    schema_name="dwd_bank",
+                    table_name="dwd_acct_swap_demo",
+                    columns=[
+                        ColumnMeta(column_name="acct_code", data_type="character varying(24)", column_comment="新主账号候选", ordinal_position=1),
+                        ColumnMeta(column_name="acct_no", data_type="character varying(24)", column_comment="历史老账号", ordinal_position=2),
+                    ],
+                ),
+            )
+            ctx.standard_catalog.upsert_field_bindings(
+                prof.connection_id,
+                [
+                    {"schema_name": "dwd_bank", "table_name": "dwd_acct_swap_demo", "column_name": "acct_code", "std_code": "QM_ACCT_001"},
+                    {"schema_name": "dwd_bank", "table_name": "dwd_acct_swap_demo", "column_name": "acct_no", "std_code": "QM_ACCT_002"},
+                ],
+            )
+            ctx.store.replace_all_items(
+                [
+                    {
+                        "connection_id": prof.connection_id,
+                        "schema_name": "dwd_bank",
+                        "table_name": "dwd_acct_swap_demo",
+                        "old_col_name": "acct_no",
+                        "old_col_type": "VARCHAR(24)",
+                        "old_col_comment": "历史老账号",
+                        "new_col_name": "acct_legacy_no",
+                        "new_col_type": "VARCHAR(32)",
+                        "new_col_comment": "历史老账号",
+                        "status": "PENDING",
+                        "strategy": "DIRECT_ALTER",
+                    },
+                    {
+                        "connection_id": prof.connection_id,
+                        "schema_name": "dwd_bank",
+                        "table_name": "dwd_acct_swap_demo",
+                        "old_col_name": "acct_code",
+                        "old_col_type": "VARCHAR(24)",
+                        "old_col_comment": "新主账号候选",
+                        "new_col_name": "acct_no",
+                        "new_col_type": "VARCHAR(32)",
+                        "new_col_comment": "新主账号",
+                        "status": "PENDING",
+                        "strategy": "DIRECT_ALTER",
+                    },
+                ],
+                "test_swap",
+            )
+            item_ids = [it["id"] for it in ctx.store.list_items()]
+
+            # 模拟批处理执行完成并同步切换物理表元数据到新列名
+            def _fake_batch_exec(item_ids: List[int], **_kw: Any) -> Dict[str, Any]:
+                for iid in item_ids:
+                    ctx.store.update_item_execution(
+                        iid,
+                        status="COMPLETED",
+                        strategy="DIRECT_ALTER",
+                        status_detail="已改名",
+                        generated_sql="SELECT 1;",
+                    )
+                return {
+                    "executed_count": len(item_ids),
+                    "success_count": len(item_ids),
+                    "failed_count": 0,
+                    "rebuild_table_count": 0,
+                    "direct_table_count": 1,
+                    "message": "执行成功",
+                }
+
+            new_meta = TableMeta(
+                schema_name="dwd_bank",
+                table_name="dwd_acct_swap_demo",
+                columns=[
+                    ColumnMeta(column_name="acct_no", data_type="character varying(32)", column_comment="新主账号", ordinal_position=1),
+                    ColumnMeta(column_name="acct_legacy_no", data_type="character varying(32)", column_comment="历史老账号", ordinal_position=2),
+                ],
+            )
+            svc = StandardMigratorService(ctx)
+            with mock.patch.object(svc, "_get_engine_for_connection") as m_eng:
+                fake_eng = mock.MagicMock()
+                fake_eng.execute_batch_items.side_effect = _fake_batch_exec
+                m_eng.return_value = (fake_eng, prof)
+                with mock.patch.object(ctx.connection_hub, "probe_session", return_value=mock.MagicMock()):
+                    with mock.patch.object(ctx.metadata_hub, "_probe_single_table_on_conn", return_value=new_meta):
+                        res = svc.execute_batch(item_ids)
+
+            self.assertIn("table_stats_by_conn", res)
+            st_map = res["table_stats_by_conn"][prof.connection_id]
+            tbl_st = st_map["dwd_bank.dwd_acct_swap_demo"]
+            self.assertEqual(tbl_st["bound_count"], 2)
+            self.assertEqual(tbl_st["compliant_count"], 2)
+            self.assertEqual(tbl_st["non_compliant_count"], 0)
+            self.assertEqual(tbl_st["total_cols"], 2)
+
+            binds = ctx.standard_catalog.get_table_field_bindings(
+                prof.connection_id, "dwd_bank", "dwd_acct_swap_demo"
+            )
+            self.assertEqual(set(binds.keys()), {"acct_no", "acct_legacy_no"})
+            self.assertNotIn("acct_code", binds)
+            self.assertEqual(binds["acct_no"]["std_code"], "QM_ACCT_001")
+            self.assertEqual(binds["acct_legacy_no"]["std_code"], "QM_ACCT_002")
+
 
 if __name__ == "__main__":
     unittest.main()
