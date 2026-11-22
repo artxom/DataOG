@@ -16,8 +16,10 @@ import io
 import json
 import os
 import sqlite3
+import ssl
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from typing import Any, Dict, List
 from unittest import mock
@@ -26,7 +28,7 @@ import openpyxl
 
 from core.platform.context import PlatformContext
 from core.platform.driver_manager import JdbcConnectionAdapter
-from core.platform.llm_hub import LLMHub, extract_json_payload
+from core.platform.llm_hub import LLMHub, build_llm_ssl_context, extract_json_payload
 from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
 from core.platform.storage import PlatformStateStore
 
@@ -726,6 +728,71 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             finally:
                 httpd.shutdown()
                 httpd.server_close()
+
+    def test_llm_hub_tls_ssl_context_fallback_and_cert_error_hint(self) -> None:
+        """验证 LLMHub TLS CA 多级回退（SSL_CERT_FILE / 系统 CA 路径 / certifi）与证书校验失败清晰引导."""
+        # 1. 显式 SSL_CERT_FILE 优先直走默认上下文（不覆盖用户自定义 CA）
+        fake_default_ctx = mock.MagicMock(spec=ssl.SSLContext)
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": "/tmp/custom_corp_ca.pem"}, clear=False):
+            with mock.patch("core.platform.llm_hub.ssl.create_default_context", return_value=fake_default_ctx) as m_cdc:
+                got = build_llm_ssl_context()
+                self.assertIs(got, fake_default_ctx)
+                m_cdc.assert_called_once_with()
+
+        # 2. 默认 OpenSSL 仓库为空且 truststore 不可用时，回退系统常见 CA 路径 (/etc/ssl/cert.pem 等)
+        class _FakeSSLContext:
+            def __init__(self) -> None:
+                self.loaded_cafiles: List[str] = []
+
+            def cert_store_stats(self) -> Dict[str, int]:
+                return {"x509_ca": 100 if self.loaded_cafiles else 0}
+
+            def load_verify_locations(self, cafile: str = "", cadata: str = "") -> None:
+                if cafile:
+                    self.loaded_cafiles.append(cafile)
+
+        fake_sys_ctx = _FakeSSLContext()
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": "", "SSL_CERT_DIR": ""}, clear=False):
+            with mock.patch("core.platform.llm_hub._try_build_truststore_context", return_value=None):
+                with mock.patch("core.platform.llm_hub.ssl.create_default_context", return_value=fake_sys_ctx):
+                    with mock.patch("core.platform.llm_hub._COMMON_SYSTEM_CA_FILES", ("/mock/system/cert.pem",)):
+                        with mock.patch(
+                            "core.platform.llm_hub.os.path.isfile",
+                            side_effect=lambda p: p == "/mock/system/cert.pem",
+                        ):
+                            ctx_res = build_llm_ssl_context()
+                            self.assertIs(ctx_res, fake_sys_ctx)
+                            self.assertEqual(fake_sys_ctx.loaded_cafiles, ["/mock/system/cert.pem"])
+
+        # 3. 系统 CA 路径均缺失时回退到 certifi.where()
+        fake_certifi_ctx = _FakeSSLContext()
+        fake_certifi_mod = mock.MagicMock()
+        fake_certifi_mod.where.return_value = "/mock/certifi/cacert.pem"
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": "", "SSL_CERT_DIR": ""}, clear=False):
+            with mock.patch("core.platform.llm_hub._try_build_truststore_context", return_value=None):
+                with mock.patch("core.platform.llm_hub.ssl.create_default_context", return_value=fake_certifi_ctx):
+                    with mock.patch("core.platform.llm_hub._COMMON_SYSTEM_CA_FILES", ()):
+                        with mock.patch.dict("sys.modules", {"certifi": fake_certifi_mod}):
+                            with mock.patch(
+                                "core.platform.llm_hub.os.path.isfile",
+                                side_effect=lambda p: p == "/mock/certifi/cacert.pem",
+                            ):
+                                ctx_certifi = build_llm_ssl_context()
+                                self.assertIs(ctx_certifi, fake_certifi_ctx)
+                                self.assertEqual(fake_certifi_ctx.loaded_cafiles, ["/mock/certifi/cacert.pem"])
+
+        # 4. SSLCertVerificationError 给出明确中文诊断指引（企业代理/SSL_CERT_FILE）
+        fake_opener = mock.MagicMock()
+        fake_opener.open.side_effect = urllib.error.URLError(
+            ssl.SSLCertVerificationError(1, "[SSL: CERTIFICATE_VERIFY_FAILED] self-signed")
+        )
+        with mock.patch("core.platform.llm_hub.urllib.request.build_opener", return_value=fake_opener):
+            with self.assertRaises(RuntimeError) as cert_err:
+                LLMHub._request_openai_json(
+                    "GET", "https://api.deepseek.com/models", "sk-test", None, 5.0
+                )
+            self.assertIn("SSL_CERT_FILE", str(cert_err.exception))
+            self.assertIn("TLS 证书校验未通过", str(cert_err.exception))
 
     def test_readonly_sql_guard_redteam_matrix_and_false_positive_immunity(self) -> None:
         """红队验证：双模态词法/语法只读沙箱拦截一切写/DDL/锁/多语句/转义偷渡/危险函数，且合法查询零误伤."""
