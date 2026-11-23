@@ -50,7 +50,7 @@
 ## 5. 当前代码基线快照
 - **当前主干最新正式版本**：**`v3.0.0`**（基于 3.0 零耦合插件架构新增第五个独立 Dock 应用 **`Data.O.G`**「基于大模型的智能数据助手」，配套平台级 0 KB 新增依赖离线知识库 `KnowledgeHub` 与 DDL/写操作分级二次确认门禁 `sql_risk_guard`）。
 - **核心入口、脚本与工具**：
-  - `app.py`（FastAPI `3.0.0` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）。
+  - `app.py`（FastAPI `3.0.0` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）、`knowledge_packs/`（DWS 9.1 / Inceptor 9.x / PGSQL 19 离线知识包 `.json.gz` 与源码 `.md`，不打入安装包，含 `build_packs.py` 与 GitHub 自助下载索引）。
   - `tools/admin_console/` & `DataOG_Console.command`、`tools/keygen_src/` & `tools/build_keygen.py`、`demo_sandbox/`（启明商业银行信创三引擎演示沙箱）：全部严格排除于客户安装包之外。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
   - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.0.0"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（6 领域子路由含 `knowledge.py`）、`schemas.py`、`models.py`。

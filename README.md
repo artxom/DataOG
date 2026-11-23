@@ -8,6 +8,7 @@
 - **零延迟平台共享与离线安全授权**：底层一次配置数据库连接（支持按端点指纹自动匹配本机个人凭据）、JDBC 驱动与 AI 大模型（内置 **DeepSeek** 与 **Google Gemini** 接入），内建 **离线非对称激活码授权与 C 原生防反编译护盾**，并可一键打包为独立免安装 Windows `DataOG.exe` 程序。
 
 - **GitHub 仓库**：https://github.com/artxom/DataOG
+- **初始化离线知识库下载**：详见 [knowledge_packs/README.md](./knowledge_packs/README.md)（[DWS 9.1](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_DWS_9.1.json.gz) · [Inceptor 9.x](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_INCEPTOR_9.x.json.gz) · [PostgreSQL 19](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_PGSQL_19.json.gz) · [全量合集包](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_ALL_STARTER.json.gz)）
 - **项目架构记忆与工程规范**：详见 [AGENTS.md](./AGENTS.md)
 - **3.0 插件模块化开发指南**：详见 [docs/MODULE_SDK_3_0.md](./docs/MODULE_SDK_3_0.md)
 - **版本变更记录**：详见 [CHANGELOG.md](./CHANGELOG.md)
@@ -93,6 +94,7 @@ DataOG/
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css（已清理 392 行废弃死样式）
 │   └── js/                       # main.js（零业务视图静态依赖）、core/（http / platform_api / app_registry / dom / state / type_compat）、apps/（3.0 独立懒加载应用含 ai_assistant/）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图含 knowledge_view.js）
 ├── docs/                         # 3.0 模块化开发指南 (MODULE_SDK_3_0.md)
+├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
 ├── tests/                        # 86 项全量自动化测试（智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
@@ -171,3 +173,19 @@ DATAOG_HOME="./demo_sandbox/.demo_home" python3 app.py
 python -m pip install "pyinstaller>=6.10.0"
 python build_exe.py
 ```
+
+---
+
+## 五、初始化离线知识库下载（DWS 9.1 / Inceptor 9.x / PostgreSQL 19）
+
+为保障离线/内网环境中 **Data.O.G 智能数据助手** 与 **参考知识库 (`KnowledgeHub`)** 开箱即用，同时严格保持安装包零体积膨胀，仓库在 [`knowledge_packs/`](./knowledge_packs/README.md) 独立提供面向最新主流数据库版本的离线初始化知识包（`.json.gz`）及对应 Markdown 原文档，您和团队成员可根据实际连接的数据库按需下载：
+
+| 目标数据库与适用版本 | 知识包文件名 | 内容与分块 | 下载与在线查看超链接 |
+| :--- | :--- | :--- | :--- |
+| **华为云 GaussDB(DWS)** (`9.1 / 8.3`) | `DataOG_KB_DWS_9.1.json.gz` | 3 篇 / 24 块（`~8.2 KB`） | [直接下载 (.json.gz)](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_DWS_9.1.json.gz) · [Markdown 源码](https://github.com/artxom/DataOG/tree/main/knowledge_packs/sources/dws) |
+| **星环 Inceptor / ArgoDB** (`9.3 / 9.4`) | `DataOG_KB_INCEPTOR_9.x.json.gz` | 3 篇 / 20 块（`~6.5 KB`） | [直接下载 (.json.gz)](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_INCEPTOR_9.x.json.gz) · [Markdown 源码](https://github.com/artxom/DataOG/tree/main/knowledge_packs/sources/inceptor) |
+| **官方 PostgreSQL** (`19 / 18 / 17`) | `DataOG_KB_PGSQL_19.json.gz` | 3 篇 / 15 块（`~7.1 KB`） | [直接下载 (.json.gz)](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_PGSQL_19.json.gz) · [Markdown 源码](https://github.com/artxom/DataOG/tree/main/knowledge_packs/sources/pgsql) |
+| **全量合集包（三库一键导入）** | `DataOG_KB_ALL_STARTER.json.gz` | 9 篇 / 59 块（`~19.4 KB`） | [直接下载 (.json.gz)](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_ALL_STARTER.json.gz) · [完整下载说明](./knowledge_packs/README.md) |
+
+**导入方式**：打开 Data.O.G → **「系统配置」→「参考知识库」→「导入知识包」** 选择下载好的 `.json.gz` 即可；如需单独微调某份手册，也可下载 `sources/` 下对应 `.md` 文件后点击 **「上传参考文档」** 并指定方言导入。
+
