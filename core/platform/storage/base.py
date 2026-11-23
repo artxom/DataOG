@@ -146,23 +146,29 @@ class _BaseStateStore(_SchemaColumnMixin):
         scope: str = "workspace",
     ) -> None:
         """供业务插件模块幂等注册私有/工作区 SQLite 表结构并自动演进补齐新增列."""
+        clean_table = str(table_name or "").strip()
+        if not _SAFE_SQL_IDENT_RE.match(clean_table):
+            raise ValueError(f"非法的插件表名: {table_name!r}")
         norm_scope = "private" if str(scope or "").strip().lower() == "private" else "workspace"
         with self._lock:
+            if norm_scope == "workspace" and clean_table in self.get_private_table_names():
+                raise ValueError(f"私有保险箱表 [{clean_table}] 严禁注册为共享工作区表")
             bucket = self._registered_schemas[norm_scope]
             if norm_scope == "private":
-                self._plugin_private_tables.add(table_name)
+                self._plugin_private_tables.add(clean_table)
+                self._plugin_workspace_tables.discard(clean_table)
             else:
-                self._plugin_workspace_tables.add(table_name)
-            existing_idx = next((i for i, t in enumerate(bucket) if t[0] == table_name), None)
+                self._plugin_workspace_tables.add(clean_table)
+            existing_idx = next((i for i, t in enumerate(bucket) if t[0] == clean_table), None)
             if existing_idx is None:
-                bucket.append((table_name, create_sql, list(expected_columns)))
+                bucket.append((clean_table, create_sql, list(expected_columns)))
             else:
-                bucket[existing_idx] = (table_name, create_sql, list(expected_columns))
+                bucket[existing_idx] = (clean_table, create_sql, list(expected_columns))
             cm = self._get_private_conn() if norm_scope == "private" else self._get_workspace_conn()
             with cm as conn:
                 if create_sql.strip():
                     conn.executescript(create_sql)
-                self._ensure_columns_for_table(conn, table_name, expected_columns)
+                self._ensure_columns_for_table(conn, clean_table, expected_columns)
                 conn.commit()
 
     @contextlib.contextmanager

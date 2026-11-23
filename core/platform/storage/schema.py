@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from typing import Dict, List, Tuple
+
+_SAFE_SQL_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 
 # 明确路由至共享工作区 (workspace_meta) 的纯业务元数据键白名单；其余全部归属本地私有库 (app_meta)
 WORKSPACE_META_KEYS = frozenset(
@@ -350,16 +353,20 @@ def ensure_columns_for_table(
     table_name: str,
     col_defs: List[Tuple[str, str]],
 ) -> None:
+    if not _SAFE_SQL_IDENT_RE.match(table_name or ""):
+        raise ValueError(f"非法的 SQLite 表名: {table_name!r}")
     existing = {
         str(row["name"] if isinstance(row, sqlite3.Row) else row[1]).lower()
-        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        for row in conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
     }
     if not existing:
         return
     for col_name, col_ddl in col_defs:
+        if not _SAFE_SQL_IDENT_RE.match(col_name or ""):
+            raise ValueError(f"非法的 SQLite 列名: {col_name!r}")
         if col_name.lower() not in existing:
             conn.execute(
-                f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"
+                f'ALTER TABLE "{table_name}" ADD COLUMN "{col_name}" {col_ddl}'
             )
 
 
@@ -370,17 +377,7 @@ class _SchemaColumnMixin:
         table_name: str,
         col_defs: List[Tuple[str, str]],
     ) -> None:
-        existing = {
-            str(row["name"] if isinstance(row, sqlite3.Row) else row[1]).lower()
-            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-        }
-        if not existing:
-            return
-        for col_name, col_ddl in col_defs:
-            if col_name.lower() not in existing:
-                conn.execute(
-                    f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_ddl}"
-                )
+        ensure_columns_for_table(conn, table_name, col_defs)
 
     @classmethod
     def _ensure_private_schema_columns(cls, conn: sqlite3.Connection) -> None:

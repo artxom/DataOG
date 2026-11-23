@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from core.dws_engine import item_requires_table_rebuild
 from core.platform.dialects import clean_identifier_input

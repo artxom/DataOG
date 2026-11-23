@@ -9,10 +9,6 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from core.dws_engine import (
-    analyze_item_changes,
-    item_requires_table_rebuild,
-)
 from core.platform.dialects import clean_identifier_input
 from core.platform.excel_io import (
     ResolvedWorkbook,

@@ -2,7 +2,6 @@
  * 跨环境比对视图 — Spotlight 风格已保存映射表对选择器混入类
  */
 
-import { isAbortError } from "../../core/http.js";
 import { badge, clearEl, el } from "../../core/dom.js";
 
 export class CrossPairPickerMixin {

@@ -14,8 +14,6 @@ from openpyxl.utils import get_column_letter
 from core.platform.dialects import (
     analyze_cross_column_compatibility,
     clean_identifier_input,
-    is_cross_type_compatible,
-    normalize_cross_type,
 )
 from core.platform.excel_io import (
     ResolvedWorkbook,

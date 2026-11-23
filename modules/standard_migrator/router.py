@@ -148,7 +148,9 @@ def api_migrator_item_sql(
 
 
 @router.get("/checklist/template.xlsx")
-def api_migrator_template():
+def api_migrator_template(
+    _ctx: PlatformContext = Depends(get_platform_context),
+):
     return file_download_response(
         StandardMigratorService.generate_template_bytes(),
         "DataOG_字段贯标标准导入模板.xlsx",

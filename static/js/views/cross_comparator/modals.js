@@ -3,9 +3,7 @@
  */
 
 import { crossApi } from "../../api/cross_api.js";
-import { badge, el } from "../../core/dom.js";
 import { openExportReportModal } from "../../ui/export_report_modal.js";
-import { Modal } from "../../ui/modal.js";
 import { openStandardPickerModal } from "../../ui/standard_picker_modal.js";
 import { Toast } from "../../ui/toast.js";
 import { openUploadWizardModal } from "../../ui/upload_wizard_modal.js";

@@ -60,7 +60,7 @@
   - `modules/standard_migrator/`（`service.py` + `bindings_mixin.py` + `report_mixin.py`）、`modules/cross_comparator/`（`service.py` + `search_and_push_mixin.py` + `io_and_report_mixin.py`）、`modules/ddl_translator/`、`modules/data_explorer/`（`scope="private"`）。
 - **前端 ES Modules 工作台 (`static/`)**：
   - `index.html`、`css/tokens.css` & `workbench.css`（已清理 392 行死样式）、`js/main.js`（零静态 View 依赖）、`js/core/` (`http.js`/`platform_api.js`/`app_registry.js`/`dom.js`/`state.js`/`type_compat.js`/`api.js` 兼容重导出)、`js/apps/index.js`（懒加载注册总入口）、`js/api/`（4 模块独立客户端）、`js/ui/`（底座公共组件，零业务依赖）、`js/views/`（含 `workspace_merge_wizard.js`、`standard_migrator/modals.js`、`cross_comparator/{modals,endpoint_deck,pair_picker}.js`）。
-- **自动化测试套件 (`tests/`，共 77 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (18)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (4)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
+- **自动化测试套件 (`tests/`，共 79 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (18)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (6)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
 
 ## 6. AI 只读探查四道硬隔离铁律
 涉及 AI 自动查询必须复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束：

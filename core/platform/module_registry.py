@@ -93,16 +93,28 @@ def _iter_child_package_names(root_pkg: Any, package_name: str) -> List[str]:
         prefix = f"{package_name}."
         loader = getattr(root_pkg, "__loader__", None)
         toc = getattr(loader, "toc", None)
+        is_pkg_fn = getattr(loader, "is_package", None)
         if isinstance(toc, (set, frozenset, list, tuple)):
-            for entry in toc:
-                if not isinstance(entry, str) or not entry.startswith(prefix):
+            for entry in sorted(e for e in toc if isinstance(e, str)):
+                if not entry.startswith(prefix):
                     continue
                 rest = entry[len(prefix) :]
                 if "." in rest:
                     child = rest.split(".", 1)[0]
-                    if child and not child.startswith("_") and child not in seen:
-                        seen.add(child)
-                        names.append(child)
+                else:
+                    # 兼容单文件插件包 (modules/<pkg>/__init__.py，toc 中仅含 "modules.<pkg>")
+                    is_single_pkg = False
+                    if callable(is_pkg_fn):
+                        try:
+                            is_single_pkg = bool(is_pkg_fn(entry))
+                        except Exception:
+                            is_single_pkg = False
+                    if not is_single_pkg:
+                        continue
+                    child = rest
+                if child and not child.startswith("_") and child not in seen:
+                    seen.add(child)
+                    names.append(child)
 
     if not names and pkg_paths:
         prefix = f"{package_name}."
@@ -190,6 +202,8 @@ def mount_module_spec(app: Any, ctx: Any, spec: ModuleSpec) -> None:
             routes[static_mount_idx:static_mount_idx] = added
         else:
             app.include_router(spec.router)
+        if hasattr(app, "openapi_schema"):
+            app.openapi_schema = None
 
 
 def mount_discovered_modules(

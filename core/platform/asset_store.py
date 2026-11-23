@@ -75,7 +75,7 @@ class AssetStore:
             os.chmod(self.assets_dir, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         except OSError:
             pass
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._registered_app_ids: set[str] = set(VALID_APP_IDS)
 
     def register_app_id(self, app_id: str) -> str:
@@ -87,8 +87,12 @@ class AssetStore:
             self._registered_app_ids.add(clean)
         return clean
 
+    def _snapshot_app_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._registered_app_ids)
+
     def _valid_upload_slots(self) -> set[str]:
-        return {"wallpaper", "brand", *(f"app:{aid}" for aid in self._registered_app_ids)}
+        return {"wallpaper", "brand", *(f"app:{aid}" for aid in self._snapshot_app_ids())}
 
     def _resolve_safe_asset_path(self, asset_name: str) -> Optional[str]:
         clean = (asset_name or "").strip()
@@ -131,7 +135,7 @@ class AssetStore:
         raw_apps = saved.get("app_icons")
         app_icons: Dict[str, str] = {}
         if isinstance(raw_apps, dict):
-            allowed_ids = self._registered_app_ids | set(VALID_APP_IDS)
+            allowed_ids = self._snapshot_app_ids() | set(VALID_APP_IDS)
             for aid, raw_name in raw_apps.items():
                 norm_aid = str(aid or "").strip().lower()
                 if norm_aid not in allowed_ids:

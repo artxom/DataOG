@@ -22,7 +22,7 @@
   - 新增 `registerDesktopApp()` 声明式桌面应用注册中心，支持动态 `import()` 按需懒加载、自定义 SVG 矢量路径 (`registerIconPath`)、默认渐变背景、应用专属 CSS 按需注入 (`stylesheets`) 与工作区切换自动销毁策略 (`resetOnWorkspaceSwitch`)；`main.js` 彻底零静态导入任何业务 View，`static/js/ui/*` 零耦合业务 API。
   - 将原 898 行单体 `static/js/core/api.js` 拆分为 `core/http.js`（传输原语）、`core/platform_api.js`（平台共享接口）与 `api/{migrator,cross,ddl,explorer}_api.js`（各模块独立客户端），保留 `core/api.js` 轻量兼容重导出入口。
 - **3.0 模块开发指南与专项回归测试 (`docs/MODULE_SDK_3_0.md`, `tests/test_modular_architecture.py`)**：
-  - 新增 `docs/MODULE_SDK_3_0.md` 规范 3.0 零侵入开发范式与底座能力矩阵；新增 4 项模块化架构端到端回归测试（全套自动化单元测试扩充至 **77 项**）。
+  - 新增 `docs/MODULE_SDK_3_0.md` 规范 3.0 零侵入开发范式与底座能力矩阵；新增 6 项模块化架构端到端回归测试（覆盖冻结态单/多文件插件发现、底座零反向导入、全路由 Gate 2 覆盖、SQL 关键字列工作区流转、前端 `main.js` 异步懒加载竞态/失败恢复与拆分 Mixin 运行时验证；全套自动化单元测试扩充至 **79 项**）。
 
 ### Changed
 - **核心单体文件全面拆解瘦身与去重**：

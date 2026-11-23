@@ -9,6 +9,8 @@
 
 import { registerIconPath } from "./dom.js";
 
+const SAFE_APP_ID_RE = /^[a-z][a-z0-9_-]{1,31}$/;
+
 const _appsById = new Map();
 const _legacyRouteMap = new Map();
 const _loadedStylesheets = new Set();
@@ -57,9 +59,9 @@ export function registerDesktopApp(spec) {
   if (!spec || typeof spec !== "object") {
     throw new Error("registerDesktopApp 需要传入应用清单对象");
   }
-  const id = String(spec.id || "").trim();
+  const id = String(spec.id || "").trim().toLowerCase();
   const title = String(spec.title || "").trim();
-  if (!id || !title || typeof spec.loader !== "function") {
+  if (!id || !SAFE_APP_ID_RE.test(id) || !title || typeof spec.loader !== "function") {
     throw new Error(`无效的桌面应用注册清单: id=${id}, title=${title}`);
   }
 
@@ -139,9 +141,28 @@ export function ensureAppStylesheets(appId) {
 
   for (const href of manifest.stylesheets) {
     if (_loadedStylesheets.has(href)) continue;
-    const exists =
-      typeof document.querySelector === "function" &&
-      document.querySelector(`link[rel="stylesheet"][href="${href}"]`);
+    let exists = false;
+    if (typeof document.querySelectorAll === "function") {
+      const existingLinks = document.querySelectorAll('link[rel="stylesheet"]');
+      for (const linkEl of existingLinks) {
+        if (linkEl.getAttribute?.("href") === href) {
+          exists = true;
+          break;
+        }
+      }
+    }
+    if (!exists && document.head?.children) {
+      for (const child of document.head.children) {
+        if (
+          String(child.tagName || "").toLowerCase() === "link" &&
+          child.getAttribute?.("rel") === "stylesheet" &&
+          child.getAttribute?.("href") === href
+        ) {
+          exists = true;
+          break;
+        }
+      }
+    }
     if (!exists) {
       const link = document.createElement("link");
       link.setAttribute("rel", "stylesheet");
@@ -157,7 +178,7 @@ export function ensureAppStylesheets(appId) {
  * 异步按需实例化指定桌面应用（自动注入专属样式表并动态加载 ES Module）
  */
 export async function loadAppInstance(appId) {
-  const manifest = getDesktopApp(appId) || DESKTOP_APPS[0];
+  const manifest = getDesktopApp(appId);
   if (!manifest) {
     throw new Error(`未找到已注册的桌面应用: ${appId}`);
   }

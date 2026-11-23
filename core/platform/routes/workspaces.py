@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from typing import Optional
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context

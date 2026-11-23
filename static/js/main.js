@@ -322,6 +322,7 @@ async function syncWindowHost() {
 
   const appId = store.state.activeApp;
   if (!appId) {
+    windowMountSeq += 1;
     hostEl.hidden = true;
     // 清空宿主但绝不销毁 appInstances 里的实例引用，确保最小化窗口 DOM 状态完整保留在内存中
     clearEl(hostEl);
@@ -344,19 +345,22 @@ async function syncWindowHost() {
   let inst = appInstances.get(appId);
   const isFreshInstance = !inst;
   if (!inst) {
+    let loadedInst = null;
     try {
-      inst = await loadAppInstance(appId);
+      loadedInst = await loadAppInstance(appId);
     } catch (err) {
       Toast.error(`加载模块「${getAppTitle(appId)}」失败: ${err.message}`);
-      return;
-    }
-    // 防止用户快速切换 Dock 应用时异步懒加载竞态覆盖新窗口
-    if (reqSeq !== windowMountSeq || store.state.activeApp !== appId) {
-      if (!appInstances.has(appId)) {
-        appInstances.set(appId, inst);
+      if (reqSeq === windowMountSeq && store.state.activeApp === appId) {
+        store.closeApp(appId);
       }
       return;
     }
+    // 防止用户快速切换 Dock / 关闭 / 锁定时异步懒加载竞态污染缓存或覆盖新窗口
+    if (reqSeq !== windowMountSeq || store.state.activeApp !== appId) {
+      loadedInst?.destroy?.();
+      return;
+    }
+    inst = loadedInst;
     appInstances.set(appId, inst);
   }
 
@@ -441,9 +445,23 @@ async function syncWindowHost() {
   activeWindowAppId = appId;
   clearEl(hostEl, winEl);
 
-  if (isFreshInstance || ctx) {
-    inst._mountedOnce = true;
-    await inst.mount(winBody, ctx, refreshHeader);
+  if (isFreshInstance || !inst._mountedOnce || ctx) {
+    try {
+      await inst.mount(winBody, ctx, refreshHeader);
+      inst._mountedOnce = true;
+    } catch (err) {
+      Toast.error(`初始化模块「${getAppTitle(appId)}」失败: ${err.message}`);
+      if (!inst._mountedOnce) {
+        inst.destroy?.();
+        if (appInstances.get(appId) === inst) {
+          appInstances.delete(appId);
+        }
+        if (reqSeq === windowMountSeq && store.state.activeApp === appId) {
+          store.closeApp(appId);
+        }
+      }
+      return;
+    }
   } else {
     // 从右下角最小化小抽屉恢复：原封不动挂回内存中的 inst.root DOM 树，100% 保留未保存输入、光标与滚动位置
     inst.refreshHeader = refreshHeader;
@@ -703,6 +721,7 @@ export async function bootstrapWorkbench() {
 
   const enterLoginGate = async (statusPayload = null) => {
     isAuthorized = false;
+    windowMountSeq += 1;
     store.state.activeApp = null;
     if (winHostEl) {
       winHostEl.hidden = true;
@@ -819,6 +838,12 @@ export async function bootstrapWorkbench() {
       store.state.minimizedApps = (store.state.minimizedApps || []).filter((id) =>
         keptAppIds.has(id)
       );
+      if (store.state.activeApp && !keptAppIds.has(store.state.activeApp)) {
+        windowMountSeq += 1;
+        activeWindowDom = null;
+        activeWindowAppId = null;
+        syncWindowHost();
+      }
       renderMacDock();
       syncMenubarIndicators();
     } else if (reason === "workspace_meta" || reason === "llm" || reason === "logs" || reason === "bootstrap" || reason === "license") {

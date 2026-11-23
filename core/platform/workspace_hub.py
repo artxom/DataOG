@@ -321,10 +321,13 @@ def _extract_sanitized_workspace_to_file(
         Sequence[Tuple[str, str, List[Tuple[str, str]]]]
     ] = None,
     extra_meta_keys: Optional[Sequence[str]] = None,
+    extra_private_tables: Optional[Sequence[str]] = None,
 ) -> Dict[str, int]:
     """将来源 SQLite 库中的白名单业务表（含已注册的 3.0 插件共享表）净化写入全新的自包含 `.dataog.db` 文件（零私有表、零凭据）."""
     src_tables = _get_table_names(src_conn)
     private_forbidden = set(PRIVATE_ONLY_TABLES)
+    if extra_private_tables:
+        private_forbidden.update(str(t).strip() for t in extra_private_tables if str(t).strip())
     safe_plugin_specs: List[Tuple[str, str, List[Tuple[str, str]]]] = []
     for tbl, ddl, exp_cols in (extra_workspace_tables or ()):
         clean_tbl = str(tbl or "").strip()
@@ -426,22 +429,24 @@ def _extract_sanitized_workspace_to_file(
                 counts[tbl] = 0
                 continue
             dst_cols = _get_table_columns(dst_conn, tbl)
-            rows = src_conn.execute(f"SELECT * FROM {tbl}").fetchall()
+            rows = src_conn.execute(f'SELECT * FROM "{tbl}"').fetchall()
             if not rows:
                 counts[tbl] = 0
                 continue
             common = [
                 c
                 for c in rows[0].keys()
-                if c in dst_cols and (not skip_auto_id or c != "id")
+                if c in dst_cols
+                and re.match(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$", c)
+                and (not skip_auto_id or c != "id")
             ]
             if not common:
                 counts[tbl] = 0
                 continue
             ph = ", ".join("?" for _ in common)
-            col_sql = ", ".join(common)
+            col_sql = ", ".join(f'"{c}"' for c in common)
             dst_conn.executemany(
-                f"INSERT OR REPLACE INTO {tbl} ({col_sql}) VALUES ({ph})",
+                f'INSERT OR REPLACE INTO "{tbl}" ({col_sql}) VALUES ({ph})',
                 [[r[c] for c in common] for r in rows],
             )
             counts[tbl] = len(rows)
@@ -657,6 +662,7 @@ class WorkspaceManager:
                         workspace_description=clean_desc,
                         extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
                         extra_meta_keys=list(self.store.get_workspace_meta_keys()),
+                        extra_private_tables=list(self.store.get_private_table_names()),
                     )
             else:
                 conn = sqlite3.connect(dst_path, timeout=15.0)
@@ -774,6 +780,7 @@ class WorkspaceManager:
                                 include_metadata_cache=True,
                                 extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
                                 extra_meta_keys=list(self.store.get_workspace_meta_keys()),
+                                extra_private_tables=list(self.store.get_private_table_names()),
                             )
 
             self.store.switch_workspace_db(target_path)
@@ -836,6 +843,7 @@ class WorkspaceManager:
                         workspace_description=rec.get("description") or "",
                         extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
                         extra_meta_keys=list(self.store.get_workspace_meta_keys()),
+                        extra_private_tables=list(self.store.get_private_table_names()),
                     )
                 with open(tmp_export_path, "rb") as fh:
                     data = fh.read()
@@ -907,6 +915,7 @@ class WorkspaceManager:
                         workspace_description=eff_desc,
                         extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
                         extra_meta_keys=list(self.store.get_workspace_meta_keys()),
+                        extra_private_tables=list(self.store.get_private_table_names()),
                     )
                     topo_rows = _read_safe_topology_rows(sconn, src_tables)
 
@@ -1124,6 +1133,7 @@ class WorkspaceManager:
                         "meta_schemas",
                         "meta_tables",
                         "meta_columns",
+                        *(t for t, _, _ in self.store.get_registered_plugin_workspace_specs()),
                     }
                     if not (src_tables & recognized):
                         raise ValueError("上传的 SQLite 文件不包含有效的 Data.O.G 业务数据表")

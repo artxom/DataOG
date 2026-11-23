@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -11,7 +10,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from core.platform.models import (
     ConnectionProfile,
@@ -19,10 +18,7 @@ from core.platform.models import (
     sanitize_jdbc_url,
     split_extra_props_secrets,
 )
-from core.platform.storage.schema import (
-    WORKSPACE_META_KEYS,
-    init_workspace_schema_on_conn,
-)
+from core.platform.storage.schema import WORKSPACE_META_KEYS
 from core.platform.storage_paths import (
     decode_obfuscated_anchor,
     encode_obfuscated_anchor,
