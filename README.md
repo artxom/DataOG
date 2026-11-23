@@ -1,4 +1,4 @@
-# Data.O.G v2.9.2 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.0.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -14,21 +14,22 @@
 
 ---
 
-## 一、macOS 桌面级交互与四大核心模块
+## 一、macOS 桌面级交互与五大核心模块
 
 ### 1. 离线登录授权、桌面 Dock 与窗口控制语义（红黄绿三键）
 - **离线非对称激活码登录门禁（默认开启）**：未激活、到期、跨机拷贝或手动锁定时全屏毛玻璃门禁拦截，默认选中「激活码模式」（「账号密码登录」在离线试用期标注暂未开放），自动采集展示本机 IP 与机器码并支持一键复制设备申请码 (`REQ1-...`)；激活时弹出 `<dialog>` 提示 **`当前激活码可用日期至 YYYY-MM-DD`**，有效期内再次打开直接进入工作台，支持顶部菜单栏查看授权、在线续期或一键锁定退回登录页。
 - **顶部 28px 毛玻璃全局菜单栏**：提供 `Data.O.G` 快速显示桌面、当前活动应用指示、当前团队工作区快速入口胶囊、`授权至 YYYY-MM-DD` 授权胶囊、AI 模型状态胶囊、`⌘K` Spotlight 秒级库表字段检索、SQL 执行审计日志弹窗、自动/浅色/深色外观切换与实时时钟。
-- **底部居中悬浮毛玻璃 macOS Dock 栏**：纯净桌面壁纸留白，底部居中 Dock 承载四大应用图标（悬停放大上浮、名称气泡与运行圆点），常规窗口态常驻底部，全屏最大化时自动下沉隐藏、鼠标贴底即可唤出。
+- **底部居中悬浮毛玻璃 macOS Dock 栏**：纯净桌面壁纸留白，底部居中 Dock 承载五大应用图标（悬停放大上浮、名称气泡与运行圆点），常规窗口态常驻底部，全屏最大化时自动下沉隐藏、鼠标贴底即可唤出。
 - 🔴 **关闭 (`✕`)**：关闭当前窗口返回桌面，并**彻底销毁重置当前工具的运行时界面状态**（已落盘的 SQLite 配置与数据标准不受影响）。
 - 🟡 **最小化 (`−`)**：将当前工作窗口收纳至 **Dock 栏竖直分隔线右侧缩略窗口区**，**100% 保留内存 DOM、未提交的编辑内容与滚动位置**；点击 Dock 缩略窗口即可瞬间恢复回离开前的工作现场。
 - 🟢 **最大化 (`+`)**（或双击窗口标题栏）：在常规留白桌面窗口与全屏沉浸工作区之间平滑切换。
 
-### 2. 桌面四大独立功能模块
+### 2. 桌面五大独立功能模块
 1. **系统配置 (`settings`)**
-   - **外观与图标**：内置多款亮暗自适应壁纸预设，支持上传本地自定义桌面壁纸（支持 `铺满` / `适应`）、上传自定义 `Data.O.G` 软件主图标（同步更新浏览器 Favicon）以及四大模块自定义图标，全部安全持久化于本地私有存储。
+   - **外观与图标**：内置多款亮暗自适应壁纸预设，支持上传本地自定义桌面壁纸（支持 `铺满` / `适应`）、上传自定义 `Data.O.G` 软件主图标（同步更新浏览器 Favicon）以及五大模块自定义图标，全部安全持久化于本地私有存储。
    - **工作区协作**：支持多工作区新建（空白/克隆）、重命名、热切换、删除与业务统计看板；一键导出零密钥、自包含的 `.dataog.db` 团队共享工作区（可选是否携带元数据缓存），一键导入同事分享的工作区为独立工作区，或启动 **三步引导式「合并同事进度」向导**（同时兼容 `.dataog.db` 与旧版 `dataog_state.db`，严格白名单只读过滤私密表、按端点指纹自动对齐数据源、支持勾选模块与 `仅补充缺失/未绑定` / `按更新时间保留较新` / `覆盖冲突项` 三大策略，并在落盘前提供跨环境映射表对差异预览）。
    - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——无密码连接拓扑随工作区协同共享，个人账号与密码严格落盘于本机私有凭据库并支持按 `(db_type, host, port, dbname)` / `jdbc_url` 端点指纹跨工作区自动匹配；免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
+   - **参考知识库 (`KnowledgeHub`)**：零新增依赖离线知识库管理中心，内置 11 篇主流数据库方言速查卡并支持上传 `.md` / `.txt` / `.sql` / `.html` / `.json` / `.csv` / `.docx` / `.xlsx` 参考资料，借助 SQLite FTS5 + BM25 实现中英文与报错码毫秒级离线检索，支持按方言导出/导入轻量 `.json.gz` 知识包与团队分享，并可选接入 OpenAI 兼容 `/embeddings` 接口做混合排序（离线自动退回纯 FTS5）。
    - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
 2. **数据探查 (`explorer`)**
    - 顶栏分段切换 **`SQL 查询` | `AI 探查`**，左侧统一维持 **DataGrip 风格四级已连接数据库目录树**（`连接` → `Schema` → `表/视图` → `字段`）。
@@ -43,6 +44,10 @@
 4. **多邻国 (`polyglot`)**
    - **智能命名**：输入中文表名或字段名清单，结合系统配置中的大模型 API（未配密钥时自动回退内置 170+ 金融与通用数仓标准词根引擎），按命名规范（`snake_case` / `UPPER_SNAKE` / `camelCase`、数仓分层前缀 `ods_/dwd_/dws_/ads_/dim_`、标准词根缩写）生成标准英文名、推荐 SQL 类型与建表草稿。
    - **方言翻译**：支持从已连数据库表/视图、数据标准或直接粘贴 `CREATE TABLE` / `CREATE VIEW` / 异构查询 SQL，转换为目标数据库方言（`DWS` / `PGSQL` / `INCEPTOR` / `MYSQL` / `DM8` / `ORACLE` / `SQLITE`），融合确定性四层递归视图血缘穿透 AST 引擎与大模型 `AI 语法适配`。
+5. **Data.O.G 智能数据助手 (`ai_assistant`)**
+   - **全局研发运维双模式调度**：可绑定任意已配置数据库连接（实时调取目录元数据、视图血缘、执行计划 `EXPLAIN` 与只读采样验证），也可切换至「离线纯方言模式」指定目标数据库方言（DWS / PGSQL / MySQL / Oracle / DM8 / Kingbase / Inceptor / DB2 / GBase / SQLite / 通用）结合本机参考知识库完成语法确认、报错排障与调优建议。
+   - **循序渐进多轮探索**：支持场景芯片路由（`自动识别` / `数据查询` / `报错排障` / `性能优化` / `语法确认` / `DDL 助手`）、歧义场景交互式「澄清确认卡」、只读 SQL 报错自主查表自我修正、`EXPLAIN` 实测诊断、知识库出处角标定位（右侧按需滑出「库表速览 / 参考知识库」抽屉）以及末尾「下一步推进建议」。
+   - **DDL / 写操作分级二次确认门禁**：自主探索阶段物理仅开放只读通道；所有建表/改表与数据写入语句均在对话提示框以分级风险卡片展示（常规 DDL/INSERT 一键确认，高危 `DROP`/`TRUNCATE`/`DELETE`/`UPDATE` 预估影响行数并强制输入 `CONFIRM` 解锁），支持卡片内微调 SQL（服务端独立重新定级）、多条有序 DDL 批执行与失败一键转 AI 诊断修复。
 
 ---
 
@@ -50,18 +55,21 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.9.2 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
+├── app.py                        # FastAPI 3.0.0 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
-│   │   ├── routes/               # 平台领域子路由包（auth_and_system / data_sources / appearance_and_llm / standards / workspaces）
+│   │   ├── routes/               # 平台领域子路由包（auth_and_system / data_sources / appearance_and_llm / knowledge / standards / workspaces）
 │   │   ├── storage/              # 双库分离 WAL 引擎包（schema / base / legacy_migration / platform_repos / governance_repos，支持 3.0 插件表自动随工作区流转）
 │   │   ├── storage_paths.py      # 三层分离混淆私有路径解析器（OS 用户隐藏目录、时钟锚点混淆编码与 DATAOG_HOME 隔离）
 │   │   ├── workspace_hub.py      # 团队共享工作区生命周期管理、零密钥 .dataog.db 导出与三步引导式增量合并引擎
 │   │   ├── license_hub.py        # RFC 8032 Ed25519 离线激活码中枢、Gate 2 能力校验、双位置时钟防回拨与 C 原生护盾桥接
 │   │   ├── _license_native_src/  # 纯标准 C 密码学核心与 _license_shield 原生动态库源码（64 位挑战-应答防补丁）
 │   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心（支持动态注册 3.0 应用图标槽位）
+│   │   ├── knowledge_hub.py      # 零新增依赖离线知识库中枢（多格式解析、FTS5+BM25、方言硬隔离、.json.gz 分享包与可选 Embedding RRF）
+│   │   ├── builtin_dialect_kb.py # 内置 11 篇主流数据库方言语法与排障速查卡（~20 KB）
+│   │   ├── sql_risk_guard.py     # SQL 词法多语句安全切分器与 WRITE/DDL 分级风险定级守卫
 │   │   ├── standard_catalog.py   # 全局 46 列标准字典中枢、多库物理格式解析、单事务批量绑标与分级落标核验
 │   │   ├── offline_report/       # 通用离线交互网页报告 (runtime.py) 与单库/跨环境单 Sheet Excel 生成器包
 │   │   ├── import_progress.py    # 线程安全全平台任务/导入实时阶段进度、节流缩略微日志与 SSE 追踪中枢
@@ -79,14 +87,15 @@ DataOG/
 │   ├── standard_migrator/        # /api/modules/standard_migrator 落标绑定核验、单库批量贯标与库级离线报告（按 Mixin 拆分）
 │   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境五虚拟列图形化比对、检索与库级报告（按 Mixin 拆分）
 │   ├── ddl_translator/           # /api/modules/ddl_translator    多邻国（智能命名 + 跨方言翻译）
-│   └── data_explorer/            # /api/modules/data_explorer     AI 只读智能数据探查多轮会话引擎
+│   ├── data_explorer/            # /api/modules/data_explorer     AI 只读智能数据探查多轮会话引擎
+│   └── ai_assistant/             # /api/modules/ai_assistant      Data.O.G 3.0 旗舰多轮渐进式数据库智能助手（含写确认门禁）
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css（已清理 392 行废弃死样式）
-│   └── js/                       # main.js（零业务视图静态依赖）、core/（http / platform_api / app_registry / dom / state / type_compat）、apps/（应用注册与懒加载入口）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图）
+│   └── js/                       # main.js（零业务视图静态依赖）、core/（http / platform_api / app_registry / dom / state / type_compat）、apps/（3.0 独立懒加载应用含 ai_assistant/）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图含 knowledge_view.js）
 ├── docs/                         # 3.0 模块化开发指南 (MODULE_SDK_3_0.md)
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 81 项全量自动化测试（模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
+├── tests/                        # 86 项全量自动化测试（智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -120,7 +129,8 @@ DataOG/
 | **`v2.8.2`** | `fix/binding-stats-and-rename-sync` → `main` | **改名贯标字段绑定自动迁移与落标统计 `6/8` 僵尸绑标修复**：在执行单条/批量/保序重建后单事务原子迁移旧字段绑标并强制重刷元数据；核验期间自动裁剪无效物理列残留绑定；`get_connection_binding_stats()` 关联 `meta_columns` 过滤历史僵尸行并附带真实表总列数；前端执行完毕即时同步左树徽标并自动刷新绑标清单 |
 | **`v2.9.0`** | `refactor/v2.9.0-modular-slimming` → `main` | **2.X 终结规整瘦身与 3.0 模块化基石**：落地后端 `ModuleSpec` 插件自动发现与 `http_utils` 公共任务/下载 SDK、3.0 插件共享工作区表自动流转与动态图标槽位、前端 `app_registry.js` 懒加载注册中心与 HTTP/平台/模块 API 彻底分层；拆解 `storage/`、`routes/`、`offline_report/` 及巨型业务 Service/View 单体，去重 `dws_engine.py` 并清理 392 行死 CSS，配套 `docs/MODULE_SDK_3_0.md` 与 6 项模块化回归测试 |
 | **`v2.9.1`** | `fix/v2.9.1-ci-frozen-packaging` → `main` | **CI 零 `httpx` 依赖与 Windows `DataOG.exe` 冻结态自检打包修复**：移除 `test_modular_architecture.py` 对 `httpx` 的隐式依赖并补齐零 `httpx` 静态防线；`build_exe.py` 新增客户运行时测试纯净暂存与构建后泄露校验，剔除 `test_admin_console.py`/`test_demo_sandbox.py` 恢复云端 Windows `DataOG.exe` 编译与 GitHub Release 自动发布；同步加固冻结态 `__spec__.loader` 插件发现与私有表越权注册拦截 |
-| **`v2.9.2`**（当前正式版） | `feat/v2.9.2-report-schema-bound-scope` → `main` | **单库与跨环境报告支持 Schema 筛选及表级落标范围收敛**：导出离线 HTML / Excel 报告与预填模板新增 Schema 多选过滤，默认启用「仅包含已绑定落标需求的表（表级落标范围）」在探查前剪枝零绑标表与无关 Schema（含探查后僵尸绑标兜底剔除与推荐/单侧清单同步收敛），并在导出弹窗与离线 HTML 顶栏实时标注筛选范围（81 项测试全绿） |
+| **`v2.9.2`** | `feat/v2.9.2-report-schema-bound-scope` → `main` | **单库与跨环境报告支持 Schema 筛选及表级落标范围收敛**：导出离线 HTML / Excel 报告与预填模板新增 Schema 多选过滤，默认启用「仅包含已绑定落标需求的表（表级落标范围）」在探查前剪枝零绑标表与无关 Schema（含探查后僵尸绑标兜底剔除与推荐/单侧清单同步收敛），并在导出弹窗与离线 HTML 顶栏实时标注筛选范围 |
+| **`v3.0.0`**（当前正式版） | `feat/v3.0.0-ai-assistant-knowledge-hub` → `main` | **独立 Dock 旗舰应用 `Data.O.G`（智能数据助手）与零依赖离线知识库 (`KnowledgeHub`)**：新增第五个独立懒加载 Dock 应用，支持在线连库与离线纯方言双模式、场景模式芯片与歧义澄清卡、7 工具渐进自主探索（含只读 SQL 报错自修正、`EXPLAIN` 诊断与引用溯源）、DDL/写操作分级二次确认卡片（常规一键确认 / 高危影响行数估算 + `CONFIRM` 门禁 + 服务端重定级防篡改 + 批执行闭环），配套 0 KB 新增依赖 FTS5 离线知识库（9 格式解析、11 篇内置方言速查卡、`.json.gz` 分享包与可选 Embedding 混合排序）（86 项测试全绿） |
 
 ---
 
@@ -131,7 +141,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（81 项模块化插件扩展、三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告与 Schema 范围收敛、只读沙箱红队矩阵、演示沙箱闭环、管理员总控台安全与功能回归、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（86 项）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检

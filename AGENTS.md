@@ -48,19 +48,19 @@
    - **分支清理**：合并与打标推送完成后及时删除已使命终结的临时工作分支，确认远端 `main` 与新标签就位。
 
 ## 5. 当前代码基线快照
-- **当前主干最新正式版本**：**`v2.9.2`**（在 3.0 模块化基石之上为单库与跨环境库级报告新增 Schema 多选过滤与默认「仅包含已绑定落标需求的表」表级落标范围剪枝，避免对无关 Schema 与零绑标表进行大规模比对；同步完善导出弹窗与离线 HTML 范围标注）。
+- **当前主干最新正式版本**：**`v3.0.0`**（基于 3.0 零耦合插件架构新增第五个独立 Dock 应用 **`Data.O.G`**「基于大模型的智能数据助手」，配套平台级 0 KB 新增依赖离线知识库 `KnowledgeHub` 与 DDL/写操作分级二次确认门禁 `sql_risk_guard`）。
 - **核心入口、脚本与工具**：
-  - `app.py`（FastAPI `2.9.2` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）。
+  - `app.py`（FastAPI `3.0.0` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）。
   - `tools/admin_console/` & `DataOG_Console.command`、`tools/keygen_src/` & `tools/build_keygen.py`、`demo_sandbox/`（启明商业银行信创三引擎演示沙箱）：全部严格排除于客户安装包之外。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
-  - `module_registry.py`（`ModuleSpec`/`ModuleRegistry`/`discover_module_specs`/`mount_discovered_modules`）、`http_utils.py`（`json_error`/`file_download_response`/`run_tracked_task`/`run_tracked_upload`）、`context.py`（`version="2.9.2"`、Gate 2 HMAC 复核）、`router.py`（24 行聚合）+ `routes/`（5 领域子路由）、`schemas.py`、`models.py`。
-  - `storage_paths.py`、`storage/`（`schema`/`base`/`legacy_migration`/`platform_repos`/`governance_repos`，支持 3.0 插件共享表与扩展元键动态注册）、`workspace_hub.py`（零密钥 `.dataog.db` 导出/克隆/引导式增量合并，自动携带插件共享表，维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）。
-  - `license_hub.py` & `_license_native_src/`、`asset_store.py`（支持 `register_app_id` 动态图标槽位）、`standard_catalog.py`、`offline_report/`（`runtime.py` 通用离线 HTML+Excel 外壳 + `single_db.py`/`cross_env.py`）、`import_progress.py`、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`llm_hub.py`、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`、`core/dws_engine.py`（去重复用 `dialects`）。
-- **四大独立插件模块 (`modules/`, 导出 `MODULE_SPEC`, 严格零互引)**：
-  - `modules/standard_migrator/`（`service.py` + `bindings_mixin.py` + `report_mixin.py`）、`modules/cross_comparator/`（`service.py` + `search_and_push_mixin.py` + `io_and_report_mixin.py`）、`modules/ddl_translator/`、`modules/data_explorer/`（`scope="private"`）。
+  - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.0.0"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（6 领域子路由含 `knowledge.py`）、`schemas.py`、`models.py`。
+  - `knowledge_hub.py` & `builtin_dialect_kb.py`（零新增依赖支持 `.md`/`.txt`/`.sql`/`.html`/`.json`/`.csv`/`.docx`/`.xlsx`，FTS5+BM25 中英/错误码切词、方言硬过滤、11 篇内置方言速查卡、`.json.gz` 知识包、可选 `/embeddings` RRF 与离线回退，Layer 2 私有隔离）、`sql_risk_guard.py`（词法多语句切分 + `READONLY`/`STANDARD_WRITE`/`HIGH_RISK` 定级 + 安全影响行数探针）。
+  - `storage_paths.py`、`storage/`、`workspace_hub.py`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）、`license_hub.py` & `_license_native_src/`、`asset_store.py`、`standard_catalog.py`、`offline_report/`、`import_progress.py`、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`llm_hub.py`（含 `create_embeddings`）、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`、`core/dws_engine.py`。
+- **五大独立插件模块 (`modules/`, 导出 `MODULE_SPEC`, 严格零互引)**：
+  - `modules/standard_migrator/`、`modules/cross_comparator/`、`modules/ddl_translator/`、`modules/data_explorer/`（`scope="private"`）、`modules/ai_assistant/`（`scope="private"`，在线连库/纯方言双模式、7 安全只读工具与渐进多轮探索、DDL/写提案分级确认执行闭环）。
 - **前端 ES Modules 工作台 (`static/`)**：
-  - `index.html`、`css/tokens.css` & `workbench.css`（已清理 392 行死样式）、`js/main.js`（零静态 View 依赖）、`js/core/` (`http.js`/`platform_api.js`/`app_registry.js`/`dom.js`/`state.js`/`type_compat.js`/`api.js` 兼容重导出)、`js/apps/index.js`（懒加载注册总入口）、`js/api/`（4 模块独立客户端）、`js/ui/`（底座公共组件，零业务依赖）、`js/views/`（含 `workspace_merge_wizard.js`、`standard_migrator/modals.js`、`cross_comparator/{modals,endpoint_deck,pair_picker}.js`）。
-- **自动化测试套件 (`tests/`，共 81 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (20)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (6)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
+  - `index.html`、`css/tokens.css` & `workbench.css`、`js/main.js`（零静态 View 依赖）、`js/core/`、`js/apps/`（`index.js` + `ai_assistant/` 独立懒加载应用）、`js/api/`、`js/ui/`、`js/views/`（含 `knowledge_view.js`、`workspace_merge_wizard.js`、`standard_migrator/modals.js`、`cross_comparator/*.js`）。
+- **自动化测试套件 (`tests/`，共 86 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (20)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (6)、`test_ai_assistant_and_kb.py` (5)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
 
 ## 6. AI 只读探查四道硬隔离铁律
 涉及 AI 自动查询必须复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束：

@@ -21,6 +21,7 @@ import { DESKTOP_APPS, store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
 import { Toast } from "../ui/toast.js";
 import { ConnectionsView, renderDriversSection } from "./connections_view.js";
+import { KnowledgeSettingsView } from "./knowledge_view.js";
 import { WorkspaceView } from "./workspace_view.js";
 
 const WALLPAPER_PRESETS = [
@@ -35,6 +36,7 @@ const SECTIONS = [
   { id: "workspaces", label: "工作区协作" },
   { id: "connections", label: "数据库连接" },
   { id: "drivers", label: "JDBC 驱动" },
+  { id: "knowledge", label: "参考知识库" },
   { id: "llm", label: "AI 模型" },
 ];
 
@@ -43,6 +45,7 @@ export class SettingsView {
     this.activeSection = "appearance";
     this.connectionsPane = new ConnectionsView({ onChange: () => this.render() });
     this.workspacePane = new WorkspaceView({ onChange: () => this.render() });
+    this.knowledgePane = new KnowledgeSettingsView({ onChange: () => this.render() });
     this.selectedProviderId = "deepseek";
     this.llmDraft = null;
     this.newModelInputText = "";
@@ -60,6 +63,7 @@ export class SettingsView {
   }
 
   destroy() {
+    this.knowledgePane?.destroy();
     this._unsub?.();
   }
 
@@ -85,6 +89,8 @@ export class SettingsView {
     this._syncLlmDraftFromStore();
     if (this.activeSection === "workspaces") {
       this.workspacePane.refreshFromServer();
+    } else if (this.activeSection === "knowledge") {
+      this.knowledgePane.refreshFromServer();
     }
     this.render();
     this.refreshHeader?.();
@@ -675,6 +681,8 @@ export class SettingsView {
               this.activeSection = s.id;
               if (s.id === "workspaces") {
                 this.workspacePane.refreshFromServer();
+              } else if (s.id === "knowledge") {
+                this.knowledgePane.refreshFromServer();
               }
               this.render();
               this.refreshHeader?.();
@@ -701,6 +709,9 @@ export class SettingsView {
       paneBody = this.connectionsPane.root;
     } else if (this.activeSection === "drivers") {
       paneBody = renderDriversSection(() => this.render());
+    } else if (this.activeSection === "knowledge") {
+      this.knowledgePane.render();
+      paneBody = this.knowledgePane.root;
     } else {
       paneBody = this._renderLlmSection();
     }

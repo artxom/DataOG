@@ -8,6 +8,28 @@
 
 ---
 
+## [3.0.0] - 2026-11-23
+
+> **Data.O.G 3.0 正式版本**：基于 3.0 零耦合插件微内核体系，上线第五个独立 Dock 应用 **`Data.O.G`**（基于大模型的智能数据助手），配套平台级零新增依赖离线知识库 (`KnowledgeHub`) 与 DDL/写操作分级二次确认门禁 (`sql_risk_guard`)。
+
+### Added
+- **平台级零新增依赖离线参考知识库 (`core/platform/knowledge_hub.py`, `builtin_dialect_kb.py`, `routes/knowledge.py`, `llm_hub.py`, `static/js/views/knowledge_view.js`)**：
+  - **严格 0 KB 新增第三方依赖**：纯标准库 + 已有 `openpyxl` 支持 `.md` / `.txt` / `.sql` / `.html` / `.htm` / `.json` / `.csv` / `.docx`（含 XXE 与解压膨胀防护）/ `.xlsx` 解析切分，并借助 SQLite 原生 FTS5 + BM25 实现中英文与报错码（`ORA-00942`、`ERROR 1064`、`DISTRIBUTE BY` 等）混合检索；内置 11 篇主流方言速查卡且用户上传资料默认享有更高排序权重。
+  - **方言硬隔离与两阶段渐进读取**：按目标数据库方言（仅检索当前方言 + `GENERIC`）硬过滤防止跨库语法串味；支持先搜命中摘要再按需读取上下邻近段落原文，全部资料归属 Layer 2 本机私有保险箱（跨工作区全局共享且不撑大 `.dataog.db`），支持按方言导出/导入轻量 `.json.gz` 知识包分享。
+  - **可选 Embedding 语义混排 (`LLMHub.create_embeddings`)**：支持在「系统配置 → 参考知识库」可选接入 OpenAI 兼容 `/embeddings` 接口做 RRF 混合排序；离线或网关不可达时自动无感退回纯 FTS5。
+- **DDL 与写操作词法级风险分级与安全切分底座 (`core/platform/sql_risk_guard.py`)**：
+  - 支持在字符串、注释与 `$tag$` Dollar-Quoting 外安全切分多条语句，服务端独立将语句定级为 `READONLY`、`STANDARD_WRITE`（`CREATE`/`ALTER`/`COMMENT`/`INSERT`/`MERGE`）或 `HIGH_RISK`（`DROP`/`TRUNCATE`/`DELETE`/`UPDATE`/`GRANT`/`REVOKE`/`ALTER ... DROP` 等），并为单表 `DELETE`/`UPDATE` 自动生成经 `validate_readonly_sql` 验证的影响行数只读预估查询。
+- **第五个独立 Dock 应用 `Data.O.G` (`modules/ai_assistant/`, `static/js/apps/ai_assistant/`)**：
+  - **双模式与全局研发运维调度**：严格遵守 3.0 模块隔离规范与现有「数据探查」完全并行零耦合；支持「在线连库模式」（调度全局连接、元数据与视图血缘、硬件级只读 SQL 与 `EXPLAIN`）与「离线纯方言模式」（无数据库连接即可按选定方言配合知识库完成语法确认、SQL 改写、报错排障与 DDL 建模）。
+  - **循序渐进多轮探索引擎**：提供场景芯片（`自动识别` / `数据查询` / `报错排障` / `性能优化` / `语法确认` / `DDL 助手`）、歧义场景交互式「澄清确认卡」、7 工具自主只读循环（含 SQL 报错自动结合元数据与知识库自我修正、真实 `EXPLAIN` 诊断）、可点击溯源的知识引用角标、内联可导出结果表、末尾「下一步推进建议」及长对话滑动摘要压缩。
+  - **独立可折叠三栏界面**：左栏多轮会话管理 + 中央渐进对话流 + 按需滑出右侧「库表速览 / 参考知识库」双标签抽屉。
+- **全链路自动化测试 (`tests/test_ai_assistant_and_kb.py`, `tests/test_modular_architecture.py`)**：新增 SQL 分级切分、零依赖多格式解析与 FTS5 方言隔离、多轮澄清与自我纠错、DDL/高危写确认防篡改与批执行以及 Node.js 3.0 前端验证共 5 项测试（全量自动化测试增至 **86 项**）。
+
+### Security
+- **写操作物理级隔离与分级二次确认防绕过门禁**：自主推理工具箱物理仅持有 `execute_readonly_sql` 只读通道；任何 DDL 与写操作均强制落入带校验哈希的待确认提案卡片，高危语句展示影响行数估算与警告并强制输入 `CONFIRM` 解锁；即使用户在确认卡片内手改 SQL，服务端每次提交均重新独立词法定级（阻止 `INSERT` 改 `DROP` 绕过），支持多条有序 DDL 批执行、失败自动回写对话并支持一键触发 AI 诊断修复。
+
+---
+
 ## [2.9.2] - 2026-11-23
 
 ### Added

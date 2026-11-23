@@ -78,6 +78,7 @@ class TestModularArchitectureV29(unittest.TestCase):
                 "cross_comparator",
                 "ddl_translator",
                 "data_explorer",
+                "ai_assistant",
             ],
         )
 
@@ -419,11 +420,11 @@ const {
 } = await imp("static/js/core/app_registry.js");
 const { renderAppSquircle } = await imp("static/js/core/dom.js");
 
-if (DESKTOP_APPS.length !== 4) {
-  throw new Error(`Expected 4 built-in desktop apps, got ${DESKTOP_APPS.length}`);
+if (DESKTOP_APPS.length !== 5) {
+  throw new Error(`Expected 5 desktop apps (4 builtin + v3.0 ai_assistant), got ${DESKTOP_APPS.length}`);
 }
 
-// 验证 4 个内建桌面应用均可通过懒加载动态 import 正常实例化并销毁
+// 验证全部已注册桌面应用均可通过懒加载动态 import 正常实例化并销毁
 for (const builtinApp of [...DESKTOP_APPS]) {
   const bInst = await loadAppInstance(builtinApp.id);
   if (!bInst || typeof bInst.mount !== "function" || typeof bInst.getHeaderParts !== "function") {
@@ -454,7 +455,7 @@ const manifest = registerDesktopApp({
   },
 });
 
-if (DESKTOP_APPS.length !== 5 || !getDesktopApp("dq_studio")) {
+if (DESKTOP_APPS.length !== 6 || !getDesktopApp("dq_studio")) {
   throw new Error("DESKTOP_APPS did not dynamically include dq_studio");
 }
 
@@ -472,7 +473,10 @@ const inst2 = await loadAppInstance("dq_studio");
 if (inst1.appId !== "dq_studio" || loaderCalls !== 2) {
   throw new Error("Lazy loader execution failed");
 }
-if (headNode.children.length !== 1 || headNode.children[0].getAttribute("href") !== "/js/apps/dq_studio/style.css") {
+const dqLinks = headNode.children.filter(
+  (c) => c.getAttribute("href") === "/js/apps/dq_studio/style.css"
+);
+if (headNode.children.length !== 2 || dqLinks.length !== 1) {
   throw new Error("Stylesheet injection should be idempotent and appended once");
 }
 
@@ -668,12 +672,14 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
             "core.platform.routes.auth_and_system",
             "core.platform.routes.data_sources",
             "core.platform.routes.appearance_and_llm",
+            "core.platform.routes.knowledge",
             "core.platform.routes.standards",
             "core.platform.routes.workspaces",
             "modules.standard_migrator.router",
             "modules.cross_comparator.router",
             "modules.ddl_translator.router",
             "modules.data_explorer.router",
+            "modules.ai_assistant.router",
         ]
         for mod_name in route_mod_names:
             mod_obj = importlib.import_module(mod_name)

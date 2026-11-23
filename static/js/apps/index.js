@@ -83,3 +83,6 @@ export function registerBuiltinDesktopApps() {
 }
 
 registerBuiltinDesktopApps();
+
+// 3.0 独立功能模块插件（按需懒加载）
+import "./ai_assistant/register.js";

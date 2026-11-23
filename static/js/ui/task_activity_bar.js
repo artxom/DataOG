@@ -267,26 +267,26 @@ export class TaskActivityBar {
 
   _reveal() {
     if (this._destroyed) return;
-    this.el.classList.remove("is-hidden");
+    this.el.classList?.remove("is-hidden");
   }
 
   _setToneClass(status) {
-    this.el.classList.remove("is-warn", "is-error", "is-done", "is-running");
+    this.el.classList?.remove("is-warn", "is-error", "is-done", "is-running");
     if (status === "warn") {
-      this.el.classList.add("is-warn");
+      this.el.classList?.add("is-warn");
     } else if (status === "error") {
-      this.el.classList.add("is-error");
+      this.el.classList?.add("is-error");
     } else if (status === "done") {
-      this.el.classList.add("is-done");
+      this.el.classList?.add("is-done");
     } else {
-      this.el.classList.add("is-running");
+      this.el.classList?.add("is-running");
     }
   }
 
   _setPopoverOpen(open) {
     this._popoverOpen = Boolean(open);
     this.popoverEl.hidden = !this._popoverOpen;
-    this.popoverEl.classList.toggle("is-open", this._popoverOpen);
+    this.popoverEl.classList?.toggle("is-open", this._popoverOpen);
     this.stepsBtn.setAttribute("aria-expanded", this._popoverOpen ? "true" : "false");
     const count = this._activeRun?.recentLogs?.length || 0;
     this.stepsBtn.textContent = `步骤 (${count}) ${this._popoverOpen ? "▴" : "▾"}`;
@@ -594,8 +594,8 @@ export class TaskActivityBar {
 
     this._clearAutoHideTimer();
     this._setPopoverOpen(false);
-    this.el.classList.add("is-hidden");
-    this.el.classList.remove("is-warn", "is-error", "is-done", "is-running");
+    this.el.classList?.add("is-hidden");
+    this.el.classList?.remove("is-warn", "is-error", "is-done", "is-running");
 
     const runId = ++this._runSeq;
     const taskId = createTaskId(prefix);
@@ -746,8 +746,8 @@ export class TaskActivityBar {
   hide() {
     this._clearAutoHideTimer();
     this._setPopoverOpen(false);
-    this.el.classList.add("is-hidden");
-    this.el.classList.remove("is-warn", "is-error", "is-done", "is-running");
+    this.el.classList?.add("is-hidden");
+    this.el.classList?.remove("is-warn", "is-error", "is-done", "is-running");
   }
 
   destroy() {
