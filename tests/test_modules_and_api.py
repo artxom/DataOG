@@ -3024,7 +3024,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 ctx.metadata_hub, "refresh_catalog", wraps=ctx.metadata_hub.refresh_catalog
             ) as spy_refresh:
                 html_res = client.get(
-                    f"/api/modules/standard_migrator/bindings/report.html?connection_id={p1.connection_id}",
+                    f"/api/modules/standard_migrator/bindings/report.html?connection_id={p1.connection_id}&only_bound_tables=false",
                     headers={"X-Task-Id": "rep_html_1"},
                 )
             self.assertEqual(html_res.status_code, 200, html_res.text)
@@ -3053,7 +3053,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 ctx.metadata_hub, "refresh_catalog", wraps=ctx.metadata_hub.refresh_catalog
             ) as spy_refresh2:
                 html_res2 = client.get(
-                    "/api/modules/standard_migrator/bindings/report.html?connection_id=c_single",
+                    "/api/modules/standard_migrator/bindings/report.html?connection_id=c_single&only_bound_tables=false",
                     headers={"X-Task-Id": "rep_html_2"},
                 )
             self.assertEqual(html_res2.status_code, 200)
@@ -3082,7 +3082,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 {"t_cust", "t_ord", "t_edge", "t_missing_only"},
             )
 
-            xlsx_res = client.get("/api/modules/standard_migrator/bindings/report.xlsx?connection_id=c_single")
+            xlsx_res = client.get("/api/modules/standard_migrator/bindings/report.xlsx?connection_id=c_single&only_bound_tables=false")
             self.assertEqual(xlsx_res.status_code, 200)
             wb = openpyxl.load_workbook(io.BytesIO(xlsx_res.content))
             self.assertEqual(wb.sheetnames, ["全库落标与贯标报告"])
@@ -3253,7 +3253,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
                 mock.patch.object(ctx.metadata_hub, "get_table_metadata", side_effect=_spy_single),
             ):
                 html_res = client.get(
-                    "/api/modules/cross_comparator/report.html",
+                    "/api/modules/cross_comparator/report.html?only_bound_tables=false",
                     headers={"X-Task-Id": "cross_rep_1"},
                 )
 
@@ -3280,7 +3280,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             self.assertEqual([t["table_name"] for t in data_obj["source_only_tables"]], ["t_src_only"])
             self.assertEqual([t["table_name"] for t in data_obj["target_only_tables"]], ["t_tgt_only"])
 
-            xlsx_res = client.get("/api/modules/cross_comparator/report.xlsx")
+            xlsx_res = client.get("/api/modules/cross_comparator/report.xlsx?only_bound_tables=false")
             self.assertEqual(xlsx_res.status_code, 200)
             wb = openpyxl.load_workbook(io.BytesIO(xlsx_res.content))
             self.assertEqual(wb.sheetnames, ["跨环境库级比对报告"])
@@ -3308,7 +3308,7 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             with mock.patch.object(
                 ctx.metadata_hub, "refresh_catalog", wraps=ctx.metadata_hub.refresh_catalog
             ) as spy_self_ref:
-                self_rep = client.get("/api/modules/cross_comparator/report.xlsx")
+                self_rep = client.get("/api/modules/cross_comparator/report.xlsx?only_bound_tables=false")
             self.assertEqual(self_rep.status_code, 200)
             self.assertEqual(spy_self_ref.call_count, 1)
 
@@ -4550,6 +4550,455 @@ view.destroy();
             self.assertNotIn("acct_code", binds)
             self.assertEqual(binds["acct_no"]["std_code"], "QM_ACCT_001")
             self.assertEqual(binds["acct_legacy_no"]["std_code"], "QM_ACCT_002")
+
+    def test_single_db_report_schema_filter_and_only_bound_tables(self) -> None:
+        """验证单库落标贯标报告支持 Schema 选择与表级仅含已绑标表（探查前剪枝+探查后兜底）."""
+        import time
+        from core.platform.models import ColumnMeta, SchemaMeta, TableMeta
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            ctx = app.state.platform_ctx
+            client = TestClient(app)
+
+            p = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "c_multi_sch",
+                    "name": "多Schema数仓",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 8000,
+                    "dbname": "dw",
+                    "default_schema": "dwd",
+                    "user": "u",
+                    "password": "p",
+                }
+            )
+            cid = p.connection_id
+
+            ctx.standard_catalog.upsert_item(
+                {"std_code": "S_CUST", "cn_name": "客户号", "en_abbr": "cust_id", "type_dws": "VARCHAR(32)"}
+            )
+            ctx.standard_catalog.upsert_item(
+                {"std_code": "S_ORD", "cn_name": "订单号", "en_abbr": "ord_id", "type_dws": "VARCHAR(32)"}
+            )
+
+            ctx.store.save_catalog_snapshot(
+                cid,
+                schemas=[
+                    SchemaMeta(schema_name="dwd", table_count=3, view_count=0),
+                    SchemaMeta(schema_name="ods", table_count=2, view_count=0),
+                    SchemaMeta(schema_name="empty_sch", table_count=1, view_count=0),
+                ],
+                tables=[
+                    {"schema_name": "dwd", "table_name": "t_cust", "object_type": "TABLE"},
+                    {"schema_name": "dwd", "table_name": "t_raw", "object_type": "TABLE"},
+                    {"schema_name": "dwd", "table_name": "t_stale", "object_type": "TABLE"},
+                    {"schema_name": "ods", "table_name": "t_ord", "object_type": "TABLE"},
+                    {"schema_name": "ods", "table_name": "t_ods_raw", "object_type": "TABLE"},
+                    {"schema_name": "empty_sch", "table_name": "t_none", "object_type": "TABLE"},
+                ],
+            )
+            for sch, tbl, col_name, col_type in (
+                ("dwd", "t_cust", "cust_id", "VARCHAR(32)"),
+                ("dwd", "t_raw", "raw_id", "VARCHAR(16)"),
+                ("dwd", "t_stale", "valid_col", "VARCHAR(16)"),
+                ("ods", "t_ord", "ord_id", "VARCHAR(32)"),
+                ("ods", "t_ods_raw", "x1", "VARCHAR(16)"),
+                ("empty_sch", "t_none", "n1", "VARCHAR(16)"),
+            ):
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name=sch,
+                        table_name=tbl,
+                        columns=[ColumnMeta(1, col_name, col_type)],
+                    ),
+                )
+            with ctx.metadata_hub._neg_lock:
+                ctx.metadata_hub._missing_table_cache[(cid, "dwd", "t_missing")] = time.monotonic()
+
+            ctx.standard_catalog.upsert_field_bindings(
+                cid,
+                [
+                    {"schema_name": "dwd", "table_name": "t_cust", "column_name": "cust_id", "std_code": "S_CUST"},
+                    {"schema_name": "dwd", "table_name": "t_stale", "column_name": "deleted_ghost_col", "std_code": "S_CUST"},
+                    {"schema_name": "dwd", "table_name": "t_missing", "column_name": "ghost_c", "std_code": "S_CUST"},
+                    {"schema_name": "ods", "table_name": "t_ord", "column_name": "ord_id", "std_code": "S_ORD"},
+                ],
+            )
+            ctx.store.replace_all_items(
+                [
+                    {
+                        "connection_id": cid,
+                        "schema_name": "dwd",
+                        "table_name": "t_cust",
+                        "old_col_name": "cust_id",
+                        "old_col_type": "TEXT",
+                        "old_col_comment": "",
+                        "new_col_name": "cust_id",
+                        "new_col_type": "VARCHAR(32)",
+                        "new_col_comment": "客户号",
+                    },
+                    {
+                        "connection_id": cid,
+                        "schema_name": "ods",
+                        "table_name": "t_ord",
+                        "old_col_name": "ord_id",
+                        "old_col_type": "TEXT",
+                        "old_col_comment": "",
+                        "new_col_name": "ord_id",
+                        "new_col_type": "VARCHAR(32)",
+                        "new_col_comment": "订单号",
+                    },
+                ],
+                "multi_q.xlsx",
+                preserve_history=False,
+            )
+
+            # 1. 默认导出 (only_bound_tables=True)：仅探查已绑标表，剪除探查后变 0 绑标的 t_stale，保留缺表 t_missing
+            probed_1: List[Tuple[str, str]] = []
+            orig_batch = ctx.metadata_hub.get_tables_metadata_batch
+
+            def _spy_batch(c_id, targets, *args, **kwargs):
+                for _s, _t in targets:
+                    probed_1.append((str(_s).lower(), str(_t).lower()))
+                return orig_batch(c_id, targets, *args, **kwargs)
+
+            with mock.patch.object(ctx.metadata_hub, "get_tables_metadata_batch", side_effect=_spy_batch):
+                html_def = client.get(f"/api/modules/standard_migrator/bindings/report.html?connection_id={cid}")
+            self.assertEqual(html_def.status_code, 200, html_def.text)
+            probed_names_1 = {t for _s, t in probed_1}
+            self.assertNotIn("t_raw", probed_names_1)
+            self.assertNotIn("t_ods_raw", probed_names_1)
+            self.assertNotIn("t_none", probed_names_1)
+            self.assertIn("t_stale", probed_names_1)
+
+            m_json_1 = re.search(
+                r'<script id="report-data" type="application/json">(.*?)</script>',
+                html_def.text,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(m_json_1)
+            p_def = json.loads(m_json_1.group(1))
+            self.assertTrue(p_def["report_scope"]["only_bound_tables"])
+            self.assertEqual(p_def["report_scope"]["selected_schemas"], [])
+            self.assertEqual(p_def["report_scope"]["skipped_unbound_tables_count"], 4)
+            self.assertEqual({t["table"]["table_name"] for t in p_def["tables"]}, {"t_cust", "t_ord", "t_missing"})
+
+            xlsx_def = client.get(f"/api/modules/standard_migrator/bindings/report.xlsx?connection_id={cid}")
+            self.assertEqual(xlsx_def.status_code, 200)
+            wb_def = openpyxl.load_workbook(io.BytesIO(xlsx_def.content))
+            tbls_xlsx_def = {r[2] for r in wb_def.active.iter_rows(min_row=2, values_only=True)}
+            self.assertEqual(tbls_xlsx_def, {"t_cust", "t_ord", "t_missing"})
+
+            # 2. 指定 schemas=dwd：仅探查并输出 dwd 已绑标表，队列项亦同步按 Schema 收敛
+            probed_2: List[Tuple[str, str]] = []
+
+            def _spy_batch_2(c_id, targets, *args, **kwargs):
+                for _s, _t in targets:
+                    probed_2.append((str(_s).lower(), str(_t).lower()))
+                return orig_batch(c_id, targets, *args, **kwargs)
+
+            with mock.patch.object(ctx.metadata_hub, "get_tables_metadata_batch", side_effect=_spy_batch_2):
+                html_dwd = client.get(
+                    f"/api/modules/standard_migrator/bindings/report.html?connection_id={cid}&schemas=dwd"
+                )
+            self.assertEqual(html_dwd.status_code, 200)
+            self.assertNotIn(("ods", "t_ord"), probed_2)
+            p_dwd = json.loads(
+                re.search(r'<script id="report-data" type="application/json">(.*?)</script>', html_dwd.text, re.DOTALL).group(1)
+            )
+            self.assertEqual(p_dwd["report_scope"]["selected_schemas"], ["dwd"])
+            self.assertEqual(p_dwd["report_scope"]["skipped_unbound_tables_count"], 2)
+            self.assertEqual({t["table"]["table_name"] for t in p_dwd["tables"]}, {"t_cust", "t_missing"})
+            self.assertEqual([it["schema_name"] for it in p_dwd["migration_items"]], ["dwd"])
+
+            # 多选 schemas=dwd,ods
+            html_both = client.get(
+                f"/api/modules/standard_migrator/bindings/report.html?connection_id={cid}&schemas=dwd,ods"
+            )
+            self.assertEqual(html_both.status_code, 200)
+            p_both = json.loads(
+                re.search(r'<script id="report-data" type="application/json">(.*?)</script>', html_both.text, re.DOTALL).group(1)
+            )
+            self.assertEqual({t["table"]["table_name"] for t in p_both["tables"]}, {"t_cust", "t_missing", "t_ord"})
+
+            # 3. schemas=dwd&only_bound_tables=false：含 dwd 下全部表且仍排除 ods/empty_sch
+            html_dwd_all = client.get(
+                f"/api/modules/standard_migrator/bindings/report.html?connection_id={cid}&schemas=dwd&only_bound_tables=false"
+            )
+            self.assertEqual(html_dwd_all.status_code, 200)
+            p_dwd_all = json.loads(
+                re.search(r'<script id="report-data" type="application/json">(.*?)</script>', html_dwd_all.text, re.DOTALL).group(1)
+            )
+            self.assertFalse(p_dwd_all["report_scope"]["only_bound_tables"])
+            self.assertEqual(p_dwd_all["report_scope"]["skipped_unbound_tables_count"], 0)
+            self.assertEqual(
+                {t["table"]["table_name"] for t in p_dwd_all["tables"]},
+                {"t_cust", "t_raw", "t_stale", "t_missing"},
+            )
+
+            # 4. 仅选择无绑标 Schema 且 only_bound_tables=true 返回 400
+            err_res = client.get(
+                f"/api/modules/standard_migrator/bindings/report.xlsx?connection_id={cid}&schemas=empty_sch"
+            )
+            self.assertEqual(err_res.status_code, 400)
+            self.assertIn("empty_sch", err_res.json()["error"])
+
+            # 5. 预填模板支持 schemas 过滤且保留未绑标物理表供补绑
+            tpl_dwd = client.get(
+                f"/api/modules/standard_migrator/bindings/template.xlsx?connection_id={cid}&scope=all&schemas=dwd"
+            )
+            self.assertEqual(tpl_dwd.status_code, 200)
+            wb_tpl = openpyxl.load_workbook(io.BytesIO(tpl_dwd.content))
+            tpl_tbls = {r[1] for r in wb_tpl["字段与数据标准对照"].iter_rows(min_row=2, values_only=True)}
+            self.assertEqual(tpl_tbls, {"t_cust", "t_raw", "t_stale"})
+
+    def test_cross_env_report_schema_filter_and_only_bound_tables(self) -> None:
+        """验证跨环境库级比对报告支持两侧 Schema 筛选、仅含已绑标表默认剪枝及前端弹窗结构防线."""
+        from core.platform.models import ColumnMeta, SchemaMeta, TableMeta
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(db_path=os.path.join(tmp, "state.db"))
+            ctx = app.state.platform_ctx
+            client = TestClient(app)
+
+            src_p = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "c_src_m",
+                    "name": "源端多模式",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 8000,
+                    "dbname": "src",
+                    "default_schema": "ods",
+                    "user": "u",
+                    "password": "p",
+                }
+            )
+            tgt_p = ctx.connection_hub.save_profile(
+                {
+                    "connection_id": "c_tgt_m",
+                    "name": "目标多模式",
+                    "db_type": "DWS",
+                    "host": "127.0.0.1",
+                    "port": 8000,
+                    "dbname": "tgt",
+                    "default_schema": "dwd",
+                    "user": "u",
+                    "password": "p",
+                }
+            )
+            ctx.standard_catalog.upsert_item(
+                {"std_code": "S_1", "cn_name": "客户号", "en_abbr": "c1", "type_dws": "VARCHAR(32)"}
+            )
+
+            ctx.store.save_catalog_snapshot(
+                src_p.connection_id,
+                schemas=[
+                    SchemaMeta(schema_name="ods", table_count=6, view_count=0),
+                    SchemaMeta(schema_name="dm", table_count=1, view_count=0),
+                ],
+                tables=[
+                    {"schema_name": "ods", "table_name": "src_a"},
+                    {"schema_name": "ods", "table_name": "src_unbound_pair"},
+                    {"schema_name": "ods", "table_name": "rec_bound"},
+                    {"schema_name": "ods", "table_name": "rec_unbound"},
+                    {"schema_name": "ods", "table_name": "solo_src_bound"},
+                    {"schema_name": "ods", "table_name": "solo_src_unbound"},
+                    {"schema_name": "dm", "table_name": "src_dm"},
+                ],
+            )
+            for sch, tbl, col in (
+                ("ods", "src_a", "c1"),
+                ("ods", "src_unbound_pair", "u1"),
+                ("ods", "rec_bound", "r1"),
+                ("ods", "rec_unbound", "r2"),
+                ("ods", "solo_src_bound", "s1"),
+                ("ods", "solo_src_unbound", "s2"),
+                ("dm", "src_dm", "d1"),
+            ):
+                ctx.store.save_table_meta(
+                    src_p.connection_id,
+                    TableMeta(schema_name=sch, table_name=tbl, columns=[ColumnMeta(1, col, "VARCHAR(32)")]),
+                )
+
+            ctx.store.save_catalog_snapshot(
+                tgt_p.connection_id,
+                schemas=[
+                    SchemaMeta(schema_name="dwd", table_count=6, view_count=0),
+                    SchemaMeta(schema_name="dm", table_count=1, view_count=0),
+                ],
+                tables=[
+                    {"schema_name": "dwd", "table_name": "tgt_a"},
+                    {"schema_name": "dwd", "table_name": "tgt_unbound_pair"},
+                    {"schema_name": "dwd", "table_name": "rec_bound"},
+                    {"schema_name": "dwd", "table_name": "rec_unbound"},
+                    {"schema_name": "dwd", "table_name": "solo_tgt_bound"},
+                    {"schema_name": "dwd", "table_name": "solo_tgt_unbound"},
+                    {"schema_name": "dm", "table_name": "tgt_dm"},
+                ],
+            )
+            for sch, tbl, col in (
+                ("dwd", "tgt_a", "c1"),
+                ("dwd", "tgt_unbound_pair", "u1"),
+                ("dwd", "rec_bound", "r1"),
+                ("dwd", "rec_unbound", "r2"),
+                ("dwd", "solo_tgt_bound", "t1"),
+                ("dwd", "solo_tgt_unbound", "t2"),
+                ("dm", "tgt_dm", "d1"),
+            ):
+                ctx.store.save_table_meta(
+                    tgt_p.connection_id,
+                    TableMeta(schema_name=sch, table_name=tbl, columns=[ColumnMeta(1, col, "VARCHAR(32)")]),
+                )
+
+            ctx.standard_catalog.upsert_field_bindings(
+                src_p.connection_id,
+                [
+                    {"schema_name": "ods", "table_name": "rec_bound", "column_name": "r1", "std_code": "S_1"},
+                    {"schema_name": "ods", "table_name": "solo_src_bound", "column_name": "s1", "std_code": "S_1"},
+                ],
+            )
+            ctx.standard_catalog.upsert_field_bindings(
+                tgt_p.connection_id,
+                [
+                    {"schema_name": "dwd", "table_name": "solo_tgt_bound", "column_name": "t1", "std_code": "S_1"},
+                ],
+            )
+
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "source", "connection_id": src_p.connection_id})
+            client.post("/api/modules/cross_comparator/bind-role", json={"role": "target", "connection_id": tgt_p.connection_id})
+
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "pair_bound_ods_dwd",
+                        "source_schema": "ods",
+                        "source_table": "src_a",
+                        "target_schema": "dwd",
+                        "target_table": "tgt_a",
+                        "pairings": [{"source_col": "c1", "target_col": "c1", "source_std_code": "S_1", "target_std_code": "S_1"}],
+                    },
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "pair_unbound_ods_dwd",
+                        "source_schema": "ods",
+                        "source_table": "src_unbound_pair",
+                        "target_schema": "dwd",
+                        "target_table": "tgt_unbound_pair",
+                        "sync_to_field_bindings": False,
+                        "pairings": [{"source_col": "u1", "target_col": "u1"}],
+                    },
+                ).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "pair_bound_dm",
+                        "source_schema": "dm",
+                        "source_table": "src_dm",
+                        "target_schema": "dm",
+                        "target_table": "tgt_dm",
+                        "pairings": [{"source_col": "d1", "target_col": "d1", "source_std_code": "S_1", "target_std_code": "S_1"}],
+                    },
+                ).status_code,
+                200,
+            )
+
+            # 1. 默认导出 (only_bound_tables=True)：零绑标表对不被探查，且推荐/单侧表仅保留含绑标者
+            probed: List[Tuple[str, str]] = []
+            orig_batch = ctx.metadata_hub.get_tables_metadata_batch
+
+            def _spy_batch(c_id, targets, *args, **kwargs):
+                for _s, _t in targets:
+                    probed.append((c_id, str(_t).lower()))
+                return orig_batch(c_id, targets, *args, **kwargs)
+
+            with mock.patch.object(ctx.metadata_hub, "get_tables_metadata_batch", side_effect=_spy_batch):
+                res_def = client.get("/api/modules/cross_comparator/report.html")
+            self.assertEqual(res_def.status_code, 200, res_def.text)
+            probed_tbls = {t for _c, t in probed}
+            self.assertNotIn("src_unbound_pair", probed_tbls)
+            self.assertNotIn("tgt_unbound_pair", probed_tbls)
+
+            d_def = json.loads(
+                re.search(r'<script id="report-data" type="application/json">(.*?)</script>', res_def.text, re.DOTALL).group(1)
+            )
+            self.assertTrue(d_def["report_scope"]["only_bound_tables"])
+            self.assertEqual(d_def["report_scope"]["skipped_unbound_tables_count"], 4)
+            self.assertEqual({p["table_binding"]["std_table_key"] for p in d_def["pairs"]}, {"pair_bound_ods_dwd", "pair_bound_dm"})
+            self.assertEqual([r["table_name"] for r in d_def["recommended_pairings"]], ["rec_bound"])
+            self.assertEqual([t["table_name"] for t in d_def["source_only_tables"]], ["solo_src_bound"])
+            self.assertEqual([t["table_name"] for t in d_def["target_only_tables"]], ["solo_tgt_bound"])
+
+            xlsx_def = client.get("/api/modules/cross_comparator/report.xlsx")
+            self.assertEqual(xlsx_def.status_code, 200)
+            wb_def = openpyxl.load_workbook(io.BytesIO(xlsx_def.content))
+            keys_xlsx = {r[2] for r in wb_def.active.iter_rows(min_row=2, values_only=True)}
+            self.assertNotIn("pair_unbound_ods_dwd", keys_xlsx)
+            self.assertIn("pair_bound_ods_dwd", keys_xlsx)
+
+            # 2. 按两侧 Schema 过滤：source_schemas=ods&target_schemas=dwd
+            res_sch = client.get("/api/modules/cross_comparator/report.html?source_schemas=ods&target_schemas=dwd")
+            self.assertEqual(res_sch.status_code, 200)
+            d_sch = json.loads(
+                re.search(r'<script id="report-data" type="application/json">(.*?)</script>', res_sch.text, re.DOTALL).group(1)
+            )
+            self.assertEqual(d_sch["report_scope"]["source_schemas"], ["ods"])
+            self.assertEqual(d_sch["report_scope"]["target_schemas"], ["dwd"])
+            self.assertEqual([p["table_binding"]["std_table_key"] for p in d_sch["pairs"]], ["pair_bound_ods_dwd"])
+            self.assertEqual([r["table_name"] for r in d_sch["recommended_pairings"]], ["rec_bound"])
+
+            # 非对称过滤：被过滤掉的已保存映射表 ods.src_a / dm.tgt_dm 不得被误判为 solo 表
+            res_asym = client.get("/api/modules/cross_comparator/report.html?source_schemas=ods&target_schemas=dm")
+            self.assertEqual(res_asym.status_code, 200)
+            d_asym = json.loads(
+                re.search(r'<script id="report-data" type="application/json">(.*?)</script>', res_asym.text, re.DOTALL).group(1)
+            )
+            self.assertEqual(d_asym["pairs"], [])
+            self.assertEqual([t["table_name"] for t in d_asym["source_only_tables"]], ["rec_bound", "solo_src_bound"])
+            self.assertNotIn("src_a", [t["table_name"] for t in d_asym["source_only_tables"]])
+            self.assertEqual(d_asym["target_only_tables"], [])
+
+            # 3. 取消勾选 only_bound_tables=false 保留零绑标表对与未配对表，仍受 Schema 限制
+            res_all = client.get(
+                "/api/modules/cross_comparator/report.html?source_schemas=ods&target_schemas=dwd&only_bound_tables=false"
+            )
+            self.assertEqual(res_all.status_code, 200)
+            d_all = json.loads(
+                re.search(r'<script id="report-data" type="application/json">(.*?)</script>', res_all.text, re.DOTALL).group(1)
+            )
+            self.assertFalse(d_all["report_scope"]["only_bound_tables"])
+            self.assertEqual({p["table_binding"]["std_table_key"] for p in d_all["pairs"]}, {"pair_bound_ods_dwd", "pair_unbound_ods_dwd"})
+            self.assertEqual({r["table_name"] for r in d_all["recommended_pairings"]}, {"rec_bound", "rec_unbound"})
+            self.assertEqual({t["table_name"] for t in d_all["source_only_tables"]}, {"solo_src_bound", "solo_src_unbound"})
+            self.assertEqual({t["table_name"] for t in d_all["target_only_tables"]}, {"solo_tgt_bound", "solo_tgt_unbound"})
+
+            # 4. 前端弹窗与样式静态防线
+            static_dir = resolve_static_dir()
+            with open(os.path.join(static_dir, "js", "ui", "export_report_modal.js"), "r", encoding="utf-8") as f:
+                exp_js = f.read()
+            self.assertIn("filterGroups", exp_js)
+            self.assertIn("getScopeSummary", exp_js)
+            self.assertNotIn('"ok"', exp_js)
+            for mod_rel in (
+                os.path.join("js", "views", "standard_migrator", "modals.js"),
+                os.path.join("js", "views", "cross_comparator", "modals.js"),
+            ):
+                with open(os.path.join(static_dir, mod_rel), "r", encoding="utf-8") as f:
+                    m_txt = f.read()
+                self.assertIn("onlyBoundTables", m_txt)
+                self.assertIn("defaultChecked: true", m_txt)
 
 
 if __name__ == "__main__":

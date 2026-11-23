@@ -162,6 +162,7 @@ _SINGLE_DB_APP_JS = r"""
 (() => {
   const DATA = JSON.parse(document.getElementById("report-data").textContent);
   const CONN = DATA.connection || {};
+  const SCOPE = DATA.report_scope || {};
   const AGG = DATA.aggregate || {};
   const TABLES = DATA.tables || [];
   const MIG_ITEMS = DATA.migration_items || [];
@@ -435,6 +436,7 @@ _SINGLE_DB_APP_JS = r"""
         el("h1", { className: "title-main", text: (CONN.name || "数据源") + " · 库级落标与贯标离线报告" }),
         badge(CONN.db_type || "DB", "info"),
         badge("格式: " + (DATA.format_profile_label || DATA.format_profile || "AUTO")),
+        SCOPE.scope_label ? badge("范围: " + SCOPE.scope_label, "lav") : null,
         badge("生成: " + (DATA.generated_at || ""))
       ),
       el("div", { className: "topbar-actions" },
@@ -446,8 +448,9 @@ _SINGLE_DB_APP_JS = r"""
   }
 
   function renderKpis() {
+    const skipCnt = SCOPE.only_bound_tables ? Number(SCOPE.skipped_unbound_tables_count || 0) : 0;
     const cards = [
-      { label: "库表总数", val: String(AGG.total_tables ?? TABLES.length), sub: "已绑标表 " + (AGG.bound_tables_count ?? 0) + " / 全达标表 " + (AGG.full_compliant_tables_count ?? 0) },
+      { label: "库表总数", val: String(AGG.total_tables ?? TABLES.length), sub: "已绑标表 " + (AGG.bound_tables_count ?? 0) + " / 全达标表 " + (AGG.full_compliant_tables_count ?? 0) + (skipCnt > 0 ? "（已过滤 " + skipCnt + " 张未绑标表）" : "") },
       { label: "总字段数", val: String(AGG.total_cols ?? 0), sub: "已绑标 " + (AGG.bound_cols ?? 0) + " · 未绑标 " + (AGG.unbound_cols ?? 0) },
       { label: "绑标覆盖率", val: String(AGG.coverage_pct ?? 0) + "%", pct: Number(AGG.coverage_pct ?? 0), sub: (AGG.bound_cols ?? 0) + " / " + (AGG.total_cols ?? 0) + " 列" },
       { label: "标准落标率", val: String(AGG.compliant_pct ?? 0) + "%", pct: Number(AGG.compliant_pct ?? 0), sub: "已落标 " + (AGG.compliant_cols ?? 0) + " · 仅差注释 " + (AGG.comment_only_cols ?? 0) },

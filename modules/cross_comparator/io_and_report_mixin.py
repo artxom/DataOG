@@ -5,7 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import io
 import json
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -915,8 +915,68 @@ class _CrossIoAndReportMixin:
             "target_candidates": target_candidates,
         }
 
-    @staticmethod
+    _NORM_SCHEMA_DIALECTS = frozenset(
+        {
+            "SQLITE",
+            "INCEPTOR",
+            "MYSQL",
+            "MARIADB",
+            "OCEANBASE",
+            "DORIS",
+            "STARROCKS",
+            "TIDB",
+        }
+    )
+
+    @classmethod
+    def _norm_side_schema(cls, raw_sch: str, def_sch: str, db_type: str) -> str:
+        cs = clean_identifier_input(raw_sch or "") or def_sch
+        dt = (db_type or "").strip().upper()
+        if cs.lower() == "public" and def_sch.lower() != "public" and dt in cls._NORM_SCHEMA_DIALECTS:
+            return def_sch
+        if dt == "SQLITE":
+            return "main"
+        return cs
+
+    @classmethod
+    def _build_side_schema_filter(
+        cls,
+        schemas: Union[str, Sequence[str]],
+        def_sch: str,
+        db_type: str,
+    ) -> Tuple[List[str], Set[str], Callable[[str], bool]]:
+        raw_items = (
+            [x.strip() for x in schemas.split(",") if x.strip()]
+            if isinstance(schemas, str)
+            else [str(x).strip() for x in (schemas or []) if str(x).strip()]
+        )
+        selected: List[str] = []
+        seen_sel: Set[str] = set()
+        for raw_s in raw_items:
+            cs = clean_identifier_input(raw_s)
+            if cs and cs.lower() not in seen_sel:
+                seen_sel.add(cs.lower())
+                selected.append(cs)
+
+        sel_set: Set[str] = set()
+        for s in selected:
+            sel_set.add(s.lower())
+            sel_set.add(cls._norm_side_schema(s, def_sch, db_type).lower())
+
+        def _matches(raw_s: str) -> bool:
+            if not sel_set:
+                return True
+            cs = clean_identifier_input(raw_s or "") or def_sch
+            return (
+                cs.lower() in sel_set
+                or cls._norm_side_schema(cs, def_sch, db_type).lower() in sel_set
+            )
+
+        return selected, sel_set, _matches
+
+    @classmethod
     def _compute_recommended_pairings(
+        cls,
         *,
         saved_tables: List[Dict[str, Any]],
         src_cat_tables: List[Dict[str, Any]],
@@ -929,30 +989,14 @@ class _CrossIoAndReportMixin:
         tgt_db_type: str = "",
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
         """仅基于目录表名与 SQLite 绑标统计计算推荐同名表与单侧独有表（严禁执行自动列预比对）."""
-        norm_sch_dialects = {
-            "SQLITE", "INCEPTOR", "MYSQL", "MARIADB", "OCEANBASE", "DORIS", "STARROCKS", "TIDB"
-        }
-
-        def _norm_saved_sch(raw_sch: str, def_sch: str, db_type: str) -> str:
-            cs = clean_identifier_input(raw_sch or "") or def_sch
-            if (
-                cs.lower() == "public"
-                and def_sch.lower() != "public"
-                and db_type.upper() in norm_sch_dialects
-            ):
-                return def_sch
-            if db_type.upper() == "SQLITE":
-                return "main"
-            return cs
-
         saved_src_keys: Set[Tuple[str, str]] = set()
         saved_tgt_keys: Set[Tuple[str, str]] = set()
         for t in saved_tables:
-            s_s = _norm_saved_sch(str(t.get("source_schema") or ""), src_def_schema, src_db_type)
+            s_s = cls._norm_side_schema(str(t.get("source_schema") or ""), src_def_schema, src_db_type)
             s_t = clean_identifier_input(str(t.get("source_table") or t.get("std_table_name") or ""))
             if s_t:
                 saved_src_keys.add((s_s.lower(), s_t.lower()))
-            t_s = _norm_saved_sch(str(t.get("target_schema") or ""), tgt_def_schema, tgt_db_type)
+            t_s = cls._norm_side_schema(str(t.get("target_schema") or ""), tgt_def_schema, tgt_db_type)
             t_t = clean_identifier_input(str(t.get("target_table") or t.get("std_table_name") or ""))
             if t_t:
                 saved_tgt_keys.add((t_s.lower(), t_t.lower()))
@@ -1070,9 +1114,12 @@ class _CrossIoAndReportMixin:
         format_profile: str = "AUTO",
         source_format_profile: str = "AUTO",
         target_format_profile: str = "AUTO",
+        source_schemas: Union[str, Sequence[str]] = "",
+        target_schemas: Union[str, Sequence[str]] = "",
+        only_bound_tables: bool = True,
         progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
-        """构建跨环境库级比对报告数据（自动沿用按库落标格式，未刷新库先采集目录，未配对同名表仅推荐不预比对）."""
+        """构建跨环境库级比对报告数据（自动沿用按库落标格式，支持两侧 Schema 筛选与表级已绑标范围收敛）."""
         report = progress_cb or noop_progress
         report(4.0, "加载配置与连接", "正在读取来源库、目标库及按库数据标准格式...", 0, 0)
 
@@ -1091,10 +1138,120 @@ class _CrossIoAndReportMixin:
 
         src_cid = str(src_conn.get("connection_id") or "") if src_conn.get("configured") else ""
         tgt_cid = str(tgt_conn.get("connection_id") or "") if tgt_conn.get("configured") else ""
-        saved_tables, _, _, _ = self._resolve_comparison_target()
+        same_cid = bool(src_cid and src_cid == tgt_cid)
 
-        if not src_cid and not tgt_cid and not saved_tables:
+        if src_cid:
+            self.ctx.standard_catalog.purge_invalid_error_bindings(src_cid)
+        if tgt_cid and not same_cid:
+            self.ctx.standard_catalog.purge_invalid_error_bindings(tgt_cid)
+
+        all_saved_tables, _, _, _ = self._resolve_comparison_target()
+
+        if not src_cid and not tgt_cid and not all_saved_tables:
             raise ValueError("请先在跨环境比对中选择来源库或目标库，或先保存/导入映射表对")
+
+        src_def_sch = str(
+            src_conn.get("effective_default_schema") or src_conn.get("default_schema") or "public"
+        )
+        tgt_def_sch = str(
+            tgt_conn.get("effective_default_schema") or tgt_conn.get("default_schema") or "public"
+        )
+        src_db_type = str(src_conn.get("db_type") or "")
+        tgt_db_type = str(tgt_conn.get("db_type") or "")
+
+        sel_src_schemas, src_sch_set, _src_schema_matches = self._build_side_schema_filter(
+            source_schemas, src_def_sch, src_db_type
+        )
+        sel_tgt_schemas, tgt_sch_set, _tgt_schema_matches = self._build_side_schema_filter(
+            target_schemas, tgt_def_sch, tgt_db_type
+        )
+
+        src_bound_tables = (
+            self.ctx.standard_catalog.list_bound_tables_for_connection(src_cid) if src_cid else []
+        )
+        tgt_bound_tables = (
+            src_bound_tables
+            if same_cid
+            else (
+                self.ctx.standard_catalog.list_bound_tables_for_connection(tgt_cid)
+                if tgt_cid
+                else []
+            )
+        )
+
+        def _build_bound_key_set(
+            b_list: List[Tuple[str, str]], def_sch: str, db_type: str
+        ) -> Set[Tuple[str, str]]:
+            keys: Set[Tuple[str, str]] = set()
+            for bs, bt in b_list:
+                sc = clean_identifier_input(bs or def_sch) or def_sch
+                tc = clean_identifier_input(bt or "")
+                if not tc:
+                    continue
+                keys.add((sc.lower(), tc.lower()))
+                keys.add((self._norm_side_schema(sc, def_sch, db_type).lower(), tc.lower()))
+            return keys
+
+        src_bound_keys = _build_bound_key_set(src_bound_tables, src_def_sch, src_db_type)
+        tgt_bound_keys = _build_bound_key_set(tgt_bound_tables, tgt_def_sch, tgt_db_type)
+
+        def _pair_matches_schemas(tb: Dict[str, Any]) -> bool:
+            ss = clean_identifier_input(str(tb.get("source_schema") or src_def_sch)) or src_def_sch
+            ts = clean_identifier_input(str(tb.get("target_schema") or tgt_def_sch)) or tgt_def_sch
+            return (not src_sch_set or _src_schema_matches(ss)) and (
+                not tgt_sch_set or _tgt_schema_matches(ts)
+            )
+
+        schema_saved_tables = [tb for tb in all_saved_tables if _pair_matches_schemas(tb)]
+
+        def _pair_has_binding(tb: Dict[str, Any]) -> bool:
+            if int(tb.get("bound_std_count") or 0) > 0:
+                return True
+            ss = clean_identifier_input(str(tb.get("source_schema") or src_def_sch)) or src_def_sch
+            st = clean_identifier_input(str(tb.get("source_table") or tb.get("std_table_name") or ""))
+            if st and (
+                (ss.lower(), st.lower()) in src_bound_keys
+                or (self._norm_side_schema(ss, src_def_sch, src_db_type).lower(), st.lower())
+                in src_bound_keys
+            ):
+                return True
+            ts = clean_identifier_input(str(tb.get("target_schema") or tgt_def_sch)) or tgt_def_sch
+            tt = clean_identifier_input(str(tb.get("target_table") or tb.get("std_table_name") or ""))
+            if tt and (
+                (ts.lower(), tt.lower()) in tgt_bound_keys
+                or (self._norm_side_schema(ts, tgt_def_sch, tgt_db_type).lower(), tt.lower())
+                in tgt_bound_keys
+            ):
+                return True
+            return False
+
+        probe_saved_tables = (
+            [tb for tb in schema_saved_tables if _pair_has_binding(tb)]
+            if only_bound_tables
+            else list(schema_saved_tables)
+        )
+
+        src_has_bound_in_scope = any(
+            _src_schema_matches(clean_identifier_input(bs or src_def_sch) or src_def_sch)
+            for bs, _bt in src_bound_tables
+        )
+        tgt_has_bound_in_scope = any(
+            _tgt_schema_matches(clean_identifier_input(bs or tgt_def_sch) or tgt_def_sch)
+            for bs, _bt in tgt_bound_tables
+        )
+        if (
+            only_bound_tables
+            and not probe_saved_tables
+            and not src_has_bound_in_scope
+            and not tgt_has_bound_in_scope
+        ):
+            if sel_src_schemas or sel_tgt_schemas:
+                raise ValueError(
+                    "所选 Schema 范围内暂无已绑定数据标准的映射表对或单库绑标表（可调整 Schema 或取消勾选「仅包含已绑标表」）"
+                )
+            raise ValueError(
+                "当前跨环境来源库与目标库均暂无已绑定数据标准的映射表对或库表（请先绑定数据标准，或取消勾选「仅包含已绑标表」导出全量报告）"
+            )
 
         src_cat = (
             self.ctx.metadata_hub.get_catalog_tree(src_cid, auto_refresh=False)
@@ -1103,7 +1260,7 @@ class _CrossIoAndReportMixin:
         )
         tgt_cat = (
             src_cat
-            if (tgt_cid and tgt_cid == src_cid)
+            if same_cid
             else (
                 self.ctx.metadata_hub.get_catalog_tree(tgt_cid, auto_refresh=False)
                 if tgt_cid
@@ -1111,7 +1268,6 @@ class _CrossIoAndReportMixin:
             )
         )
 
-        same_cid = bool(src_cid and src_cid == tgt_cid)
         need_src_refresh = bool(src_cid and not (src_cat.get("tables") or []))
         need_tgt_refresh = bool(tgt_cid and not same_cid and not (tgt_cat.get("tables") or []))
 
@@ -1172,20 +1328,29 @@ class _CrossIoAndReportMixin:
                 if err_tgt:
                     warnings.append(err_tgt)
 
-        src_cat_tables = src_cat.get("tables") or []
-        tgt_cat_tables = tgt_cat.get("tables") or []
+        raw_src_cat_tables = src_cat.get("tables") or []
+        raw_tgt_cat_tables = tgt_cat.get("tables") or []
+        src_cat_tables = [
+            t
+            for t in raw_src_cat_tables
+            if _src_schema_matches(
+                clean_identifier_input(str(t.get("schema_name") or src_def_sch)) or src_def_sch
+            )
+        ]
+        tgt_cat_tables = [
+            t
+            for t in raw_tgt_cat_tables
+            if _tgt_schema_matches(
+                clean_identifier_input(str(t.get("schema_name") or tgt_def_sch)) or tgt_def_sch
+            )
+        ]
 
-        if not saved_tables and not src_cat_tables and not tgt_cat_tables:
+        if not probe_saved_tables and not src_cat_tables and not tgt_cat_tables:
             if warnings:
                 raise ValueError("；".join(warnings))
+            if sel_src_schemas or sel_tgt_schemas:
+                raise ValueError("所选 Schema 范围内暂无可导出的映射表对或库表")
             raise ValueError("当前跨环境来源库与目标库均暂无可导出的映射表对或库表")
-
-        src_def_sch = str(
-            src_conn.get("effective_default_schema") or src_conn.get("default_schema") or "public"
-        )
-        tgt_def_sch = str(
-            tgt_conn.get("effective_default_schema") or tgt_conn.get("default_schema") or "public"
-        )
 
         src_metas_map: Optional[Dict[Tuple[str, str], TableMeta]] = None
         tgt_metas_map: Optional[Dict[Tuple[str, str], TableMeta]] = None
@@ -1194,12 +1359,12 @@ class _CrossIoAndReportMixin:
         src_probe_warn = ""
         tgt_probe_warn = ""
 
-        if saved_tables:
+        if probe_saved_tables:
             src_targets: List[Tuple[str, str]] = []
             tgt_targets: List[Tuple[str, str]] = []
             seen_s_t: Set[Tuple[str, str]] = set()
             seen_t_t: Set[Tuple[str, str]] = set()
-            for tb in saved_tables:
+            for tb in probe_saved_tables:
                 ss = clean_identifier_input(str(tb.get("source_schema") or src_def_sch)) or src_def_sch
                 st = clean_identifier_input(str(tb.get("source_table") or tb.get("std_table_name") or ""))
                 if st and (ss.lower(), st.lower()) not in seen_s_t:
@@ -1214,9 +1379,9 @@ class _CrossIoAndReportMixin:
             report(
                 20.0,
                 "批量加载已保存表对结构",
-                f"正在批量探查 {len(saved_tables)} 组已保存表对结构（未配对表不自动预比对）...",
+                f"正在批量探查 {len(probe_saved_tables)} 组已保存表对结构（未配对表不自动预比对）...",
                 0,
-                len(saved_tables),
+                len(probe_saved_tables),
             )
             if same_cid and (src_targets or tgt_targets):
                 merged_targets: List[Tuple[str, str]] = []
@@ -1279,10 +1444,11 @@ class _CrossIoAndReportMixin:
                             warnings.append(f"目标库探查受限: {tgt_probe_warn}")
 
         pairs: List[Dict[str, Any]] = []
-        tot_pairs = len(saved_tables)
+        skipped_unbound_pairs = 0
+        tot_pairs = len(probe_saved_tables)
         p_step = 1 if tot_pairs <= 25 else 5
         agg = {
-            "saved_pairs_count": tot_pairs,
+            "saved_pairs_count": 0,
             "recommended_pairs_count": 0,
             "source_total_tables": len(src_cat_tables),
             "target_total_tables": len(tgt_cat_tables),
@@ -1298,7 +1464,7 @@ class _CrossIoAndReportMixin:
             "unbound_tgt_cols": 0,
         }
 
-        for idx, t in enumerate(saved_tables, start=1):
+        for idx, t in enumerate(probe_saved_tables, start=1):
             if idx == 1 or idx % p_step == 0 or idx == tot_pairs:
                 pct = 48.0 + 38.0 * (idx / max(1, tot_pairs))
                 report(
@@ -1326,6 +1492,9 @@ class _CrossIoAndReportMixin:
                 prefetched_tgt_warning=tgt_probe_warn,
             )
             hydrated = self._hydrate_five_col_pair(comp)
+            if only_bound_tables and len(hydrated["center_rows"]) == 0:
+                skipped_unbound_pairs += 1
+                continue
             pairs.append(hydrated)
 
             bk_s = hydrated["bookmark_summary"]
@@ -1345,20 +1514,70 @@ class _CrossIoAndReportMixin:
             self.ctx.standard_catalog.get_connection_binding_stats(src_cid) if src_cid else {}
         )
         tgt_bind_stats = (
-            self.ctx.standard_catalog.get_connection_binding_stats(tgt_cid) if tgt_cid else {}
+            src_bind_stats
+            if same_cid
+            else (self.ctx.standard_catalog.get_connection_binding_stats(tgt_cid) if tgt_cid else {})
         )
-        recommendations, source_only, target_only = self._compute_recommended_pairings(
-            saved_tables=saved_tables,
+        raw_recommendations, raw_source_only, raw_target_only = self._compute_recommended_pairings(
+            saved_tables=all_saved_tables,
             src_cat_tables=src_cat_tables,
             tgt_cat_tables=tgt_cat_tables,
             src_def_schema=src_def_sch,
             tgt_def_schema=tgt_def_sch,
             src_bind_stats=src_bind_stats,
             tgt_bind_stats=tgt_bind_stats,
-            src_db_type=str(src_conn.get("db_type") or ""),
-            tgt_db_type=str(tgt_conn.get("db_type") or ""),
+            src_db_type=src_db_type,
+            tgt_db_type=tgt_db_type,
         )
+        if only_bound_tables:
+            recommendations = [
+                r
+                for r in raw_recommendations
+                if int(r.get("source_bound_count") or 0) > 0
+                or int(r.get("target_bound_count") or 0) > 0
+            ]
+            source_only = [t for t in raw_source_only if int(t.get("bound_count") or 0) > 0]
+            target_only = [t for t in raw_target_only if int(t.get("bound_count") or 0) > 0]
+            skipped_unbound_tables_count = (
+                (len(schema_saved_tables) - len(probe_saved_tables))
+                + skipped_unbound_pairs
+                + (len(raw_recommendations) - len(recommendations))
+                + (len(raw_source_only) - len(source_only))
+                + (len(raw_target_only) - len(target_only))
+            )
+        else:
+            recommendations = raw_recommendations
+            source_only = raw_source_only
+            target_only = raw_target_only
+            skipped_unbound_tables_count = 0
+
+        if not pairs and not recommendations and not source_only and not target_only:
+            if only_bound_tables:
+                raise ValueError(
+                    "所选范围内暂无已绑定数据标准的表对或库表（请先绑定数据标准，或取消勾选「仅包含已绑标表」导出全量报告）"
+                )
+            raise ValueError("所选范围内暂无可导出的映射表对或库表")
+
+        agg["saved_pairs_count"] = len(pairs)
         agg["recommended_pairs_count"] = len(recommendations)
+
+        scope_parts: List[str] = []
+        if sel_src_schemas:
+            s_txt = ", ".join(sel_src_schemas[:2]) + (
+                f" 等{len(sel_src_schemas)}" if len(sel_src_schemas) > 2 else ""
+            )
+            scope_parts.append(f"源:{s_txt}")
+        if sel_tgt_schemas:
+            t_txt = ", ".join(sel_tgt_schemas[:2]) + (
+                f" 等{len(sel_tgt_schemas)}" if len(sel_tgt_schemas) > 2 else ""
+            )
+            scope_parts.append(f"目标:{t_txt}")
+        schema_part = " / ".join(scope_parts) if scope_parts else "全部 Schema"
+        scope_label = (
+            f"{schema_part} · 仅已绑标表"
+            if only_bound_tables
+            else ("全库全量" if not scope_parts else f"{schema_part} · 全部表")
+        )
 
         report(
             98.0,
@@ -1371,6 +1590,13 @@ class _CrossIoAndReportMixin:
         return {
             "report_type": "cross_env",
             "catalogs_auto_refreshed": catalogs_auto_refreshed,
+            "report_scope": {
+                "source_schemas": sel_src_schemas,
+                "target_schemas": sel_tgt_schemas,
+                "only_bound_tables": bool(only_bound_tables),
+                "skipped_unbound_tables_count": skipped_unbound_tables_count,
+                "scope_label": scope_label,
+            },
             "source_connection": {
                 "configured": bool(src_conn.get("configured")),
                 "connection_id": src_cid,
@@ -1403,12 +1629,18 @@ class _CrossIoAndReportMixin:
         format_profile: str = "AUTO",
         source_format_profile: str = "AUTO",
         target_format_profile: str = "AUTO",
+        source_schemas: Union[str, Sequence[str]] = "",
+        target_schemas: Union[str, Sequence[str]] = "",
+        only_bound_tables: bool = True,
         progress_cb: ProgressCallback = noop_progress,
     ) -> bytes:
         report_data = self.build_database_cross_report_data(
             format_profile=format_profile,
             source_format_profile=source_format_profile,
             target_format_profile=target_format_profile,
+            source_schemas=source_schemas,
+            target_schemas=target_schemas,
+            only_bound_tables=only_bound_tables,
             progress_cb=progress_cb,
         )
         return build_cross_env_excel_bytes(report_data)
@@ -1419,12 +1651,18 @@ class _CrossIoAndReportMixin:
         format_profile: str = "AUTO",
         source_format_profile: str = "AUTO",
         target_format_profile: str = "AUTO",
+        source_schemas: Union[str, Sequence[str]] = "",
+        target_schemas: Union[str, Sequence[str]] = "",
+        only_bound_tables: bool = True,
         progress_cb: ProgressCallback = noop_progress,
     ) -> bytes:
         report_data = self.build_database_cross_report_data(
             format_profile=format_profile,
             source_format_profile=source_format_profile,
             target_format_profile=target_format_profile,
+            source_schemas=source_schemas,
+            target_schemas=target_schemas,
+            only_bound_tables=only_bound_tables,
             progress_cb=progress_cb,
         )
         return build_cross_env_html_bytes(report_data)

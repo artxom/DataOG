@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -18,8 +18,68 @@ from core.platform.excel_io import (
 from core.platform.import_progress import ProgressCallback, noop_progress
 
 
+_DEFAULT_SCHEMA_ALIAS_DIALECTS = frozenset(
+    {
+        "SQLITE",
+        "INCEPTOR",
+        "MYSQL",
+        "MARIADB",
+        "OCEANBASE",
+        "DORIS",
+        "STARROCKS",
+        "TIDB",
+    }
+)
+
+
 class _StandardBindingsMixin:
     """第 2 步核心闭环：字段绑标、智能预匹配、落标检查、对照模板/上传与纳入贯标队列."""
+
+    @staticmethod
+    def _norm_dialect_schema(raw_s: str, default_schema: str, db_type: str) -> str:
+        cs = clean_identifier_input(raw_s or "") or default_schema
+        dt = (db_type or "").strip().upper()
+        if cs.lower() == "public" and default_schema.lower() != "public" and dt in _DEFAULT_SCHEMA_ALIAS_DIALECTS:
+            return default_schema
+        if dt == "SQLITE":
+            return "main"
+        return cs
+
+    @classmethod
+    def _build_schema_filter(
+        cls,
+        schemas: Union[str, Sequence[str]],
+        default_schema: str,
+        db_type: str,
+    ) -> Tuple[List[str], Set[str], Callable[[str], bool]]:
+        raw_items = (
+            [x.strip() for x in schemas.split(",") if x.strip()]
+            if isinstance(schemas, str)
+            else [str(x).strip() for x in (schemas or []) if str(x).strip()]
+        )
+        selected: List[str] = []
+        seen_sel: Set[str] = set()
+        for raw_s in raw_items:
+            cs = clean_identifier_input(raw_s)
+            if cs and cs.lower() not in seen_sel:
+                seen_sel.add(cs.lower())
+                selected.append(cs)
+
+        sel_set: Set[str] = set()
+        for s in selected:
+            sel_set.add(s.lower())
+            sel_set.add(cls._norm_dialect_schema(s, default_schema, db_type).lower())
+
+        def _matches(raw_s: str) -> bool:
+            if not sel_set:
+                return True
+            cs = clean_identifier_input(raw_s or "") or default_schema
+            return (
+                cs.lower() in sel_set
+                or cls._norm_dialect_schema(cs, default_schema, db_type).lower() in sel_set
+            )
+
+        return selected, sel_set, _matches
 
     # =========================================================================
     # 第 2 步核心闭环：字段绑标 + 三维分级落标核验 + 对照模板/上传 + 转贯标任务
@@ -874,6 +934,7 @@ class _StandardBindingsMixin:
         connection_id: str = "",
         schema_name: str = "",
         tables: str = "",
+        schemas: str = "",
         scope: str = "",
         progress_cb: ProgressCallback = noop_progress,
     ) -> bytes:
@@ -934,16 +995,20 @@ class _StandardBindingsMixin:
                             if not bound_tables:
                                 raise
                     seen_t: Set[Tuple[str, str]] = set()
+                    _, _, _tpl_schema_matches = self._build_schema_filter(
+                        schemas, eff_def, prof.db_type
+                    )
+
                     for t in cat_tables:
                         s_c = clean_identifier_input(t.get("schema_name") or eff_def) or eff_def
                         t_c = clean_identifier_input(t.get("table_name") or "")
-                        if t_c and (s_c.lower(), t_c.lower()) not in seen_t:
+                        if t_c and _tpl_schema_matches(s_c) and (s_c.lower(), t_c.lower()) not in seen_t:
                             seen_t.add((s_c.lower(), t_c.lower()))
                             targets.append((s_c, t_c))
                     for s_b, t_b in bound_tables:
                         s_c = clean_identifier_input(s_b or eff_def) or eff_def
                         t_c = clean_identifier_input(t_b or "")
-                        if t_c and (s_c.lower(), t_c.lower()) not in seen_t:
+                        if t_c and _tpl_schema_matches(s_c) and (s_c.lower(), t_c.lower()) not in seen_t:
                             seen_t.add((s_c.lower(), t_c.lower()))
                             targets.append((s_c, t_c))
 

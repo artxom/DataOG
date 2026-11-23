@@ -8,6 +8,17 @@
 
 ---
 
+## [2.9.2] - 2026-11-23
+
+### Added
+- **单库与跨环境库级报告支持 Schema 选择与表级落标范围聚焦 (`modules/standard_migrator`, `modules/cross_comparator`, `static/js/`)**：
+  - **单库落标贯标报告 (`report_mixin.py`, `router.py`, `bindings_mixin.py`)**：`/bindings/report.html`、`/bindings/report.xlsx` 与预填模板 `/bindings/template.xlsx` 新增 `schemas` 多选参数；报告接口默认开启 `only_bound_tables=true`，仅对至少有 1 个字段绑定落标需求的表（表一级在落标范围）与所选 Schema 内的贯标队列执行核验及导出；在探查前直接剪枝未绑标表且不触发全库目录采集，探查后对历史僵尸绑标清空变零绑标的表进行兜底剔除（保留库内缺表但有绑标的需求表），返回 `report_scope` 范围明细。
+  - **跨环境库级比对报告 (`io_and_report_mixin.py`, `router.py`, `service.py`, `governance_repos.py`)**：`/report.html` 与 `/report.xlsx` 新增 `source_schemas`、`target_schemas` 与默认 `only_bound_tables=true`；在 `list_cross_tables()` 增加 `bound_std_count` 统计、`get_role_connection_info()` 增加 `binding_stats`，并在探查前剪枝零绑标表对且在推荐同名表/单侧独有表清单中同步过滤零绑标表（同时保持全量 `all_saved_tables` 去重防误归类），避免对无关 Schema 与无落标需求表进行大规模对比。
+  - **前端导出弹窗与离线 HTML 范围标注 (`export_report_modal.js`, `standard_migrator/modals.js`, `cross_comparator/modals.js`, `offline_report/`)**：扩展 `openExportReportModal` 支持 Schema 多选标签组（含绑标/总表计数、快速「仅选含绑标」、刷新目录与超 10 项持久搜索过滤）与默认勾选的「仅包含已绑定落标需求的表（表级落标范围）」开关及实时范围预览；离线 HTML 报告顶栏新增范围徽标与 KPI 过滤计数提示（保留单 Sheet 名与「导出全库 Excel」按钮契约）。
+  - **自动化回归测试 (`tests/test_modules_and_api.py`, `tests/test_demo_sandbox.py`)**：新增单库与跨环境 Schema 筛选及 `only_bound_tables` 剪枝/兜底测试，扩充全量自动化单元测试至 **81 项**。
+
+---
+
 ## [2.9.1] - 2026-11-23
 
 ### Fixed
