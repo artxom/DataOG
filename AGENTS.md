@@ -48,12 +48,12 @@
    - **分支清理**：合并与打标推送完成后及时删除已使命终结的临时工作分支，确认远端 `main` 与新标签就位。
 
 ## 5. 当前代码基线快照
-- **当前主干最新正式版本**：**`v2.9.0`**（2.X 终结规整瘦身版 & 3.0 模块化基石：后端 `ModuleSpec` 自动发现、`http_utils` SDK、插件工作区表自动流转、前端 `app_registry` 懒加载注册与 API 分层、核心/业务单体全面拆解与死代码清理）。
+- **当前主干最新正式版本**：**`v2.9.1`**（2.X 终结规整瘦身版 & 3.0 模块化基石：后端 `ModuleSpec` 自动发现、`http_utils` SDK、插件工作区表自动流转、前端 `app_registry` 懒加载注册与 API 分层、核心/业务单体全面拆解与死代码清理，并修复 CI 零 `httpx` 依赖与 `build_exe.py` 客户版测试纯净暂存恢复 Windows `DataOG.exe` 自动编译发布）。
 - **核心入口、脚本与工具**：
-  - `app.py`（FastAPI `2.9.0` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）。
+  - `app.py`（FastAPI `2.9.1` 微内核、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）。
   - `tools/admin_console/` & `DataOG_Console.command`、`tools/keygen_src/` & `tools/build_keygen.py`、`demo_sandbox/`（启明商业银行信创三引擎演示沙箱）：全部严格排除于客户安装包之外。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
-  - `module_registry.py`（`ModuleSpec`/`ModuleRegistry`/`discover_module_specs`/`mount_discovered_modules`）、`http_utils.py`（`json_error`/`file_download_response`/`run_tracked_task`/`run_tracked_upload`）、`context.py`（`version="2.9.0"`、Gate 2 HMAC 复核）、`router.py`（24 行聚合）+ `routes/`（5 领域子路由）、`schemas.py`、`models.py`。
+  - `module_registry.py`（`ModuleSpec`/`ModuleRegistry`/`discover_module_specs`/`mount_discovered_modules`）、`http_utils.py`（`json_error`/`file_download_response`/`run_tracked_task`/`run_tracked_upload`）、`context.py`（`version="2.9.1"`、Gate 2 HMAC 复核）、`router.py`（24 行聚合）+ `routes/`（5 领域子路由）、`schemas.py`、`models.py`。
   - `storage_paths.py`、`storage/`（`schema`/`base`/`legacy_migration`/`platform_repos`/`governance_repos`，支持 3.0 插件共享表与扩展元键动态注册）、`workspace_hub.py`（零密钥 `.dataog.db` 导出/克隆/引导式增量合并，自动携带插件共享表，维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）。
   - `license_hub.py` & `_license_native_src/`、`asset_store.py`（支持 `register_app_id` 动态图标槽位）、`standard_catalog.py`、`offline_report/`（`runtime.py` 通用离线 HTML+Excel 外壳 + `single_db.py`/`cross_env.py`）、`import_progress.py`、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`llm_hub.py`、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`、`core/dws_engine.py`（去重复用 `dialects`）。
 - **四大独立插件模块 (`modules/`, 导出 `MODULE_SPEC`, 严格零互引)**：

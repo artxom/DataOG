@@ -155,7 +155,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.9.0",
+            "version": "2.9.1",
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": self.license_hub.get_auth_status(),
             "active_workspace": self.workspace_hub.get_active_workspace_summary(),

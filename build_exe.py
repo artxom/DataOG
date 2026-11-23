@@ -33,6 +33,29 @@ def _ensure_utf8_stdio() -> None:
 _ensure_utf8_stdio()
 _ORIG_RMTREE = shutil.rmtree
 
+# 仅限开发期与本机内部使用的测试文件（依赖已排除的 tools / demo_sandbox），严禁打入客户版安装包
+EXCLUDED_CUSTOMER_TEST_FILES = frozenset(
+    {
+        "test_admin_console.py",
+        "test_demo_sandbox.py",
+    }
+)
+
+
+def stage_customer_tests_dir(tests_src: str, staging_dir: str) -> str:
+    """构建仅包含客户运行时自检测试的纯净暂存目录（剔除 dev-only 测试与 __pycache__）."""
+    _safe_rmtree(staging_dir)
+    os.makedirs(staging_dir, exist_ok=True)
+    for fname in sorted(os.listdir(tests_src)):
+        if fname in EXCLUDED_CUSTOMER_TEST_FILES:
+            continue
+        if not fname.endswith(".py"):
+            continue
+        src_file = os.path.join(tests_src, fname)
+        if os.path.isfile(src_file):
+            shutil.copy2(src_file, os.path.join(staging_dir, fname))
+    return staging_dir
+
 
 def _clear_readonly_tree(root_path: str) -> None:
     """递归解除目录与文件的只读限制."""
@@ -149,7 +172,6 @@ def build_executable() -> None:
         sys.exit(1)
 
     add_static_arg = f"{static_src}{os.pathsep}static"
-    add_tests_arg = f"{tests_src}{os.pathsep}tests"
     exe_name = "DataOG"
 
     # 若 Windows 下有正在运行的同名进程，先尝试关闭以释放 dist 目录文件锁
@@ -169,6 +191,10 @@ def build_executable() -> None:
     work_path = os.path.join(temp_build_root, "work")
     spec_path = os.path.join(temp_build_root, "spec")
     cache_path = os.path.join(temp_build_root, "cache")
+    staged_tests_dir = stage_customer_tests_dir(
+        tests_src, os.path.join(temp_build_root, "staged_tests")
+    )
+    add_tests_arg = f"{staged_tests_dir}{os.pathsep}tests"
     os.makedirs(work_path, exist_ok=True)
     os.makedirs(spec_path, exist_ok=True)
     os.makedirs(cache_path, exist_ok=True)
@@ -311,6 +337,16 @@ def build_executable() -> None:
             if not bundled_shield:
                 print(f"[错误] 打包产物中缺失原生防反编译护盾文件: {shield_fname}")
                 sys.exit(1)
+        # 校验 dev-only 测试未泄露进客户发行包，避免 DataOG.exe --test 因 tools/demo_sandbox 排除而失败
+        leaked_dev_tests = [
+            fname
+            for _, _, fs in os.walk(dist_bundle_dir)
+            for fname in fs
+            if fname in EXCLUDED_CUSTOMER_TEST_FILES
+        ]
+        if leaked_dev_tests:
+            print(f"[错误] 客户发行包中泄露了开发期测试文件: {sorted(set(leaked_dev_tests))}")
+            sys.exit(1)
         total_bytes = sum(
             os.path.getsize(os.path.join(r, f))
             for r, _, fs in os.walk(dist_bundle_dir)

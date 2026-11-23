@@ -8,6 +8,19 @@
 
 ---
 
+## [2.9.1] - 2026-11-23
+
+### Fixed
+- **修复 GitHub Actions 零 `httpx` 环境测试失败与 Windows 独立打包 `DataOG.exe --test` 冻结态自检回归 (`tests/test_modular_architecture.py`, `build_exe.py`)**：
+  - 将 `tests/test_modular_architecture.py` 中的 `fastapi.testclient.TestClient`（隐式依赖被裁剪的 `httpx`）切换为项目零依赖标准库 ASGI `tests.test_modules_and_api.TestClient`，修复仅安装 `requirements.txt` 的 CI `unit-tests` 与无 `httpx` 冻结包测试崩溃，并补充全量 `tests/test_*.py` 零 `httpx` 静态防线守卫。
+  - 修复 `build_exe.py` 打包客户版 `DataOG.exe` 时整目录拷贝 `tests/` 导致开发期测试 (`test_admin_console.py`、`test_demo_sandbox.py`) 随包进入 `_internal/tests/` 的问题（因 `tools`/`demo_sandbox` 已被严格排除于安装包之外，导致自 v2.7.1 起 Windows CI `DataOG.exe --test` 自检失败并阻断 GitHub Release 发布）；新增 `stage_customer_tests_dir()` 仅暂存客户运行时自检测试并增加构建后泄露校验。
+- **底座插件发现与工作区表隔离边界加固 (`core/platform/module_registry.py`, `core/platform/storage/base.py`, `tests/test_modular_architecture.py`)**：
+  - `module_registry._iter_child_package_names()` 补充 `__spec__.loader` 回退路径，增强 PyInstaller 冻结态插件发现兼容性。
+  - `PlatformStateStore.register_workspace_tables()` 与 `register_private_tables()` 补充私有表越权注册拦截（与 `register_table_schema` 保持一致）。
+  - 为 `tests/test_modular_architecture.py` 中 Node.js 子进程调用显式指定 `encoding="utf-8", errors="replace"`，避免 Windows 非 UTF-8 控制台编码异常。
+
+---
+
 ## [2.9.0] - 2026-11-23
 
 > **2.X 终结规整与瘦身里程碑（3.0 模块化基石）**：全面重构后端插件微内核与前端桌面应用注册体系，拆解历史巨型单体文件、消除跨模块重复实现与冗余 CSS，实现未来 3.0 新增功能模块与现有 2.X 功能零耦合即插即用。
