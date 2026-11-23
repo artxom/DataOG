@@ -135,15 +135,11 @@ try:
     from fastapi.responses import JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
 
-    from core.dws_engine import DWSMigratorEngine
     from core.platform.context import PlatformContext
     from core.platform.license_hub import AUTH_PUBLIC_EXEMPT_PREFIXES
+    from core.platform.module_registry import mount_discovered_modules
     from core.platform.router import router as platform_router
     from core.platform.storage_paths import redact_private_storage_paths
-    from modules.cross_comparator.router import router as cross_comparator_router
-    from modules.data_explorer.router import router as data_explorer_router
-    from modules.ddl_translator.router import router as ddl_translator_router
-    from modules.standard_migrator.router import router as standard_migrator_router
 except BaseException:
     err_text = traceback.format_exc()
     print("=" * 74)
@@ -267,39 +263,14 @@ def create_app(
     ctx: Optional[PlatformContext] = None,
     *,
     private_root: Optional[str] = None,
+    extra_modules: Optional[List[Any]] = None,
 ) -> FastAPI:
     if ctx is None:
         if db_path:
             ctx = PlatformContext(db_path=db_path)
         else:
             ctx = PlatformContext(private_root=private_root)
-    ctx.register_module_manifest(
-        module_id="standard_migrator",
-        title="单库落标贯标台",
-        subtitle="物理列序保序重建、Kahn 拓扑改名与多线程批量落标",
-        api_prefix="/api/modules/standard_migrator",
-    )
-    ctx.register_module_manifest(
-        module_id="cross_comparator",
-        title="跨环境双列拟物书签比对",
-        subtitle="来源库 × 目标库 双列拖拽配对、拟物数标书签与闭环推送",
-        api_prefix="/api/modules/cross_comparator",
-    )
-    ctx.register_module_manifest(
-        module_id="ddl_translator",
-        title="跨方言 DDL 与视图穿透",
-        subtitle="多方言建表 DDL 互译与上游视图四层血缘自动穿透",
-        api_prefix="/api/modules/ddl_translator",
-    )
-    ctx.register_module_manifest(
-        module_id="data_explorer",
-        title="AI 只读智能数据探查",
-        subtitle="硬件级只读沙箱与多轮自动采样画像会话",
-        api_prefix="/api/modules/data_explorer",
-    )
-
     store = ctx.store
-    engine = DWSMigratorEngine(store)
 
     # 清理旧版本遗留的内置沙盒假数据，确保纯净初始化
     if store.get_meta("current_excel_name") == "内置示例_DWS贯标清单.xlsx":
@@ -308,14 +279,13 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="2.8.2",
+        version="2.9.0",
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
     )
     app.state.platform_ctx = ctx
     app.state.store = store
-    app.state.engine = engine
 
     def _apply_security_headers(resp: Response) -> Response:
         resp.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -390,12 +360,11 @@ def create_app(
                 pass
         return _apply_security_headers(response)
 
-    # 注册平台公共底座路由与四大独立插件模块路由
+    # 注册平台公共底座路由并自动发现挂载 modules/* 全部独立插件模块
     app.include_router(platform_router)
-    app.include_router(standard_migrator_router)
-    app.include_router(cross_comparator_router)
-    app.include_router(ddl_translator_router)
-    app.include_router(data_explorer_router)
+    mount_discovered_modules(app, ctx)
+    if extra_modules:
+        mount_discovered_modules(app, ctx, specs=extra_modules)
 
     # =========================================================================
     # 向后兼容 v1.0.0 历史 API 路由（共享同一底层 PlatformStateStore）
@@ -435,7 +404,9 @@ def create_app(
                 "has_saved_password": False,
                 "password_masked": "",
             }
-        info = dict(engine.get_public_conn_info())
+        from core.dws_engine import DWSMigratorEngine
+
+        info = dict(DWSMigratorEngine(store).get_public_conn_info())
         has_pwd = bool(info.pop("password", ""))
         info["has_saved_password"] = has_pwd
         info["password_masked"] = "******" if has_pwd else ""
@@ -529,7 +500,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v2.8.2 — 多功能数据工程与数据治理一体化工作台")
+    print("  Data.O.G v2.9.0 — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")

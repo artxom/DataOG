@@ -5,7 +5,8 @@
  * 2. 方言翻译 — 跨数据库建表 DDL 互译、四层递归视图血缘穿透与 AI 异构 SQL 语法深度适配
  */
 
-import { ddlApi, isAbortError } from "../core/api.js";
+import { ddlApi } from "../api/ddl_api.js";
+import { isAbortError } from "../core/http.js";
 import { badge, clearEl, copyText, downloadBlob, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";

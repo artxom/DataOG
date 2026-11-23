@@ -2,7 +2,7 @@
  * Data.O.G 系统配置子面板：数据库连接与 JDBC 驱动管理 (ConnectionsPane & DriversPane)
  */
 
-import { platformApi } from "../core/api.js";
+import { platformApi } from "../core/platform_api.js";
 import { badge, clearEl, el, formatBytes, pickLocalFile, statusDot } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";

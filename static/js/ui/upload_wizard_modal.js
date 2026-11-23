@@ -5,7 +5,7 @@
  * 2. 内置双阶段实时进度条（XHR 字节流上传进度 + 服务端实时行级/表级解析核验进度轮询 + 实时计时器）。
  */
 
-import { platformApi } from "../core/api.js";
+import { platformApi } from "../core/platform_api.js";
 import { badge, clearEl, el, formatBytes, pickLocalFile, svgIcon } from "../core/dom.js";
 import { Modal } from "./modal.js";
 import { Toast } from "./toast.js";

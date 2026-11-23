@@ -3,7 +3,8 @@
  * 共享左侧 DataGrip 风格四级数据库清单 (DatabaseTree) + 双模工作区（SQL 查询 | AI 只读智能探查）
  */
 
-import { isAbortError, platformApi } from "../core/api.js";
+import { isAbortError } from "../core/http.js";
+import { platformApi } from "../core/platform_api.js";
 import { badge, clearEl, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";

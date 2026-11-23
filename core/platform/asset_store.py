@@ -36,6 +36,7 @@ MAX_ICON_BYTES = 4 * 1024 * 1024  # 4 MB
 
 ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 SAFE_ASSET_NAME_RE = re.compile(r"^[a-f0-9]{32}\.(png|jpg|webp|gif)$")
+SAFE_APP_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 
 
 def detect_safe_raster_image(content: bytes, filename: str = "") -> Tuple[str, str]:
@@ -74,7 +75,24 @@ class AssetStore:
             os.chmod(self.assets_dir, stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
         except OSError:
             pass
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._registered_app_ids: set[str] = set(VALID_APP_IDS)
+
+    def register_app_id(self, app_id: str) -> str:
+        """动态注册桌面应用图标槽位，使 3.0 新增桌面模块免修改底座即可支持自定义图标."""
+        clean = (app_id or "").strip().lower()
+        if not SAFE_APP_ID_RE.match(clean):
+            raise ValueError(f"非法的桌面应用标识 app_id: {app_id!r}")
+        with self._lock:
+            self._registered_app_ids.add(clean)
+        return clean
+
+    def _snapshot_app_ids(self) -> set[str]:
+        with self._lock:
+            return set(self._registered_app_ids)
+
+    def _valid_upload_slots(self) -> set[str]:
+        return {"wallpaper", "brand", *(f"app:{aid}" for aid in self._snapshot_app_ids())}
 
     def _resolve_safe_asset_path(self, asset_name: str) -> Optional[str]:
         clean = (asset_name or "").strip()
@@ -117,10 +135,14 @@ class AssetStore:
         raw_apps = saved.get("app_icons")
         app_icons: Dict[str, str] = {}
         if isinstance(raw_apps, dict):
-            for aid in VALID_APP_IDS:
-                aname = str(raw_apps.get(aid) or "").strip()
+            allowed_ids = self._snapshot_app_ids() | set(VALID_APP_IDS)
+            for aid, raw_name in raw_apps.items():
+                norm_aid = str(aid or "").strip().lower()
+                if norm_aid not in allowed_ids:
+                    continue
+                aname = str(raw_name or "").strip()
                 if aname and self._asset_exists(aname):
-                    app_icons[aid] = aname
+                    app_icons[norm_aid] = aname
 
         return {
             "wallpaper_id": wp_id,
@@ -183,7 +205,7 @@ class AssetStore:
         content: bytes,
     ) -> Dict[str, Any]:
         norm_slot = (slot or "").strip().lower()
-        if norm_slot not in VALID_UPLOAD_SLOTS:
+        if norm_slot not in self._valid_upload_slots():
             raise ValueError(f"不支持的图标/壁纸槽位: {slot}")
 
         max_bytes = MAX_WALLPAPER_BYTES if norm_slot == "wallpaper" else MAX_ICON_BYTES
@@ -227,7 +249,7 @@ class AssetStore:
 
     def reset_slot(self, slot: str) -> Dict[str, Any]:
         norm_slot = (slot or "").strip().lower()
-        valid_resets = VALID_UPLOAD_SLOTS | {"all_icons", "all"}
+        valid_resets = self._valid_upload_slots() | {"all_icons", "all"}
         if norm_slot not in valid_resets:
             raise ValueError(f"不支持的重置槽位: {slot}")
 

@@ -14,6 +14,7 @@ from core.platform.import_progress import ImportProgressHub
 from core.platform.license_hub import LicenseHub
 from core.platform.llm_hub import LLMHub
 from core.platform.metadata_hub import MetadataHub
+from core.platform.module_registry import ModuleRegistry
 from core.platform.query_engine import QueryEngine
 from core.platform.standard_catalog import StandardCatalog
 from core.platform.storage import PlatformStateStore
@@ -115,6 +116,7 @@ class PlatformContext:
         )
         self.import_progress = ImportProgressHub()
         self.task_progress = self.import_progress
+        self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
 
     def register_module_manifest(
@@ -124,17 +126,19 @@ class PlatformContext:
         title: str,
         subtitle: str = "",
         api_prefix: str = "",
+        desktop_app_id: str = "",
     ) -> None:
         if any(m["module_id"] == module_id for m in self._registered_modules):
             return
-        self._registered_modules.append(
-            {
-                "module_id": module_id,
-                "title": title,
-                "subtitle": subtitle,
-                "api_prefix": api_prefix,
-            }
-        )
+        entry: Dict[str, str] = {
+            "module_id": module_id,
+            "title": title,
+            "subtitle": subtitle,
+            "api_prefix": api_prefix,
+        }
+        if desktop_app_id:
+            entry["desktop_app_id"] = desktop_app_id
+        self._registered_modules.append(entry)
 
     def build_platform_bootstrap(self) -> Dict[str, Any]:
         connections = self.connection_hub.list_profiles()
@@ -151,7 +155,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.8.2",
+            "version": "2.9.0",
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": self.license_hub.get_auth_status(),
             "active_workspace": self.workspace_hub.get_active_workspace_summary(),

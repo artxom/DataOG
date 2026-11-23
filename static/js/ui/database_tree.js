@@ -6,7 +6,8 @@
  * - multi  (AI 探查模式)：直接在树内 Schema / 表节点勾选焦点表，点击 ▸ 仍可展开查看字段结构
  */
 
-import { isAbortError, platformApi } from "../core/api.js";
+import { isAbortError } from "../core/http.js";
+import { platformApi } from "../core/platform_api.js";
 import { badge, clearEl, el, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { TaskActivityBar } from "./task_activity_bar.js";

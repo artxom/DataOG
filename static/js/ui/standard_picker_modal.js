@@ -3,7 +3,7 @@
  * 在第 2 步「落标绑定」与第 3 步「跨环境书签比对」中共用，实时检索全局标准字典
  */
 
-import { standardsApi } from "../core/api.js";
+import { standardsApi } from "../core/platform_api.js";
 import { badge, clearEl, el, svgIcon } from "../core/dom.js";
 import { Modal } from "./modal.js";
 import { Toast } from "./toast.js";
