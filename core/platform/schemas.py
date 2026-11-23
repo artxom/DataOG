@@ -154,4 +154,36 @@ class WorkspaceMergeExecutePayload(BaseModel):
     strategy: str = Field(default="supplement")
 
 
+class KnowledgeTextDocPayload(BaseModel):
+    title: str = Field(..., min_length=1, max_length=160)
+    content: str = Field(..., min_length=1)
+    dialect: str = "GENERIC"
+    tags: List[str] = Field(default_factory=list)
+
+
+class KnowledgeDocUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    dialect: Optional[str] = None
+    tags: Optional[List[str]] = None
+    enabled: Optional[bool] = None
+
+
+class KnowledgeSearchPayload(BaseModel):
+    query: str = ""
+    dialect: str = ""
+    top_k: int = Field(default=6, ge=1, le=20)
+    include_builtin: bool = True
+    use_embeddings: bool = True
+
+
+class KnowledgeEmbeddingConfigPayload(BaseModel):
+    enabled: bool = False
+    provider_id: str = ""
+    base_url: str = ""
+    api_key: Optional[str] = None
+    clear_api_key: bool = False
+    model: str = ""
+
+
+
 

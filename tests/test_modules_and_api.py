@@ -393,11 +393,14 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             app = create_app(db_path=os.path.join(tmpdir, "dataog_state.db"))
             client = TestClient(app)
 
-            # 1. Bootstrap 检查四大插件清单注册
+            # 1. Bootstrap 检查五大插件清单注册
             boot = client.get("/api/platform/bootstrap").json()
             self.assertTrue(boot["ok"])
             mod_ids = {m["module_id"] for m in boot["modules"]}
-            self.assertEqual(mod_ids, {"standard_migrator", "cross_comparator", "ddl_translator", "data_explorer"})
+            self.assertEqual(
+                mod_ids,
+                {"standard_migrator", "cross_comparator", "ddl_translator", "data_explorer", "ai_assistant"},
+            )
 
             # 2. 上传并删除自定义 JDBC .jar 驱动
             up_drv = client.post(

@@ -709,3 +709,77 @@ class LLMHub:
             "available_models": self.list_available_models(),
             "message": f"已同步 {len(cleaned)} 个可用模型 ({elapsed_ms} ms)",
         }
+
+    def create_embeddings(
+        self,
+        texts: List[str],
+        *,
+        provider_id: str = "",
+        model: str = "",
+        base_url: str = "",
+        api_key: str = "",
+        timeout_sec: float = 15.0,
+    ) -> List[List[float]]:
+        """零依赖调用 OpenAI 兼容 `/embeddings` 接口生成文本向量（离线/本地网关可免 Key）."""
+        clean_inputs = [str(t or "") for t in (texts or [])]
+        if not clean_inputs:
+            return []
+
+        eff_base_url = (base_url or "").strip()
+        eff_api_key = (api_key or "").strip()
+        eff_model = (model or "").strip()
+
+        if not eff_base_url:
+            resolved = self.resolve_provider_and_model(
+                provider_id=provider_id,
+                model=eff_model,
+                require_ready=True,
+            )
+            assert resolved is not None
+            prof, resolved_model = resolved
+            eff_base_url = prof.base_url
+            if not eff_api_key:
+                eff_api_key = prof.api_key
+            if not eff_model:
+                eff_model = resolved_model
+        else:
+            eff_base_url = validate_llm_base_url(eff_base_url)
+            if "::" in eff_model and not provider_id:
+                _, eff_model = eff_model.split("::", 1)
+                eff_model = eff_model.strip()
+
+        if not eff_model:
+            raise ValueError("未指定 Embedding 模型名称")
+
+        is_local = any(h in eff_base_url.lower() for h in ("127.0.0.1", "localhost"))
+        if not eff_api_key and not is_local:
+            raise ValueError("调用远端 Embedding 接口前请先填写 API Key")
+
+        endpoint = eff_base_url.rstrip("/") + "/embeddings"
+        body: Dict[str, Any] = {
+            "model": eff_model,
+            "input": clean_inputs,
+        }
+        data = self._request_openai_json(
+            "POST", endpoint, eff_api_key, body, max(1.0, float(timeout_sec))
+        )
+        items = data.get("data")
+        if not isinstance(items, list):
+            raise RuntimeError("Embedding 服务端返回的 data 字段格式异常")
+
+        ordered = sorted(
+            (it for it in items if isinstance(it, dict)),
+            key=lambda it: int(it.get("index", 0) or 0),
+        )
+        vectors: List[List[float]] = []
+        for item in ordered:
+            emb = item.get("embedding")
+            if not isinstance(emb, list) or not emb:
+                raise RuntimeError("Embedding 服务端返回的向量条目无效")
+            vec = [float(x) for x in emb]
+            vectors.append(vec)
+        if len(vectors) != len(clean_inputs):
+            raise RuntimeError(
+                f"Embedding 返回向量数量 ({len(vectors)}) 与输入文本数 ({len(clean_inputs)}) 不一致"
+            )
+        return vectors

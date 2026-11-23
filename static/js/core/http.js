@@ -35,7 +35,11 @@ async function parseJsonOrThrow(resp) {
     const msg =
       (payload && (payload.error || payload.detail || payload.message)) ||
       `请求失败 (HTTP ${resp.status})`;
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    const err = new Error(typeof msg === "string" ? msg : JSON.stringify(msg));
+    err.status = resp.status;
+    err.data = payload;
+    err.code = payload?.code || "";
+    throw err;
   }
   return payload;
 }

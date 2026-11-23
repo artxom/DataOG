@@ -253,3 +253,70 @@ export const standardsApi = {
     }),
   clear: () => requestJson("/api/platform/standards/clear", { method: "POST" }),
 };
+
+export const knowledgeApi = {
+  summary: () => requestJson("/api/platform/knowledge/summary", { cache: "no-store" }),
+  listDocuments: ({ dialect = "", includeBuiltin = true, keyword = "" } = {}) => {
+    const qs = new URLSearchParams({
+      dialect: dialect || "",
+      include_builtin: includeBuiltin ? "true" : "false",
+      keyword: keyword || "",
+    });
+    return requestJson(`/api/platform/knowledge/documents?${qs.toString()}`, { cache: "no-store" });
+  },
+  getDocument: (docId, includeChunks = true) =>
+    requestJson(
+      `/api/platform/knowledge/documents/${encodeURIComponent(docId)}?include_chunks=${includeChunks ? "true" : "false"}`
+    ),
+  uploadDocument: (file, { dialect = "GENERIC", title = "", tags = "", progressId = "" } = {}) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("dialect", dialect || "GENERIC");
+    if (title) fd.append("title", title);
+    if (tags) fd.append("tags", tags);
+    if (progressId) fd.append("progress_id", progressId);
+    return uploadFormData("/api/platform/knowledge/documents/upload", fd);
+  },
+  createTextDocument: (payload) =>
+    requestJson("/api/platform/knowledge/documents/text", { method: "POST", body: payload }),
+  updateDocument: (docId, payload) =>
+    requestJson(`/api/platform/knowledge/documents/${encodeURIComponent(docId)}`, {
+      method: "PUT",
+      body: payload,
+    }),
+  deleteDocument: (docId) =>
+    requestJson(`/api/platform/knowledge/documents/${encodeURIComponent(docId)}`, {
+      method: "DELETE",
+    }),
+  search: (payload) =>
+    requestJson("/api/platform/knowledge/search", { method: "POST", body: payload }),
+  getChunkSection: (chunkId, windowSize = 1) =>
+    requestJson(
+      `/api/platform/knowledge/chunks/${encodeURIComponent(chunkId)}?window=${encodeURIComponent(String(windowSize))}`
+    ),
+  exportPack: ({ dialect = "", docIds = [] } = {}) => {
+    const qs = new URLSearchParams();
+    if (dialect) qs.set("dialect", dialect);
+    if (Array.isArray(docIds) && docIds.length) qs.set("doc_ids", docIds.join(","));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return downloadApiFile(`/api/platform/knowledge/export${suffix}`, {
+      fallbackName: "DataOG_KB_Pack.json.gz",
+    });
+  },
+  importPack: (file, { overwriteExisting = false } = {}) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("overwrite_existing", overwriteExisting ? "true" : "false");
+    return uploadFormData("/api/platform/knowledge/import", fd);
+  },
+  getEmbeddingConfig: () => requestJson("/api/platform/knowledge/embedding-config", { cache: "no-store" }),
+  saveEmbeddingConfig: (payload) =>
+    requestJson("/api/platform/knowledge/embedding-config", { method: "PUT", body: payload }),
+  reindexEmbeddings: (docId = "", opts = {}) => {
+    const qs = docId ? `?doc_id=${encodeURIComponent(docId)}` : "";
+    return requestJson(
+      `/api/platform/knowledge/embeddings/reindex${qs}`,
+      withRequestOpts({ method: "POST" }, opts)
+    );
+  },
+};

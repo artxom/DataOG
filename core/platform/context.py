@@ -11,6 +11,7 @@ from core.platform.asset_store import AssetStore
 from core.platform.connection_hub import ConnectionHub
 from core.platform.driver_manager import DriverManager
 from core.platform.import_progress import ImportProgressHub
+from core.platform.knowledge_hub import KnowledgeHub
 from core.platform.license_hub import LicenseHub
 from core.platform.llm_hub import LLMHub
 from core.platform.metadata_hub import MetadataHub
@@ -106,6 +107,7 @@ class PlatformContext:
         self.query_engine = QueryEngine(self.store, self.connection_hub)
         self.asset_store = AssetStore(self.store, assets_dir=eff_assets_dir)
         self.llm_hub = LLMHub(self.store)
+        self.knowledge_hub = KnowledgeHub(self.store, self.llm_hub)
         self.standard_catalog = StandardCatalog(self.store)
         self.workspace_hub = WorkspaceManager(
             self.store,
@@ -155,7 +157,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "2.9.2",
+            "version": "3.0.0",
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": self.license_hub.get_auth_status(),
             "active_workspace": self.workspace_hub.get_active_workspace_summary(),
@@ -168,6 +170,7 @@ class PlatformContext:
             "java_runtime": self.driver_manager.get_java_runtime_status(),
             "llm_providers": self.llm_hub.list_providers(),
             "llm_models": self.llm_hub.list_available_models(),
+            "knowledge_summary": self.knowledge_hub.get_summary(),
             "standard_dict_summary": self.standard_catalog.get_summary(),
             "modules": list(self._registered_modules),
             "logs": self.store.list_logs(limit=150),
