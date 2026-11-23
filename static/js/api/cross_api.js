@@ -142,6 +142,9 @@ export const crossApi = {
     formatProfile = "AUTO",
     sourceFormatProfile = "AUTO",
     targetFormatProfile = "AUTO",
+    sourceSchemas = "",
+    targetSchemas = "",
+    onlyBoundTables = true,
     taskId = "",
     signal = undefined,
   } = {}) => {
@@ -149,6 +152,9 @@ export const crossApi = {
     if (formatProfile) qs.set("format_profile", formatProfile);
     if (sourceFormatProfile) qs.set("source_format_profile", sourceFormatProfile);
     if (targetFormatProfile) qs.set("target_format_profile", targetFormatProfile);
+    if (sourceSchemas) qs.set("source_schemas", sourceSchemas);
+    if (targetSchemas) qs.set("target_schemas", targetSchemas);
+    qs.set("only_bound_tables", onlyBoundTables ? "true" : "false");
     return downloadApiFile(`/api/modules/cross_comparator/report.html?${qs.toString()}`, {
       fallbackName: "DataOG_跨环境库级比对离线报告.html",
       taskId,
@@ -159,6 +165,9 @@ export const crossApi = {
     formatProfile = "AUTO",
     sourceFormatProfile = "AUTO",
     targetFormatProfile = "AUTO",
+    sourceSchemas = "",
+    targetSchemas = "",
+    onlyBoundTables = true,
     taskId = "",
     signal = undefined,
   } = {}) => {
@@ -166,6 +175,9 @@ export const crossApi = {
     if (formatProfile) qs.set("format_profile", formatProfile);
     if (sourceFormatProfile) qs.set("source_format_profile", sourceFormatProfile);
     if (targetFormatProfile) qs.set("target_format_profile", targetFormatProfile);
+    if (sourceSchemas) qs.set("source_schemas", sourceSchemas);
+    if (targetSchemas) qs.set("target_schemas", targetSchemas);
+    qs.set("only_bound_tables", onlyBoundTables ? "true" : "false");
     return downloadApiFile(`/api/modules/cross_comparator/report.xlsx?${qs.toString()}`, {
       fallbackName: "DataOG_跨环境库级比对报告.xlsx",
       taskId,

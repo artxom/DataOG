@@ -161,6 +161,7 @@ export const migratorApi = {
     connectionId = "",
     schemaName = "",
     tables = "",
+    schemas = "",
     scope = "",
     taskId = "",
     signal = undefined,
@@ -169,6 +170,7 @@ export const migratorApi = {
     if (connectionId) qs.set("connection_id", connectionId);
     if (schemaName) qs.set("schema_name", schemaName);
     if (tables) qs.set("tables", tables);
+    if (schemas) qs.set("schemas", schemas);
     if (scope) qs.set("scope", scope);
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
     return downloadApiFile(`/api/modules/standard_migrator/bindings/template.xlsx${suffix}`, {
@@ -195,6 +197,8 @@ export const migratorApi = {
     connectionId = "",
     formatProfile = "AUTO",
     tables = "",
+    schemas = "",
+    onlyBoundTables = true,
     taskId = "",
     signal = undefined,
   } = {}) => {
@@ -202,6 +206,8 @@ export const migratorApi = {
     if (connectionId) qs.set("connection_id", connectionId);
     if (formatProfile) qs.set("format_profile", formatProfile);
     if (tables) qs.set("tables", tables);
+    if (schemas) qs.set("schemas", schemas);
+    qs.set("only_bound_tables", onlyBoundTables ? "true" : "false");
     return downloadApiFile(`/api/modules/standard_migrator/bindings/report.xlsx?${qs.toString()}`, {
       fallbackName: "DataOG_全库落标与贯标报告.xlsx",
       taskId,
@@ -212,6 +218,8 @@ export const migratorApi = {
     connectionId = "",
     formatProfile = "AUTO",
     tables = "",
+    schemas = "",
+    onlyBoundTables = true,
     taskId = "",
     signal = undefined,
   } = {}) => {
@@ -219,6 +227,8 @@ export const migratorApi = {
     if (connectionId) qs.set("connection_id", connectionId);
     if (formatProfile) qs.set("format_profile", formatProfile);
     if (tables) qs.set("tables", tables);
+    if (schemas) qs.set("schemas", schemas);
+    qs.set("only_bound_tables", onlyBoundTables ? "true" : "false");
     return downloadApiFile(`/api/modules/standard_migrator/bindings/report.html?${qs.toString()}`, {
       fallbackName: "DataOG_全库落标与贯标离线报告.html",
       taskId,

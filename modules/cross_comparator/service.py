@@ -107,6 +107,7 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
                 **brief,
                 "schemas": [],
                 "tables": [],
+                "binding_stats": {},
             }
 
         cat = self.ctx.metadata_hub.get_catalog_tree(
@@ -119,6 +120,9 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
                 for s in cat["schemas"]
             ],
             "tables": cat["tables"],
+            "binding_stats": self.ctx.standard_catalog.get_connection_binding_stats(
+                brief["connection_id"]
+            ),
         }
 
     @staticmethod

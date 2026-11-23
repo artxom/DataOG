@@ -791,6 +791,16 @@ class _GovernanceReposMixin:
                 SELECT
                     t.*,
                     COUNT(c.id) AS column_count,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN TRIM(COALESCE(c.source_std_code, '')) != ''
+                                  OR TRIM(COALESCE(c.target_std_code, '')) != ''
+                                THEN 1 ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS bound_std_count,
                     COALESCE(GROUP_CONCAT(DISTINCT NULLIF(c.bound_source_col, '')), '') AS source_cols_text,
                     COALESCE(GROUP_CONCAT(DISTINCT NULLIF(c.bound_target_col, '')), '') AS target_cols_text,
                     COALESCE(

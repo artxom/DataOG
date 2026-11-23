@@ -4,7 +4,9 @@
 
 import { migratorApi } from "../../api/migrator_api.js";
 import { isAbortError } from "../../core/http.js";
+import { platformApi } from "../../core/platform_api.js";
 import { badge, el } from "../../core/dom.js";
+import { store } from "../../core/state.js";
 import { openExportReportModal } from "../../ui/export_report_modal.js";
 import { Modal } from "../../ui/modal.js";
 import { SqlCodeBox } from "../../ui/sql_code_box.js";
@@ -152,11 +154,153 @@ export class StandardMigratorModalsMixin {
     const dbLabel = conn ? `${conn.name} (${conn.db_type || "DB"})` : cid;
     const fmtProfile =
       cid === this.activeConnId ? this.formatProfile : conn?.standard_format || "AUTO";
+    const dbType = String(conn?.db_type || "").toUpperCase();
+    const defSchema = String(
+      conn?.effective_default_schema ||
+        conn?.default_schema ||
+        (dbType === "SQLITE" ? "main" : "public")
+    );
+    const aliasDialects = new Set([
+      "SQLITE",
+      "INCEPTOR",
+      "MYSQL",
+      "MARIADB",
+      "OCEANBASE",
+      "DORIS",
+      "STARROCKS",
+      "TIDB",
+    ]);
+    const normSch = (rawS) => {
+      const s = String(rawS || "").trim() || defSchema;
+      if (s.toLowerCase() === "public" && defSchema.toLowerCase() !== "public" && aliasDialects.has(dbType)) {
+        return defSchema;
+      }
+      if (dbType === "SQLITE") return "main";
+      return s;
+    };
 
-    openExportReportModal({
+    let liveStats = cid === this.activeConnId ? this.tableStats || {} : {};
+    let liveCatalog = store.state.catalogTrees[cid] || null;
+
+    const buildSchemaItems = () => {
+      const map = new Map();
+      const ensureEntry = (schName) => {
+        const norm = normSch(schName);
+        const low = norm.toLowerCase();
+        if (!map.has(low)) {
+          map.set(low, { name: norm, totalSet: new Set(), boundSet: new Set() });
+        }
+        return map.get(low);
+      };
+
+      for (const s of liveCatalog?.schemas || []) {
+        const sName = typeof s === "string" ? s : s?.schema_name;
+        if (sName) ensureEntry(sName);
+      }
+      for (const t of liveCatalog?.tables || []) {
+        const tName = String(t?.table_name || "").trim().toLowerCase();
+        if (!tName) continue;
+        const entry = ensureEntry(t?.schema_name || defSchema);
+        entry.totalSet.add(tName);
+      }
+      for (const [k, st] of Object.entries(liveStats || {})) {
+        if (!st || Number(st.bound_count || 0) <= 0) continue;
+        const dotIdx = k.indexOf(".");
+        const rawS = dotIdx >= 0 ? k.slice(0, dotIdx) : defSchema;
+        const rawT = (dotIdx >= 0 ? k.slice(dotIdx + 1) : k).trim().toLowerCase();
+        if (!rawT) continue;
+        const entry = ensureEntry(rawS);
+        entry.boundSet.add(rawT);
+        entry.totalSet.add(rawT);
+      }
+
+      return Array.from(map.values())
+        .map((it) => ({
+          name: it.name,
+          total_count: it.totalSet.size,
+          bound_count: it.boundSet.size,
+        }))
+        .sort((a, b) => {
+          const aHas = a.bound_count > 0 ? 1 : 0;
+          const bHas = b.bound_count > 0 ? 1 : 0;
+          if (aHas !== bHas) return bHas - aHas;
+          if (a.bound_count !== b.bound_count) return b.bound_count - a.bound_count;
+          return a.name.localeCompare(b.name);
+        });
+    };
+
+    let currentItems = buildSchemaItems();
+
+    const ctrl = openExportReportModal({
       title: "导出库级落标与贯标报告",
-      scopeBadge: `库级全量 · ${conn ? conn.name : cid}`,
-      scopeHint: `导出数据源 [${dbLabel}] 全库所有表的落标核验与贯标队列汇总；若库目录缓存为空，将先自动触发全库目录采集后再生成报告。`,
+      scopeBadge: `${conn ? conn.name : cid}`,
+      getScopeSummary: (fState) => {
+        const sel = Array.isArray(fState?.schemas) ? fState.schemas : [];
+        const onlyBound = fState?.onlyBoundTables !== false;
+        const selSet = new Set(sel.map((s) => String(s).toLowerCase()));
+        const matched = sel.length
+          ? currentItems.filter((it) => selSet.has(it.name.toLowerCase()))
+          : currentItems;
+        const totalTables = matched.reduce((acc, it) => acc + (it.total_count || 0), 0);
+        const boundTables = matched.reduce((acc, it) => acc + (it.bound_count || 0), 0);
+        const skippedTables = Math.max(0, totalTables - boundTables);
+        const hasCatalogOrStats = Boolean(
+          (liveCatalog?.tables || []).length || Object.keys(liveStats || {}).length
+        );
+        const scopeTag = sel.length ? `已选 ${sel.length} 个 Schema` : "全部 Schema";
+        const modeTag = onlyBound ? "仅已绑标表" : "包含未绑标表";
+
+        if (onlyBound && boundTables === 0 && hasCatalogOrStats) {
+          return {
+            badge: `${scopeTag} · ${modeTag}`,
+            badgeTone: "warn",
+            isWarn: true,
+            hint: `数据源 [${dbLabel}] 在所选范围内暂无已绑定落标需求的表（可切换 Schema 或取消勾选「仅包含已绑标表」导出全库表）。`,
+          };
+        }
+        return {
+          badge: `${scopeTag} · ${modeTag}`,
+          badgeTone: onlyBound ? "info" : "neutral",
+          isWarn: false,
+          hint: onlyBound
+            ? hasCatalogOrStats
+              ? `数据源 [${dbLabel}] 预计核验 ${boundTables} 张表一级在落标范围内的库表` +
+                (skippedTables > 0 ? `，自动跳过 ${skippedTables} 张零绑标表` : "") +
+                "（不触发无关表扫描）。"
+              : `数据源 [${dbLabel}] 将仅对至少绑定 1 个落标字段的表进行核验并输出报告（不触发全库无关表扫描）。`
+            : `数据源 [${dbLabel}] 将导出所选范围内全部 ${totalTables || "所有"} 张表的落标核验与贯标队列汇总。`,
+        };
+      },
+      filterGroups: [
+        {
+          id: "schemas",
+          label: "选择导出的 Schema（可多选，不选代表全部）",
+          allLabel: "全部 Schema",
+          items: currentItems,
+          onRefreshItems: async () => {
+            try {
+              const cat = await platformApi.refreshMetadata(cid);
+              if (cat) {
+                liveCatalog = cat;
+                store.updateCatalogTree(cid, cat);
+              }
+              currentItems = buildSchemaItems();
+              return currentItems;
+            } catch (err) {
+              Toast.error(err?.message || "刷新目录失败");
+              return null;
+            }
+          },
+        },
+      ],
+      toggles: [
+        {
+          id: "onlyBoundTables",
+          label: "仅包含已绑定落标需求的表（表级落标范围）",
+          desc: "默认开启：若整张表没有任何字段绑定数据标准，将直接跳过不放入报告且不触发在线结构探测。",
+          defaultChecked: true,
+        },
+      ],
       options: [
         {
           id: "html",
@@ -167,55 +311,66 @@ export class StandardMigratorModalsMixin {
           shortExt: ".html",
           ctaLabel: "导出离线网页报告 (.html)",
           desc: "单个离线 HTML 文件，双击浏览器打开即可按库/表/状态交互筛选与查阅贯标 SQL，并内置「导出单 Sheet Excel (.xlsx)」按钮。",
-          onExport: () =>
-            this._runExportReportTask(
+          onExport: (fState) => {
+            const schemasParam = (fState?.schemas || []).join(",");
+            const onlyBound = fState?.onlyBoundTables !== false;
+            return this._runExportReportTask(
               "导出离线网页报告 (.html)",
               ({ taskId, signal }) =>
                 migratorApi.exportBindingReportHtml({
                   connectionId: cid,
                   formatProfile: fmtProfile,
                   tables: "",
+                  schemas: schemasParam,
+                  onlyBoundTables: onlyBound,
                   taskId,
                   signal,
                 }),
               { syncCatalog: true, connId: cid }
-            ),
+            );
+          },
         },
         {
           id: "xlsx",
           title: "直接导出库级 Excel (.xlsx)",
-          badge: "单 Sheet 全库表",
+          badge: "单 Sheet 汇总",
           badgeTone: "info",
           icon: "table",
           shortExt: ".xlsx",
           ctaLabel: "导出库级 Excel (.xlsx)",
-          desc: "在一个 Sheet「全库落标与贯标报告」中汇集当前数据库所有表与字段的物理结构、数标匹配、落标状态与贯标队列进展。",
-          onExport: () =>
-            this._runExportReportTask(
+          desc: "在一个 Sheet「全库落标与贯标报告」中汇集所选范围内库表与字段的物理结构、数标匹配、落标状态与贯标队列进展。",
+          onExport: (fState) => {
+            const schemasParam = (fState?.schemas || []).join(",");
+            const onlyBound = fState?.onlyBoundTables !== false;
+            return this._runExportReportTask(
               "导出库级落标 Excel (.xlsx)",
               ({ taskId, signal }) =>
                 migratorApi.exportBindingReport({
                   connectionId: cid,
                   formatProfile: fmtProfile,
                   tables: "",
+                  schemas: schemasParam,
+                  onlyBoundTables: onlyBound,
                   taskId,
                   signal,
                 }),
               { syncCatalog: true, connId: cid }
-            ),
+            );
+          },
         },
       ],
       secondaryActions: [
         {
           label: "全库预填对照模板 (.xlsx)",
           icon: "download",
-          hint: "预填当前库所有表字段与已绑标准，补充数据项编号后可直接回传导入",
-          onClick: () =>
+          hint: "预填所选 Schema 下所有表字段与已绑标准，补充数据项编号后可直接回传导入",
+          onClick: (fState) =>
             this._runExportReportTask(
-              "下载全库预填对照模板 (.xlsx)",
+              "下载预填对照模板 (.xlsx)",
               ({ taskId, signal }) =>
                 migratorApi.downloadBindingTemplate({
                   connectionId: cid,
+                  schemas: (fState?.schemas || []).join(","),
                   scope: "all",
                   taskId,
                   signal,
@@ -236,6 +391,32 @@ export class StandardMigratorModalsMixin {
         },
       ],
     });
+
+    const needCat = !liveCatalog?.tables?.length;
+    const needStats = cid !== this.activeConnId || !Object.keys(liveStats || {}).length;
+    if (ctrl && (needCat || needStats)) {
+      Promise.all([
+        needCat ? platformApi.getMetadataTree(cid, false).catch(() => null) : null,
+        needStats ? migratorApi.getBindingsOverview(cid, fmtProfile).catch(() => null) : null,
+      ]).then(([catRes, ovRes]) => {
+        if (this._destroyed || ctrl.isClosed()) return;
+        let changed = false;
+        if (catRes) {
+          liveCatalog = catRes;
+          store.updateCatalogTree(cid, catRes);
+          changed = true;
+        }
+        if (ovRes?.table_stats) {
+          liveStats = ovRes.table_stats;
+          if (cid === this.activeConnId) this.tableStats = ovRes.table_stats;
+          changed = true;
+        }
+        if (changed) {
+          currentItems = buildSchemaItems();
+          ctrl.updateGroupItems("schemas", currentItems);
+        }
+      });
+    }
   }
 
   async openLoadFromDbModal() {

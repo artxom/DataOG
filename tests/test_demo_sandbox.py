@@ -121,7 +121,19 @@ class TestDemoSandboxAssets(unittest.TestCase):
             wb_single.close()
 
             cc = CrossComparatorService(ctx)
-            rpt_data = cc.build_database_cross_report_data()
+            rpt_bound_only = cc.build_database_cross_report_data()
+            self.assertTrue(rpt_bound_only["report_scope"]["only_bound_tables"])
+            self.assertGreater(len(rpt_bound_only["pairs"]), 0)
+            self.assertTrue(all(len(p["center_rows"]) > 0 for p in rpt_bound_only["pairs"]))
+            self.assertTrue(
+                all(
+                    int(r.get("source_bound_count") or 0) > 0
+                    or int(r.get("target_bound_count") or 0) > 0
+                    for r in rpt_bound_only["recommended_pairings"]
+                )
+            )
+
+            rpt_data = cc.build_database_cross_report_data(only_bound_tables=False)
             agg = rpt_data["aggregate"]
             self.assertEqual(agg["saved_pairs_count"], 120)
             self.assertEqual(agg["recommended_pairs_count"], 20)

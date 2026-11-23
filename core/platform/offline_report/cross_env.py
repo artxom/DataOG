@@ -387,6 +387,7 @@ _CROSS_ENV_APP_JS = r"""
   const DATA = JSON.parse(document.getElementById("report-data").textContent);
   const SRC = DATA.source_connection || {};
   const TGT = DATA.target_connection || {};
+  const SCOPE = DATA.report_scope || {};
   const AGG = DATA.aggregate || {};
   const PAIRS = DATA.pairs || [];
   const REC_PAIRS = DATA.recommended_pairings || [];
@@ -821,6 +822,7 @@ _CROSS_ENV_APP_JS = r"""
         badge("来源: " + srcLbl, "info"),
         el("span", { style: { color: "var(--muted)" }, text: "↔" }),
         badge("目标: " + tgtLbl, "ok"),
+        SCOPE.scope_label ? badge("范围: " + SCOPE.scope_label, "lav") : null,
         badge("生成: " + (DATA.generated_at || ""))
       ),
       el("div", { className: "topbar-actions" },
@@ -832,8 +834,9 @@ _CROSS_ENV_APP_JS = r"""
   }
 
   function renderKpis() {
+    const skipCnt = SCOPE.only_bound_tables ? Number(SCOPE.skipped_unbound_tables_count || 0) : 0;
     const cards = [
-      { label: "已保存映射表对", val: String(AGG.saved_pairs_count ?? PAIRS.length), sub: "来源总表 " + (AGG.source_total_tables ?? 0) + " · 目标总表 " + (AGG.target_total_tables ?? 0) },
+      { label: "已保存映射表对", val: String(AGG.saved_pairs_count ?? PAIRS.length), sub: "来源总表 " + (AGG.source_total_tables ?? 0) + " · 目标总表 " + (AGG.target_total_tables ?? 0) + (skipCnt > 0 ? "（已过滤 " + skipCnt + " 张零绑标表）" : "") },
       { label: "推荐同名未配对表", val: String(AGG.recommended_pairs_count ?? REC_PAIRS.length), sub: "仅推荐清单（未自动预比对）" },
       { label: "标准一致组 (UNIFIED)", val: String(AGG.unified_cols ?? 0), sub: "共已映射 " + (AGG.total_center_rows ?? 0) + " 组" },
       { label: "标准异标 (SPLIT_DIFF)", val: String(AGG.split_diff_cols ?? 0), sub: "单侧绑标 " + (AGG.split_partial_cols ?? 0) + " 组" },
