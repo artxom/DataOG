@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple
-from urllib.parse import quote
-
-from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
-from fastapi.responses import JSONResponse
-from starlette.concurrency import run_in_threadpool
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 
 from core.platform.context import PlatformContext, get_platform_context
-from core.platform.router import extract_task_id
+from core.platform.http_utils import (
+    MEDIA_TYPE_HTML,
+    MEDIA_TYPE_XLSX,
+    file_download_response,
+    json_error,
+    run_tracked_task,
+    run_tracked_upload,
+)
 from modules.standard_migrator.schemas import (
     AutoMatchBindingsPayload,
     BindMigratorConnectionPayload,
@@ -27,55 +29,6 @@ from modules.standard_migrator.service import StandardMigratorService
 router = APIRouter(prefix="/api/modules/standard_migrator", tags=["standard_migrator"])
 
 
-def _err(msg: str, status_code: int = 400) -> JSONResponse:
-    return JSONResponse({"ok": False, "error": msg}, status_code=status_code)
-
-
-async def _run_tracked_task(
-    *,
-    request: Request,
-    task_id: str,
-    ctx: PlatformContext,
-    title: str,
-    start_detail: str,
-    fn: Callable[..., Dict[str, Any]],
-    args: Tuple[Any, ...] = (),
-    kwargs: Optional[Dict[str, Any]] = None,
-    default_detail: str = "处理完成",
-    detail_fn: Optional[Callable[[Dict[str, Any]], str]] = None,
-    count_fn: Optional[Callable[[Dict[str, Any]], Tuple[int, int]]] = None,
-) -> Any:
-    """统一包装支持 task_id 实时进度与取消生命周期的模块端点."""
-    tid = extract_task_id(request, task_id)
-    try:
-        if tid:
-            ctx.task_progress.start(tid, title, detail=start_detail)
-        reporter = ctx.task_progress.make_reporter(tid)
-        call_kwargs = dict(kwargs or {})
-        call_kwargs["progress_cb"] = reporter
-        res = await run_in_threadpool(fn, *args, **call_kwargs)
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            processed, total = count_fn(res) if count_fn else (0, 0)
-            detail = (
-                detail_fn(res)
-                if detail_fn
-                else str(res.get("message") or default_detail)
-            )
-            ctx.task_progress.finish(
-                tid,
-                stage="处理完成",
-                detail=detail,
-                warning=str(res.get("warning") or ""),
-                processed=processed,
-                total=total,
-            )
-        return res
-    except Exception as exc:
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.fail(tid, str(exc))
-        return _err(str(exc), 400)
-
-
 @router.get("/state")
 def api_migrator_state(ctx: PlatformContext = Depends(get_platform_context)):
     return StandardMigratorService(ctx).get_workspace_state()
@@ -88,7 +41,7 @@ async def api_migrator_bind_connection(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -107,7 +60,7 @@ async def api_migrator_sync(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -127,23 +80,16 @@ async def api_migrator_upload_checklist(
     progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        raw = await file.read()
-        ctx.import_progress.start(progress_id, "解析单库贯标改造清单")
-        reporter = ctx.import_progress.make_reporter(progress_id)
-        res = await run_in_threadpool(
-            StandardMigratorService(ctx).upload_excel_checklist,
-            file.filename or "checklist.xlsx",
-            raw,
-            default_schema=default_schema,
-            default_table=default_table,
-            progress_cb=reporter,
-        )
-        ctx.import_progress.finish(progress_id, detail=res.get("message", "导入完成"))
-        return res
-    except Exception as exc:
-        ctx.import_progress.fail(progress_id, str(exc))
-        return _err(str(exc), 400)
+    raw = await file.read()
+    return await run_tracked_upload(
+        ctx=ctx,
+        progress_id=progress_id,
+        title="解析单库贯标改造清单",
+        fn=StandardMigratorService(ctx).upload_excel_checklist,
+        args=(file.filename or "checklist.xlsx", raw),
+        kwargs={"default_schema": default_schema, "default_table": default_table},
+        default_detail="导入完成",
+    )
 
 
 @router.post("/checklist/load-from-db")
@@ -153,7 +99,7 @@ async def api_migrator_load_from_db(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -187,7 +133,7 @@ def api_migrator_delete_items(
     try:
         return StandardMigratorService(ctx).delete_items(payload.item_ids)
     except Exception as exc:
-        return _err(str(exc), 400)
+        return json_error(str(exc), 400)
 
 
 @router.get("/items/{item_id}/sql")
@@ -198,32 +144,26 @@ def api_migrator_item_sql(
     try:
         return StandardMigratorService(ctx).preview_item_sql(item_id)
     except Exception as exc:
-        return _err(str(exc), 400)
+        return json_error(str(exc), 400)
 
 
 @router.get("/checklist/template.xlsx")
 def api_migrator_template():
-    content = StandardMigratorService.generate_template_bytes()
-    fn = quote("DataOG_字段贯标标准导入模板.xlsx")
-    return Response(
-        content=content,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f"attachment; filename=template.xlsx; filename*=UTF-8''{fn}"
-        },
+    return file_download_response(
+        StandardMigratorService.generate_template_bytes(),
+        "DataOG_字段贯标标准导入模板.xlsx",
+        media_type=MEDIA_TYPE_XLSX,
+        ascii_fallback="template.xlsx",
     )
 
 
 @router.get("/checklist/report.xlsx")
 def api_migrator_report(ctx: PlatformContext = Depends(get_platform_context)):
-    content = StandardMigratorService(ctx).export_report_bytes()
-    fn = quote("DataOG_单库贯标核验与执行报告.xlsx")
-    return Response(
-        content=content,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={
-            "Content-Disposition": f"attachment; filename=report.xlsx; filename*=UTF-8''{fn}"
-        },
+    return file_download_response(
+        StandardMigratorService(ctx).export_report_bytes(),
+        "DataOG_单库贯标核验与执行报告.xlsx",
+        media_type=MEDIA_TYPE_XLSX,
+        ascii_fallback="report.xlsx",
     )
 
 
@@ -234,7 +174,7 @@ async def api_migrator_execute_single(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -254,7 +194,7 @@ async def api_migrator_execute_batch(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -288,7 +228,7 @@ def api_migrator_rebuild_preview(
             connection_id=payload.connection_id,
         )
     except Exception as exc:
-        return _err(str(exc), 400)
+        return json_error(str(exc), 400)
 
 
 @router.post("/rebuild/execute")
@@ -298,7 +238,7 @@ async def api_migrator_rebuild_execute(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -336,7 +276,7 @@ def api_bindings_overview(
             format_profile=format_profile,
         )
     except Exception as exc:
-        return _err(str(exc), 400)
+        return json_error(str(exc), 400)
 
 
 @router.get("/bindings/table")
@@ -351,7 +291,7 @@ async def api_bindings_table(
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     target_label = f"{schema_name}.{table_name}" if schema_name else table_name
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -390,7 +330,7 @@ def api_bindings_save(
             active_table=payload.active_table,
         )
     except Exception as exc:
-        return _err(str(exc), 400)
+        return json_error(str(exc), 400)
 
 
 @router.post("/bindings/auto-match")
@@ -400,7 +340,7 @@ async def api_bindings_auto_match(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -429,7 +369,7 @@ async def api_bindings_check_compliance(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    return await _run_tracked_task(
+    return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
@@ -460,41 +400,28 @@ async def api_bindings_template(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    tid = extract_task_id(request, task_id)
-    try:
-        if tid:
-            ctx.task_progress.start(
-                tid,
-                "生成预填对照模板 (.xlsx)",
-                detail="正在准备读取库表结构与已绑数据标准...",
-            )
-        reporter = ctx.task_progress.make_reporter(tid)
-        content = await run_in_threadpool(
-            StandardMigratorService(ctx).generate_binding_template_bytes,
-            connection_id=connection_id,
-            schema_name=schema_name,
-            tables=tables,
-            scope=scope,
-            progress_cb=reporter,
-        )
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.finish(
-                tid,
-                stage="模板已生成",
-                detail="字段与数据标准对照模板 (.xlsx) 生成完成",
-            )
-        fn = quote("DataOG_字段与数据标准对照模板.xlsx")
-        return Response(
-            content=content,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": f"attachment; filename=binding_template.xlsx; filename*=UTF-8''{fn}"
-            },
-        )
-    except Exception as exc:
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.fail(tid, str(exc))
-        return _err(str(exc), 400)
+    return await run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="生成预填对照模板 (.xlsx)",
+        start_detail="正在准备读取库表结构与已绑数据标准...",
+        fn=StandardMigratorService(ctx).generate_binding_template_bytes,
+        kwargs={
+            "connection_id": connection_id,
+            "schema_name": schema_name,
+            "tables": tables,
+            "scope": scope,
+        },
+        finish_stage="模板已生成",
+        default_detail="字段与数据标准对照模板 (.xlsx) 生成完成",
+        response_fn=lambda raw: file_download_response(
+            raw,
+            "DataOG_字段与数据标准对照模板.xlsx",
+            media_type=MEDIA_TYPE_XLSX,
+            ascii_fallback="binding_template.xlsx",
+        ),
+    )
 
 
 @router.post("/bindings/upload")
@@ -507,30 +434,26 @@ async def api_bindings_upload(
     progress_id: str = Form(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    try:
-        raw = await file.read()
-        ctx.import_progress.start(progress_id, "解析表字段与数据标准对照关系")
-        reporter = ctx.import_progress.make_reporter(progress_id)
-        res = await run_in_threadpool(
-            StandardMigratorService(ctx).upload_field_bindings_excel,
-            filename=file.filename or "bindings.xlsx",
-            content=raw,
-            connection_id=connection_id,
-            default_schema=default_schema,
-            mode=mode,
-            format_profile=format_profile,
-            progress_cb=reporter,
-        )
-        ctx.import_progress.finish(
-            progress_id,
-            detail=res.get("message", "对照关系导入完成"),
-            processed=int(res.get("imported_count", 0)),
-            total=int(res.get("imported_count", 0)),
-        )
-        return res
-    except Exception as exc:
-        ctx.import_progress.fail(progress_id, str(exc))
-        return _err(str(exc), 400)
+    raw = await file.read()
+    return await run_tracked_upload(
+        ctx=ctx,
+        progress_id=progress_id,
+        title="解析表字段与数据标准对照关系",
+        fn=StandardMigratorService(ctx).upload_field_bindings_excel,
+        kwargs={
+            "filename": file.filename or "bindings.xlsx",
+            "content": raw,
+            "connection_id": connection_id,
+            "default_schema": default_schema,
+            "mode": mode,
+            "format_profile": format_profile,
+        },
+        default_detail="对照关系导入完成",
+        count_fn=lambda r: (
+            int(r.get("imported_count", 0)),
+            int(r.get("imported_count", 0)),
+        ),
+    )
 
 
 @router.get("/bindings/report.xlsx")
@@ -542,40 +465,27 @@ async def api_bindings_report(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    tid = extract_task_id(request, task_id)
-    try:
-        if tid:
-            ctx.task_progress.start(
-                tid,
-                "导出全库落标与贯标报告 (.xlsx)",
-                detail="正在准备采集数据源目录并汇总全库落标与贯标数据...",
-            )
-        reporter = ctx.task_progress.make_reporter(tid)
-        content = await run_in_threadpool(
-            StandardMigratorService(ctx).export_binding_report_bytes,
-            connection_id=connection_id,
-            format_profile=format_profile,
-            tables=tables,
-            progress_cb=reporter,
-        )
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.finish(
-                tid,
-                stage="导出完成",
-                detail="单 Sheet 全库落标与贯标 Excel 报告已生成",
-            )
-        fn = quote("DataOG_全库落标与贯标报告.xlsx")
-        return Response(
-            content=content,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={
-                "Content-Disposition": f"attachment; filename=binding_report.xlsx; filename*=UTF-8''{fn}"
-            },
-        )
-    except Exception as exc:
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.fail(tid, str(exc))
-        return _err(str(exc), 400)
+    return await run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="导出全库落标与贯标报告 (.xlsx)",
+        start_detail="正在准备采集数据源目录并汇总全库落标与贯标数据...",
+        fn=StandardMigratorService(ctx).export_binding_report_bytes,
+        kwargs={
+            "connection_id": connection_id,
+            "format_profile": format_profile,
+            "tables": tables,
+        },
+        finish_stage="导出完成",
+        default_detail="单 Sheet 全库落标与贯标 Excel 报告已生成",
+        response_fn=lambda raw: file_download_response(
+            raw,
+            "DataOG_全库落标与贯标报告.xlsx",
+            media_type=MEDIA_TYPE_XLSX,
+            ascii_fallback="binding_report.xlsx",
+        ),
+    )
 
 
 @router.get("/bindings/report.html")
@@ -587,41 +497,27 @@ async def api_bindings_report_html(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    tid = extract_task_id(request, task_id)
-    try:
-        if tid:
-            ctx.task_progress.start(
-                tid,
-                "导出离线交互网页报告 (.html)",
-                detail="正在准备采集数据源目录并构建离线可交互库级报告...",
-            )
-        reporter = ctx.task_progress.make_reporter(tid)
-        content = await run_in_threadpool(
-            StandardMigratorService(ctx).export_binding_report_html_bytes,
-            connection_id=connection_id,
-            format_profile=format_profile,
-            tables=tables,
-            progress_cb=reporter,
-        )
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.finish(
-                tid,
-                stage="导出完成",
-                detail="离线交互库级网页报告 (.html) 已生成，支持直接双击打开并导出 Excel",
-            )
-        fn = quote("DataOG_全库落标与贯标离线报告.html")
-        return Response(
-            content=content,
-            media_type="text/html; charset=utf-8",
-            headers={
-                "Content-Disposition": f"attachment; filename=binding_report.html; filename*=UTF-8''{fn}",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
-    except Exception as exc:
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.fail(tid, str(exc))
-        return _err(str(exc), 400)
+    return await run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="导出离线交互网页报告 (.html)",
+        start_detail="正在准备采集数据源目录并构建离线可交互库级报告...",
+        fn=StandardMigratorService(ctx).export_binding_report_html_bytes,
+        kwargs={
+            "connection_id": connection_id,
+            "format_profile": format_profile,
+            "tables": tables,
+        },
+        finish_stage="导出完成",
+        default_detail="离线交互库级网页报告 (.html) 已生成，支持直接双击打开并导出 Excel",
+        response_fn=lambda raw: file_download_response(
+            raw,
+            "DataOG_全库落标与贯标离线报告.html",
+            media_type=MEDIA_TYPE_HTML,
+            ascii_fallback="binding_report.html",
+        ),
+    )
 
 
 @router.post("/bindings/stage-migration")
@@ -639,4 +535,4 @@ def api_bindings_stage_migration(
             append=payload.append,
         )
     except Exception as exc:
-        return _err(str(exc), 400)
+        return json_error(str(exc), 400)

@@ -7,7 +7,7 @@
  * 4. AI 模型 — Cherry Studio 风格多服务商接入（DeepSeek / Google Gemini / OpenAI 兼容网关）
  */
 
-import { platformApi } from "../core/api.js";
+import { platformApi } from "../core/platform_api.js";
 import {
   badge,
   clearEl,
@@ -53,7 +53,7 @@ export class SettingsView {
       if (reason === "workspace_switched") {
         this.connectionsPane.resetToNew();
       }
-      if (["appearance", "llm", "connections", "drivers", "workspace_switched", "workspace_meta", "bootstrap"].includes(reason)) {
+      if (["appearance", "apps_changed", "llm", "connections", "drivers", "workspace_switched", "workspace_meta", "bootstrap"].includes(reason)) {
         this.render();
       }
     });
@@ -281,7 +281,7 @@ export class SettingsView {
         el(
           "div",
           { className: "icon-slot-info" },
-          renderAppSquircle(m.id, app, "md"),
+          renderAppSquircle(m.id, app, "md", m),
           el(
             "div",
             {},

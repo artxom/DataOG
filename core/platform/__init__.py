@@ -5,6 +5,13 @@ from core.platform.context import PlatformContext, get_platform_context
 from core.platform.driver_manager import DRIVER_TEMPLATES, DriverManager, JdbcConnectionAdapter
 from core.platform.inceptor_client import InceptorThriftClient
 from core.platform.metadata_hub import MetadataHub
+from core.platform.module_registry import (
+    ModuleRegistry,
+    ModuleSpec,
+    discover_module_specs,
+    mount_discovered_modules,
+    mount_module_spec,
+)
 from core.platform.models import (
     ColumnMeta,
     ConnectionProfile,
@@ -27,6 +34,8 @@ __all__ = [
     "InceptorThriftClient",
     "JdbcConnectionAdapter",
     "MetadataHub",
+    "ModuleRegistry",
+    "ModuleSpec",
     "PlatformContext",
     "PlatformStateStore",
     "QueryColumn",
@@ -34,5 +43,8 @@ __all__ = [
     "QueryResult",
     "SchemaMeta",
     "TableMeta",
+    "discover_module_specs",
     "get_platform_context",
+    "mount_discovered_modules",
+    "mount_module_spec",
 ]

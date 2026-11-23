@@ -9,7 +9,13 @@
  *    - 绿色最大化 (+): 在留白桌面窗口与全屏沉浸画布间平滑切换
  */
 
-import { authApi, platformApi } from "./core/api.js";
+import { authApi, platformApi } from "./core/platform_api.js";
+import {
+  getDefaultAppSummary,
+  getDesktopApp,
+  getDesktopApps,
+  loadAppInstance,
+} from "./core/app_registry.js";
 import {
   badge,
   clearEl,
@@ -18,21 +24,10 @@ import {
   renderBrandMark,
   svgIcon,
 } from "./core/dom.js";
-import { DESKTOP_APPS, store } from "./core/state.js";
+import { store } from "./core/state.js";
 import { AuthGateController } from "./ui/auth_gate.js";
 import { bindDialogLightDismissFallback } from "./ui/modal.js";
 import { Toast } from "./ui/toast.js";
-import { PolyglotView } from "./views/ddl_translator_view.js";
-import { SettingsView } from "./views/settings_view.js";
-import { SqlConsoleView } from "./views/sql_console_view.js";
-import { StandardView } from "./views/standard_view.js";
-
-const DEFAULT_SUMMARIES = {
-  settings: "外观 · 工作区 · 连接 · AI",
-  explorer: "SQL 查询",
-  standard: "字典 · 落标 · 比对",
-  polyglot: "命名 · 方言",
-};
 
 const THEME_MODES = [
   { value: "light dark", label: "自动" },
@@ -45,26 +40,12 @@ const THEME_STORAGE_KEY = "dataog_color_scheme";
 const appInstances = new Map();
 let activeWindowDom = null;
 let activeWindowAppId = null;
+let windowMountSeq = 0;
 let isAuthorized = false;
 let authGateController = null;
 
-function createAppInstance(appId) {
-  switch (appId) {
-    case "settings":
-      return new SettingsView();
-    case "explorer":
-      return new SqlConsoleView();
-    case "standard":
-      return new StandardView();
-    case "polyglot":
-      return new PolyglotView();
-    default:
-      return new SettingsView();
-  }
-}
-
 function getAppTitle(appId) {
-  return DESKTOP_APPS.find((a) => a.id === appId)?.title || "桌面";
+  return getDesktopApp(appId)?.title || "桌面";
 }
 
 /* =========================================================================
@@ -204,7 +185,7 @@ function renderMacDock() {
   const minimizedList = store.state.minimizedApps || [];
   const minimizedSet = new Set(minimizedList);
 
-  const appNodes = DESKTOP_APPS.map((appItem) => {
+  const appNodes = getDesktopApps().map((appItem) => {
     const isActive = activeId === appItem.id;
     const isRunning =
       isActive ||
@@ -221,7 +202,7 @@ function renderMacDock() {
         onClick: () => store.openApp(appItem.id),
       },
       el("span", { className: "dock-tooltip", text: appItem.title }),
-      el("span", { className: "dock-icon-box" }, renderAppSquircle(appItem.id, appearance, "lg")),
+      el("span", { className: "dock-icon-box" }, renderAppSquircle(appItem.id, appearance, "lg", appItem)),
       el("span", {
         className: `dock-dot ${isRunning ? "is-visible" : ""} ${isActive ? "is-focused" : ""}`.trim(),
         title: isRunning ? "运行中" : "",
@@ -233,7 +214,8 @@ function renderMacDock() {
   if (minimizedList.length > 0) {
     minimizedNodes.push(el("span", { className: "dock-separator", role: "separator" }));
     for (const appId of minimizedList) {
-      const sub = store.state.appSummaries[appId] || DEFAULT_SUMMARIES[appId] || "";
+      const appManifest = getDesktopApp(appId);
+      const sub = store.state.appSummaries[appId] || getDefaultAppSummary(appId) || "";
       const tip = sub ? `${getAppTitle(appId)} · ${sub}` : getAppTitle(appId);
       minimizedNodes.push(
         el(
@@ -251,7 +233,7 @@ function renderMacDock() {
             "span",
             { className: "dock-minimized-tile" },
             el("span", { className: "dock-mini-win-chrome" }, el("span"), el("span"), el("span")),
-            el("span", { className: "dock-mini-app-badge" }, renderAppSquircle(appId, appearance, "sm"))
+            el("span", { className: "dock-mini-app-badge" }, renderAppSquircle(appId, appearance, "sm", appManifest))
           ),
           el("span", { className: "dock-dot is-visible" })
         )
@@ -358,10 +340,23 @@ async function syncWindowHost() {
     return;
   }
 
+  const reqSeq = ++windowMountSeq;
   let inst = appInstances.get(appId);
   const isFreshInstance = !inst;
   if (!inst) {
-    inst = createAppInstance(appId);
+    try {
+      inst = await loadAppInstance(appId);
+    } catch (err) {
+      Toast.error(`加载模块「${getAppTitle(appId)}」失败: ${err.message}`);
+      return;
+    }
+    // 防止用户快速切换 Dock 应用时异步懒加载竞态覆盖新窗口
+    if (reqSeq !== windowMountSeq || store.state.activeApp !== appId) {
+      if (!appInstances.has(appId)) {
+        appInstances.set(appId, inst);
+      }
+      return;
+    }
     appInstances.set(appId, inst);
   }
 
@@ -785,13 +780,14 @@ export async function bootstrapWorkbench() {
       inst.destroy?.();
       appInstances.delete(appId);
     }
-    if (DEFAULT_SUMMARIES[appId]) {
-      store.state.appSummaries[appId] = DEFAULT_SUMMARIES[appId];
+    const defSummary = getDefaultAppSummary(appId);
+    if (defSummary) {
+      store.state.appSummaries[appId] = defSummary;
     }
   });
 
   store.subscribe((_state, reason) => {
-    if (reason === "bootstrap" || reason === "appearance") {
+    if (reason === "bootstrap" || reason === "appearance" || reason === "apps_changed") {
       syncDesktopAppearance();
     }
     if (reason === "window") {
@@ -801,20 +797,27 @@ export async function bootstrapWorkbench() {
     } else if (reason === "summary") {
       renderMacDock();
     } else if (reason === "workspace_switched") {
-      // 切换或合并工作区后，销毁已缓存的业务模块实例确保下次进入即加载最新工作区数据
-      for (const staleId of ["explorer", "standard", "polyglot"]) {
+      // 切换或合并工作区后，销毁所有声明为工作区态的已缓存模块实例（自动覆盖全部 2.X / 3.0 业务应用）
+      const keptAppIds = new Set();
+      for (const appManifest of getDesktopApps()) {
+        if (!appManifest.resetOnWorkspaceSwitch) {
+          keptAppIds.add(appManifest.id);
+          continue;
+        }
+        const staleId = appManifest.id;
         const staleInst = appInstances.get(staleId);
         if (staleInst) {
           staleInst.destroy?.();
           appInstances.delete(staleId);
         }
-        if (DEFAULT_SUMMARIES[staleId]) {
-          store.state.appSummaries[staleId] = DEFAULT_SUMMARIES[staleId];
+        const defSummary = getDefaultAppSummary(staleId);
+        if (defSummary) {
+          store.state.appSummaries[staleId] = defSummary;
         }
         store.state.maximizedApps.delete(staleId);
       }
-      store.state.minimizedApps = (store.state.minimizedApps || []).filter(
-        (id) => id === "settings"
+      store.state.minimizedApps = (store.state.minimizedApps || []).filter((id) =>
+        keptAppIds.has(id)
       );
       renderMacDock();
       syncMenubarIndicators();

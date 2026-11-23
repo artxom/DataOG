@@ -1,4 +1,4 @@
-# Data.O.G v2.8.2 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.9.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -9,6 +9,7 @@
 
 - **GitHub 仓库**：https://github.com/artxom/DataOG
 - **项目架构记忆与工程规范**：详见 [AGENTS.md](./AGENTS.md)
+- **3.0 插件模块化开发指南**：详见 [docs/MODULE_SDK_3_0.md](./docs/MODULE_SDK_3_0.md)
 - **版本变更记录**：详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
@@ -49,16 +50,20 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.8.2 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、路由装配）
+├── app.py                        # FastAPI 2.9.0 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
+│   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
+│   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
+│   │   ├── routes/               # 平台领域子路由包（auth_and_system / data_sources / appearance_and_llm / standards / workspaces）
+│   │   ├── storage/              # 双库分离 WAL 引擎包（schema / base / legacy_migration / platform_repos / governance_repos，支持 3.0 插件表自动随工作区流转）
 │   │   ├── storage_paths.py      # 三层分离混淆私有路径解析器（OS 用户隐藏目录、时钟锚点混淆编码与 DATAOG_HOME 隔离）
 │   │   ├── workspace_hub.py      # 团队共享工作区生命周期管理、零密钥 .dataog.db 导出与三步引导式增量合并引擎
 │   │   ├── license_hub.py        # RFC 8032 Ed25519 离线激活码中枢、Gate 2 能力校验、双位置时钟防回拨与 C 原生护盾桥接
 │   │   ├── _license_native_src/  # 纯标准 C 密码学核心与 _license_shield 原生动态库源码（64 位挑战-应答防补丁）
-│   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心
+│   │   ├── asset_store.py        # 本地桌面壁纸与软件/模块自定义图标安全持久化中心（支持动态注册 3.0 应用图标槽位）
 │   │   ├── standard_catalog.py   # 全局 46 列标准字典中枢、多库物理格式解析、单事务批量绑标与分级落标核验
-│   │   ├── offline_report.py     # 库级单 Sheet Excel (.xlsx) 与零依赖离线交互网页报告 (.html，内嵌纯 JS .xlsx 生成器) 引擎
+│   │   ├── offline_report/       # 通用离线交互网页报告 (runtime.py) 与单库/跨环境单 Sheet Excel 生成器包
 │   │   ├── import_progress.py    # 线程安全全平台任务/导入实时阶段进度、节流缩略微日志与 SSE 追踪中枢
 │   │   ├── llm_hub.py            # 零额外依赖标准库 DeepSeek / Gemini / OpenAI 兼容协议大模型中枢
 │   │   ├── readonly_guard.py     # 双模态词法/语法级只读 SQL 白名单沙箱校验器
@@ -66,22 +71,22 @@ DataOG/
 │   │   ├── connection_hub.py     # 全局数据源档案池与连接会话上下文（无密码拓扑 × 私有凭据自动匹配、readonly_session 与 60s 温探查池）
 │   │   ├── metadata_hub.py       # 双层单会话批量元数据探查器（含 120s 负缓存、单连接视图穿透与锁超时熔断）与本地 SQLite 缓存检索中枢
 │   │   ├── query_engine.py       # 跨驱动安全截断查询、硬件级只读执行通道与 CSV/Excel 导出引擎
-│   │   ├── storage.py            # 双库分离 WAL 引擎（本地私有保险箱 + 共享工作区 *.dataog.db）、旧版 <exe_dir>/data 无损自动迁移与幂等列演进
 │   │   └── dialects/             # 标识符清洗、类型映射矩阵、跨库长度/精度包络与类型转换诊断、DDL 生成与四层视图血缘穿透
-│   ├── dws_engine.py             # 单库保序重建、Kahn 拓扑改名与分区继承核心引擎
+│   ├── dws_engine.py             # 单库保序重建、Kahn 拓扑改名与分区继承核心引擎（去重直接复用 dialects 底座）
 │   ├── excel_formula.py          # Excel 公式最终结果兜底求值（VLOOKUP/XLOOKUP/INDEX+MATCH）与 #N/A 错误值置空引擎
 │   └── excel_handler.py          # Excel 安全解析（防 XXE / Zip-Slip）、模板生成与结果导出
-├── modules/                      # 相互独立的插件化业务模块（严格零跨模块私有导入）
-│   ├── standard_migrator/        # /api/modules/standard_migrator 落标绑定核验、单库批量贯标与库级离线报告导出引擎
-│   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境五虚拟列图形化比对、长度包络与转换诊断、/pairs/search 与库级报告导出引擎
+├── modules/                      # 相互独立的插件化业务模块（导出 MODULE_SPEC 自动发现挂载，严格零跨模块私有导入）
+│   ├── standard_migrator/        # /api/modules/standard_migrator 落标绑定核验、单库批量贯标与库级离线报告（按 Mixin 拆分）
+│   ├── cross_comparator/         # /api/modules/cross_comparator  跨环境五虚拟列图形化比对、检索与库级报告（按 Mixin 拆分）
 │   ├── ddl_translator/           # /api/modules/ddl_translator    多邻国（智能命名 + 跨方言翻译）
 │   └── data_explorer/            # /api/modules/data_explorer     AI 只读智能数据探查多轮会话引擎
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
-│   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css
-│   └── js/                       # main.js（登录门禁联动、底部 Dock 与窗口管理器）、core/（含 type_compat.js）、ui/（含 AuthGate / TaskActivityBar / ExportReportModal）、views/（四大模块视图）
+│   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css（已清理 392 行废弃死样式）
+│   └── js/                       # main.js（零业务视图静态依赖）、core/（http / platform_api / app_registry / dom / state / type_compat）、apps/（应用注册与懒加载入口）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图）
+├── docs/                         # 3.0 模块化开发指南 (MODULE_SDK_3_0.md)
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 73 项全量自动化测试（三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
+├── tests/                        # 77 项全量自动化测试（模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -112,7 +117,8 @@ DataOG/
 | **`v2.7.1`** | `fix/migrator-global-queue-perf-sql` & `chore/release-v2.7.1-and-auto-release-rule` → `main` | **全局持久化贯标队列、全链路响应优化、仅注释差异 SQL 修复与银行演示沙箱**：新增 `migration_items.connection_id` 跨表/跨库累加与单条多方言 SQL 预览；移除入队冗余远端重连并叠加 `LicenseHub` 热缓存/Gate 2 HMAC 快验与 `DataGrid` 原位勾选优化；精确隔离仅注释差异防误触发整表重建；随附「启明商业银行」Docker 三引擎混合演示沙箱与每次变更强制升版自动发版闭环规范 |
 | **`v2.8.0`** | `feat/admin-console` → `main` | **本地可视化管理员总控台 (`tools/admin_console/` & `DataOG_Console.command`)**：新增带 PBKDF2 加盐登录认证、`HttpOnly`+`SameSite=Strict` 会话、429 暴力破解限流与严格 CSP 零 XSS 前端的总控台，支持一键全套拉起三引擎演示沙箱并自动激活启动 `Data.O.G`、可视化解析 `REQ1` 申请码与签发/一键写入离线激活码、双工作台启停日志监控，以及三库 DBeaver JDBC URL 与 5 大暗雷 AI 提问一键复制 |
 | **`v2.8.1`** | `fix/llm-tls-ca-fallback` → `main` | **跨平台 AI HTTPS TLS 根证书多级自动解析修复**：修复 macOS Python.org 等默认空白 CA 仓环境直连 DeepSeek 等官方 HTTPS AI 接口报 `self-signed certificate in certificate chain` 问题，在严格保留全量 TLS 校验的前提下实现 `SSL_CERT_FILE` / `truststore` / `/etc/ssl/cert.pem` / `certifi` / 钥匙串多级 CA 自动加载与清晰代理提示 |
-| **`v2.8.2`**（当前正式版） | `fix/binding-stats-and-rename-sync` → `main` | **改名贯标字段绑定自动迁移与落标统计 `6/8` 僵尸绑标修复**：在执行单条/批量/保序重建后单事务原子迁移旧字段绑标并强制重刷元数据；核验期间自动裁剪无效物理列残留绑定；`get_connection_binding_stats()` 关联 `meta_columns` 过滤历史僵尸行并附带真实表总列数；前端执行完毕即时同步左树徽标并自动刷新绑标清单 |
+| **`v2.8.2`** | `fix/binding-stats-and-rename-sync` → `main` | **改名贯标字段绑定自动迁移与落标统计 `6/8` 僵尸绑标修复**：在执行单条/批量/保序重建后单事务原子迁移旧字段绑标并强制重刷元数据；核验期间自动裁剪无效物理列残留绑定；`get_connection_binding_stats()` 关联 `meta_columns` 过滤历史僵尸行并附带真实表总列数；前端执行完毕即时同步左树徽标并自动刷新绑标清单 |
+| **`v2.9.0`**（当前正式版） | `refactor/v2.9.0-modular-slimming` → `main` | **2.X 终结规整瘦身与 3.0 模块化基石**：落地后端 `ModuleSpec` 插件自动发现与 `http_utils` 公共任务/下载 SDK、3.0 插件共享工作区表自动流转与动态图标槽位、前端 `app_registry.js` 懒加载注册中心与 HTTP/平台/模块 API 彻底分层；拆解 `storage/`、`routes/`、`offline_report/` 及巨型业务 Service/View 单体，去重 `dws_engine.py` 并清理 392 行死 CSS，配套 `docs/MODULE_SDK_3_0.md` 与 4 项模块化回归测试 |
 
 ---
 
@@ -123,7 +129,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（73 项三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、演示沙箱闭环、管理员总控台安全与功能回归、跨模块隔离与前端零 XSS 安全校验）
+# 运行全量自动化单元测试（77 项模块化插件扩展、三层分离存储与团队增量合并、核心引擎与兼容判定矩阵、离线非对称激活码与跨平台 C 原生护盾、平台底座与任务进度流、按库标准与五虚拟列防重叠比对、库级离线报告、只读沙箱红队矩阵、演示沙箱闭环、管理员总控台安全与功能回归、跨模块隔离与前端零 XSS 安全校验）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检

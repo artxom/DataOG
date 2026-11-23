@@ -6,7 +6,9 @@
  * - 焦点表直接从左侧 DataGrip 四级数据库清单勾选联动，右侧不堆叠方块胶囊
  */
 
-import { explorerApi, isAbortError, platformApi } from "../core/api.js";
+import { explorerApi } from "../api/explorer_api.js";
+import { isAbortError } from "../core/http.js";
+import { platformApi } from "../core/platform_api.js";
 import { badge, clearEl, copyText, el, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";

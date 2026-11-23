@@ -6,7 +6,8 @@
  * - 支持排他任务自动中止、用户手动取消、可折叠毛玻璃步骤明细气泡
  */
 
-import { isAbortError, tasksApi } from "../core/api.js";
+import { isAbortError } from "../core/http.js";
+import { tasksApi } from "../core/platform_api.js";
 import { badge, clearEl, el } from "../core/dom.js";
 
 const TERMINAL_STATUSES = new Set([

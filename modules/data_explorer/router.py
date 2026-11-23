@@ -8,11 +8,9 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
-from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext, get_platform_context
-from core.platform.router import extract_task_id
+from core.platform.http_utils import json_error, run_tracked_task
 from modules.data_explorer.schemas import (
     AskExplorerPayload,
     CreateExplorerSessionPayload,
@@ -21,10 +19,6 @@ from modules.data_explorer.schemas import (
 from modules.data_explorer.service import DataExplorerService
 
 router = APIRouter(prefix="/api/modules/data_explorer", tags=["data_explorer"])
-
-
-def _err(message: str, status_code: int = 400) -> JSONResponse:
-    return JSONResponse({"ok": False, "error": message}, status_code=status_code)
 
 
 @router.get("/sessions")
@@ -62,7 +56,7 @@ def api_create_explorer_session(
             "sessions": svc.list_sessions(connection_id=payload.connection_id),
         }
     except Exception as exc:
-        return _err(str(exc), 400)
+        return json_error(str(exc), 400)
 
 
 @router.get("/sessions/{session_id}")
@@ -70,10 +64,9 @@ def api_get_explorer_session(
     session_id: str,
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    svc = DataExplorerService(ctx)
-    detail = svc.get_session_detail(session_id)
+    detail = DataExplorerService(ctx).get_session_detail(session_id)
     if detail is None:
-        return _err("未找到指定的探查会话", 404)
+        return json_error("未找到指定的探查会话", 404)
     return {"ok": True, "session": detail}
 
 
@@ -84,15 +77,14 @@ def api_update_explorer_session(
     payload: UpdateExplorerSessionPayload,
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    svc = DataExplorerService(ctx)
-    updated = svc.update_session(
+    updated = DataExplorerService(ctx).update_session(
         session_id,
         title=payload.title,
         schema_name=payload.schema_name,
         focus_tables=payload.focus_tables,
     )
     if updated is None:
-        return _err("未找到指定的探查会话", 404)
+        return json_error("未找到指定的探查会话", 404)
     return {"ok": True, "session": updated}
 
 
@@ -103,9 +95,8 @@ def api_delete_explorer_session(
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     svc = DataExplorerService(ctx)
-    ok = svc.delete_session(session_id)
-    if not ok:
-        return _err("未找到要删除的探查会话", 404)
+    if not svc.delete_session(session_id):
+        return json_error("未找到要删除的探查会话", 404)
     return {
         "ok": True,
         "sessions": svc.list_sessions(connection_id=connection_id),
@@ -120,44 +111,33 @@ async def api_run_ai_exploration(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    tid = extract_task_id(request, task_id)
-    svc = DataExplorerService(ctx)
-    try:
-        if tid:
-            ctx.task_progress.start(
-                tid,
-                "AI 只读智能探查",
-                detail="正在校验数据源连接与探查沙箱环境...",
-            )
-        reporter = ctx.task_progress.make_reporter(tid)
-        res = await run_in_threadpool(
-            svc.ask_and_explore,
-            session_id=payload.session_id,
-            connection_id=payload.connection_id,
-            schema_name=payload.schema_name,
-            focus_tables=payload.focus_tables,
-            prompt=payload.prompt,
-            goal_type=payload.goal_type,
-            provider_id=payload.provider_id,
-            model=payload.model,
-            max_steps=payload.max_steps,
-            sample_limit=payload.sample_limit,
-            progress_cb=reporter,
-            cancel_check=(lambda: ctx.task_progress.is_cancelled(tid)) if tid else None,
-        )
-        asst_msg = res.get("assistant_message") or {}
-        step_cnt = len(asst_msg.get("steps") or [])
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.finish(
-                tid,
-                stage="探查完成",
-                detail=f"已完成 AI 只读探查（共 {step_cnt} 步采样）",
-                warning=str(res.get("warning") or ""),
-                processed=step_cnt,
-                total=step_cnt,
-            )
-        return {"ok": True, **res}
-    except Exception as exc:
-        if tid and not ctx.task_progress.is_cancelled(tid):
-            ctx.task_progress.fail(tid, str(exc))
-        return _err(str(exc), 400)
+    return await run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="AI 只读智能探查",
+        start_detail="正在校验数据源连接与探查沙箱环境...",
+        fn=DataExplorerService(ctx).ask_and_explore,
+        kwargs={
+            "session_id": payload.session_id,
+            "connection_id": payload.connection_id,
+            "schema_name": payload.schema_name,
+            "focus_tables": payload.focus_tables,
+            "prompt": payload.prompt,
+            "goal_type": payload.goal_type,
+            "provider_id": payload.provider_id,
+            "model": payload.model,
+            "max_steps": payload.max_steps,
+            "sample_limit": payload.sample_limit,
+        },
+        inject_cancel_check=True,
+        finish_stage="探查完成",
+        detail_fn=lambda r: (
+            f"已完成 AI 只读探查（共 {len(((r.get('assistant_message') or {}).get('steps') or []))} 步采样）"
+        ),
+        count_fn=lambda r: (
+            len(((r.get("assistant_message") or {}).get("steps") or [])),
+            len(((r.get("assistant_message") or {}).get("steps") or [])),
+        ),
+        response_fn=lambda r: {"ok": True, **r},
+    )

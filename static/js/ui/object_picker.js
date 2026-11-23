@@ -2,7 +2,7 @@
  * Data.O.G 紧凑型级联库表选择器 (ObjectPicker: Connection → Schema → Table/View)
  */
 
-import { platformApi } from "../core/api.js";
+import { platformApi } from "../core/platform_api.js";
 import { clearEl, el } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { Toast } from "./toast.js";

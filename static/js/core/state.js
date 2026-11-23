@@ -6,23 +6,24 @@
  * - 最大化 (toggleMaximize): 在常规留白窗口态与全屏工作态间切换
  */
 
-export const DESKTOP_APPS = [
-  { id: "settings", title: "系统配置" },
-  { id: "explorer", title: "数据探查" },
-  { id: "standard", title: "数据标准" },
-  { id: "polyglot", title: "多邻国" },
-];
+import "../apps/index.js";
+import {
+  DESKTOP_APPS,
+  getDefaultAppSummary,
+  getDesktopApps,
+  onDesktopAppsChanged,
+  resolveAppRoute,
+} from "./app_registry.js";
 
-const LEGACY_ROUTE_MAP = {
-  connections: { appId: "settings", defaultCtx: { section: "connections" } },
-  sql_console: { appId: "explorer", defaultCtx: {} },
-  standard_migrator: { appId: "standard", defaultCtx: { mode: "migrator" } },
-  cross_comparator: { appId: "standard", defaultCtx: { mode: "comparator" } },
-  ddl_translator: { appId: "polyglot", defaultCtx: { mode: "dialect" } },
-};
+export { DESKTOP_APPS };
 
 class WorkbenchStore {
   constructor() {
+    const initialSummaries = {};
+    for (const app of getDesktopApps()) {
+      initialSummaries[app.id] = app.defaultSummary || app.title;
+    }
+
     this.state = {
       brandName: "Data.O.G",
       storageMode: "SEPARATED",
@@ -47,20 +48,24 @@ class WorkbenchStore {
       modules: [],
       logs: [],
 
-      // 桌面窗口状态机
-      activeApp: null, // null 表示显示纯净桌面；否则为 settings | explorer | standard | polyglot
+      // 桌面窗口状态机（动态适配全部通过 app_registry 注册的 2.X / 3.0 应用）
+      activeApp: null,
       minimizedApps: [], // 已最小化至 Dock 右侧收纳区的应用 ID 列表（严格保留内存状态）
       maximizedApps: new Set(),
-      appSummaries: {
-        settings: "外观 · 工作区 · 连接 · AI",
-        explorer: "SQL 查询",
-        standard: "字典 · 落标 · 比对",
-        polyglot: "命名 · 方言",
-      },
+      appSummaries: initialSummaries,
       moduleContext: null,
     };
     this.listeners = new Set();
     this.destroyHandlers = new Set();
+
+    onDesktopAppsChanged((apps) => {
+      for (const app of apps) {
+        if (!this.state.appSummaries[app.id]) {
+          this.state.appSummaries[app.id] = app.defaultSummary || app.title;
+        }
+      }
+      this.emit("apps_changed");
+    });
   }
 
   subscribe(fn) {
@@ -201,13 +206,13 @@ class WorkbenchStore {
    * 打开或恢复指定桌面应用模块
    */
   openApp(targetId, context = null) {
-    const mapped = LEGACY_ROUTE_MAP[targetId];
-    const appId = mapped ? mapped.appId : targetId;
-    const mergedContext = mapped
-      ? { ...mapped.defaultCtx, ...(context || {}) }
-      : context;
+    const resolved = resolveAppRoute(targetId, context);
+    if (!resolved) return;
+    const { appId, context: mergedContext } = resolved;
 
-    if (!DESKTOP_APPS.some((a) => a.id === appId)) return;
+    if (!this.state.appSummaries[appId]) {
+      this.state.appSummaries[appId] = getDefaultAppSummary(appId);
+    }
 
     // 若当前已有另一个活动窗口打开，自动将其最小化至右下角抽屉以保护现场状态
     const cur = this.state.activeApp;

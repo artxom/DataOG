@@ -3,7 +3,7 @@
  * 以「数据项编号」为主键维护全行最新数据标准，支持 46 列模板先导导入、增量合并、在线增删改与多库物理类型查阅
  */
 
-import { standardsApi } from "../core/api.js";
+import { standardsApi } from "../core/platform_api.js";
 import { badge, clearEl, el, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { DataGrid } from "../ui/data_grid.js";

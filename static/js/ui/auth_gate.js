@@ -3,7 +3,7 @@
  * 严格遵循零 innerHTML / 零阻塞弹窗红线。
  */
 
-import { authApi } from "../core/api.js";
+import { authApi } from "../core/platform_api.js";
 import {
   badge,
   clearEl,

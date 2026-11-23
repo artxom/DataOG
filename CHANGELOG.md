@@ -8,6 +8,36 @@
 
 ---
 
+## [2.9.0] - 2026-11-23
+
+> **2.X 终结规整与瘦身里程碑（3.0 模块化基石）**：全面重构后端插件微内核与前端桌面应用注册体系，拆解历史巨型单体文件、消除跨模块重复实现与冗余 CSS，实现未来 3.0 新增功能模块与现有 2.X 功能零耦合即插即用。
+
+### Added
+- **后端插件微内核与自动发现机制 (`core/platform/module_registry.py`, `core/platform/http_utils.py`)**：
+  - 新增声明式 `ModuleSpec` / `ModuleRegistry`、`discover_module_specs()` 与 `mount_discovered_modules()`；四大现有模块均在 `modules/<id>/__init__.py` 导出 `MODULE_SPEC`，`app.py` 彻底移除硬编码模块导入、清单声明与路由挂载，3.0 新增后端模块零改 `app.py` 即可自动发现接入（含运行期动态挂载自动插入根路径静态托管之前）。
+  - 新增 `core/platform/http_utils.py` 统一封装 `json_error`、`extract_task_id`、`file_download_response`、`run_tracked_task`（含 `cancel_check` 注入）与 `run_tracked_upload`，消除全部插件路由层重复进度/下载样板代码。
+  - `AssetStore` 新增 `register_app_id()` 动态注册机制，3.0 新桌面应用通过 `ModuleSpec.desktop_app_id` 自动接入系统外观图标自定义槽位。
+  - `PlatformStateStore` 与 `WorkspaceManager` 新增插件共享工作区表 (`register_table_schema(..., scope="workspace")`) 与扩展工作区元键 (`register_workspace_meta_keys`) 自动纳管能力，3.0 模块专属工作区表自动随 `.dataog.db` 导出/克隆/导入，私有表 (`scope="private"`) 严格物理阻断零泄露（保持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 100% 兼容）。
+- **前端桌面应用插件注册中心与按需懒加载 (`static/js/core/app_registry.js`, `static/js/apps/index.js`, `static/js/core/http.js`, `static/js/core/platform_api.js`, `static/js/api/*.js`)**：
+  - 新增 `registerDesktopApp()` 声明式桌面应用注册中心，支持动态 `import()` 按需懒加载、自定义 SVG 矢量路径 (`registerIconPath`)、默认渐变背景、应用专属 CSS 按需注入 (`stylesheets`) 与工作区切换自动销毁策略 (`resetOnWorkspaceSwitch`)；`main.js` 彻底零静态导入任何业务 View，`static/js/ui/*` 零耦合业务 API。
+  - 将原 898 行单体 `static/js/core/api.js` 拆分为 `core/http.js`（传输原语）、`core/platform_api.js`（平台共享接口）与 `api/{migrator,cross,ddl,explorer}_api.js`（各模块独立客户端），保留 `core/api.js` 轻量兼容重导出入口。
+- **3.0 模块开发指南与专项回归测试 (`docs/MODULE_SDK_3_0.md`, `tests/test_modular_architecture.py`)**：
+  - 新增 `docs/MODULE_SDK_3_0.md` 规范 3.0 零侵入开发范式与底座能力矩阵；新增 4 项模块化架构端到端回归测试（全套自动化单元测试扩充至 **77 项**）。
+
+### Changed
+- **核心单体文件全面拆解瘦身与去重**：
+  - `core/dws_engine.py` 移除 13 处共 ~374 行与 `core/platform/dialects` 重复拷贝的标识符/类型/DWS DDL 解析函数，直接复用并向后兼容重导出底座实现。
+  - `core/platform/storage.py` (3,809 行) 按职责拆解为 `core/platform/storage/` 子包（`schema.py`、`base.py`、`legacy_migration.py`、`platform_repos.py`、`governance_repos.py`、`__init__.py`）。
+  - `core/platform/router.py` (1,281 行) 拆解为 `core/platform/routes/` 五个高内聚领域子路由模块，聚合入口瘦身至 24 行。
+  - `core/platform/offline_report.py` (3,024 行) 拆解为 `core/platform/offline_report/` 子包（`runtime.py` 通用离线 HTML+Excel 引擎可供 3.0 模块复用、`single_db.py`、`cross_env.py`）。
+  - `modules/standard_migrator/service.py` (3,043 行) 与 `modules/cross_comparator/service.py` (3,783 行) 拆分为高内聚内部 Mixin 模块；四个插件路由文件统一基于 `http_utils.py` 精简约 375 行重复胶水代码。
+  - 前端 `workspace_view.js` 拆出 `workspace_merge_wizard.js`，`standard_migrator_view.js` 拆出 `standard_migrator/modals.js`，`cross_comparator_view.js` (3,889 行) 拆出 `cross_comparator/{modals,endpoint_deck,pair_picker}.js` 三个子模块。
+
+### Removed
+- 清理 `static/css/workbench.css` 中已彻底废弃的历史 v2.0 三栏比对 (`.tri-compare-grid` / `.tri-lane*` / `.spine-*`) 与 v2.3 双列拟物书签 (`.dual-compare-*` / `.bookmark-*`) 死样式共计 ~392 行。
+
+---
+
 ## [2.8.2] - 2026-11-23
 
 ### Fixed

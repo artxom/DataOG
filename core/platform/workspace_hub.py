@@ -37,8 +37,10 @@ from core.platform.models import (
     split_extra_props_secrets,
 )
 from core.platform.storage import (
+    PRIVATE_ONLY_TABLES,
     WORKSPACE_META_KEYS,
     PlatformStateStore,
+    ensure_columns_for_table,
     init_workspace_schema_on_conn,
 )
 from core.platform.storage_paths import default_workspace_filename
@@ -217,12 +219,20 @@ def _format_endpoint_label(row_dict: Dict[str, Any]) -> str:
     return f"{base}/{dbn}" if dbn else (base or dt)
 
 
-def _read_whitelisted_meta(conn: sqlite3.Connection, tables: Set[str]) -> Dict[str, Any]:
+def _read_whitelisted_meta(
+    conn: sqlite3.Connection,
+    tables: Set[str],
+    *,
+    extra_meta_keys: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    allowed_keys = set(WORKSPACE_META_KEYS)
+    if extra_meta_keys:
+        allowed_keys.update(str(k) for k in extra_meta_keys if str(k))
     out: Dict[str, Any] = {}
     if "workspace_meta" in tables:
         for r in conn.execute("SELECT key, value FROM workspace_meta").fetchall():
             k = str(r["key"] or "")
-            if k in WORKSPACE_META_KEYS:
+            if k in allowed_keys:
                 try:
                     out[k] = json.loads(r["value"])
                 except Exception:
@@ -230,7 +240,7 @@ def _read_whitelisted_meta(conn: sqlite3.Connection, tables: Set[str]) -> Dict[s
     if "app_meta" in tables:
         for r in conn.execute("SELECT key, value FROM app_meta").fetchall():
             k = str(r["key"] or "")
-            if k in WORKSPACE_META_KEYS and k not in out:
+            if k in allowed_keys and k not in out:
                 try:
                     out[k] = json.loads(r["value"])
                 except Exception:
@@ -307,9 +317,28 @@ def _extract_sanitized_workspace_to_file(
     include_metadata_cache: bool = True,
     workspace_name: Optional[str] = None,
     workspace_description: Optional[str] = None,
+    extra_workspace_tables: Optional[
+        Sequence[Tuple[str, str, List[Tuple[str, str]]]]
+    ] = None,
+    extra_meta_keys: Optional[Sequence[str]] = None,
 ) -> Dict[str, int]:
-    """将来源 SQLite 库中的白名单业务表净化写入全新的自包含 `.dataog.db` 文件（零私有表、零凭据）."""
+    """将来源 SQLite 库中的白名单业务表（含已注册的 3.0 插件共享表）净化写入全新的自包含 `.dataog.db` 文件（零私有表、零凭据）."""
     src_tables = _get_table_names(src_conn)
+    private_forbidden = set(PRIVATE_ONLY_TABLES)
+    safe_plugin_specs: List[Tuple[str, str, List[Tuple[str, str]]]] = []
+    for tbl, ddl, exp_cols in (extra_workspace_tables or ()):
+        clean_tbl = str(tbl or "").strip()
+        if (
+            clean_tbl
+            and clean_tbl not in private_forbidden
+            and re.match(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$", clean_tbl)
+        ):
+            safe_plugin_specs.append((clean_tbl, str(ddl or ""), list(exp_cols or [])))
+
+    allowed_meta_keys = set(WORKSPACE_META_KEYS)
+    if extra_meta_keys:
+        allowed_meta_keys.update(str(k) for k in extra_meta_keys if str(k))
+
     recognized = {
         "workspace_meta",
         "connection_topology",
@@ -322,6 +351,7 @@ def _extract_sanitized_workspace_to_file(
         "meta_schemas",
         "meta_tables",
         "meta_columns",
+        *(t for t, _, _ in safe_plugin_specs),
     }
     if not (src_tables & recognized):
         raise ValueError("该 SQLite 文件不包含任何 Data.O.G 业务工作区表结构")
@@ -337,16 +367,23 @@ def _extract_sanitized_workspace_to_file(
         dst_conn.execute("PRAGMA journal_mode = DELETE;")
         dst_conn.execute("PRAGMA synchronous = NORMAL;")
         init_workspace_schema_on_conn(dst_conn)
+        for tbl, ddl, exp_cols in safe_plugin_specs:
+            if ddl.strip():
+                dst_conn.executescript(ddl)
+            if exp_cols:
+                ensure_columns_for_table(dst_conn, tbl, exp_cols)
 
         # 1. workspace_meta（严格仅保留业务元数据键）
-        meta_map = _read_whitelisted_meta(src_conn, src_tables)
+        meta_map = _read_whitelisted_meta(
+            src_conn, src_tables, extra_meta_keys=list(allowed_meta_keys)
+        )
         meta_map["workspace_format_version"] = WORKSPACE_FORMAT_VERSION
         if workspace_name is not None:
             meta_map["workspace_name"] = workspace_name
         if workspace_description is not None:
             meta_map["workspace_description"] = workspace_description
         for k, v in meta_map.items():
-            if k in WORKSPACE_META_KEYS:
+            if k in allowed_meta_keys:
                 dst_conn.execute(
                     "INSERT OR REPLACE INTO workspace_meta (key, value) VALUES (?, ?)",
                     (k, json.dumps(v, ensure_ascii=False)),
@@ -373,17 +410,18 @@ def _extract_sanitized_workspace_to_file(
         counts["connections_count"] = len(topo_rows)
 
         # 3. 其余白名单业务表
-        copy_specs: List[Tuple[str, bool]] = [
-            ("standard_dictionary", True),
-            ("field_standard_bindings", True),
-            ("cross_table_bindings", True),
-            ("cross_column_bindings", True),
-            ("migration_items", True),
-            ("meta_schemas", include_metadata_cache),
-            ("meta_tables", include_metadata_cache),
-            ("meta_columns", include_metadata_cache),
+        copy_specs: List[Tuple[str, bool, bool]] = [
+            ("standard_dictionary", True, True),
+            ("field_standard_bindings", True, True),
+            ("cross_table_bindings", True, True),
+            ("cross_column_bindings", True, True),
+            ("migration_items", True, True),
+            ("meta_schemas", include_metadata_cache, True),
+            ("meta_tables", include_metadata_cache, True),
+            ("meta_columns", include_metadata_cache, True),
+            *((tbl, True, False) for tbl, _, _ in safe_plugin_specs),
         ]
-        for tbl, should_copy in copy_specs:
+        for tbl, should_copy, skip_auto_id in copy_specs:
             if not should_copy or tbl not in src_tables:
                 counts[tbl] = 0
                 continue
@@ -392,7 +430,11 @@ def _extract_sanitized_workspace_to_file(
             if not rows:
                 counts[tbl] = 0
                 continue
-            common = [c for c in rows[0].keys() if c in dst_cols and c != "id"]
+            common = [
+                c
+                for c in rows[0].keys()
+                if c in dst_cols and (not skip_auto_id or c != "id")
+            ]
             if not common:
                 counts[tbl] = 0
                 continue
@@ -613,6 +655,8 @@ class WorkspaceManager:
                         include_metadata_cache=True,
                         workspace_name=clean_name,
                         workspace_description=clean_desc,
+                        extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
+                        extra_meta_keys=list(self.store.get_workspace_meta_keys()),
                     )
             else:
                 conn = sqlite3.connect(dst_path, timeout=15.0)
@@ -620,6 +664,11 @@ class WorkspaceManager:
                 try:
                     conn.execute("PRAGMA journal_mode = WAL;")
                     init_workspace_schema_on_conn(conn)
+                    for tbl, ddl, exp_cols in self.store.get_registered_plugin_workspace_specs():
+                        if ddl.strip():
+                            conn.executescript(ddl)
+                        if exp_cols:
+                            ensure_columns_for_table(conn, tbl, exp_cols)
                     conn.execute(
                         "INSERT OR REPLACE INTO workspace_meta (key, value) VALUES (?, ?)",
                         ("workspace_format_version", json.dumps(WORKSPACE_FORMAT_VERSION)),
@@ -723,6 +772,8 @@ class WorkspaceManager:
                                 sconn,
                                 def_path,
                                 include_metadata_cache=True,
+                                extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
+                                extra_meta_keys=list(self.store.get_workspace_meta_keys()),
                             )
 
             self.store.switch_workspace_db(target_path)
@@ -783,6 +834,8 @@ class WorkspaceManager:
                         include_metadata_cache=bool(include_metadata_cache),
                         workspace_name=rec["name"],
                         workspace_description=rec.get("description") or "",
+                        extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
+                        extra_meta_keys=list(self.store.get_workspace_meta_keys()),
                     )
                 with open(tmp_export_path, "rb") as fh:
                     data = fh.read()
@@ -852,6 +905,8 @@ class WorkspaceManager:
                         include_metadata_cache=True,
                         workspace_name=eff_name,
                         workspace_description=eff_desc,
+                        extra_workspace_tables=self.store.get_registered_plugin_workspace_specs(),
+                        extra_meta_keys=list(self.store.get_workspace_meta_keys()),
                     )
                     topo_rows = _read_safe_topology_rows(sconn, src_tables)
 

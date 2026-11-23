@@ -141,6 +141,19 @@ const ICON_PATHS = {
 };
 
 /**
+ * 动态注册扩展矢量图标路径，供 3.0 新桌面应用注册专属图标而无需修改 core/dom.js
+ * @param {string} name
+ * @param {string} pathD
+ */
+export function registerIconPath(name, pathD) {
+  const key = String(name || "").trim();
+  const d = String(pathD || "").trim();
+  if (key && d) {
+    ICON_PATHS[key] = d;
+  }
+}
+
+/**
  * 使用 createElementNS 安全绘制矢量图标
  * @param {string} name
  * @param {number} [size]
@@ -222,14 +235,20 @@ export function renderBrandMark(appearance, size = "lg") {
 }
 
 /**
- * 渲染四大桌面模块超椭圆图标（支持本地自定义上传图片覆盖）
+ * 渲染桌面模块超椭圆图标（支持本地自定义上传图片覆盖与 3.0 扩展应用渐变配置）
  */
-export function renderAppSquircle(appId, appearance, size = "lg") {
+export function renderAppSquircle(appId, appearance, size = "lg", appManifest = null) {
   const customUrl = appearance?.app_icons?.[appId] || "";
   const sizeCls = size === "sm" ? "squircle-sm" : size === "md" ? "squircle-md" : "";
   const iconSize = size === "sm" ? 15 : size === "md" ? 20 : 28;
+  const iconName = appManifest?.iconName || appId;
+  const boxStyle = {};
+  if (!customUrl && appManifest?.iconGradient) {
+    boxStyle.background = appManifest.iconGradient;
+  }
   const box = el("span", {
     className: `squircle-icon squircle-${appId} ${sizeCls}`.trim(),
+    style: Object.keys(boxStyle).length ? boxStyle : undefined,
   });
 
   if (customUrl) {
@@ -237,11 +256,11 @@ export function renderAppSquircle(appId, appearance, size = "lg") {
       el("img", {
         className: "squircle-custom-img",
         src: customUrl,
-        alt: appId,
+        alt: appManifest?.title || appId,
       })
     );
   } else {
-    box.appendChild(svgIcon(appId, iconSize));
+    box.appendChild(svgIcon(iconName, iconSize));
   }
   return box;
 }
