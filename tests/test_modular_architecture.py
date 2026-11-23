@@ -21,9 +21,9 @@ import unittest
 from unittest import mock
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
-from fastapi.testclient import TestClient
 
 from app import create_app, resolve_static_dir
+from tests.test_modules_and_api import TestClient
 from core import dws_engine
 from core.platform import dialects
 from core.platform.asset_store import AssetStore
@@ -160,6 +160,10 @@ class TestModularArchitectureV29(unittest.TestCase):
                 ctx.store.register_table_schema("llm_providers", "", [], scope="workspace")
             with self.assertRaises(ValueError):
                 ctx.store.register_table_schema("dq_local_secrets", "", [], scope="workspace")
+            with self.assertRaises(ValueError):
+                ctx.store.register_workspace_tables(["llm_providers"])
+            with self.assertRaises(ValueError):
+                ctx.store.register_workspace_tables(["bad; DROP TABLE x"])
 
             # 写入 3.0 插件的工作区表（含 SQL 保留关键字列 "order" / "group"）、工作区元键与私有表
             with ctx.store.module_db(scope="workspace") as conn:
@@ -487,6 +491,8 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
             ["node", "--input-type=module", "-e", node_script, project_root],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
         )
         self.assertEqual(
@@ -650,7 +656,12 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
             mock.patch("core.platform.module_registry.importlib.import_module", side_effect=_fake_import),
         ):
             frozen_specs = discover_module_specs("fake_mods")
+            # 同时验证 __loader__ 为 None 但 __spec__.loader 存在时的回退发现路径
+            root_mod.__loader__ = None
+            root_mod.__spec__ = types.SimpleNamespace(loader=_FakeFrozenLoader())
+            frozen_specs_via_spec = discover_module_specs("fake_mods")
         self.assertEqual([s.module_id for s in frozen_specs], ["beta", "alpha"])
+        self.assertEqual([s.module_id for s in frozen_specs_via_spec], ["beta", "alpha"])
 
         # 2. 验证所有平台子路由与模块路由函数的类型注解均可正常解析（严防缺失 import 导致运行期异常）
         route_mod_names = [
@@ -709,6 +720,47 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
                     if "get_platform_context" not in m.group(2):
                         missing_gate2.append(f"{os.path.relpath(rpath, project_root)}:{m.group(1)}")
             self.assertEqual(missing_gate2, [], f"以下 API 端点缺少 Gate 2 依赖 get_platform_context: {missing_gate2}")
+
+            # 4. 零 httpx 依赖与客户打包自检防线：严禁测试依赖被裁剪的 fastapi.testclient/httpx，且客户包必须剔除 dev-only 测试
+            httpx_test_violations = []
+            for tpath in glob.glob(os.path.join(project_root, "tests", "test_*.py")):
+                with open(tpath, encoding="utf-8") as fh:
+                    ttree = ast.parse(fh.read(), filename=tpath)
+                for node in ast.walk(ttree):
+                    mods = []
+                    if isinstance(node, ast.Import):
+                        mods = [a.name for a in node.names]
+                    elif isinstance(node, ast.ImportFrom) and node.module:
+                        mods = [node.module]
+                    for m in mods:
+                        if m in ("fastapi.testclient", "starlette.testclient", "httpx") or m.startswith("httpx."):
+                            httpx_test_violations.append(f"{os.path.relpath(tpath, project_root)} -> {m}")
+            self.assertEqual(
+                httpx_test_violations,
+                [],
+                f"测试套件严禁导入需 httpx 的 TestClient（请改用 tests.test_modules_and_api.TestClient）: {httpx_test_violations}",
+            )
+
+            import build_exe
+
+            with tempfile.TemporaryDirectory() as stage_tmp:
+                staged = build_exe.stage_customer_tests_dir(
+                    os.path.join(project_root, "tests"),
+                    os.path.join(stage_tmp, "staged_tests"),
+                )
+                staged_files = set(os.listdir(staged))
+                self.assertNotIn("test_admin_console.py", staged_files)
+                self.assertNotIn("test_demo_sandbox.py", staged_files)
+                self.assertNotIn("__pycache__", staged_files)
+                for expected_test in (
+                    "test_core.py",
+                    "test_platform.py",
+                    "test_modules_and_api.py",
+                    "test_workspace_separation.py",
+                    "test_license_auth.py",
+                    "test_modular_architecture.py",
+                ):
+                    self.assertIn(expected_test, staged_files)
 
     def test_frontend_main_lazy_load_race_recovery_and_extracted_mixins_via_node(self) -> None:
         """Node.js 真实执行：验证 main.js 异步懒加载竞态/失败恢复/工作区切换，app_registry 严格校验与拆分 View Mixin 运行时完整性."""
@@ -1021,6 +1073,8 @@ process.exit(0);
             ["node", "--input-type=module", "-e", node_script, project_root],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=25,
         )
         self.assertEqual(

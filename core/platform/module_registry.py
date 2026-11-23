@@ -91,7 +91,9 @@ def _iter_child_package_names(root_pkg: Any, package_name: str) -> List[str]:
     # PyInstaller 冻结态兜底：若 iter_modules 未返回，则扫描 PyiFrozenImporter.toc 与 walk_packages
     if not names:
         prefix = f"{package_name}."
-        loader = getattr(root_pkg, "__loader__", None)
+        loader = getattr(root_pkg, "__loader__", None) or getattr(
+            getattr(root_pkg, "__spec__", None), "loader", None
+        )
         toc = getattr(loader, "toc", None)
         is_pkg_fn = getattr(loader, "is_package", None)
         if isinstance(toc, (set, frozenset, list, tuple)):

@@ -1,4 +1,4 @@
-# Data.O.G v2.9.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v2.9.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -50,7 +50,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 2.9.0 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
+├── app.py                        # FastAPI 2.9.1 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
@@ -118,7 +118,8 @@ DataOG/
 | **`v2.8.0`** | `feat/admin-console` → `main` | **本地可视化管理员总控台 (`tools/admin_console/` & `DataOG_Console.command`)**：新增带 PBKDF2 加盐登录认证、`HttpOnly`+`SameSite=Strict` 会话、429 暴力破解限流与严格 CSP 零 XSS 前端的总控台，支持一键全套拉起三引擎演示沙箱并自动激活启动 `Data.O.G`、可视化解析 `REQ1` 申请码与签发/一键写入离线激活码、双工作台启停日志监控，以及三库 DBeaver JDBC URL 与 5 大暗雷 AI 提问一键复制 |
 | **`v2.8.1`** | `fix/llm-tls-ca-fallback` → `main` | **跨平台 AI HTTPS TLS 根证书多级自动解析修复**：修复 macOS Python.org 等默认空白 CA 仓环境直连 DeepSeek 等官方 HTTPS AI 接口报 `self-signed certificate in certificate chain` 问题，在严格保留全量 TLS 校验的前提下实现 `SSL_CERT_FILE` / `truststore` / `/etc/ssl/cert.pem` / `certifi` / 钥匙串多级 CA 自动加载与清晰代理提示 |
 | **`v2.8.2`** | `fix/binding-stats-and-rename-sync` → `main` | **改名贯标字段绑定自动迁移与落标统计 `6/8` 僵尸绑标修复**：在执行单条/批量/保序重建后单事务原子迁移旧字段绑标并强制重刷元数据；核验期间自动裁剪无效物理列残留绑定；`get_connection_binding_stats()` 关联 `meta_columns` 过滤历史僵尸行并附带真实表总列数；前端执行完毕即时同步左树徽标并自动刷新绑标清单 |
-| **`v2.9.0`**（当前正式版） | `refactor/v2.9.0-modular-slimming` → `main` | **2.X 终结规整瘦身与 3.0 模块化基石**：落地后端 `ModuleSpec` 插件自动发现与 `http_utils` 公共任务/下载 SDK、3.0 插件共享工作区表自动流转与动态图标槽位、前端 `app_registry.js` 懒加载注册中心与 HTTP/平台/模块 API 彻底分层；拆解 `storage/`、`routes/`、`offline_report/` 及巨型业务 Service/View 单体，去重 `dws_engine.py` 并清理 392 行死 CSS，配套 `docs/MODULE_SDK_3_0.md` 与 6 项模块化回归测试 |
+| **`v2.9.0`** | `refactor/v2.9.0-modular-slimming` → `main` | **2.X 终结规整瘦身与 3.0 模块化基石**：落地后端 `ModuleSpec` 插件自动发现与 `http_utils` 公共任务/下载 SDK、3.0 插件共享工作区表自动流转与动态图标槽位、前端 `app_registry.js` 懒加载注册中心与 HTTP/平台/模块 API 彻底分层；拆解 `storage/`、`routes/`、`offline_report/` 及巨型业务 Service/View 单体，去重 `dws_engine.py` 并清理 392 行死 CSS，配套 `docs/MODULE_SDK_3_0.md` 与 6 项模块化回归测试 |
+| **`v2.9.1`**（当前正式版） | `fix/v2.9.1-ci-frozen-packaging` → `main` | **CI 零 `httpx` 依赖与 Windows `DataOG.exe` 冻结态自检打包修复**：移除 `test_modular_architecture.py` 对 `httpx` 的隐式依赖并补齐零 `httpx` 静态防线；`build_exe.py` 新增客户运行时测试纯净暂存与构建后泄露校验，剔除 `test_admin_console.py`/`test_demo_sandbox.py` 恢复云端 Windows `DataOG.exe` 编译与 GitHub Release 自动发布；同步加固冻结态 `__spec__.loader` 插件发现与私有表越权注册拦截 |
 
 ---
 

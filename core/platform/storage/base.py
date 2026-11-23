@@ -192,14 +192,21 @@ class _BaseStateStore(_SchemaColumnMixin):
                 clean = str(name or "").strip()
                 if clean and _SAFE_SQL_IDENT_RE.match(clean):
                     self._plugin_private_tables.add(clean)
+                    self._plugin_workspace_tables.discard(clean)
 
     def register_workspace_tables(self, table_names: Iterable[str]) -> None:
         """声明归属团队共享工作区的插件表白名单."""
         with self._lock:
+            private_names = self.get_private_table_names()
             for name in table_names:
                 clean = str(name or "").strip()
-                if clean and _SAFE_SQL_IDENT_RE.match(clean):
-                    self._plugin_workspace_tables.add(clean)
+                if not clean:
+                    continue
+                if not _SAFE_SQL_IDENT_RE.match(clean):
+                    raise ValueError(f"非法的插件工作区表名: {name!r}")
+                if clean in private_names:
+                    raise ValueError(f"私有保险箱表 [{clean}] 严禁注册为共享工作区表")
+                self._plugin_workspace_tables.add(clean)
 
     def register_workspace_meta_keys(self, keys: Iterable[str]) -> None:
         """动态注册插件归属的 workspace_meta 业务键，实现免改底座接入团队共享工作区."""
