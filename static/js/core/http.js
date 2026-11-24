@@ -316,3 +316,154 @@ export async function downloadApiFile(
     throw err;
   }
 }
+
+export async function streamSsePost(
+  url,
+  {
+    body = undefined,
+    signal = undefined,
+    taskId = "",
+    onEvent = null,
+    trackInRing = true,
+  } = {}
+) {
+  const opts = {
+    method: "POST",
+    headers: { Accept: "text/event-stream" },
+  };
+  if (signal) {
+    opts.signal = signal;
+  }
+  const normalizedTaskId = taskId ? String(taskId).trim() : "";
+  if (normalizedTaskId) {
+    opts.headers["X-Task-Id"] = normalizedTaskId;
+  }
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+
+  const reqId = perfMonitor.beginRequest({ method: "POST", url, kind: "sse_post", trackInRing });
+  let fetchDoneMs = null;
+  let respHeaders = null;
+  let respStatus = 0;
+
+  try {
+    const resp = await fetch(url, opts);
+    fetchDoneMs = perfMonitor.now();
+    respHeaders = resp?.headers || null;
+    respStatus = Number(resp?.status || 0);
+
+    if (!resp.ok) {
+      await parseJsonOrThrow(resp);
+    }
+
+    const ct = String(resp.headers?.get("content-type") || "").toLowerCase();
+    if (!ct.includes("text/event-stream") || !resp.body || typeof resp.body.getReader !== "function") {
+      const parsed = await parseJsonOrThrow(resp);
+      perfMonitor.finishRequest(reqId, {
+        status: respStatus,
+        ok: true,
+        fetchDoneMs,
+        bodyDoneMs: perfMonitor.now(),
+        headers: respHeaders,
+      });
+      return { fallbackJson: parsed };
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    let donePayload = null;
+    let streamError = null;
+
+    const dispatchFrames = (flushAll = false) => {
+      const parts = buf.split(/\r?\n\r?\n/);
+      if (!flushAll) {
+        buf = parts.pop() ?? "";
+      } else {
+        buf = "";
+      }
+      for (const frame of parts) {
+        if (!frame || !frame.trim()) continue;
+        const lines = frame.split(/\r?\n/);
+        let eventName = "message";
+        const dataLines = [];
+        for (const line of lines) {
+          if (!line || line.startsWith(":")) continue;
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim() || "message";
+          } else if (line.startsWith("data:")) {
+            dataLines.push(line.slice(5).trimStart());
+          }
+        }
+        if (!dataLines.length) continue;
+        const rawData = dataLines.join("\n");
+        let parsed = null;
+        try {
+          parsed = JSON.parse(rawData);
+        } catch (_e) {
+          parsed = { raw: rawData };
+        }
+        const effEvent =
+          parsed && typeof parsed === "object" && parsed.type
+            ? String(parsed.type)
+            : eventName;
+        if (effEvent === "done") {
+          donePayload = parsed;
+        }
+        if (effEvent === "error") {
+          streamError = new Error(
+            (parsed && (parsed.error || parsed.message)) || "流式响应发生错误"
+          );
+        }
+        if (typeof onEvent === "function") {
+          onEvent(effEvent, parsed);
+        }
+      }
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          buf += decoder.decode();
+          dispatchFrames(true);
+          break;
+        }
+        if (value) {
+          buf += decoder.decode(value, { stream: true });
+          dispatchFrames(false);
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock?.();
+      } catch (_e) {
+        // ignore release lock error
+      }
+    }
+
+    if (streamError && !donePayload) {
+      throw streamError;
+    }
+    perfMonitor.finishRequest(reqId, {
+      status: respStatus,
+      ok: true,
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: respHeaders,
+    });
+    return donePayload || { ok: true };
+  } catch (err) {
+    perfMonitor.finishRequest(reqId, {
+      status: err?.status || respStatus,
+      ok: false,
+      error: err?.message || String(err),
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: err?._headers || respHeaders,
+    });
+    throw err;
+  }
+}

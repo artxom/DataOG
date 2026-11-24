@@ -3,7 +3,7 @@
  * 严格遵守 3.0 隔离规范：仅从 core/http.js 导入基础请求原语。
  */
 
-import { downloadApiFile, requestJson, uploadFormData, withRequestOpts } from "../../core/http.js";
+import { downloadApiFile, requestJson, streamSsePost, uploadFormData, withRequestOpts } from "../../core/http.js";
 
 const BASE = "/api/modules/ai_assistant";
 
@@ -37,6 +37,9 @@ export const assistantApi = {
 
   sendChatTurn: (payload, opts = {}) =>
     requestJson(`${BASE}/chat`, withRequestOpts({ method: "POST", body: payload }, opts)),
+
+  streamChatTurn: (payload, { signal = undefined, taskId = "", onEvent = null } = {}) =>
+    streamSsePost(`${BASE}/chat/stream`, { body: payload, signal, taskId, onEvent }),
 
   uploadAttachment: (file, sessionId = "") => {
     const fd = new FormData();

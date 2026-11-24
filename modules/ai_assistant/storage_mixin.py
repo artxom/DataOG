@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from typing import Any, Dict, List, Optional
 import uuid
+
+from modules.ai_assistant.attachments import estimate_tokens, format_with_line_numbers
 
 
 def _now_str() -> str:
@@ -57,6 +60,7 @@ class AssistantStorageMixin:
                 task_mode TEXT NOT NULL DEFAULT 'auto',
                 provider_id TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT '',
+                thinking_mode TEXT NOT NULL DEFAULT 'auto',
                 rolling_summary TEXT NOT NULL DEFAULT '',
                 turn_count INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT '',
@@ -75,6 +79,7 @@ class AssistantStorageMixin:
                 ("task_mode", "TEXT NOT NULL DEFAULT 'auto'"),
                 ("provider_id", "TEXT NOT NULL DEFAULT ''"),
                 ("model", "TEXT NOT NULL DEFAULT ''"),
+                ("thinking_mode", "TEXT NOT NULL DEFAULT 'auto'"),
                 ("rolling_summary", "TEXT NOT NULL DEFAULT ''"),
                 ("turn_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
@@ -93,6 +98,8 @@ class AssistantStorageMixin:
                 task_mode TEXT NOT NULL DEFAULT 'auto',
                 response_type TEXT NOT NULL DEFAULT 'answer',
                 content TEXT NOT NULL DEFAULT '',
+                reasoning TEXT NOT NULL DEFAULT '',
+                reasoning_ms REAL NOT NULL DEFAULT 0,
                 steps_json TEXT NOT NULL DEFAULT '[]',
                 citations_json TEXT NOT NULL DEFAULT '[]',
                 clarification_json TEXT NOT NULL DEFAULT '{}',
@@ -114,6 +121,8 @@ class AssistantStorageMixin:
                 ("task_mode", "TEXT NOT NULL DEFAULT 'auto'"),
                 ("response_type", "TEXT NOT NULL DEFAULT 'answer'"),
                 ("content", "TEXT NOT NULL DEFAULT ''"),
+                ("reasoning", "TEXT NOT NULL DEFAULT ''"),
+                ("reasoning_ms", "REAL NOT NULL DEFAULT 0"),
                 ("steps_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("citations_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("clarification_json", "TEXT NOT NULL DEFAULT '{}'"),
@@ -148,6 +157,7 @@ class AssistantStorageMixin:
                 summary TEXT NOT NULL DEFAULT '',
                 raw_text TEXT NOT NULL DEFAULT '',
                 csv_profile_json TEXT NOT NULL DEFAULT '{}',
+                outline_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_ai_asst_att_sid
@@ -169,6 +179,7 @@ class AssistantStorageMixin:
                 ("summary", "TEXT NOT NULL DEFAULT ''"),
                 ("raw_text", "TEXT NOT NULL DEFAULT ''"),
                 ("csv_profile_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("outline_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ],
             scope="private",
@@ -256,6 +267,7 @@ class AssistantStorageMixin:
 
     @staticmethod
     def _row_to_session_dict(row: Any) -> Dict[str, Any]:
+        keys = set(row.keys())
         focus_tables = _safe_json_loads(row["focus_tables_json"], [])
         return {
             "session_id": str(row["session_id"]),
@@ -268,6 +280,7 @@ class AssistantStorageMixin:
             "task_mode": str(row["task_mode"] or "auto"),
             "provider_id": str(row["provider_id"] or ""),
             "model": str(row["model"] or ""),
+            "thinking_mode": str(row["thinking_mode"] or "auto") if "thinking_mode" in keys else "auto",
             "rolling_summary": str(row["rolling_summary"] or ""),
             "turn_count": int(row["turn_count"] or 0),
             "created_at": str(row["created_at"] or ""),
@@ -301,8 +314,9 @@ class AssistantStorageMixin:
 
     @staticmethod
     def _row_to_message_dict(row: Any, proposals_by_id: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        keys = set(row.keys())
         pid = str(row["proposal_id"] or "")
-        att_raw = row["attachments_json"] if "attachments_json" in row.keys() else "[]"
+        att_raw = row["attachments_json"] if "attachments_json" in keys else "[]"
         return {
             "id": int(row["id"]),
             "session_id": str(row["session_id"]),
@@ -311,6 +325,8 @@ class AssistantStorageMixin:
             "task_mode": str(row["task_mode"] or "auto"),
             "response_type": str(row["response_type"] or "answer"),
             "content": str(row["content"] or ""),
+            "reasoning": str(row["reasoning"] or "") if "reasoning" in keys else "",
+            "reasoning_ms": float(row["reasoning_ms"] or 0.0) if "reasoning_ms" in keys else 0.0,
             "steps": _safe_json_loads(row["steps_json"], []),
             "citations": _safe_json_loads(row["citations_json"], []),
             "clarification": _safe_json_loads(row["clarification_json"], {}),
@@ -327,6 +343,8 @@ class AssistantStorageMixin:
 
     @staticmethod
     def _row_to_attachment_dict(row: Any, *, include_raw: bool = False) -> Dict[str, Any]:
+        keys = set(row.keys())
+        outline_raw = row["outline_json"] if "outline_json" in keys else "{}"
         out: Dict[str, Any] = {
             "attachment_id": str(row["attachment_id"]),
             "session_id": str(row["session_id"] or ""),
@@ -340,9 +358,10 @@ class AssistantStorageMixin:
             "estimated_tokens": int(row["estimated_tokens"] or 0),
             "chunk_count": int(row["chunk_count"] or 0),
             "oversized": bool(row["oversized"]),
-            "recommended_strategy": str(row["recommended_strategy"] or "inline"),
+            "recommended_strategy": str(row["recommended_strategy"] or "full_context"),
             "summary": str(row["summary"] or ""),
             "csv_profile": _safe_json_loads(row["csv_profile_json"], {}),
+            "outline": _safe_json_loads(outline_raw, {}),
             "created_at": str(row["created_at"] or ""),
         }
         if include_raw:
@@ -401,6 +420,7 @@ class AssistantStorageMixin:
         task_mode: str = "auto",
         provider_id: str = "",
         model: str = "",
+        thinking_mode: str = "auto",
     ) -> Dict[str, Any]:
         eff_cid = (connection_id or "").strip()
         eff_dialect = (dialect or "").strip().upper() or "DWS"
@@ -424,15 +444,18 @@ class AssistantStorageMixin:
             f"{eff_dialect} 智能助手" if eff_mode == "dialect" else "数据库智能会话"
         )
         clean_focus = _normalize_focus_tables(focus_tables)
+        clean_tmode = (thinking_mode or "auto").strip().lower()
+        if clean_tmode not in ("auto", "enabled", "disabled"):
+            clean_tmode = "auto"
 
         with self.ctx.store.module_db(scope="private") as conn:
             conn.execute(
                 """
                 INSERT INTO ai_assistant_sessions (
                     session_id, title, work_mode, connection_id, dialect, schema_name,
-                    focus_tables_json, task_mode, provider_id, model, rolling_summary,
+                    focus_tables_json, task_mode, provider_id, model, thinking_mode, rolling_summary,
                     turn_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?, ?)
                 """,
                 (
                     sid,
@@ -445,6 +468,7 @@ class AssistantStorageMixin:
                     (task_mode or "auto").strip().lower(),
                     (provider_id or "").strip(),
                     (model or "").strip(),
+                    clean_tmode,
                     now,
                     now,
                 ),
@@ -493,6 +517,7 @@ class AssistantStorageMixin:
         task_mode: Optional[str] = None,
         provider_id: Optional[str] = None,
         model: Optional[str] = None,
+        thinking_mode: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         current = self.get_session_detail(session_id)
         if current is None:
@@ -525,6 +550,11 @@ class AssistantStorageMixin:
         new_task_mode = current["task_mode"] if task_mode is None else (task_mode.strip().lower() or "auto")
         new_pid = current["provider_id"] if provider_id is None else provider_id.strip()
         new_mdl = current["model"] if model is None else model.strip()
+        if thinking_mode is None:
+            new_tmode = current.get("thinking_mode") or "auto"
+        else:
+            cand_tm = thinking_mode.strip().lower()
+            new_tmode = cand_tm if cand_tm in ("auto", "enabled", "disabled") else "auto"
         now = _now_str()
 
         with self.ctx.store.module_db(scope="private") as conn:
@@ -532,7 +562,7 @@ class AssistantStorageMixin:
                 """
                 UPDATE ai_assistant_sessions
                 SET title = ?, work_mode = ?, connection_id = ?, dialect = ?, schema_name = ?,
-                    focus_tables_json = ?, task_mode = ?, provider_id = ?, model = ?, updated_at = ?
+                    focus_tables_json = ?, task_mode = ?, provider_id = ?, model = ?, thinking_mode = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
@@ -545,6 +575,7 @@ class AssistantStorageMixin:
                     new_task_mode,
                     new_pid,
                     new_mdl,
+                    new_tmode,
                     now,
                     session_id,
                 ),
@@ -582,6 +613,8 @@ class AssistantStorageMixin:
         task_mode: str = "auto",
         response_type: str = "answer",
         content: str = "",
+        reasoning: str = "",
+        reasoning_ms: float = 0.0,
         steps: Optional[List[Dict[str, Any]]] = None,
         citations: Optional[List[Dict[str, Any]]] = None,
         clarification: Optional[Dict[str, Any]] = None,
@@ -599,10 +632,11 @@ class AssistantStorageMixin:
                 """
                 INSERT INTO ai_assistant_messages (
                     session_id, turn_index, role, task_mode, response_type, content,
+                    reasoning, reasoning_ms,
                     steps_json, citations_json, clarification_json, next_steps_json,
                     result_table_json, attachments_json, proposal_id, provider_name, model,
                     total_elapsed_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -611,6 +645,8 @@ class AssistantStorageMixin:
                     task_mode,
                     response_type,
                     content,
+                    reasoning or "",
+                    round(float(reasoning_ms or 0.0), 1),
                     json.dumps(steps or [], ensure_ascii=False),
                     json.dumps(citations or [], ensure_ascii=False),
                     json.dumps(clarification or {}, ensure_ascii=False),
@@ -726,8 +762,8 @@ class AssistantStorageMixin:
                 INSERT INTO ai_assistant_attachments (
                     attachment_id, session_id, filename, file_ext, file_kind, encoding,
                     size_bytes, line_count, row_count, estimated_tokens, chunk_count,
-                    oversized, recommended_strategy, summary, raw_text, csv_profile_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    oversized, recommended_strategy, summary, raw_text, csv_profile_json, outline_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     aid,
@@ -742,10 +778,11 @@ class AssistantStorageMixin:
                     int(parsed.get("estimated_tokens") or 0),
                     len(chunks),
                     1 if parsed.get("oversized") else 0,
-                    str(parsed.get("recommended_strategy") or "inline"),
+                    str(parsed.get("recommended_strategy") or "full_context"),
                     str(parsed.get("summary") or ""),
                     str(parsed.get("raw_text") or ""),
                     json.dumps(parsed.get("csv_profile") or {}, ensure_ascii=False),
+                    json.dumps(parsed.get("outline") or {}, ensure_ascii=False),
                     now,
                 ),
             )
@@ -884,12 +921,84 @@ class AssistantStorageMixin:
             "chunks": [self._row_to_attachment_chunk_dict(cr, include_content=True) for cr in crows],
         }
 
+    def read_attachment_lines(
+        self,
+        attachment_id: str,
+        start_line: int = 1,
+        end_line: int = 250,
+        *,
+        max_lines: int = 400,
+        max_tokens: int = 10000,
+    ) -> Optional[Dict[str, Any]]:
+        """按 1-based 行号区间读取附件原文片段（带行号，受行数与 Token 双重安全上限保护）."""
+        aid = (attachment_id or "").strip()
+        if not aid:
+            return None
+        with self.ctx.store.module_db(scope="private") as conn:
+            arow = conn.execute(
+                "SELECT attachment_id, filename, raw_text FROM ai_assistant_attachments WHERE attachment_id = ?",
+                (aid,),
+            ).fetchone()
+        if arow is None:
+            return None
+
+        all_lines = str(arow["raw_text"] or "").splitlines()
+        total_lines = len(all_lines)
+        if total_lines == 0:
+            return {
+                "attachment_id": aid,
+                "filename": str(arow["filename"] or ""),
+                "start_line": 0,
+                "end_line": 0,
+                "total_lines": 0,
+                "has_more": False,
+                "truncated_by_tokens": False,
+                "content": "",
+            }
+
+        s_line = max(1, min(total_lines, int(start_line or 1)))
+        req_end = int(end_line or (s_line + 249))
+        if req_end < s_line:
+            req_end = s_line + 249
+        safe_max_lines = max(1, min(400, int(max_lines or 400)))
+        e_line = min(total_lines, req_end, s_line + safe_max_lines - 1)
+
+        selected_lines: List[str] = []
+        running_tokens = 0
+        truncated_by_tokens = False
+        safe_max_tokens = max(500, int(max_tokens or 10000))
+        actual_end = s_line - 1
+
+        for ln_no in range(s_line, e_line + 1):
+            ln_text = all_lines[ln_no - 1]
+            ln_tok = estimate_tokens(ln_text) + 2
+            if selected_lines and running_tokens + ln_tok > safe_max_tokens:
+                truncated_by_tokens = True
+                break
+            selected_lines.append(ln_text)
+            running_tokens += ln_tok
+            actual_end = ln_no
+
+        numbered = format_with_line_numbers("\n".join(selected_lines), start_line=s_line)
+        return {
+            "attachment_id": aid,
+            "filename": str(arow["filename"] or ""),
+            "start_line": s_line,
+            "end_line": actual_end,
+            "total_lines": total_lines,
+            "has_more": actual_end < total_lines,
+            "truncated_by_tokens": truncated_by_tokens,
+            "content": numbered,
+        }
+
     def search_attachment_content(
         self,
         attachment_id: str,
         keyword: str,
         *,
-        limit: int = 8,
+        regex: bool = False,
+        context_lines: int = 2,
+        limit: int = 12,
     ) -> Optional[Dict[str, Any]]:
         aid = (attachment_id or "").strip()
         kw = (keyword or "").strip()
@@ -897,63 +1006,88 @@ class AssistantStorageMixin:
             return None
         with self.ctx.store.module_db(scope="private") as conn:
             arow = conn.execute(
-                "SELECT * FROM ai_assistant_attachments WHERE attachment_id = ?",
+                "SELECT attachment_id, filename, raw_text FROM ai_assistant_attachments WHERE attachment_id = ?",
                 (aid,),
             ).fetchone()
             if arow is None:
                 return None
             crows = conn.execute(
-                "SELECT * FROM ai_assistant_attachment_chunks WHERE attachment_id = ? ORDER BY chunk_index ASC",
+                "SELECT chunk_index, title, range_label, start_line, end_line FROM ai_assistant_attachment_chunks WHERE attachment_id = ? ORDER BY chunk_index ASC",
                 (aid,),
             ).fetchall()
 
-        terms = [t.lower() for t in kw.split() if t.strip()]
-        cap = max(1, min(20, int(limit or 8)))
-        hits: List[Dict[str, Any]] = []
-        for cr in crows:
-            content = str(cr["content"] or "")
-            start_ln = int(cr["start_line"] or 1)
-            for rel_idx, line in enumerate(content.splitlines()):
-                low = line.lower()
-                if terms and all(t in low for t in terms):
-                    hits.append(
-                        {
-                            "chunk_index": int(cr["chunk_index"] or 0),
-                            "title": str(cr["title"] or ""),
-                            "range_label": str(cr["range_label"] or ""),
-                            "line_no": start_ln + rel_idx,
-                            "snippet": line.strip()[:220],
-                        }
-                    )
-                    break
-            if len(hits) >= cap:
-                break
+        all_lines = str(arow["raw_text"] or "").splitlines()
+        total_lines = len(all_lines)
+        cap = max(1, min(30, int(limit or 12)))
+        ctx_n = max(0, min(6, int(context_lines if context_lines is not None else 2)))
 
-        # 若整行 AND 未命中，按任意词兜底返回包含任一关键词的片段
-        if not hits and terms:
-            for cr in crows:
-                content = str(cr["content"] or "")
-                start_ln = int(cr["start_line"] or 1)
-                for rel_idx, line in enumerate(content.splitlines()):
-                    low = line.lower()
-                    if any(t in low for t in terms):
-                        hits.append(
-                            {
-                                "chunk_index": int(cr["chunk_index"] or 0),
-                                "title": str(cr["title"] or ""),
-                                "range_label": str(cr["range_label"] or ""),
-                                "line_no": start_ln + rel_idx,
-                                "snippet": line.strip()[:220],
-                            }
-                        )
+        chunks_meta = [
+            {
+                "chunk_index": int(cr["chunk_index"] or 0),
+                "title": str(cr["title"] or ""),
+                "range_label": str(cr["range_label"] or ""),
+                "start_line": int(cr["start_line"] or 1),
+                "end_line": int(cr["end_line"] or total_lines),
+            }
+            for cr in crows
+        ]
+
+        def _locate_chunk(ln: int) -> Dict[str, Any]:
+            for cm in chunks_meta:
+                if cm["start_line"] <= ln <= cm["end_line"]:
+                    return cm
+            return chunks_meta[0] if chunks_meta else {"chunk_index": 0, "title": "", "range_label": f"L{ln}"}
+
+        def _build_hit(line_no: int, line_text: str) -> Dict[str, Any]:
+            cm = _locate_chunk(line_no)
+            c_start = max(1, line_no - ctx_n)
+            c_end = min(total_lines, line_no + ctx_n)
+            ctx_block = format_with_line_numbers(
+                "\n".join(all_lines[c_start - 1 : c_end]),
+                start_line=c_start,
+            )
+            return {
+                "chunk_index": cm["chunk_index"],
+                "title": cm["title"],
+                "range_label": cm["range_label"],
+                "line_no": line_no,
+                "snippet": line_text.strip()[:240],
+                "context": ctx_block[:1200],
+            }
+
+        hits: List[Dict[str, Any]] = []
+        if regex and kw:
+            try:
+                pat = re.compile(kw, re.IGNORECASE)
+            except re.error as exc:
+                raise ValueError(f"正则表达式语法错误: {exc}") from exc
+            for idx, line in enumerate(all_lines, start=1):
+                if pat.search(line):
+                    hits.append(_build_hit(idx, line))
+                    if len(hits) >= cap:
                         break
-                if len(hits) >= cap:
-                    break
+        else:
+            terms = [t.lower() for t in kw.split() if t.strip()]
+            if terms:
+                for idx, line in enumerate(all_lines, start=1):
+                    low = line.lower()
+                    if all(t in low for t in terms):
+                        hits.append(_build_hit(idx, line))
+                        if len(hits) >= cap:
+                            break
+                if not hits:
+                    for idx, line in enumerate(all_lines, start=1):
+                        low = line.lower()
+                        if any(t in low for t in terms):
+                            hits.append(_build_hit(idx, line))
+                            if len(hits) >= cap:
+                                break
 
         return {
             "attachment_id": aid,
             "filename": str(arow["filename"] or ""),
             "keyword": kw,
+            "total_lines": total_lines,
             "hit_count": len(hits),
             "hits": hits,
         }

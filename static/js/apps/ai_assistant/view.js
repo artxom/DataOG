@@ -31,7 +31,10 @@ const TASK_MODES = [
 const DEFAULT_ATTACHMENT_LIMITS = {
   max_csv_bytes: 2 * 1024 * 1024,
   max_text_bytes: 5 * 1024 * 1024,
-  inline_token_budget: 3500,
+  inline_token_budget: 32000,
+  csv_inline_token_budget: 8000,
+  chunk_target_tokens: 12000,
+  chunk_hard_max_tokens: 16000,
   max_attachments_per_turn: 5,
   csv_extensions: [".csv", ".tsv"],
   allowed_extensions: [
@@ -57,9 +60,16 @@ const PASTE_TO_ATTACHMENT_MIN_CHARS = 4000;
 const PASTE_TO_ATTACHMENT_MIN_LINES = 80;
 
 const STRATEGY_OPTIONS = [
-  { id: "auto", label: "自动策略（SQL/文本分步拆解 · CSV 沙箱查询）" },
-  { id: "stepped_batch", label: "强制分步拆解（逐片汇总防爆窗）" },
-  { id: "on_demand", label: "按需工具检索（省 Token）" },
+  { id: "auto", label: "智能上下文（窗口内直通全文 · 超出时大纲+按行探索）" },
+  { id: "full_context", label: "强制全量直通（一次性完整送入当前模型）" },
+  { id: "agentic_explore", label: "结构大纲 + 按行/正则精准探索（省 Token）" },
+  { id: "stepped_batch", label: "强制逐片拆解分析（超大脚本兜底）" },
+];
+
+const THINKING_MODE_OPTIONS = [
+  { id: "auto", label: "思考: 自动" },
+  { id: "enabled", label: "思考: 深度开启" },
+  { id: "disabled", label: "思考: 快速关闭" },
 ];
 
 const FALLBACK_DIALECTS = [
@@ -137,9 +147,14 @@ export class AiAssistantView {
     this.attachmentLimits = { ...DEFAULT_ATTACHMENT_LIMITS };
     this.pendingAttachments = [];
     this.largePayloadStrategy = "auto";
+    this.thinkingMode = "auto";
     this.isDraggingFile = false;
     this.uploadingAttachment = false;
     this.expandedStepsMsgIds = new Set();
+    this.expandedReasoningMsgIds = new Set();
+    this._liveState = null;
+    this._liveSessionId = "";
+    this._streamRenderTimer = null;
 
     this.activityBar = new TaskActivityBar({ graceMs: 120 });
     this.activityBar.el.style.margin = "8px 18px 0";
@@ -170,6 +185,10 @@ export class AiAssistantView {
   }
 
   destroy() {
+    if (this._streamRenderTimer) {
+      clearTimeout(this._streamRenderTimer);
+      this._streamRenderTimer = null;
+    }
     this.activityBar?.destroy();
     this._unsub?.();
   }
@@ -196,6 +215,30 @@ export class AiAssistantView {
     }
     const [providerId, ...rest] = this.selectedModelKey.split("::");
     return { providerId, model: rest.join("::") };
+  }
+
+  _getSelectedModelMeta() {
+    const { providerId, model } = this._parseSelectedModel();
+    if (!providerId && !model) return null;
+    const models = store.state.llmModels || [];
+    return (
+      models.find((m) => m.provider_id === providerId && m.model === model) ||
+      models.find((m) => m.provider_id === providerId) ||
+      null
+    );
+  }
+
+  _formatTokenCount(n) {
+    const v = Number(n || 0);
+    if (!Number.isFinite(v) || v <= 0) return "0";
+    if (v >= 1000000) return `${(v / 1000000).toFixed(v % 1000000 === 0 ? 0 : 1)}M`;
+    if (v >= 1000) return `${Math.round(v / 1000)}K`;
+    return String(Math.round(v));
+  }
+
+  stopStreaming() {
+    if (!this.loading) return;
+    this.activityBar?.cancel?.();
   }
 
   _getCurrentConnProfile() {
@@ -310,16 +353,24 @@ export class AiAssistantView {
       {
         className: "mac-input mac-input-sm",
         "aria-label": "选择 AI 模型",
-        style: { maxWidth: "185px" },
+        style: { maxWidth: "240px" },
         disabled: models.length === 0 || this.loading,
         onChange: (e) => {
           this.selectedModelKey = e.target.value;
+          if (this.pendingAttachments.length) {
+            this.render();
+          }
         },
       },
       models.length
         ? models.map((m) => {
             const val = `${m.provider_id}::${m.model}`;
-            const opt = el("option", { value: val, text: `${m.model} (${m.provider_name})` });
+            const ctxLabel = m.context_window ? ` · ${this._formatTokenCount(m.context_window)}` : "";
+            const thinkLabel = m.supports_thinking ? " · 深度思考" : "";
+            const opt = el("option", {
+              value: val,
+              text: `${m.model} (${m.provider_name}${ctxLabel}${thinkLabel})`,
+            });
             if (val === this.selectedModelKey) opt.selected = true;
             return opt;
           })
@@ -433,6 +484,8 @@ export class AiAssistantView {
   startNewSession() {
     this.currentSession = null;
     this.taskMode = "auto";
+    this.thinkingMode = "auto";
+    this._liveSessionId = "";
     this.focusTables = [];
     this.pendingAttachments = [];
     this.largePayloadStrategy = "auto";
@@ -450,12 +503,14 @@ export class AiAssistantView {
       const sess = res.session;
       if (!sess) return;
       this.currentSession = sess;
+      this._liveSessionId = sess.session_id || "";
       this.workMode = sess.work_mode || (sess.connection_id ? "connection" : "dialect");
       this.connectionId = sess.connection_id || "";
       this.dialect = sess.dialect || "DWS";
       this.schemaName = sess.schema_name || "";
       this.focusTables = [...(sess.focus_tables || [])];
       this.taskMode = sess.task_mode || "auto";
+      this.thinkingMode = sess.thinking_mode || "auto";
       this.pendingAttachments = [];
       this.largePayloadStrategy = "auto";
       this.render();
@@ -586,9 +641,18 @@ export class AiAssistantView {
       });
       if (res?.attachment) {
         this.pendingAttachments = [...this.pendingAttachments, res.attachment];
-        if (res.attachment.oversized) {
+        const ctxWin = Number(this._getSelectedModelMeta()?.context_window || 64000);
+        const attBud = Number(
+          this._getSelectedModelMeta()?.attachment_budget || Math.floor(ctxWin * 0.65)
+        );
+        const tok = Number(res.attachment.estimated_tokens || 0);
+        if (res.attachment.file_kind !== "csv" && tok <= attBud && tok > 0) {
+          Toast.success(
+            `已将长文本转为附件「${res.attachment.filename}」（~${tok} tokens，支持当前模型 ${this._formatTokenCount(ctxWin)} 窗口直接全量分析）`
+          );
+        } else if (res.attachment.oversized) {
           Toast.info(
-            `已将超长粘贴内容转为附件「${res.attachment.filename}」（~${res.attachment.estimated_tokens} tokens · ${res.attachment.chunk_count} 片）`
+            `已将超长粘贴内容转为附件「${res.attachment.filename}」（~${tok} tokens · ${res.attachment.chunk_count} 片）`
           );
         } else {
           Toast.success(`已将粘贴内容转为附件「${res.attachment.filename}」`);
@@ -666,6 +730,58 @@ export class AiAssistantView {
     );
 
     const blocks = [metaRow];
+    const outline = detail.outline && typeof detail.outline === "object" ? detail.outline : null;
+    if (
+      outline &&
+      (outline.summary_line ||
+        (outline.objects || []).length ||
+        (outline.sections || []).length ||
+        (outline.referenced_tables || []).length)
+    ) {
+      const objs = Array.isArray(outline.objects) ? outline.objects : [];
+      const secs = Array.isArray(outline.sections) ? outline.sections : [];
+      const refs = Array.isArray(outline.referenced_tables) ? outline.referenced_tables : [];
+      blocks.push(
+        el(
+          "div",
+          { className: "mac-group-box ai-asst-outline-box" },
+          el(
+            "div",
+            { style: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" } },
+            el("strong", { style: { fontSize: "12.5px" }, text: "结构化源码大纲（零 Token 索引）" }),
+            outline.is_stored_procedure ? badge("存储过程 / PL-SQL", "info") : null,
+            outline.summary_line
+              ? el("span", { className: "muted", style: { fontSize: "11.5px" }, text: outline.summary_line })
+              : null
+          ),
+          objs.length
+            ? el(
+                "div",
+                { className: "ai-asst-outline-chips" },
+                objs.map((o) => badge(`L${o.line || 1} ${o.kind || ""} ${o.name || ""}`.trim(), "neutral"))
+              )
+            : null,
+          refs.length
+            ? el(
+                "div",
+                { className: "ai-asst-outline-chips" },
+                el("span", { className: "muted", style: { fontSize: "11px" }, text: "涉及表:" }),
+                refs.slice(0, 18).map((tbl) => badge(tbl, "info"))
+              )
+            : null,
+          secs.length
+            ? el(
+                "div",
+                { className: "ai-asst-outline-list" },
+                secs.slice(0, 30).map((sec) =>
+                  el("div", { className: "mono muted", text: `L${sec.line || 1} · ${sec.title || ""}` })
+                )
+              )
+            : null
+        )
+      );
+    }
+
     const prof = detail.csv_profile || {};
     if (detail.file_kind === "csv" && Array.isArray(prof.columns) && prof.columns.length) {
       const schemaBox = el(
@@ -779,11 +895,25 @@ export class AiAssistantView {
       this.pendingAttachments = [];
     }
     const effStrategy = strategyOverride || this.largePayloadStrategy || "auto";
+    this._liveSessionId = this.currentSession?.session_id || "";
+    this._liveState = {
+      statusText: "正在连接模型...",
+      thinking: "",
+      thinkingStarted: false,
+      thinkingOpen: true,
+      thinkingDone: false,
+      thinkingMs: 0,
+      steps: [],
+      content: "",
+      refs: null,
+    };
     this._pendingUserAttachments = sentPendingSnapshot;
     this._pendingUserPrompt =
       text || `请结合附带的 ${effAttachIds.length} 份文件进行分析与诊断。`;
     this.loading = true;
     this.render();
+    this.refreshHeader?.();
+    this._scrollToBottom();
 
     try {
       const payload = {
@@ -797,6 +927,7 @@ export class AiAssistantView {
         task_mode: effTaskMode,
         provider_id: providerId,
         model,
+        thinking_mode: this.thinkingMode || "auto",
         max_steps: this.maxSteps,
         sample_limit: this.sampleLimit,
         clarification_reply: clarificationReply,
@@ -811,10 +942,15 @@ export class AiAssistantView {
       const res = await this.activityBar.track(
         "Data.O.G 智能分析探索",
         async ({ taskId, signal }) => {
-          const out = await assistantApi.sendChatTurn(payload, { taskId, signal });
-          const stepCnt = out?.assistant_message?.steps?.length ?? 0;
+          const out = await assistantApi.streamChatTurn(payload, {
+            taskId,
+            signal,
+            onEvent: (evType, ev) => this._handleStreamEvent(evType, ev),
+          });
+          const rawRes = out?.fallbackJson || out || {};
+          const stepCnt = rawRes?.assistant_message?.steps?.length ?? 0;
           return {
-            ...out,
+            ...rawRes,
             message: stepCnt > 0 ? `已完成分析（共 ${stepCnt} 步探索）` : "已完成智能分析",
           };
         },
@@ -822,24 +958,56 @@ export class AiAssistantView {
       );
 
       this.currentSession = res.session || this.currentSession;
+      if (this.currentSession?.session_id) {
+        this._liveSessionId = this.currentSession.session_id;
+      }
       if (res.assistant_message?.id && (res.assistant_message.steps || []).length > 0) {
         this.expandedStepsMsgIds.add(res.assistant_message.id);
       }
       const sessRes = await assistantApi.listSessions();
       this.sessions = sessRes.sessions || this.sessions;
     } catch (err) {
-      if (overrideText === null && !this.draftPrompt) {
-        this.draftPrompt = text;
-      }
-      if (!useOverrideAttach && sentPendingSnapshot.length && !this.pendingAttachments.length) {
-        this.pendingAttachments = sentPendingSnapshot;
-      }
       if (isAbortError(err)) {
-        Toast.info("已取消本次分析");
+        Toast.info("已停止生成");
+        let recoveredTurn = false;
+        if (this._liveSessionId) {
+          try {
+            const [sessRes, listRes] = await Promise.all([
+              assistantApi.getSession(this._liveSessionId),
+              assistantApi.listSessions(),
+            ]);
+            if (sessRes?.session) {
+              this.currentSession = sessRes.session;
+              recoveredTurn = true;
+            }
+            if (listRes?.sessions) {
+              this.sessions = listRes.sessions;
+            }
+          } catch (_e) {
+            // 忽略停止生成后的会话刷新错误
+          }
+        }
+        if (!recoveredTurn && overrideText === null && !this.draftPrompt) {
+          this.draftPrompt = text;
+        }
+        if (!recoveredTurn && !useOverrideAttach && sentPendingSnapshot.length && !this.pendingAttachments.length) {
+          this.pendingAttachments = sentPendingSnapshot;
+        }
       } else {
+        if (overrideText === null && !this.draftPrompt) {
+          this.draftPrompt = text;
+        }
+        if (!useOverrideAttach && sentPendingSnapshot.length && !this.pendingAttachments.length) {
+          this.pendingAttachments = sentPendingSnapshot;
+        }
         Toast.error(err.message || "智能分析请求失败");
       }
     } finally {
+      if (this._streamRenderTimer) {
+        clearTimeout(this._streamRenderTimer);
+        this._streamRenderTimer = null;
+      }
+      this._liveState = null;
       this._pendingUserAttachments = [];
       this._pendingUserPrompt = "";
       this.loading = false;
@@ -849,9 +1017,329 @@ export class AiAssistantView {
     }
   }
 
+  _handleStreamEvent(evType, ev) {
+    const state = this._liveState;
+    if (!state) return;
+    const refs = state.refs;
+
+    if (evType === "session_init") {
+      if (ev?.session?.session_id) {
+        this._liveSessionId = ev.session.session_id;
+      }
+      const stratMap = {
+        full_context: `已装入全量上下文（${this._formatTokenCount(ev?.context_window || 0)} 窗口）· 模型分析中...`,
+        agentic_explore: "已生成结构大纲 · 智能按行/正则探索中...",
+        stepped_batch: "正在分步拆解长文本分析...",
+      };
+      state.statusText = stratMap[ev?.strategy] || "模型推理分析中...";
+      this._renderLiveStatusDOM();
+      return;
+    }
+
+    if (evType === "status") {
+      state.statusText = String(ev?.detail || ev?.stage || "探索分析中...");
+      this._renderLiveStatusDOM();
+      return;
+    }
+
+    if (evType === "thinking_start") {
+      if (state.thinking) {
+        state.thinking += "\n\n";
+      }
+      state.thinkingStarted = true;
+      state.thinkingDone = false;
+      state.thinkingOpen = true;
+      state.statusText = "模型正在深度思考...";
+      this._renderLiveStatusDOM();
+      this._renderLiveThinkingDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "thinking_delta") {
+      const delta = String(ev?.delta || "");
+      if (!delta) return;
+      state.thinkingStarted = true;
+      state.thinking += delta;
+      if (state.thinkingOpen && refs?.thinkingPreEl) {
+        refs.thinkingPreEl.textContent = state.thinking;
+        refs.thinkingPreEl.scrollTop = refs.thinkingPreEl.scrollHeight;
+      } else {
+        this._renderLiveThinkingDOM();
+      }
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "thinking_end") {
+      state.thinkingDone = true;
+      state.thinkingMs += Number(ev?.elapsed_ms || 0);
+      state.thinkingOpen = false;
+      state.statusText = "思考完成，正在生成回答...";
+      this._renderLiveStatusDOM();
+      this._renderLiveThinkingDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "tool_start") {
+      state.steps.push({
+        step: Number(ev?.step || state.steps.length + 1),
+        tool: String(ev?.tool || "tool"),
+        purpose: String(ev?.purpose || ev?.tool || "执行工具"),
+        status: "running",
+        ok: true,
+        elapsed_ms: 0,
+        summary: "",
+      });
+      state.statusText = `正在执行步骤 #${ev?.step || state.steps.length}: ${ev?.purpose || ev?.tool || ""}`;
+      this._renderLiveStatusDOM();
+      this._renderLiveStepsDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "tool_end") {
+      const stepNo = Number(ev?.step || 0);
+      const target =
+        [...state.steps].reverse().find((s) => stepNo > 0 && s.step === stepNo) ||
+        state.steps[state.steps.length - 1];
+      if (target) {
+        target.status = "done";
+        target.ok = Boolean(ev?.ok);
+        target.elapsed_ms = Number(ev?.elapsed_ms || 0);
+        target.summary = String(ev?.summary || "");
+      } else {
+        state.steps.push({
+          step: stepNo || state.steps.length + 1,
+          tool: String(ev?.tool || "tool"),
+          purpose: String(ev?.purpose || ev?.tool || "执行工具"),
+          status: "done",
+          ok: Boolean(ev?.ok),
+          elapsed_ms: Number(ev?.elapsed_ms || 0),
+          summary: String(ev?.summary || ""),
+        });
+      }
+      this._renderLiveStepsDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "content_reset") {
+      state.content = "";
+      if (this._streamRenderTimer) {
+        clearTimeout(this._streamRenderTimer);
+        this._streamRenderTimer = null;
+      }
+      this._renderLiveMarkdownDOM();
+      return;
+    }
+
+    if (evType === "content_delta") {
+      const delta = String(ev?.delta || "");
+      if (!delta) return;
+      const wasEmpty = !state.content;
+      state.content += delta;
+      if (wasEmpty) {
+        state.statusText = "正在流式输出回答...";
+        this._renderLiveStatusDOM();
+      }
+      this._scheduleLiveMarkdown(wasEmpty);
+    }
+  }
+
+  _scheduleLiveMarkdown(immediate = false) {
+    if (immediate) {
+      if (this._streamRenderTimer) {
+        clearTimeout(this._streamRenderTimer);
+        this._streamRenderTimer = null;
+      }
+      this._renderLiveMarkdownDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+    if (this._streamRenderTimer) return;
+    this._streamRenderTimer = setTimeout(() => {
+      this._streamRenderTimer = null;
+      this._renderLiveMarkdownDOM();
+      this._smartScrollToBottom();
+    }, 50);
+  }
+
+  _renderLiveStatusDOM() {
+    const state = this._liveState;
+    const slot = state?.refs?.statusSlot;
+    if (!slot) return;
+    clearEl(slot, statusDot(state.statusText || "正在分析...", "info"));
+  }
+
+  _renderLiveThinkingDOM() {
+    const state = this._liveState;
+    const refs = state?.refs;
+    const slot = refs?.thinkingSlot;
+    if (!slot) return;
+    if (!state.thinkingStarted && !state.thinking) {
+      refs.thinkingPreEl = null;
+      clearEl(slot);
+      return;
+    }
+    const secLabel = state.thinkingMs > 0 ? ` (${(state.thinkingMs / 1000).toFixed(1)}s)` : "";
+    const titleText = state.thinkingDone ? `已深度思考${secLabel}` : "深度思考中...";
+    let preEl = null;
+    const box = el(
+      "div",
+      { className: "ai-asst-thinking-box" },
+      el(
+        "button",
+        {
+          type: "button",
+          className: "ai-asst-thinking-toggle",
+          onClick: () => {
+            state.thinkingOpen = !state.thinkingOpen;
+            this._renderLiveThinkingDOM();
+          },
+        },
+        svgIcon("lightbulb", 13),
+        el("span", { text: titleText }),
+        el("span", {
+          className: "muted",
+          style: { marginLeft: "auto", fontSize: "11.5px" },
+          text: state.thinkingOpen ? "收起思考" : "展开思考",
+        })
+      ),
+      state.thinkingOpen
+        ? el(
+            "div",
+            { className: "ai-asst-thinking-body" },
+            (preEl = el("pre", {
+              className: "ai-asst-thinking-pre",
+              text: state.thinking || "...",
+            }))
+          )
+        : null
+    );
+    refs.thinkingPreEl = preEl;
+    clearEl(slot, box);
+    if (preEl) {
+      preEl.scrollTop = preEl.scrollHeight;
+    }
+  }
+
+  _renderLiveStepsDOM() {
+    const state = this._liveState;
+    const slot = state?.refs?.stepsSlot;
+    if (!slot) return;
+    if (!state.steps.length) {
+      clearEl(slot);
+      return;
+    }
+    const box = el(
+      "div",
+      { className: "ai-asst-trace-box" },
+      el(
+        "div",
+        { className: "ai-asst-trace-toggle" },
+        statusDot(`实时探索步骤 (${state.steps.length})`, "info")
+      ),
+      el(
+        "div",
+        { className: "ai-asst-trace-list" },
+        state.steps.map((st) =>
+          el(
+            "div",
+            {
+              className: `ai-asst-trace-step ${
+                st.status === "running" ? "is-running" : st.ok ? "is-ok" : "is-warn"
+              }`,
+            },
+            el(
+              "div",
+              { style: { display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" } },
+              badge(
+                `#${st.step} ${st.tool}`,
+                st.status === "running" ? "info" : st.ok ? "info" : "warn"
+              ),
+              el("span", { style: { fontWeight: "600", fontSize: "12px" }, text: st.purpose || st.tool }),
+              el("span", {
+                className: "muted mono",
+                style: { marginLeft: "auto", fontSize: "11px" },
+                text: st.status === "running" ? "执行中..." : `${st.elapsed_ms || 0} ms`,
+              })
+            ),
+            st.summary
+              ? el("div", { className: "muted", style: { fontSize: "11.5px", marginTop: "3px" }, text: st.summary })
+              : null
+          )
+        )
+      )
+    );
+    clearEl(slot, box);
+  }
+
+  _renderLiveMarkdownDOM() {
+    const state = this._liveState;
+    const slot = state?.refs?.contentSlot;
+    if (!slot) return;
+    if (!state.content) {
+      clearEl(slot);
+      return;
+    }
+    clearEl(
+      slot,
+      el(
+        "div",
+        { className: "ai-asst-stream-body" },
+        renderSafeMarkdown(state.content),
+        el("span", { className: "ai-asst-stream-cursor", "aria-hidden": "true" })
+      )
+    );
+  }
+
+  _renderLiveAssistantCard() {
+    const state = this._liveState;
+    if (!state) return null;
+    const statusSlot = el("div", { className: "ai-asst-stream-status" });
+    const thinkingSlot = el("div");
+    const stepsSlot = el("div");
+    const contentSlot = el("div");
+    state.refs = {
+      statusSlot,
+      thinkingSlot,
+      stepsSlot,
+      contentSlot,
+      thinkingPreEl: null,
+    };
+    this._renderLiveStatusDOM();
+    this._renderLiveThinkingDOM();
+    this._renderLiveStepsDOM();
+    this._renderLiveMarkdownDOM();
+    return el(
+      "div",
+      { className: "ai-asst-msg ai-asst-msg-assistant" },
+      el(
+        "div",
+        { className: "ai-asst-assistant-card ai-asst-live-card" },
+        statusSlot,
+        thinkingSlot,
+        stepsSlot,
+        contentSlot
+      )
+    );
+  }
+
   _scrollToBottom() {
     const stream = this.root.querySelector(".ai-asst-stream");
     if (stream) {
+      stream.scrollTop = stream.scrollHeight;
+    }
+  }
+
+  _smartScrollToBottom() {
+    const stream = this.root.querySelector(".ai-asst-stream");
+    if (!stream) return;
+    const clientH = Number(stream.clientHeight || 0);
+    const nearBottom = clientH <= 0 || stream.scrollHeight - stream.scrollTop - clientH < 140;
+    if (nearBottom) {
       stream.scrollTop = stream.scrollHeight;
     }
   }
@@ -1096,6 +1584,47 @@ export class AiAssistantView {
       );
     }
 
+    const reasoningText = String(msg.reasoning || "").trim();
+    const reasoningExpanded = this.expandedReasoningMsgIds.has(msg.id);
+    const reasoningMs = Number(msg.reasoning_ms || 0);
+    const reasoningSection = reasoningText
+      ? el(
+          "div",
+          { className: "ai-asst-thinking-box" },
+          el(
+            "button",
+            {
+              type: "button",
+              className: "ai-asst-thinking-toggle",
+              onClick: () => {
+                if (reasoningExpanded) this.expandedReasoningMsgIds.delete(msg.id);
+                else this.expandedReasoningMsgIds.add(msg.id);
+                this.render();
+              },
+            },
+            svgIcon("lightbulb", 13),
+            el("span", {
+              text:
+                reasoningMs > 0
+                  ? `已深度思考 (${(reasoningMs / 1000).toFixed(1)}s)`
+                  : "已深度思考（思考过程）",
+            }),
+            el("span", {
+              className: "muted",
+              style: { marginLeft: "auto", fontSize: "11.5px" },
+              text: reasoningExpanded ? "收起思考" : "展开思考",
+            })
+          ),
+          reasoningExpanded
+            ? el(
+                "div",
+                { className: "ai-asst-thinking-body" },
+                el("pre", { className: "ai-asst-thinking-pre", text: reasoningText })
+              )
+            : null
+        )
+      : null;
+
     const steps = msg.steps || [];
     const stepsExpanded = this.expandedStepsMsgIds.has(msg.id);
 
@@ -1269,6 +1798,7 @@ export class AiAssistantView {
       el(
         "div",
         { className: "ai-asst-assistant-card" },
+        reasoningSection,
         traceSection,
         msg.content ? renderSafeMarkdown(msg.content) : null,
         clarSection,
@@ -1304,6 +1834,28 @@ export class AiAssistantView {
       }
     }
 
+    const selModel = this._getSelectedModelMeta();
+    const thinkingSelect = el(
+      "select",
+      {
+        className: "mac-input mac-input-sm ai-asst-think-select",
+        "aria-label": "深度思考模式",
+        disabled: this.loading,
+        title: selModel?.supports_thinking
+          ? "当前模型支持 Thinking 深度思考，可切换推理深度"
+          : "控制模型推理 / Thinking 模式（自动探测或强制开/关）",
+        onChange: (e) => {
+          this.thinkingMode = e.target.value;
+          this.render();
+        },
+      },
+      THINKING_MODE_OPTIONS.map((optItem) => {
+        const opt = el("option", { value: optItem.id, text: optItem.label });
+        if (optItem.id === this.thinkingMode) opt.selected = true;
+        return opt;
+      })
+    );
+
     const modeChips = el(
       "div",
       { className: "ai-asst-mode-bar" },
@@ -1322,6 +1874,7 @@ export class AiAssistantView {
           })
         )
       ),
+      thinkingSelect,
       this.workMode === "connection"
         ? el(
             "button",
@@ -1371,15 +1924,7 @@ export class AiAssistantView {
           content: this._pendingUserPrompt,
           attachments: this._pendingUserAttachments || [],
         }),
-        el(
-          "div",
-          { className: "ai-asst-msg ai-asst-msg-assistant" },
-          el(
-            "div",
-            { className: "ai-asst-assistant-card" },
-            statusDot("正在连接模型与执行自主探索...", "info")
-          )
-        )
+        this._renderLiveAssistantCard()
       );
     }
 
@@ -1400,8 +1945,23 @@ export class AiAssistantView {
     const inlineBudget = Number(
       this.attachmentLimits.inline_token_budget || DEFAULT_ATTACHMENT_LIMITS.inline_token_budget
     );
-    const needsChunkProtection =
-      totalPendingTokens > inlineBudget || this.pendingAttachments.some((a) => Boolean(a?.oversized));
+    const csvInlineBudget = Number(this.attachmentLimits.csv_inline_token_budget || 8000);
+    const selModelMeta = this._getSelectedModelMeta();
+    const modelCtxWindow = Number(selModelMeta?.context_window || 64000);
+    const modelAttachBudget = Number(
+      selModelMeta?.attachment_budget ||
+        Math.max(inlineBudget, Math.floor(modelCtxWindow * 0.65))
+    );
+    const allCsvPending =
+      this.pendingAttachments.length > 0 &&
+      this.pendingAttachments.every((a) => a?.file_kind === "csv");
+    const overModelBudget = totalPendingTokens > modelAttachBudget;
+    const csvOverBudget = allCsvPending && totalPendingTokens > csvInlineBudget;
+    const isWarnBar = overModelBudget || csvOverBudget;
+    const ctxPct = Math.min(
+      100,
+      Math.round((totalPendingTokens / Math.max(1, modelAttachBudget)) * 100)
+    );
 
     const attachBar = this.pendingAttachments.length
       ? el(
@@ -1416,7 +1976,7 @@ export class AiAssistantView {
                 {
                   type: "button",
                   className: "ai-asst-attach-chip-main",
-                  title: att.summary || `${att.filename} (点击预览画像或分片)`,
+                  title: att.summary || `${att.filename} (点击预览大纲/画像或分片)`,
                   onClick: () => this.openAttachmentPreviewModal(att),
                 },
                 badge(String(att.file_kind || "txt").toUpperCase(), att.oversized ? "warn" : "info"),
@@ -1444,20 +2004,35 @@ export class AiAssistantView {
         )
       : null;
 
-    const strategyBar = needsChunkProtection
+    const strategyText = allCsvPending
+      ? `CSV 沙箱数据（~${totalPendingTokens} tok · 支持 SQL 聚合探查）`
+      : overModelBudget
+      ? `超出当前模型单次直通预算（~${totalPendingTokens} > ${this._formatTokenCount(modelAttachBudget)} tok · 窗口 ${this._formatTokenCount(modelCtxWindow)}），将按大纲+按行探索：`
+      : `上下文容量充裕（~${totalPendingTokens} / ${this._formatTokenCount(modelAttachBudget)} tok · ${this._formatTokenCount(modelCtxWindow)} 窗口 · 可全量直通）：`;
+
+    const strategyBar = this.pendingAttachments.length
       ? el(
           "div",
-          { className: "ai-asst-strategy-bar" },
-          statusDot(
-            `防爆窗保护（~${totalPendingTokens} > ${inlineBudget} tokens）：`,
-            "warn"
+          { className: `ai-asst-strategy-bar ${isWarnBar ? "is-warn" : "is-ok"}` },
+          el(
+            "div",
+            { className: "ai-asst-ctx-meter-wrap" },
+            statusDot(strategyText, isWarnBar ? "warn" : "success"),
+            el(
+              "div",
+              { className: "ai-asst-ctx-meter", title: `附件占比约 ${ctxPct}%` },
+              el("div", {
+                className: "ai-asst-ctx-meter-fill",
+                style: { width: `${Math.max(ctxPct, totalPendingTokens > 0 ? 6 : 0)}%` },
+              })
+            )
           ),
           el(
             "select",
             {
               className: "mac-input mac-input-sm",
               "aria-label": "大文件提交拆解策略",
-              style: { maxWidth: "300px" },
+              style: { maxWidth: "330px" },
               disabled: this.loading,
               onChange: (e) => {
                 this.largePayloadStrategy = e.target.value;
@@ -1512,8 +2087,8 @@ export class AiAssistantView {
         disabled: this.loading,
         placeholder:
           this.workMode === "connection"
-            ? "输入需求，或直接粘贴/拖拽 .txt/.sql/.csv（长文本自动切片防爆窗，Enter 发送 · Shift+Enter 换行）..."
-            : `输入 ${this.dialect} 问题，或粘贴/拖拽 .txt/.sql/.csv（长文本自动分步拆解）...`,
+            ? "输入需求，或直接粘贴/拖拽 .txt/.sql/.csv（长源码按当前模型窗口全量直通或大纲精准探索，实时流式输出 · Enter 发送）..."
+            : `输入 ${this.dialect} 问题，或粘贴/拖拽 .txt/.sql/.csv（支持大纲探索与流式深度思考）...`,
         onInput: (e) => {
           this.draftPrompt = e.target.value;
         },
@@ -1540,7 +2115,7 @@ export class AiAssistantView {
             },
           },
           svgIcon("upload", 12),
-          this.uploadingAttachment ? "解析分片中..." : "附加 .sql/.txt/.csv"
+          this.uploadingAttachment ? "解析大纲中..." : "附加 .sql/.txt/.csv"
         ),
         el(
           "button",
@@ -1558,17 +2133,28 @@ export class AiAssistantView {
           "上传 / 查阅参考知识库"
         ),
         el("span", { className: "muted", style: { fontSize: "11px", marginRight: "auto" }, text: "CSV ≤ 2MB / 文本 ≤ 5MB · 写操作需二次确认" }),
-        el(
-          "button",
-          {
-            type: "button",
-            className: "mac-btn mac-btn-primary",
-            disabled: this.loading || this.uploadingAttachment,
-            onClick: () => this.sendUserMessage(),
-          },
-          svgIcon("send", 13),
-          this.loading ? "探索中..." : "发送"
-        )
+        this.loading
+          ? el(
+              "button",
+              {
+                type: "button",
+                className: "mac-btn btn-danger",
+                onClick: () => this.stopStreaming(),
+              },
+              svgIcon("stop", 13),
+              "停止生成"
+            )
+          : el(
+              "button",
+              {
+                type: "button",
+                className: "mac-btn mac-btn-primary",
+                disabled: this.uploadingAttachment,
+                onClick: () => this.sendUserMessage(),
+              },
+              svgIcon("send", 13),
+              "发送"
+            )
       )
     );
 

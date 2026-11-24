@@ -8,6 +8,26 @@
 
 ---
 
+## [3.3.1] - 2026-11-24
+
+> **AI 助手现代长上下文策略重构、Thinking 深度思考全面适配与 SSE 实时流式输出**：彻底解决几千行存储过程被机械切碎为 30+ 片段的痛点——依据大模型实际上下文窗口在「全量带行号直通」「结构大纲 + 按行/正则自主探索」与「大块语义分步拆解」间自适应切换；全面打通主流推理模型 Thinking 通道与非标准 `<think>`/`<thought>` 流式分离，并落地自然 Markdown 实时流式打字体验与随时停止生成能力。
+
+### Added & Changed
+- **现代模型感知长上下文与存储过程语义引擎 (`core/platform/{llm_hub.py,schemas.py}`, `modules/ai_assistant/{attachments.py,storage_mixin.py,tools.py,service.py}`, `static/js/views/settings_view.js`)**：
+  - `LLMHub` 新增 `infer_model_capabilities()` 识别 DeepSeek (128K)、Gemini 2.5/3 (1M)、OpenAI o1/o3/o4/GPT-4.1/5、Claude 3.7+/4、Qwen3/QwQ 与本地网关窗口能力，并在「系统配置 → AI 模型」支持自定义 `context_window`；`/llm/models` 与 `/ai_assistant/dialects` 下发 `context_window`、`attachment_budget`、`supports_thinking` 元信息；
+  - 大幅提升文本分片阈值 (`INLINE_TOKEN_BUDGET = 32000`、`CHUNK_TARGET_TOKENS = 12000`、`CHUNK_HARD_MAX_TOKENS = 16000`)，新增存储过程逻辑分段 (`_chunk_stored_procedure_lines`)、零 Token 结构大纲 (`extract_attachment_outline`) 及紧凑行号标记 (`format_with_line_numbers`)，数千行存储过程仅需数片甚至免分片；
+  - 落地模型感知三策略 (`full_context` 窗口内全量直通与追问附件延续、`agentic_explore` 结构大纲 + 新增 `read_attachment_lines` 与正则/上下文 `search_attachment`、`stepped_batch` 大粒度兜底拆解)、`ContextLengthExceededError` 网关超限透明降级重试与滑动窗口上下文历史预算管控。
+- **Thinking 深度思考模型全链路适配 (`core/platform/llm_hub.py`, `modules/ai_assistant/{service.py,storage_mixin.py,schemas.py}`)**：
+  - 新增 `ThinkingStreamParser` 与 `strip_think_tags()` 统一解析 `reasoning_content`/`reasoning`/`thinking` 及跨分块 `<think>`/`<thought>` 标签（防误吞 SQL `<` 比较运算并支持从结构化 JSON 中剥离思考前缀）；
+  - 支持 `thinking_mode` (`auto` / `enabled` / `disabled`) 探测注入及 HTTP 400/422 参数不支持自动剥离回退；修复 `deepseek-reasoner` 连通测试 `max_tokens >= 256` 与仅返回推理字段判定；私有库持久化存储 `reasoning`、`reasoning_ms` 与 `thinking_mode`。
+- **SSE 实时流式输出与前端交互重塑 (`modules/ai_assistant/router.py`, `static/js/core/{http.js,dom.js}`, `static/js/apps/ai_assistant/{api.js,view.js,style.css}`)**：
+  - 新增 `POST /api/modules/ai_assistant/chat/stream` SSE 断点保活与脱敏异常事件端点及 `_StreamActionDemuxer`（支持模型自然流式输出 Markdown 并在末尾附带 `dataog_action`/`dataog_meta` 块，完全向后兼容历史 JSON 响应）；
+  - 前端新增 `streamSsePost()`、Thinking 开关与可折叠流式/历史思考卡片、增量节流 Markdown 渲染与闪烁光标、模型感知上下文容量进度条（绿/琥珀色动态提示）、附件大纲预览面板以及支持安全恢复局部回复的红色「停止生成」按钮。
+- **全栈测试与端到端校验 (`tests/test_platform.py`, `tests/test_ai_assistant_and_kb.py`)**：
+  - 新增 `test_llm_hub_model_capabilities_thinking_parser_and_sse_streaming`、`test_ai_assistant_sse_streaming_thinking_and_natural_markdown` 及 Node.js SSE 流式/中断/Thinking/容量条交互测试（全套自动化测试扩充至 **105 项**）。
+
+---
+
 ## [3.3.0] - 2026-11-24
 
 > **Ed25519 签名同系列累积增量升级体系与 GitHub Release 双产物自动化发版**：围绕极速无痛升级痛点，正式确立 `3.3.0` 基线，在原有完整客户端 `DataOG-Windows-x64-vX.Y.Z.zip` 之外同步自动化构建 ~875 KB 的签名增量更新包 `DataOG-Update-vX.Y.Z.zip`——凡同二级版本（如 `3.3.0+` 均适用后续 `3.3.x` 增量包）均可跨修订号累积直接升级，并支持系统目录覆盖投放与应用内「系统配置 → 版本与升级」双渠道导入、防篡改鉴权、断电/崩溃自动回退与一键版本回滚。

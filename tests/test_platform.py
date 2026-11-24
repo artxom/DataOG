@@ -794,6 +794,252 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             self.assertIn("SSL_CERT_FILE", str(cert_err.exception))
             self.assertIn("TLS 证书校验未通过", str(cert_err.exception))
 
+    def test_llm_hub_model_capabilities_thinking_parser_and_sse_streaming(self) -> None:
+        """验证模型上下文/Thinking 能力推断、交叉块 <think> 解析、SSE 流式读取/中断、400 回退及上下文超限识别."""
+        import http.server
+        import threading
+        from core.platform.llm_hub import (
+            ContextLengthExceededError,
+            ThinkingStreamParser,
+            infer_model_capabilities,
+            strip_think_tags,
+        )
+
+        # 1. 模型能力推断与 custom context_window 覆盖
+        caps_ds_chat = infer_model_capabilities("deepseek-chat", "DEEPSEEK", "https://api.deepseek.com")
+        self.assertEqual(caps_ds_chat["context_window"], 128000)
+        self.assertTrue(caps_ds_chat["supports_thinking"])
+
+        caps_ds_r1 = infer_model_capabilities("deepseek-reasoner", "DEEPSEEK", "https://api.deepseek.com")
+        self.assertGreaterEqual(caps_ds_r1["context_window"], 64000)
+        self.assertTrue(caps_ds_r1["supports_thinking"])
+        self.assertEqual(caps_ds_r1["thinking_mode"], "native_always")
+        self.assertTrue(caps_ds_r1["omit_temperature"])
+
+        caps_gemini = infer_model_capabilities("gemini-2.5-pro", "GEMINI", "https://generativelanguage.googleapis.com")
+        self.assertEqual(caps_gemini["context_window"], 1000000)
+        self.assertTrue(caps_gemini["supports_thinking"])
+
+        caps_gpt4o = infer_model_capabilities("gpt-4o", "OPENAI_COMPATIBLE", "https://api.openai.com/v1")
+        self.assertEqual(caps_gpt4o["context_window"], 128000)
+        self.assertFalse(caps_gpt4o["supports_thinking"])
+
+        caps_qwen3 = infer_model_capabilities("qwen3-32b", "OPENAI_COMPATIBLE", "http://127.0.0.1:11434/v1")
+        self.assertTrue(caps_qwen3["supports_thinking"])
+
+        caps_claude = infer_model_capabilities("claude-3-7-sonnet", "OPENAI_COMPATIBLE", "https://api.anthropic.com")
+        self.assertTrue(caps_claude["supports_thinking"])
+
+        caps_override = infer_model_capabilities(
+            "custom-proc-model", "OPENAI_COMPATIBLE", "http://127.0.0.1:11434/v1", {"context_window": 32000}
+        )
+        self.assertEqual(caps_override["context_window"], 32000)
+
+        # 2. ThinkingStreamParser 跨分块 <think>/<thought> 拆分、SQL '<' 免疫与 JSON <think> 剥离
+        parser = ThinkingStreamParser()
+        chunks = [
+            ("先识别表", "<thi"),
+            ("", "nk>推导过程\n步骤A"),
+            ("", "</thi"),
+            ("", "nk>\nWHERE a < 10 AND b < 20"),
+        ]
+        out_r: List[str] = []
+        out_c: List[str] = []
+        for rd, cd in chunks:
+            pr, pc = parser.feed(rd, cd)
+            if pr:
+                out_r.append(pr)
+            if pc:
+                out_c.append(pc)
+        fr, fc = parser.flush()
+        if fr:
+            out_r.append(fr)
+        if fc:
+            out_c.append(fc)
+        self.assertIn("先识别表", "".join(out_r))
+        self.assertIn("推导过程\n步骤A", "".join(out_r))
+        self.assertEqual("".join(out_c).strip(), "WHERE a < 10 AND b < 20")
+
+        stripped_r, stripped_c = strip_think_tags("<thought>内省</thought>\nSELECT 1 WHERE x < 5;")
+        self.assertEqual(stripped_r, "内省")
+        self.assertEqual(stripped_c.strip(), "SELECT 1 WHERE x < 5;")
+
+        parsed_obj = extract_json_payload('<think>让我思考一下</think>\n{"action": "answer", "content": "OK"}')
+        self.assertEqual(parsed_obj["content"], "OK")
+
+        # 3. 本地回环 Server 验证 SSE 流式、中断、400 Thinking 参数回退、上下文超限、test_provider
+        recorded_bodies: List[Dict[str, Any]] = []
+
+        class _MockStreamAndEdgeHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+                return
+
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                req_json = json.loads(self.rfile.read(length).decode("utf-8"))
+                recorded_bodies.append(req_json)
+                mdl = str(req_json.get("model") or "")
+
+                if mdl == "ctx-limit-model":
+                    err = json.dumps({"error": {"message": "maximum context length exceeded (32768 tokens)"}}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+
+                if mdl == "o3-mini" and "reasoning_effort" in req_json:
+                    err = json.dumps({"error": {"message": "Unknown parameter: 'reasoning_effort'"}}).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+
+                if req_json.get("stream"):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    frames = [
+                        {"choices": [{"delta": {"reasoning_content": "分析字段类型"}}]},
+                        {"choices": [{"delta": {"content": "<think>补充核对</think>"}}]},
+                        {"choices": [{"delta": {"content": "结论: `SELECT 1 WHERE x < 10;`" }}]},
+                    ]
+                    for fr_obj in frames:
+                        line = f"data: {json.dumps(fr_obj, ensure_ascii=False)}\n\n".encode("utf-8")
+                        self.wfile.write(line)
+                        self.wfile.flush()
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    return
+
+                if mdl == "deepseek-reasoner":
+                    if int(req_json.get("max_tokens") or 0) < 256:
+                        err = json.dumps({"error": {"message": "max_tokens too small for thinking"}}).encode("utf-8")
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(err)))
+                        self.end_headers()
+                        self.wfile.write(err)
+                        return
+                    raw = json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "reasoning_content": "REASONING_PING_OK",
+                                    }
+                                }
+                            ]
+                        }
+                    ).encode("utf-8")
+                else:
+                    raw = json.dumps(
+                        {"choices": [{"message": {"role": "assistant", "content": "FALLBACK_OK"}}]}
+                    ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MockStreamAndEdgeHandler)
+        port = httpd.server_address[1]
+        thr = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thr.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                store = PlatformStateStore(os.path.join(tmp, "dataog_state.db"))
+                hub = LLMHub(store)
+                hub.save_provider(
+                    {
+                        "provider_id": "custom_stream",
+                        "name": "Stream Mock GW",
+                        "provider_type": "OPENAI_COMPATIBLE",
+                        "base_url": f"http://127.0.0.1:{port}/v1",
+                        "api_key": "sk-stream-test",
+                        "default_model": "deepseek-reasoner",
+                        "models": ["deepseek-reasoner", "o3-mini", "ctx-limit-model"],
+                        "context_window": 96000,
+                        "enabled": True,
+                        "is_default": True,
+                    }
+                )
+                listed = [m for m in hub.list_available_models() if m["provider_id"] == "custom_stream"]
+                self.assertTrue(listed)
+                self.assertEqual(listed[0]["context_window"], 96000)
+                self.assertGreater(listed[0]["attachment_budget"], 32000)
+                self.assertTrue(listed[0]["supports_thinking"])
+
+                # 3a. 完整 SSE 流式读取（reasoning + cross-tag <think> + content）
+                events = list(
+                    hub.chat_completion_stream(
+                        messages=[{"role": "user", "content": "hello"}],
+                        provider_id="custom_stream",
+                        model="deepseek-reasoner",
+                        thinking_mode="enabled",
+                    )
+                )
+                r_text = "".join(e["delta"] for e in events if e["type"] == "reasoning")
+                c_text = "".join(e["delta"] for e in events if e["type"] == "content")
+                done_ev = [e for e in events if e["type"] == "done"][-1]
+                self.assertIn("分析字段类型", r_text)
+                self.assertIn("补充核对", r_text)
+                self.assertIn("SELECT 1 WHERE x < 10;", c_text)
+                self.assertFalse(done_ev["cancelled"])
+
+                # 3b. cancel_check 中断测试
+                seen_before_cancel = 0
+
+                def _cancel_after_one() -> bool:
+                    return seen_before_cancel >= 1
+
+                cancelled_events = []
+                for ev in hub.chat_completion_stream(
+                    messages=[{"role": "user", "content": "stop me"}],
+                    provider_id="custom_stream",
+                    model="deepseek-reasoner",
+                    cancel_check=_cancel_after_one,
+                ):
+                    cancelled_events.append(ev)
+                    if ev["type"] != "done":
+                        seen_before_cancel += 1
+                self.assertTrue(cancelled_events[-1]["cancelled"])
+
+                # 3c. HTTP 400 不支持 reasoning_effort 时自动剥离重试成功
+                recorded_bodies.clear()
+                res_retry = hub.chat_completion(
+                    messages=[{"role": "user", "content": "test retry"}],
+                    provider_id="custom_stream",
+                    model="o3-mini",
+                    thinking_mode="enabled",
+                )
+                self.assertEqual(res_retry["content"], "FALLBACK_OK")
+                self.assertEqual(len(recorded_bodies), 2)
+                self.assertIn("reasoning_effort", recorded_bodies[0])
+                self.assertNotIn("reasoning_effort", recorded_bodies[1])
+
+                # 3d. 上下文超限抛出 ContextLengthExceededError
+                with self.assertRaises(ContextLengthExceededError):
+                    hub.chat_completion(
+                        messages=[{"role": "user", "content": "too long"}],
+                        provider_id="custom_stream",
+                        model="ctx-limit-model",
+                    )
+
+                # 3e. test_provider 对 deepseek-reasoner 使用 >= 256 max_tokens 且容忍仅返回 reasoning_content
+                ping = hub.test_provider({"provider_id": "custom_stream", "default_model": "deepseek-reasoner"})
+                self.assertTrue(ping["ok"])
+                self.assertIn("REASONING_PING_OK", ping["reply_preview"])
+                store.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
     def test_readonly_sql_guard_redteam_matrix_and_false_positive_immunity(self) -> None:
         """红队验证：双模态词法/语法只读沙箱拦截一切写/DDL/锁/多语句/转义偷渡/危险函数，且合法查询零误伤."""
         blocked_cases = [

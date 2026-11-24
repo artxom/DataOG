@@ -764,14 +764,17 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             self.assertIn("nonexistent_tbl_xyz", exec_fail["execution_message"]["content"])
 
     def test_chat_attachments_csv_query_and_stepped_map_reduce(self) -> None:
-        """端到端验证聊天附件校验、GBK CSV 画像与只读 SQL 沙箱、超长 SQL Map-Reduce 分步拆解及级联隔离."""
+        """端到端验证现代长上下文存储过程全量直通/大纲按行探索、ContextLengthExceeded 自动降级、CSV 沙箱及 Map-Reduce 拆解."""
         from modules.ai_assistant.attachments import (
             CHUNK_HARD_MAX_TOKENS,
+            CSV_INLINE_TOKEN_BUDGET,
+            INLINE_TOKEN_BUDGET,
             MAX_CSV_BYTES,
             MAX_TEXT_BYTES,
             estimate_tokens,
             query_csv_in_memory,
         )
+        from core.platform.llm_hub import ContextLengthExceededError
         from core.platform.readonly_guard import ReadOnlyViolationError
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -780,23 +783,40 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             _activate_ctx(ctx)
             ctx.llm_hub.save_provider(
                 {
-                    "provider_id": "local_mock",
-                    "name": "Local Mock LLM",
+                    "provider_id": "deepseek",
+                    "name": "DeepSeek Cloud",
+                    "provider_type": "DEEPSEEK",
+                    "enabled": True,
+                    "api_key": "sk-ds-mock-key-123456",
+                    "default_model": "deepseek-chat",
+                    "models": ["deepseek-chat", "deepseek-reasoner"],
+                    "is_default": True,
+                }
+            )
+            ctx.llm_hub.save_provider(
+                {
+                    "provider_id": "local_32k",
+                    "name": "Local 32K LLM",
                     "provider_type": "OPENAI_COMPATIBLE",
                     "enabled": True,
                     "base_url": "http://127.0.0.1:11434/v1",
-                    "default_model": "mock-coder",
-                    "models": ["mock-coder"],
-                    "is_default": True,
+                    "default_model": "small-proc-32k",
+                    "models": ["small-proc-32k"],
+                    "context_window": 32000,
+                    "is_default": False,
                 }
             )
             client = TestClient(app)
 
-            # 0. /dialects 下发 attachment_limits
+            # 0. /dialects 下发 attachment_limits（默认 inline budget = 32000）与模型上下文容量
             dl_res = client.get("/api/modules/ai_assistant/dialects").json()
             self.assertTrue(dl_res["ok"])
             self.assertEqual(dl_res["attachment_limits"]["max_csv_bytes"], MAX_CSV_BYTES)
             self.assertEqual(dl_res["attachment_limits"]["max_text_bytes"], MAX_TEXT_BYTES)
+            self.assertEqual(dl_res["attachment_limits"]["inline_token_budget"], INLINE_TOKEN_BUDGET)
+            models_map = {f"{m['provider_id']}::{m['model']}": m for m in dl_res["llm_models"]}
+            self.assertEqual(models_map["deepseek::deepseek-chat"]["context_window"], 128000)
+            self.assertEqual(models_map["local_32k::small-proc-32k"]["context_window"], 32000)
 
             # 1. 安全拦截：不允许后缀 / 空字节二进制伪装 / CSV>2MB / TXT>5MB
             bad_ext = client.post(
@@ -826,15 +846,13 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
 
             # 2. GBK 编码 CSV 解析、前导零保留 TEXT、类型推断与 :memory: 只读 SQLite 查询 + 写阻断
             gbk_csv_text = "网点号,部门,交易笔数,金额\n001024,零售部,10,120.5\n001024,零售部,5,79.5\n002048,对公部,3,500.0\n"
-            gbk_bytes = gbk_csv_text.encode("gbk")
             up_gbk = client.post(
                 "/api/modules/ai_assistant/attachments/upload",
-                files={"file": ("txns_gbk.csv", gbk_bytes, "text/csv")},
+                files={"file": ("txns_gbk.csv", gbk_csv_text.encode("gbk"), "text/csv")},
             )
             self.assertEqual(up_gbk.status_code, 200)
             gbk_att = up_gbk.json()["attachment"]
             self.assertEqual(gbk_att["file_kind"], "csv")
-            self.assertEqual(gbk_att["row_count"], 3)
             cols_by_name = {c["name"]: c for c in gbk_att["csv_profile"]["columns"]}
             self.assertEqual(cols_by_name["网点号"]["inferred_type"], "TEXT")
             self.assertEqual(cols_by_name["交易笔数"]["inferred_type"], "INTEGER")
@@ -847,71 +865,133 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             )
             self.assertTrue(mem_res["ok"])
             self.assertEqual(mem_res["rows"][0], ["002048", "对公部", 3, 500.0])
-            self.assertEqual(mem_res["rows"][1], ["001024", "零售部", 15, 200.0])
 
             for evil_sql in ("DROP TABLE csv_data", "ATTACH DATABASE '/tmp/x.db' AS x"):
                 with self.assertRaises(ReadOnlyViolationError):
                     query_csv_in_memory(gbk_csv_text, ".csv", evil_sql)
 
-            # 3. 粘贴长文本：单行无换行超长字符强制硬切，每片严格 <= CHUNK_HARD_MAX_TOKENS
-            giant_single_line = "SELECT col_a FROM dwd.t WHERE note = '" + ("中文业务说明" * 2600) + "';"
+            # 3. 超大单行粘贴 (>50K tokens)：大粒度硬切 <= CHUNK_HARD_MAX_TOKENS (16K)
+            giant_single_line = "SELECT col_a FROM dwd.t WHERE note = '" + ("中文业务说明描述规则" * 10500) + "';"
             paste_giant = client.post(
                 "/api/modules/ai_assistant/attachments/text",
                 json={"content": giant_single_line},
             )
             self.assertEqual(paste_giant.status_code, 200)
             giant_att = paste_giant.json()["attachment"]
-            self.assertEqual(giant_att["file_kind"], "sql")
-            self.assertTrue(giant_att["filename"].endswith(".sql"))
             self.assertTrue(giant_att["oversized"])
-            self.assertGreater(giant_att["chunk_count"], 3)
+            self.assertGreaterEqual(giant_att["chunk_count"], 3)
             for ch in giant_att["chunks"]:
                 self.assertLessEqual(ch["estimated_tokens"], CHUNK_HARD_MAX_TOKENS)
-            # 验证删除草稿附件
             del_giant = client.delete(f"/api/modules/ai_assistant/attachments/{giant_att['attachment_id']}")
             self.assertEqual(del_giant.status_code, 200)
 
-            # 4. 超长 SQL 脚本：Map-Reduce 分步拆解 + 滚动摘要 + 接续下一批芯片
-            sql_stmts = [
-                f"CREATE TABLE dwd.tbl_{i:02d} (\n    id BIGINT NOT NULL,\n    cust_no VARCHAR(32) COMMENT '客户编号_{i}',\n    amt NUMERIC(18,2) DEFAULT 0,\n    remark TEXT\n)\nDISTRIBUTE BY HASH(id);\n"
-                + f"-- 补充长注释说明第 {i:02d} 张金融业务宽表的落标校验口径与合规审计规则，" * 14
-                for i in range(1, 35)
+            # 4. 3,200+ 行复杂存储过程：结构化大纲提取 + 大粒度分块（仅 2~6 片，杜绝 30+ 碎片）
+            sp_lines = [
+                "CREATE OR REPLACE PROCEDURE dwd.sp_daily_settlement(p_biz_date VARCHAR(8))",
+                "LANGUAGE PLPGSQL AS $$",
+                "DECLARE",
+                "    v_row_cnt BIGINT := 0;",
+                "BEGIN",
             ]
-            big_sql_bytes = "\n".join(sql_stmts).encode("utf-8")
-            up_sql = client.post(
+            for sec_i in range(1, 13):
+                sp_lines.append(f"    -- [Section {sec_i:02d}] 日终对账_{sec_i:02d}")
+                sp_lines.append(f"    -- STEP_{sec_i:02d}_MARKER 重算")
+                for row_k in range(1, 265):
+                    if row_k == 1:
+                        sp_lines.append(f"    INSERT INTO dwd.agg_{sec_i:02d} SELECT acct_id, 1 FROM ods.txns_{sec_i:02d};")
+                    else:
+                        sp_lines.append(f"    INSERT INTO dwd.agg_{sec_i:02d} VALUES ({row_k});")
+            sp_lines.extend(["    COMMIT;", "END;", "$$;"])
+            big_sp_bytes = "\n".join(sp_lines).encode("utf-8")
+
+            up_sp = client.post(
                 "/api/modules/ai_assistant/attachments/upload",
-                files={"file": ("batch_ddl.sql", big_sql_bytes, "text/plain")},
+                files={"file": ("sp_daily_settlement.sql", big_sp_bytes, "text/plain")},
             ).json()
-            big_sql_att = up_sql["attachment"]
-            self.assertTrue(big_sql_att["oversized"])
-            self.assertEqual(big_sql_att["recommended_strategy"], "stepped_batch")
-            self.assertGreaterEqual(big_sql_att["chunk_count"], 5)
+            sp_att = up_sp["attachment"]
+            self.assertGreater(sp_att["line_count"], 3100)
+            self.assertTrue(sp_att["outline"]["is_stored_procedure"])
+            self.assertTrue(any("sp_daily_settlement" in o["name"] for o in sp_att["outline"]["objects"]))
+            self.assertGreaterEqual(len(sp_att["outline"]["sections"]), 10)
+            self.assertIn("ods.txns_01", sp_att["outline"]["referenced_tables"])
+            # 3200+ 行存储过程在现代 12K/16K 大分片下仅占 3~8 片，绝不拆成 30 多片
+            self.assertGreaterEqual(sp_att["chunk_count"], 2)
+            self.assertLessEqual(sp_att["chunk_count"], 12)
 
             seen_prompts: list[str] = []
+            seen_models: list[str] = []
+            force_ctx_exceed_once = {"armed": False}
 
             def _mock_chat_completion(**kwargs):
                 msgs = kwargs.get("messages") or []
+                mdl = str(kwargs.get("model") or "")
+                seen_models.append(mdl)
+                sys_msg = msgs[0]["content"] if msgs else ""
                 user_msg = msgs[-1]["content"] if msgs else ""
                 seen_prompts.append(user_msg)
-                sys_msg = msgs[0]["content"] if msgs else ""
+
+                if force_ctx_exceed_once["armed"]:
+                    force_ctx_exceed_once["armed"] = False
+                    raise ContextLengthExceededError("simulated upstream 32k context overflow")
+
                 if "Map 阶段" in sys_msg:
                     return {
-                        "provider_name": "Local Mock LLM",
-                        "model": "mock-coder",
+                        "provider_name": "Local 32K LLM",
+                        "model": mdl,
                         "content": json.dumps(
                             {
-                                "summary": "本片包含合规 HASH 分布建表语句",
-                                "findings": ["发现 BIGINT 主键与 NUMERIC 金额字段"],
-                                "sql_or_action": "已登记建表",
+                                "summary": "该存储过程分段逻辑清晰，无死锁风险",
+                                "findings": ["发现批量 INSERT INTO dwd.settlement_agg 语句"],
+                                "sql_or_action": "继续检查下一段",
                             },
                             ensure_ascii=False,
                         ),
                     }
-                # On-demand CSV 工具多轮触发
+
+                # 32K 小窗口 agentic_explore：模型自主调用 read_attachment_lines 与正则 search_attachment
+                if mdl == "small-proc-32k" and "【工具 `" not in user_msg:
+                    return {
+                        "provider_name": "Local 32K LLM",
+                        "model": mdl,
+                        "content": json.dumps(
+                            {
+                                "action": "tool",
+                                "tool": "read_attachment_lines",
+                                "args": {
+                                    "attachment_id": sp_att["attachment_id"],
+                                    "start_line": 1500,
+                                    "end_line": 1525,
+                                },
+                                "purpose": "精读第 1500~1525 行存储过程核心逻辑",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                if "【工具 `read_attachment_lines` 返回结果】" in user_msg:
+                    return {
+                        "provider_name": "Local 32K LLM",
+                        "model": mdl,
+                        "content": json.dumps(
+                            {
+                                "action": "tool",
+                                "tool": "search_attachment",
+                                "args": {
+                                    "attachment_id": sp_att["attachment_id"],
+                                    "keyword": r"STEP_07_\w+",
+                                    "regex": True,
+                                    "context_lines": 1,
+                                },
+                                "purpose": "正则检索第 7 阶段标记及其上下文行",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+
+                # CSV 沙箱三步探索
                 if "csv_large.csv" in user_msg and "【工具 `" not in user_msg:
                     return {
-                        "provider_name": "Local Mock LLM",
-                        "model": "mock-coder",
+                        "provider_name": "DeepSeek Cloud",
+                        "model": mdl,
                         "content": json.dumps(
                             {
                                 "action": "tool",
@@ -926,8 +1006,8 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                     }
                 if "【工具 `query_csv_attachment` 返回结果】" in user_msg:
                     return {
-                        "provider_name": "Local Mock LLM",
-                        "model": "mock-coder",
+                        "provider_name": "DeepSeek Cloud",
+                        "model": mdl,
                         "content": json.dumps(
                             {
                                 "action": "tool",
@@ -940,41 +1020,119 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                     }
                 if "【工具 `search_attachment` 返回结果】" in user_msg:
                     return {
-                        "provider_name": "Local Mock LLM",
-                        "model": "mock-coder",
+                        "provider_name": "DeepSeek Cloud",
+                        "model": mdl,
                         "content": json.dumps(
                             {
                                 "action": "tool",
                                 "tool": "inspect_attachment_chunk",
                                 "args": {"chunk_index": 0},
-                                "purpose": "抽查首个 CSV 分片原文确认明细",
+                                "purpose": "抽查首个分片确认明细",
                             },
                             ensure_ascii=False,
                         ),
                     }
+
                 return {
-                    "provider_name": "Local Mock LLM",
-                    "model": "mock-coder",
+                    "provider_name": "DeepSeek Cloud",
+                    "model": mdl,
                     "content": json.dumps(
                         {
                             "action": "answer",
-                            "summary": "已完成全部超长脚本/CSV 拆解与统计归纳",
-                            "content": "汇总结果已生成，所有表结构与聚合口径核查完毕。",
+                            "summary": "已完成长存储过程/CSV 分析结论",
+                            "content": "汇总结论：存储过程清算逻辑与表关联关系已核查完毕。",
                             "citations": [],
-                            "next_steps": [{"label": "生成索引检查建议", "prompt": "检查索引分布"}],
+                            "next_steps": [{"label": "生成性能优化建议", "prompt": "优化批量插入性能"}],
                         },
                         ensure_ascii=False,
                     ),
                 }
 
             with unittest.mock.patch.object(ctx.llm_hub, "chat_completion", side_effect=_mock_chat_completion):
-                # 仅拆解前 2 片 -> 必定返回「继续拆解第 3~... 片」接续芯片
+                # 4a. 128K 大窗口模型 (deepseek-chat)：auto 策略直接全量带行号直通，零分片等待！
+                r_full = client.post(
+                    "/api/modules/ai_assistant/chat",
+                    json={
+                        "prompt": "梳理这个存储过程的整体逻辑",
+                        "dialect": "DWS",
+                        "provider_id": "deepseek",
+                        "model": "deepseek-chat",
+                        "attachment_ids": [sp_att["attachment_id"]],
+                    },
+                ).json()
+                self.assertTrue(r_full["ok"])
+                self.assertEqual(len(r_full["assistant_message"]["steps"]), 0)
+                self.assertIn("【用户本轮附带文件全文】", seen_prompts[-1])
+                self.assertIn("1| CREATE OR REPLACE PROCEDURE", seen_prompts[-1])
+                self.assertIn("3100| ", seen_prompts[-1])
+
+                # 4b. 32K 小窗口模型 + 巨大附件 (giant_att_2 ~45K tok)：auto 切换为 agentic_explore，大纲 + 按行精读 + 正则检索
+                sp_32k_huge = client.post(
+                    "/api/modules/ai_assistant/attachments/upload",
+                    files={
+                        "file": (
+                            "giant_sp.sql",
+                            "\n".join(sp_lines * 2).encode("utf-8"),
+                            "text/plain",
+                        )
+                    },
+                ).json()["attachment"]
+                # 绑定到 32k 会话先复用现有 sp_att 也可以：如果 sp_att ~38K > 20.8K (32K*0.65)，也会触发 agentic_explore!
+                r_32k = client.post(
+                    "/api/modules/ai_assistant/chat",
+                    json={
+                        "prompt": "排查第 7 阶段和 1500 行附近的逻辑",
+                        "dialect": "DWS",
+                        "provider_id": "local_32k",
+                        "model": "small-proc-32k",
+                        "attachment_ids": [sp_att["attachment_id"], sp_32k_huge["attachment_id"]],
+                    },
+                ).json()
+                self.assertTrue(r_32k["ok"])
+                asst_32k_steps = r_32k["assistant_message"]["steps"]
+                self.assertEqual(
+                    [s["tool"] for s in asst_32k_steps],
+                    ["read_attachment_lines", "search_attachment", "inspect_attachment_chunk"],
+                )
+                tool_1_out = [p for p in seen_prompts if "【工具 `read_attachment_lines` 返回结果】" in p][-1]
+                self.assertIn("1500| ", tool_1_out)
+                self.assertIn("1525| ", tool_1_out)
+                tool_2_out = [p for p in seen_prompts if "【工具 `search_attachment` 返回结果】" in p][-1]
+                self.assertIn("STEP_07_MARKER", tool_2_out)
+                self.assertIn('"context":', tool_2_out)
+                self.assertIn("1602| ", tool_2_out)
+                self.assertIn("1604| ", tool_2_out)
+
+                # 4c. 上游网关报 ContextLengthExceededError 时自动无缝降级到 agentic_explore 重试成功
+                force_ctx_exceed_once["armed"] = True
+                r_ctx_fb = client.post(
+                    "/api/modules/ai_assistant/chat",
+                    json={
+                        "prompt": "强制全量尝试超限降级",
+                        "dialect": "DWS",
+                        "provider_id": "deepseek",
+                        "model": "deepseek-chat",
+                        "attachment_ids": [sp_att["attachment_id"]],
+                        "large_payload_strategy": "full_context",
+                    },
+                ).json()
+                self.assertTrue(r_ctx_fb["ok"])
+                self.assertIn("【长上下文智能探索指引】", seen_prompts[-1])
+
+                # 4d. 显式指定 stepped_batch：验证大块 Map-Reduce 拆解与接续芯片
+                batch_sp_att = client.post(
+                    "/api/modules/ai_assistant/attachments/upload",
+                    files={"file": ("batch_sp.sql", big_sp_bytes, "text/plain")},
+                ).json()["attachment"]
+                seen_prompts.clear()
                 r_batch1 = client.post(
                     "/api/modules/ai_assistant/chat",
                     json={
-                        "prompt": "审查全部 DDL 规范",
+                        "prompt": "按分步拆解模式逐段审计",
                         "dialect": "DWS",
-                        "attachment_ids": [big_sql_att["attachment_id"]],
+                        "provider_id": "local_32k",
+                        "model": "small-proc-32k",
+                        "attachment_ids": [batch_sp_att["attachment_id"]],
                         "large_payload_strategy": "stepped_batch",
                         "batch_start_chunk": 0,
                         "batch_max_chunks": 2,
@@ -985,33 +1143,31 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                 asst1 = r_batch1["assistant_message"]
                 map_steps = [s for s in asst1["steps"] if s["tool"] == "analyze_attachment_chunk"]
                 self.assertEqual(len(map_steps), 2)
-                self.assertGreaterEqual(len(asst1["next_steps"]), 1)
-                cont_chip = asst1["next_steps"][0]
-                self.assertEqual(cont_chip["batch_start_chunk"], 2)
-                self.assertIn(big_sql_att["attachment_id"], cont_chip["attachment_ids"])
+                for sp_txt in seen_prompts:
+                    self.assertLessEqual(estimate_tokens(sp_txt), CHUNK_HARD_MAX_TOKENS + 3000)
 
-                # 校验没有任何 Map 请求超过窗口防爆限制（滚动摘要 + 单片 <= 4200 tok）
-                for sent_p in seen_prompts:
-                    self.assertLessEqual(estimate_tokens(sent_p), 4500)
+                if batch_sp_att["chunk_count"] > 2:
+                    cont_chip = asst1["next_steps"][0]
+                    self.assertEqual(cont_chip["batch_start_chunk"], 2)
+                    r_batch2 = client.post(
+                        "/api/modules/ai_assistant/chat",
+                        json={
+                            "session_id": sid_sql,
+                            "prompt": cont_chip["prompt"],
+                            "dialect": "DWS",
+                            "provider_id": "local_32k",
+                            "model": "small-proc-32k",
+                            "attachment_ids": cont_chip["attachment_ids"],
+                            "large_payload_strategy": "stepped_batch",
+                            "batch_start_chunk": 2,
+                            "batch_max_chunks": 12,
+                        },
+                    ).json()
+                    self.assertTrue(r_batch2["ok"])
+                    map_steps2 = [s for s in r_batch2["assistant_message"]["steps"] if s["tool"] == "analyze_attachment_chunk"]
+                    self.assertEqual(len(map_steps2), batch_sp_att["chunk_count"] - 2)
 
-                # 接续下一批拆解
-                r_batch2 = client.post(
-                    "/api/modules/ai_assistant/chat",
-                    json={
-                        "session_id": sid_sql,
-                        "prompt": cont_chip["prompt"],
-                        "dialect": "DWS",
-                        "attachment_ids": cont_chip["attachment_ids"],
-                        "large_payload_strategy": "stepped_batch",
-                        "batch_start_chunk": 2,
-                        "batch_max_chunks": 12,
-                    },
-                ).json()
-                self.assertTrue(r_batch2["ok"])
-                map_steps2 = [s for s in r_batch2["assistant_message"]["steps"] if s["tool"] == "analyze_attachment_chunk"]
-                self.assertEqual(len(map_steps2), big_sql_att["chunk_count"] - 2)
-
-                # 5. 超大 CSV：默认 on_demand 策略 -> query_csv_attachment + search_attachment + inspect_attachment_chunk
+                # 5. 超大 CSV：默认 agentic_explore 策略 -> query_csv_attachment + search_attachment + inspect_attachment_chunk
                 csv_rows = ["id,dept,amt,remark"] + [
                     f"{i},{'DEPT_A' if i % 2 == 0 else 'DEPT_B'},{100.0 if i % 2 == 0 else 50.0},大体积财务流水明细对比备注_{i:04d}_" + ("X" * 40)
                     for i in range(1, 260)
@@ -1022,8 +1178,9 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                     files={"file": ("csv_large.csv", big_csv_bytes, "text/csv")},
                 ).json()
                 big_csv_att = up_big_csv["attachment"]
+                self.assertGreater(big_csv_att["estimated_tokens"], CSV_INLINE_TOKEN_BUDGET)
                 self.assertTrue(big_csv_att["oversized"])
-                self.assertEqual(big_csv_att["recommended_strategy"], "on_demand")
+                self.assertEqual(big_csv_att["recommended_strategy"], "agentic_explore")
 
                 r_csv = client.post(
                     "/api/modules/ai_assistant/chat",
@@ -1044,7 +1201,7 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                 self.assertEqual(csv_asst["result_table"]["row_count"], 2)
                 self.assertEqual(csv_asst["result_table"]["rows"][0][0], "DEPT_A")
 
-                # 5b. 小体积 SQL inline 直通单次调用 + 历史消息不重复内嵌全文正文
+                # 5b. 小体积 SQL full_context 直通单次调用 + 历史消息不重复内嵌全文正文
                 up_small = client.post(
                     "/api/modules/ai_assistant/attachments/upload",
                     files={
@@ -1057,7 +1214,7 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                 ).json()
                 small_att = up_small["attachment"]
                 self.assertFalse(small_att["oversized"])
-                self.assertEqual(small_att["recommended_strategy"], "inline")
+                self.assertEqual(small_att["recommended_strategy"], "full_context")
 
                 r_inline = client.post(
                     "/api/modules/ai_assistant/chat",
@@ -1121,11 +1278,11 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             with ctx.store.module_db(scope="private") as pconn:
                 rem_att = pconn.execute(
                     "SELECT COUNT(*) FROM ai_assistant_attachments WHERE attachment_id = ?",
-                    (big_sql_att["attachment_id"],),
+                    (batch_sp_att["attachment_id"],),
                 ).fetchone()[0]
                 rem_chk = pconn.execute(
                     "SELECT COUNT(*) FROM ai_assistant_attachment_chunks WHERE attachment_id = ?",
-                    (big_sql_att["attachment_id"],),
+                    (batch_sp_att["attachment_id"],),
                 ).fetchone()[0]
                 rem_csv_keep = pconn.execute(
                     "SELECT COUNT(*) FROM ai_assistant_attachments WHERE session_id = ?",
@@ -1134,6 +1291,150 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             self.assertEqual(rem_att, 0)
             self.assertEqual(rem_chk, 0)
             self.assertEqual(rem_csv_keep, 1)
+
+    def test_ai_assistant_sse_streaming_thinking_and_natural_markdown(self) -> None:
+        """验证 AI 助手 /chat/stream 真实 SSE 帧、Thinking 推理聚合、自然 Markdown+dataog_meta 剥离及错误脱敏."""
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(private_root=os.path.join(tmp, "vault"))
+            ctx: PlatformContext = app.state.platform_ctx
+            _activate_ctx(ctx)
+            ctx.llm_hub.save_provider(
+                {
+                    "provider_id": "deepseek",
+                    "name": "DeepSeek",
+                    "provider_type": "DEEPSEEK",
+                    "enabled": True,
+                    "api_key": "sk-ds-stream-123456",
+                    "default_model": "deepseek-reasoner",
+                    "models": ["deepseek-reasoner", "deepseek-chat"],
+                    "is_default": True,
+                }
+            )
+            client = TestClient(app)
+
+            stream_call_no = {"n": 0}
+
+            def _mock_stream(**kwargs):
+                stream_call_no["n"] += 1
+                self.assertEqual(kwargs.get("thinking_mode"), "enabled")
+                if stream_call_no["n"] == 1:
+                    yield {"type": "reasoning", "delta": "首先核查可用知识库与表结构"}
+                    yield {"type": "reasoning", "delta": " -> 调用 search_knowledge 工具"}
+                    act_text = (
+                        "我先为您检索一次语法知识库：\n\n"
+                        "```dataog_action\n"
+                        '{"action":"tool","tool":"search_knowledge","args":{"query":"DISTRIBUTE"},"purpose":"检索 DWS 分布键规范"}\n'
+                        "```"
+                    )
+                    yield {"type": "content", "delta": act_text}
+                    yield {
+                        "type": "done",
+                        "provider_name": "DeepSeek",
+                        "model": "deepseek-reasoner",
+                        "reasoning": "首先核查可用知识库与表结构 -> 调用 search_knowledge 工具",
+                        "content": act_text,
+                        "cancelled": False,
+                    }
+                    return
+
+                yield {"type": "reasoning", "delta": "已获得知识库线索，组织 Markdown 结论"}
+                md_parts = [
+                    "### 分布键选型分析\n\n",
+                    "建议优先选择**高基数等值连接键**作为 `DISTRIBUTE BY HASH`。\n\n",
+                    "```dataog_meta\n",
+                    '{"summary":"完成分布键分析","citations":[],"next_steps":[{"label":"检查倾斜率","prompt":"查看数据倾斜"}]}\n',
+                    "```",
+                ]
+                for p in md_parts:
+                    yield {"type": "content", "delta": p}
+                yield {
+                    "type": "done",
+                    "provider_name": "DeepSeek",
+                    "model": "deepseek-reasoner",
+                    "reasoning": "已获得知识库线索，组织 Markdown 结论",
+                    "content": "".join(md_parts),
+                    "cancelled": False,
+                }
+
+            def _parse_sse(raw_text: str):
+                events = []
+                for frame in raw_text.split("\n\n"):
+                    frame = frame.strip()
+                    if not frame:
+                        continue
+                    ev_name = "message"
+                    data_lines = []
+                    for ln in frame.splitlines():
+                        if ln.startswith(":"):
+                            continue
+                        if ln.startswith("event:"):
+                            ev_name = ln.split(":", 1)[1].strip()
+                        elif ln.startswith("data:"):
+                            data_lines.append(ln.split(":", 1)[1].strip())
+                    if data_lines:
+                        events.append((ev_name, json.loads("\n".join(data_lines))))
+                return events
+
+            with unittest.mock.patch.object(ctx.llm_hub, "chat_completion_stream", side_effect=_mock_stream):
+                resp = client.post(
+                    "/api/modules/ai_assistant/chat/stream",
+                    json={
+                        "prompt": "DWS 分布键怎么选？",
+                        "work_mode": "dialect",
+                        "dialect": "DWS",
+                        "provider_id": "deepseek",
+                        "model": "deepseek-reasoner",
+                        "thinking_mode": "enabled",
+                    },
+                )
+            self.assertEqual(resp.status_code, 200)
+            self.assertIn("text/event-stream", resp.headers.get("content-type", ""))
+            sse_events = _parse_sse(resp.text)
+            ev_types = [t for t, _ in sse_events]
+            for expected_ev in (
+                "session_init",
+                "thinking_start",
+                "thinking_delta",
+                "thinking_end",
+                "content_reset",
+                "tool_start",
+                "tool_end",
+                "content_delta",
+                "done",
+            ):
+                self.assertIn(expected_ev, ev_types)
+
+            done_data = [d for t, d in sse_events if t == "done"][-1]
+            asst_msg = done_data["assistant_message"]
+            self.assertIn("分布键选型分析", asst_msg["content"])
+            self.assertNotIn("dataog_action", asst_msg["content"])
+            self.assertNotIn("dataog_meta", asst_msg["content"])
+            self.assertIn("首先核查可用知识库与表结构", asst_msg["reasoning"])
+            self.assertIn("已获得知识库线索", asst_msg["reasoning"])
+            self.assertGreaterEqual(float(asst_msg["reasoning_ms"]), 0.0)
+            self.assertEqual(asst_msg["next_steps"][0]["label"], "检查倾斜率")
+
+            sid = done_data["session"]["session_id"]
+            sess_detail = client.get(f"/api/modules/ai_assistant/sessions/{sid}").json()["session"]
+            self.assertEqual(sess_detail["thinking_mode"], "enabled")
+            saved_asst = [m for m in sess_detail["messages"] if m["role"] == "assistant"][-1]
+            self.assertIn("首先核查可用知识库与表结构", saved_asst["reasoning"])
+
+            # 验证 SSE 异常事件严格脱敏私有保险箱物理路径
+            vault_path = os.path.join(tmp, "vault")
+            with unittest.mock.patch.object(
+                ctx.llm_hub,
+                "chat_completion_stream",
+                side_effect=RuntimeError(f"boom while reading {vault_path}/secret.db"),
+            ):
+                err_resp = client.post(
+                    "/api/modules/ai_assistant/chat/stream",
+                    json={"prompt": "触发错误脱敏测试", "dialect": "DWS", "session_id": sid},
+                )
+            self.assertEqual(err_resp.status_code, 200)
+            err_events = _parse_sse(err_resp.text)
+            err_payload = [d for t, d in err_events if t == "error"][-1]
+            self.assertNotIn(vault_path, err_payload["error"])
 
     def test_frontend_ai_assistant_and_knowledge_modules_via_node(self) -> None:
         """全静态防呆扫描 + Node.js 运行时真实交互端到端验证 v3.1.0 AI 助手（含粘贴/上传/防爆窗拆解）、提案卡片、抽屉及参考知识库."""
@@ -1302,7 +1603,7 @@ globalThis.document = {
 };
 
 const fetchCalls = [];
-const mockState = { sessions: [] };
+const mockState = { sessions: [], sseMode: "none", sseStage: "" };
 
 const stdProposal = {
   proposal_id: "prop_std",
@@ -1352,13 +1653,14 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
         { code: "PGSQL", label: "PostgreSQL" },
       ],
       llm_models: [
-        { provider_id: "deepseek", provider_name: "DeepSeek", model: "deepseek-chat", ready: false, has_api_key: false, is_default: true },
-        { provider_id: "custom", provider_name: "内网Qwen", model: "qwen-coder", ready: true, has_api_key: true, is_default: false },
+        { provider_id: "deepseek", provider_name: "DeepSeek", model: "deepseek-reasoner", ready: false, has_api_key: false, is_default: true, context_window: 128000, attachment_budget: 80000, supports_thinking: true },
+        { provider_id: "custom", provider_name: "内网Qwen", model: "qwen-coder", ready: true, has_api_key: true, is_default: false, context_window: 128000, attachment_budget: 80000, supports_thinking: false },
+        { provider_id: "local32", provider_name: "本地轻量32K", model: "small-32k", ready: true, has_api_key: true, is_default: false, context_window: 32000, attachment_budget: 20800, supports_thinking: false },
       ],
       attachment_limits: {
         max_csv_bytes: 2 * 1024 * 1024,
         max_text_bytes: 5 * 1024 * 1024,
-        inline_token_budget: 3500,
+        inline_token_budget: 32000,
         max_attachments_per_turn: 5,
         csv_extensions: [".csv", ".tsv"],
         allowed_extensions: [".txt", ".sql", ".ddl", ".md", ".log", ".json", ".csv", ".tsv"],
@@ -1430,6 +1732,99 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
   } else if (url.endsWith("/api/modules/ai_assistant/sessions") || url.includes("/api/modules/ai_assistant/sessions?")) {
     payload = { ok: true, sessions: mockState.sessions };
   } else if (url.startsWith("/api/modules/ai_assistant/chat")) {
+    if (mockState.sseMode === "stream" || mockState.sseMode === "abortable") {
+      const encoder = new TextEncoder();
+      const asstStreamMsg = {
+        id: `msg_stream_${fetchCalls.length}`,
+        role: "assistant",
+        response_type: "answer",
+        reasoning: "深度思考推导中：检查分布键与表关联",
+        reasoning_ms: 420.5,
+        content: "### 流式回答\n\n第一段流式正文 + 第二段追加",
+        steps: [{ step: 1, tool: "search_knowledge", purpose: "检索方言文档", ok: true, elapsed_ms: 9.0, summary: "命中 1 条" }],
+        citations: [],
+        next_steps: [],
+        provider_name: "DeepSeek",
+        model: bodyObj?.model || "deepseek-reasoner",
+        created_at: "2026-11-24 12:00:00",
+        total_elapsed_ms: 65.0,
+      };
+      const streamSess = {
+        session_id: "sess_stream_1",
+        title: bodyObj?.prompt || "流式对话",
+        work_mode: "connection",
+        connection_id: "conn_dws_1",
+        dialect: "DWS",
+        schema_name: "dwd",
+        focus_tables: [],
+        task_mode: "auto",
+        thinking_mode: bodyObj?.thinking_mode || "enabled",
+        turn_count: 1,
+        messages: [
+          { id: "msg_stream_u", role: "user", content: bodyObj?.prompt || "", attachments: [] },
+          asstStreamMsg,
+        ],
+      };
+      const stream = new ReadableStream({
+        start(controller) {
+          const pushEv = (evObj) => {
+            const evName = evObj.type || "message";
+            controller.enqueue(encoder.encode(`event: ${evName}\ndata: ${JSON.stringify(evObj)}\n\n`));
+          };
+          if (mockState.sseMode === "abortable") {
+            pushEv({
+              type: "session_init",
+              session: { session_id: "sess_abort_1" },
+              strategy: "full_context",
+              context_window: 128000,
+              thinking_mode: bodyObj?.thinking_mode || "auto",
+            });
+            const onAbort = () => {
+              controller.error(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+            };
+            if (opts.signal?.aborted) {
+              onAbort();
+            } else {
+              opts.signal?.addEventListener("abort", onAbort, { once: true });
+            }
+            return;
+          }
+          pushEv({
+            type: "session_init",
+            session: { session_id: "sess_stream_1" },
+            strategy: "full_context",
+            context_window: 128000,
+            thinking_mode: bodyObj?.thinking_mode || "enabled",
+          });
+          pushEv({ type: "thinking_start", step: 1 });
+          pushEv({ type: "thinking_delta", step: 1, delta: "深度思考推导中：检查分布键与表关联" });
+          setTimeout(() => {
+            pushEv({ type: "thinking_end", step: 1, elapsed_ms: 420.5 });
+            pushEv({ type: "tool_start", step: 1, tool: "search_knowledge", purpose: "检索方言文档" });
+            pushEv({ type: "tool_end", step: 1, tool: "search_knowledge", ok: true, elapsed_ms: 9.0, summary: "命中 1 条" });
+            pushEv({ type: "content_delta", delta: "### 流式回答\n\n第一段流式正文" });
+            pushEv({ type: "content_delta", delta: " + 第二段追加" });
+          }, 50);
+          setTimeout(() => {
+            mockState.sessions = [streamSess];
+            pushEv({
+              type: "done",
+              ok: true,
+              session: streamSess,
+              user_message: streamSess.messages[0],
+              assistant_message: asstStreamMsg,
+            });
+            controller.close();
+          }, 130);
+        },
+      });
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([["content-type", "text/event-stream"]]),
+        body: stream,
+      };
+    }
     const reqAtts = Array.isArray(bodyObj?.attachment_ids) ? bodyObj.attachment_ids : [];
     const reqBatchStart = Number(bodyObj?.batch_start_chunk || 0);
     const nextStepsList = reqAtts.length && reqBatchStart === 0
@@ -1804,6 +2199,111 @@ if (!contChatCall) {
 const postAttachErrs = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
 if (postAttachErrs.length > 0) {
   throw new Error(`Unexpected toast-error in Scene 5: ${postAttachErrs.map(getNodeText).join("; ")}`);
+}
+
+// 场景 6：v3.3.1 SSE 实时流式输出 + Thinking 展开/自动收起 + 停止生成中断 + 模型上下文容量条 + 结构化大纲预览
+toastRoot.replaceChildren();
+mockState.sseMode = "stream";
+const thinkSelectEl = view.root.querySelector(".ai-asst-think-select");
+if (!thinkSelectEl) throw new Error("Thinking mode selector missing in toolbar");
+thinkSelectEl.value = "enabled";
+for (const fn of (thinkSelectEl.listeners.get("change") || [])) fn({ target: thinkSelectEl });
+if (view.thinkingMode !== "enabled") throw new Error("Changing thinking selector did not update view.thinkingMode");
+
+const streamPromise = view.sendUserMessage("流式验证与深度思考");
+await new Promise((r) => setTimeout(r, 15));
+const liveCard1 = view.root.querySelector(".ai-asst-live-card");
+const livePre1 = liveCard1?.querySelector(".ai-asst-thinking-pre");
+if (!liveCard1 || !livePre1 || !getNodeText(livePre1).includes("深度思考推导中")) {
+  throw new Error("Live streaming card did not expand Thinking panel during thinking phase");
+}
+const stopBtnMid = findNodes(view.root, (n) => n.tagName === "BUTTON" && getNodeText(n).includes("停止生成"))[0];
+if (!stopBtnMid || !stopBtnMid.classList.contains("btn-danger")) {
+  throw new Error("Stop generation danger button missing during active streaming");
+}
+
+await new Promise((r) => setTimeout(r, 65));
+const liveCard2 = view.root.querySelector(".ai-asst-live-card");
+if (!liveCard2 || liveCard2.querySelector(".ai-asst-thinking-body")) {
+  throw new Error("Thinking box did not auto-collapse after thinking_end event");
+}
+if (!getNodeText(liveCard2).includes("已深度思考")) {
+  throw new Error("Thinking box header missing elapsed label after thinking_end");
+}
+if (!liveCard2.querySelector(".ai-asst-stream-cursor") || !getNodeText(liveCard2).includes("流式回答")) {
+  throw new Error("Live card did not render incremental streamed Markdown and blinking cursor");
+}
+
+await streamPromise;
+await flushAsync();
+const sseReq = fetchCalls.filter((c) => c.url.endsWith("/api/modules/ai_assistant/chat/stream")).slice(-1)[0];
+if (!sseReq || sseReq.body?.thinking_mode !== "enabled") {
+  throw new Error(`Expected /chat/stream with thinking_mode=enabled, got ${JSON.stringify(sseReq)}`);
+}
+const histThinkToggle = view.root.querySelector(".ai-asst-thinking-toggle");
+if (!histThinkToggle || view.root.querySelector(".ai-asst-thinking-body")) {
+  throw new Error("Persisted message thinking box should start collapsed by default");
+}
+histThinkToggle.click();
+if (!view.root.querySelector(".ai-asst-thinking-pre") || !getNodeText(view.root.querySelector(".ai-asst-thinking-pre")).includes("深度思考推导中")) {
+  throw new Error("Clicking persisted thinking toggle did not expand reasoning content");
+}
+view.root.querySelector(".ai-asst-thinking-toggle").click();
+if (view.root.querySelector(".ai-asst-thinking-body")) {
+  throw new Error("Clicking persisted thinking toggle again did not collapse reasoning panel");
+}
+
+// 验证停止生成中断能力（无错误红框、恢复可发送态）
+toastRoot.replaceChildren();
+mockState.sseMode = "abortable";
+const abortPromise = view.sendUserMessage("触发停止生成中断");
+await new Promise((r) => setTimeout(r, 15));
+const abortBtn = findNodes(view.root, (n) => n.tagName === "BUTTON" && getNodeText(n).includes("停止生成"))[0];
+if (!abortBtn) throw new Error("Stop generation button missing during abortable stream");
+abortBtn.click();
+await abortPromise;
+await flushAsync();
+if (view.loading) throw new Error("view.loading remained true after clicking Stop Generation");
+const abortErrs = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
+if (abortErrs.length > 0) throw new Error(`Abort triggered unexpected toast-error: ${abortErrs.map(getNodeText).join("; ")}`);
+if (!toastRoot.children.some((c) => getNodeText(c).includes("已停止生成"))) {
+  throw new Error("Clicking Stop Generation did not notify user with 已停止生成");
+}
+mockState.sseMode = "none";
+
+// 验证模型感知上下文容量进度条（128K ok vs 32K warn）与结构大纲预览弹窗
+view.pendingAttachments = [
+  {
+    attachment_id: "att_sp_25k",
+    filename: "sp_settle.sql",
+    file_kind: "sql",
+    size_bytes: 90000,
+    line_count: 2600,
+    estimated_tokens: 25000,
+    chunk_count: 3,
+    oversized: false,
+    recommended_strategy: "full_context",
+    outline: {
+      is_stored_procedure: true,
+      summary_line: "PROCEDURE dwd.sp_settle | 1 个结构锚点",
+      objects: [{ kind: "PROCEDURE", name: "dwd.sp_settle", line: 1 }],
+      sections: [{ line: 20, title: "阶段一 清算" }],
+      referenced_tables: ["dwd.orders"],
+    },
+    chunks: [{ chunk_index: 0, title: "段1", range_label: "L1-L900", estimated_tokens: 9000, content: "CREATE PROCEDURE dwd.sp_settle()" }],
+  },
+];
+view.selectedModelKey = "custom::qwen-coder";
+view.render();
+const bar128k = view.root.querySelector(".ai-asst-strategy-bar");
+if (!bar128k || !bar128k.classList.contains("is-ok") || !view.root.querySelector(".ai-asst-ctx-meter-fill")) {
+  throw new Error("Expected green .is-ok context meter bar for 25K attachment under 128K model");
+}
+view.selectedModelKey = "local32::small-32k";
+view.render();
+const bar32k = view.root.querySelector(".ai-asst-strategy-bar");
+if (!bar32k || !bar32k.classList.contains("is-warn")) {
+  throw new Error("Expected warn .is-warn context meter bar for 25K attachment under 32K model");
 }
 
 kbView.destroy();

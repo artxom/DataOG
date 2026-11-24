@@ -141,6 +141,7 @@ class AssistantToolbox:
             "explain_sql": self.tool_explain_sql,
             "propose_write_sql": self.tool_propose_write_sql,
             "search_attachment": self.tool_search_attachment,
+            "read_attachment_lines": self.tool_read_attachment_lines,
             "inspect_attachment_chunk": self.tool_inspect_attachment_chunk,
             "query_csv_attachment": self.tool_query_csv_attachment,
         }
@@ -537,11 +538,52 @@ class AssistantToolbox:
         kw = str(params.get("keyword") or "").strip()
         if not kw:
             return {"ok": False, "error": "缺少检索关键词 `keyword`"}
-        limit = max(1, min(20, int(params.get("limit") or 8)))
-        res = self.storage.search_attachment_content(att["attachment_id"], kw, limit=limit)
+        regex = bool(params.get("regex", False))
+        try:
+            ctx_lines = max(0, min(6, int(params.get("context_lines", 2))))
+        except Exception:
+            ctx_lines = 2
+        limit = max(1, min(30, int(params.get("limit") or 12)))
+        res = self.storage.search_attachment_content(
+            att["attachment_id"],
+            kw,
+            regex=regex,
+            context_lines=ctx_lines,
+            limit=limit,
+        )
         if res is None:
             return {"ok": False, "error": "附件不存在或已被移除"}
         return {"ok": True, **res}
+
+    def tool_read_attachment_lines(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self.storage is None:
+            return {"ok": False, "error": "附件存储尚未就绪"}
+        att = self._resolve_attachment(str(params.get("attachment_id") or ""))
+        if att is None:
+            return {"ok": False, "error": "未找到指定的附件，请核对 `attachment_id`"}
+        try:
+            start_line = max(1, int(params.get("start_line") or 1))
+        except Exception:
+            start_line = 1
+        try:
+            raw_end = params.get("end_line")
+            end_line = int(raw_end) if raw_end is not None else (start_line + 249)
+        except Exception:
+            end_line = start_line + 249
+        res = self.storage.read_attachment_lines(
+            att["attachment_id"],
+            start_line=start_line,
+            end_line=end_line,
+            max_lines=400,
+            max_tokens=10000,
+        )
+        if res is None:
+            return {"ok": False, "error": "附件不存在或已被移除"}
+        return {
+            "ok": True,
+            **res,
+            "note": f"已读取 {res['filename']} 第 {res['start_line']}~{res['end_line']} 行 (共 {res['total_lines']} 行)",
+        }
 
     def tool_inspect_attachment_chunk(self, params: Dict[str, Any]) -> Dict[str, Any]:
         if self.storage is None:

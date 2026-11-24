@@ -17,15 +17,23 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.platform.builtin_dialect_kb import DIALECT_LABEL_MAP, normalize_kb_dialect
 from core.platform.context import PlatformContext
 from core.platform.import_progress import ProgressCallback, noop_progress
-from core.platform.llm_hub import extract_json_payload
+from core.platform.llm_hub import (
+    ContextLengthExceededError,
+    extract_json_payload,
+    infer_model_capabilities,
+    strip_think_tags,
+)
 from core.platform.models import ConnectionProfile
 from core.platform.sql_risk_guard import classify_sql_batch
 from modules.ai_assistant.attachments import (
+    CSV_INLINE_TOKEN_BUDGET,
     DEFAULT_BATCH_MAX_CHUNKS,
     INLINE_TOKEN_BUDGET,
     MAX_ATTACHMENTS_PER_TURN,
     MAX_BATCH_CHUNKS_CAP,
+    estimate_tokens,
     format_attachment_manifest,
+    format_with_line_numbers,
     infer_pasted_filename_and_ext,
     process_attachment_payload,
 )
@@ -40,8 +48,10 @@ from modules.ai_assistant.tools import (
     sanitize_error_text,
 )
 
-LOOP_WALLCLOCK_BUDGET_SEC = 120.0
+LOOP_WALLCLOCK_BUDGET_SEC = 300.0
 MAX_STEPS_CAP = 10
+
+_DATAOG_FENCE_RE = re.compile(r"```(dataog_action|dataog_meta)\s*\n?([\s\S]*?)```", re.IGNORECASE)
 
 _TASK_MODE_GUIDANCE: Dict[str, str] = {
     "query": (
@@ -168,6 +178,122 @@ def infer_task_mode(prompt: str, requested_mode: str = "auto") -> str:
     if any(kw in text for kw in ("查一下", "查询", "多少", "统计", "汇总", "明细", "前10", "top")):
         return "query"
     return "general"
+
+
+class _StreamActionDemuxer:
+    """增量分离流式 Markdown 正文与末尾/整段 dataog_action / dataog_meta 控制围栏."""
+
+    _SENTINELS = ("```dataog_meta", "```dataog_action")
+    _MAX_SENTINEL_LEN = 16
+
+    def __init__(self) -> None:
+        self.state = "UNDECIDED"  # UNDECIDED | MARKDOWN_STREAM | JSON_HOLD | ACTION_HOLD | TRAILING_META_HOLD
+        self._init_buf = ""
+        self._tail_buf = ""
+        self._raw_parts: List[str] = []
+        self._emitted_parts: List[str] = []
+
+    def _emit(self, txt: str) -> str:
+        if txt:
+            self._emitted_parts.append(txt)
+        return txt
+
+    def _scan_markdown_chunk(self, chunk: str) -> str:
+        data = self._tail_buf + chunk
+        self._tail_buf = ""
+        low = data.lower()
+
+        hit_idx = -1
+        for sent in self._SENTINELS:
+            idx = low.find(sent)
+            if idx != -1 and (hit_idx == -1 or idx < hit_idx):
+                hit_idx = idx
+        if hit_idx != -1:
+            emit_part = data[:hit_idx]
+            self.state = "TRAILING_META_HOLD"
+            return self._emit(emit_part)
+
+        hold_len = 0
+        max_k = min(len(data), self._MAX_SENTINEL_LEN - 1)
+        for k in range(max_k, 0, -1):
+            suffix_low = low[-k:]
+            if any(sent.startswith(suffix_low) for sent in self._SENTINELS):
+                hold_len = k
+                break
+        if hold_len > 0:
+            self._tail_buf = data[-hold_len:]
+            return self._emit(data[:-hold_len])
+        return self._emit(data)
+
+    def feed(self, delta: str) -> str:
+        if not delta:
+            return ""
+        self._raw_parts.append(delta)
+
+        if self.state in ("TRAILING_META_HOLD", "JSON_HOLD", "ACTION_HOLD"):
+            return ""
+        if self.state == "MARKDOWN_STREAM":
+            return self._scan_markdown_chunk(delta)
+
+        self._init_buf += delta
+        stripped = self._init_buf.lstrip()
+        if not stripped:
+            if len(self._init_buf) > 48:
+                self.state = "MARKDOWN_STREAM"
+                buf = self._init_buf
+                self._init_buf = ""
+                return self._scan_markdown_chunk(buf)
+            return ""
+
+        low_s = stripped.lower()
+        if low_s.startswith("{"):
+            self.state = "JSON_HOLD"
+            return ""
+
+        if low_s.startswith("```"):
+            if low_s.startswith("```dataog_action") or low_s.startswith("```dataog_meta"):
+                self.state = "ACTION_HOLD"
+                return ""
+            if "```dataog_action".startswith(low_s) or "```dataog_meta".startswith(low_s):
+                return ""
+            if low_s.startswith("```json"):
+                if '"action"' in low_s:
+                    self.state = "ACTION_HOLD"
+                    return ""
+                if len(low_s) < 100 and "\n```" not in low_s[7:]:
+                    return ""
+                self.state = "MARKDOWN_STREAM"
+                buf = self._init_buf
+                self._init_buf = ""
+                return self._scan_markdown_chunk(buf)
+            if "```json".startswith(low_s):
+                return ""
+            self.state = "MARKDOWN_STREAM"
+            buf = self._init_buf
+            self._init_buf = ""
+            return self._scan_markdown_chunk(buf)
+
+        self.state = "MARKDOWN_STREAM"
+        buf = self._init_buf
+        self._init_buf = ""
+        return self._scan_markdown_chunk(buf)
+
+    def finish(self) -> Tuple[str, str]:
+        tail_emit = ""
+        if self.state == "UNDECIDED" and self._init_buf:
+            self.state = "MARKDOWN_STREAM"
+            tail_emit = self._scan_markdown_chunk(self._init_buf)
+            self._init_buf = ""
+
+        if self.state == "MARKDOWN_STREAM" and self._tail_buf:
+            tail_emit += self._emit(self._tail_buf)
+            self._tail_buf = ""
+
+        return tail_emit, "".join(self._raw_parts)
+
+    @property
+    def emitted_markdown(self) -> str:
+        return "".join(self._emitted_parts)
 
 
 class AiAssistantService(AssistantStorageMixin):
@@ -356,24 +482,25 @@ class AiAssistantService(AssistantStorageMixin):
             "聚焦方言语法规则、知识库检索与标准 SQL 编写；若需产出 DDL/写语句，使用 `propose_write` 卡片规范呈现以便用户审阅或后续连库执行。\n"
         )
         attachment_tools_desc = (
-            "- `search_attachment`: {\"attachment_id\":\"att_xxx\",\"keyword\":\"关键字\",\"limit\":8} — 在用户上传的超长文本/SQL/CSV中检索关键词所在行号与分片\n"
-            "- `inspect_attachment_chunk`: {\"attachment_id\":\"att_xxx\",\"chunk_index\":0,\"window\":0} — 按分片序号精读用户附件原文片段\n"
+            "- `read_attachment_lines`: {\"attachment_id\":\"att_xxx\",\"start_line\":1,\"end_line\":250} — 按 1-based 行号区间精读长文件或存储过程原文片段（带行号，单次最多 400 行）\n"
+            "- `search_attachment`: {\"attachment_id\":\"att_xxx\",\"keyword\":\"关键字或正则\",\"regex\":false,\"context_lines\":2,\"limit\":12} — 在附件原文中检索关键字或正则并返回命中行号与上下文片段\n"
+            "- `inspect_attachment_chunk`: {\"attachment_id\":\"att_xxx\",\"chunk_index\":0,\"window\":0} — 按语义分片序号阅读附件片段\n"
             "- `query_csv_attachment`: {\"attachment_id\":\"att_xxx\",\"sql\":\"SELECT ... FROM csv_data ...\",\"limit\":50} — 在内存隔离只读 SQLite 沙箱（表名固定 `csv_data`）精确聚合查询 CSV 附件\n"
             if has_attachments
             else ""
         )
         return (
             "你是 Data.O.G 首席数据库研发与运维专家助手。\n"
-            "你具备循序渐进的自主探索与知识库检索能力：先核查事实与官方文档，再下结论，绝不凭空编造表名、字段名或错误码解释。\n\n"
+            "你具备循序渐进的自主探索与知识库检索能力：先核查事实、元数据、代码行号与官方文档，再下结论，绝不凭空编造表名、字段名、行号或错误码解释。\n\n"
             f"{guidance}\n\n"
             "【安全与行为铁律】\n"
             f"{online_rules}"
             f"2. 目标数据库方言为 `{dialect}`，单轮最多可调用 {max_steps} 次工具，只读查询单步上限 {sample_limit} 行。\n"
             "3. 当用户问题存在关键歧义（例如存在多张候选表不确定查哪张、聚合口径不明确、或未明确目标场景）时，"
-            "优先输出 `clarify` 动作给出 2~4 个可点选选项向用户确认，而不是胡乱猜测。\n"
+            "优先使用 `clarify` 动作给出 2~4 个可点选选项向用户确认，而不是胡乱猜测。\n"
             "4. 若只读 SQL 报错，不要直接放弃，请查看报错信息并结合 `inspect_table` / `search_knowledge` 自我修正重试。\n"
-            "5. 引用知识库内容时，请在 `citations` 数组列出实际检索到的 `chunk_id`。\n\n"
-            "【可用工具清单（通过 action=\"tool\" 调用）】\n"
+            "5. 引用知识库内容时，请在末尾 `dataog_meta` 的 `citations` 数组列出实际检索到的 `chunk_id`。\n\n"
+            "【可用工具清单】\n"
             "- `search_catalog`: {\"keyword\":\"关键字\",\"schema_name\":\"可选\",\"limit\":30} — 检索已连接数据库中的表与视图\n"
             "- `inspect_table`: {\"table_ref\":\"schema.table\",\"force_refresh\":false} — 查看字段类型、注释、主键、索引、分布键、视图血缘与 DDL\n"
             "- `search_knowledge`: {\"query\":\"错误码或语法关键词\",\"dialect\":\"" + dialect + "\",\"top_k\":5} — 检索离线参考资料与方言速查卡\n"
@@ -383,15 +510,23 @@ class AiAssistantService(AssistantStorageMixin):
             "- `propose_write_sql`: {\"title\":\"变更标题\",\"rationale\":\"原因与影响\",\"sql\":\"CREATE/ALTER/INSERT/UPDATE/DELETE...\",\"target_schema\":\"可选\"} — 提交 DDL/写操作待确认提案（不执行）\n"
             f"{attachment_tools_desc}\n"
             f"【当前全局上下文】\n{context_block}\n\n"
-            "【严格 JSON 输出协议（每次回复必须仅输出单个合法 JSON 对象，禁止包裹多余闲聊文本）】\n"
-            "1) 调用工具继续探索：\n"
+            "【响应与工具调用协议】\n"
+            "1) 调用工具继续探索（必须仅输出单个 `dataog_action` 代码块，勿夹杂长篇闲聊）：\n"
+            "```dataog_action\n"
             '{"action":"tool","tool":"工具名","args":{...},"purpose":"简短说明本步探索意图(36字内)"}\n'
-            "2) 存在歧义需用户先选择确认：\n"
+            "```\n"
+            "2) 存在歧义需用户先选择确认（仅输出单个 `dataog_action` 代码块）：\n"
+            "```dataog_action\n"
             '{"action":"clarify","question":"需要向用户澄清的问题","reason":"为什么需要确认","options":[{"label":"选项标题","detail":"简短说明","value":"回传给AI的选择值"}]}\n'
+            "```\n"
             "3) 提交 DDL 或数据修改提案由用户二次确认执行：\n"
-            '{"action":"propose_write","title":"变更摘要标题","rationale":"变更说明、语法依据与风险提示","target_schema":"可选Schema","sql":"完整规范 SQL（支持分号分隔多条）","summary":"简短导语","next_steps":[{"label":"下一步建议","prompt":"对应追问"}]}\n'
-            "4) 完成探索并给出最终结论：\n"
-            '{"action":"answer","summary":"核心结论一句话摘要","content":"详细 Markdown 解答（含分点分析、SQL 代码块、调优/修复建议）","citations":["chunk_id_1"],"next_steps":[{"label":"下一步深入按钮","prompt":"点击后自动填入或发送的追问"}]}\n'
+            "```dataog_action\n"
+            '{"action":"propose_write","title":"变更摘要标题","rationale":"变更说明、语法依据与风险提示","target_schema":"可选Schema","sql":"完整规范 SQL（支持分号分隔多条）","summary":"简短导语"}\n'
+            "```\n"
+            "4) 给出最终回答：**直接输出清晰、结构化的纯净 Markdown 正文**（包含小标题、分点分析、精确行号 `Lxxx`、表格及 ```sql 代码块，严禁把整段回答包进 JSON 字符串）；如需补充知识库引用或后续建议，可在回答最末尾附带可选 `dataog_meta` 块：\n"
+            "```dataog_meta\n"
+            '{"citations":["chunk_id_1"],"next_steps":[{"label":"下一步深入按钮","prompt":"点击后自动填入或发送的追问"}]}\n'
+            "```\n"
         )
 
     @staticmethod
@@ -399,6 +534,9 @@ class AiAssistantService(AssistantStorageMixin):
         session: Dict[str, Any],
         current_prompt: str,
         clarification_reply: Optional[Dict[str, Any]],
+        *,
+        history_budget_tokens: int = 24000,
+        carry_over_context: str = "",
     ) -> List[Dict[str, str]]:
         msgs: List[Dict[str, str]] = []
         rolling = str(session.get("rolling_summary") or "").strip()
@@ -409,8 +547,17 @@ class AiAssistantService(AssistantStorageMixin):
                     "content": f"【较早轮次对话摘要】\n{rolling}",
                 }
             )
+        if carry_over_context:
+            msgs.append(
+                {
+                    "role": "system",
+                    "content": carry_over_context,
+                }
+            )
+
         history = list(session.get("messages") or [])
-        for m in history[-12:]:
+        formatted_hist: List[Dict[str, str]] = []
+        for m in history[-24:]:
             role = m.get("role", "user")
             if role == "user":
                 u_content = str(m.get("content") or "")
@@ -423,27 +570,39 @@ class AiAssistantService(AssistantStorageMixin):
                     )
                     if att_refs:
                         u_content = f"{u_content}\n[已附带文件: {att_refs}]"
-                msgs.append({"role": "user", "content": u_content})
+                formatted_hist.append({"role": "user", "content": u_content})
             else:
                 parts: List[str] = []
                 if m.get("content"):
-                    parts.append(str(m["content"])[:2000])
+                    parts.append(str(m["content"])[:8000])
                 prop = m.get("proposal")
                 if isinstance(prop, dict):
                     parts.append(
                         f"[提案 {prop.get('proposal_id')} | 状态={prop.get('status')} | 风险={prop.get('risk_level')}]\n"
-                        f"SQL:\n{str(prop.get('final_sql') or prop.get('original_sql') or '')[:1200]}"
+                        f"SQL:\n{str(prop.get('final_sql') or prop.get('original_sql') or '')[:2400]}"
                     )
                     exec_res = prop.get("execution_result") or {}
                     if exec_res:
                         parts.append(
-                            f"[执行反馈]: {json.dumps(exec_res, ensure_ascii=False)[:1000]}"
+                            f"[执行反馈]: {json.dumps(exec_res, ensure_ascii=False)[:1200]}"
                         )
                 clar = m.get("clarification") or {}
                 if isinstance(clar, dict) and clar.get("question"):
                     parts.append(f"[我曾请求澄清]: {clar['question']}")
                 if parts:
-                    msgs.append({"role": "assistant", "content": "\n".join(parts)})
+                    formatted_hist.append({"role": "assistant", "content": "\n".join(parts)})
+
+        # 基于上下文剩余预算的滑动窗口：由最新轮次倒序装载历史
+        kept_rev: List[Dict[str, str]] = []
+        used_tok = 0
+        budget = max(2000, int(history_budget_tokens or 24000))
+        for item in reversed(formatted_hist):
+            item_tok = estimate_tokens(item["content"]) + 12
+            if len(kept_rev) >= 2 and used_tok + item_tok > budget:
+                break
+            kept_rev.append(item)
+            used_tok += item_tok
+        msgs.extend(reversed(kept_rev))
 
         user_text = current_prompt.strip()
         if clarification_reply:
@@ -488,6 +647,84 @@ class AiAssistantService(AssistantStorageMixin):
         except Exception as exc:
             return None, str(exc)
         return None, "返回 JSON 不是对象结构"
+
+    @classmethod
+    def _parse_agent_response(
+        cls, raw_text: str
+    ) -> Tuple[str, Optional[Dict[str, Any]], str, str]:
+        """解析大模型单步输出，兼容原生 Markdown + dataog_action/dataog_meta 围栏与传统全 JSON 协议."""
+        raw = (raw_text or "").strip()
+        if "<think" in raw.lower() or "<thought" in raw.lower():
+            _, stripped = strip_think_tags(raw)
+            raw = stripped or raw
+        if not raw:
+            return "markdown_answer", {}, "", ""
+
+        fences = list(_DATAOG_FENCE_RE.finditer(raw))
+        action_matches = [m for m in fences if m.group(1).lower() == "dataog_action"]
+        if action_matches:
+            last_act = action_matches[-1]
+            try:
+                act_obj = extract_json_payload(last_act.group(2))
+            except Exception as exc:
+                return "malformed_action", None, "", f"dataog_action JSON 解析失败: {exc}"
+            if not isinstance(act_obj, dict):
+                return "malformed_action", None, "", "dataog_action 内容必须是 JSON 对象"
+            if not act_obj.get("action") and act_obj.get("tool"):
+                act_obj["action"] = "tool"
+            outer_md = _DATAOG_FENCE_RE.sub("", raw).strip()
+            return "json_action", act_obj, outer_md, ""
+
+        # 检查是否为无围栏的未闭合 dataog_action
+        if "```dataog_action" in raw.lower():
+            idx = raw.lower().rfind("```dataog_action")
+            tail_json = raw[idx + len("```dataog_action") :].strip()
+            try:
+                act_obj = extract_json_payload(tail_json)
+                if isinstance(act_obj, dict):
+                    if not act_obj.get("action") and act_obj.get("tool"):
+                        act_obj["action"] = "tool"
+                    return "json_action", act_obj, raw[:idx].strip(), ""
+            except Exception as exc:
+                return "malformed_action", None, "", f"未闭合 dataog_action JSON 解析失败: {exc}"
+
+        # 传统全 JSON 或 ```json {"action": ...} ``` 兼容路径
+        low_head = raw.lstrip().lower()
+        looks_like_json_action = low_head.startswith("{") or (
+            low_head.startswith("```json") and '"action"' in low_head[:360]
+        )
+        if looks_like_json_action:
+            parsed_obj, parse_err = cls._parse_agent_payload(raw)
+            if isinstance(parsed_obj, dict) and ("action" in parsed_obj or "tool" in parsed_obj):
+                if not parsed_obj.get("action") and parsed_obj.get("tool"):
+                    parsed_obj["action"] = "tool"
+                return "json_action", parsed_obj, "", ""
+            if low_head.startswith("{") and parsed_obj is None:
+                return "malformed_action", None, "", parse_err
+
+        # 原生纯净 Markdown 回答 + 可选末尾 dataog_meta 围栏
+        meta_obj: Dict[str, Any] = {}
+        for mf in fences:
+            if mf.group(1).lower() == "dataog_meta":
+                try:
+                    parsed_m = extract_json_payload(mf.group(2))
+                    if isinstance(parsed_m, dict):
+                        meta_obj.update(parsed_m)
+                except Exception:
+                    continue
+        clean_md = _DATAOG_FENCE_RE.sub("", raw).strip()
+        # 若末尾存在未闭合的 ```dataog_meta 残片，同步剥离
+        if "```dataog_meta" in clean_md.lower():
+            m_idx = clean_md.lower().rfind("```dataog_meta")
+            try:
+                parsed_tail_m = extract_json_payload(clean_md[m_idx + len("```dataog_meta") :])
+                if isinstance(parsed_tail_m, dict):
+                    meta_obj.update(parsed_tail_m)
+            except Exception:
+                pass
+            clean_md = clean_md[:m_idx].strip()
+
+        return "markdown_answer", meta_obj, clean_md, ""
 
     @staticmethod
     def _normalize_next_steps(raw_steps: Any) -> List[Dict[str, str]]:
@@ -540,8 +777,9 @@ class AiAssistantService(AssistantStorageMixin):
             "estimated_tokens": int(att.get("estimated_tokens") or 0),
             "chunk_count": int(att.get("chunk_count") or 0),
             "oversized": bool(att.get("oversized")),
-            "recommended_strategy": att.get("recommended_strategy") or "inline",
+            "recommended_strategy": att.get("recommended_strategy") or "full_context",
             "summary": att.get("summary") or "",
+            "outline": att.get("outline") or {},
         }
 
     def _run_stepped_batch_analysis(
@@ -554,7 +792,9 @@ class AiAssistantService(AssistantStorageMixin):
         batch_max_chunks: int,
         provider_id: str,
         model: str,
+        thinking_mode: str,
         cb: ProgressCallback,
+        event_cb: Optional[Callable[[Dict[str, Any]], None]],
         cancel_check: Optional[Callable[[], bool]],
         t_start: float,
         trace_steps: List[Dict[str, Any]],
@@ -592,6 +832,7 @@ class AiAssistantService(AssistantStorageMixin):
 
             global_no = start_idx + offset + 1
             pct = min(68, 10 + int(((offset + 1) / max(1, len(batch))) * 55))
+            purpose_txt = f"拆解 {att['filename']} 第 {chunk['chunk_index'] + 1}/{att['chunk_count']} 片 ({chunk['range_label']})"
             cb(
                 pct,
                 "分步拆解分析",
@@ -599,6 +840,17 @@ class AiAssistantService(AssistantStorageMixin):
                 offset,
                 len(batch),
             )
+            step_no = len(trace_steps) + 1
+            if event_cb:
+                event_cb(
+                    {
+                        "type": "tool_start",
+                        "step": step_no,
+                        "tool": "analyze_attachment_chunk",
+                        "purpose": purpose_txt,
+                        "args": {"chunk_index": chunk["chunk_index"], "range_label": chunk["range_label"]},
+                    }
+                )
 
             rolling_block = ""
             if rolling_notes:
@@ -622,7 +874,8 @@ class AiAssistantService(AssistantStorageMixin):
                 provider_id=provider_id,
                 model=model,
                 temperature=0.1,
-                timeout_sec=45.0,
+                timeout_sec=60.0,
+                thinking_mode=thinking_mode,
             )
             used_provider_name = str(llm_res.get("provider_name") or used_provider_name)
             used_model = str(llm_res.get("model") or used_model)
@@ -645,21 +898,23 @@ class AiAssistantService(AssistantStorageMixin):
                 compact_text = raw_chunk_reply[:420]
 
             step_summary = (summary_line or compact_text or "已完成该分片分析")[:180]
-            trace_steps.append(
-                {
-                    "step": len(trace_steps) + 1,
-                    "tool": "analyze_attachment_chunk",
-                    "purpose": f"拆解 {att['filename']} 第 {chunk['chunk_index'] + 1}/{att['chunk_count']} 片 ({chunk['range_label']})",
-                    "args": {
-                        "attachment_id": att["attachment_id"],
-                        "chunk_index": chunk["chunk_index"],
-                        "range_label": chunk["range_label"],
-                    },
-                    "ok": True,
-                    "elapsed_ms": chunk_ms,
-                    "summary": step_summary,
-                }
-            )
+            step_rec = {
+                "step": step_no,
+                "tool": "analyze_attachment_chunk",
+                "purpose": purpose_txt,
+                "args": {
+                    "attachment_id": att["attachment_id"],
+                    "chunk_index": chunk["chunk_index"],
+                    "range_label": chunk["range_label"],
+                },
+                "ok": True,
+                "elapsed_ms": chunk_ms,
+                "summary": step_summary,
+            }
+            trace_steps.append(step_rec)
+            if event_cb:
+                event_cb({"type": "tool_end", **step_rec})
+
             tag = f"[{att['filename']} · {chunk['range_label']}]"
             rolling_notes.append(f"- {tag} {step_summary}")
             batch_digests.append(f"- **{tag} ({chunk['title']})**: {compact_text}")
@@ -699,6 +954,162 @@ class AiAssistantService(AssistantStorageMixin):
         )
         return digest_block, continuation_chip, used_provider_name, used_model
 
+    @staticmethod
+    def _build_attachment_prompt_text(
+        *,
+        turn_attachments: List[Dict[str, Any]],
+        clean_prompt: str,
+        eff_strategy: str,
+        total_att_tokens: int,
+        model_ctx_window: int,
+    ) -> str:
+        if eff_strategy == "full_context":
+            blocks = []
+            for a in turn_attachments:
+                raw_txt = str(a.get("raw_text") or "")
+                numbered = (
+                    raw_txt
+                    if a.get("file_kind") == "csv"
+                    else format_with_line_numbers(raw_txt, start_line=1)
+                )
+                blocks.append(
+                    f"--- 附件 `{a['filename']}` [id={a['attachment_id']}, {a['summary']}] ---\n"
+                    f"```\n{numbered}\n```"
+                )
+            return (
+                f"{clean_prompt}\n\n"
+                "【用户本轮附带文件全文】\n"
+                "（已完整装载进当前上下文窗口，文本/SQL 行首已附带 `行号| ` 前缀以便精准定位）\n"
+                + "\n\n".join(blocks)
+            )
+
+        if eff_strategy == "agentic_explore":
+            att_hints = "、".join(f"`{a['filename']}` (id={a['attachment_id']})" for a in turn_attachments)
+            preview_blocks: List[str] = []
+            for a in turn_attachments:
+                if a.get("file_kind") == "csv":
+                    continue
+                lines = str(a.get("raw_text") or "").splitlines()
+                if not lines:
+                    continue
+                if len(lines) <= 100:
+                    snippet = format_with_line_numbers("\n".join(lines), start_line=1)
+                else:
+                    head = format_with_line_numbers("\n".join(lines[:60]), start_line=1)
+                    tail_start = max(61, len(lines) - 29)
+                    tail = format_with_line_numbers("\n".join(lines[tail_start - 1 :]), start_line=tail_start)
+                    snippet = f"{head}\n... (中间 {tail_start - 61} 行已省略，请用 read_attachment_lines / search_attachment 按需阅读) ...\n{tail}"
+                preview_blocks.append(f"--- `{a['filename']}` 头尾预览 (共 {len(lines)} 行) ---\n```\n{snippet}\n```")
+            preview_sec = ("\n\n" + "\n\n".join(preview_blocks)) if preview_blocks else ""
+            return (
+                f"{clean_prompt}\n\n"
+                f"【长上下文智能探索指引】用户本轮附带大体积文件（{att_hints}，共 ~{total_att_tokens} tokens，当前模型上下文窗口 ~{model_ctx_window} tokens）。"
+                "请先参考全局上下文中的结构大纲与逻辑锚点行号：CSV 请直接利用画像并调用 `query_csv_attachment`（表名固定 `csv_data`）做精确 SQL 查询；"
+                "存储过程/长 SQL/文本请调用 `search_attachment` 检索关键词并调用 `read_attachment_lines` 按起止行号精读核心段落。"
+                f"{preview_sec}"
+            )
+
+        return clean_prompt
+
+    def _invoke_llm_step(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        provider_id: str,
+        model: str,
+        thinking_mode: str,
+        step_idx: int,
+        timeout_sec: float,
+        event_cb: Optional[Callable[[Dict[str, Any]], None]],
+        cancel_check: Optional[Callable[[], bool]],
+    ) -> Tuple[str, str, float, str, str, str, bool]:
+        """执行单步 LLM 调用（流式优先走 chat_completion_stream，非流式走 chat_completion）."""
+        if event_cb is None:
+            t0 = time.perf_counter()
+            llm_res = self.ctx.llm_hub.chat_completion(
+                messages=messages,
+                provider_id=provider_id,
+                model=model,
+                temperature=0.1,
+                timeout_sec=timeout_sec,
+                thinking_mode=thinking_mode,
+            )
+            elapsed = round((time.perf_counter() - t0) * 1000.0, 1)
+            raw_reply = str(llm_res.get("content") or "")
+            reasoning = str(llm_res.get("reasoning") or "")
+            return (
+                raw_reply,
+                reasoning,
+                elapsed if reasoning else 0.0,
+                str(llm_res.get("provider_name") or ""),
+                str(llm_res.get("model") or ""),
+                "",
+                False,
+            )
+
+        demuxer = _StreamActionDemuxer()
+        think_started = False
+        think_ended = False
+        t_think0 = 0.0
+        think_ms = 0.0
+        used_prov = ""
+        used_mdl = ""
+        full_content = ""
+        full_reasoning = ""
+        was_cancelled = False
+
+        for ev in self.ctx.llm_hub.chat_completion_stream(
+            messages=messages,
+            provider_id=provider_id,
+            model=model,
+            temperature=0.1,
+            timeout_sec=max(timeout_sec, 120.0),
+            thinking_mode=thinking_mode,
+            cancel_check=cancel_check,
+        ):
+            ev_type = ev.get("type")
+            if ev_type == "reasoning":
+                delta = str(ev.get("delta") or "")
+                if delta:
+                    if not think_started:
+                        think_started = True
+                        t_think0 = time.perf_counter()
+                        event_cb({"type": "thinking_start", "step": step_idx})
+                    event_cb({"type": "thinking_delta", "step": step_idx, "delta": delta})
+            elif ev_type == "content":
+                if think_started and not think_ended:
+                    think_ended = True
+                    think_ms = round((time.perf_counter() - t_think0) * 1000.0, 1)
+                    event_cb({"type": "thinking_end", "step": step_idx, "elapsed_ms": think_ms})
+                delta = str(ev.get("delta") or "")
+                if delta:
+                    md_delta = demuxer.feed(delta)
+                    if md_delta:
+                        event_cb({"type": "content_delta", "delta": md_delta})
+            elif ev_type == "done":
+                if think_started and not think_ended:
+                    think_ended = True
+                    think_ms = round((time.perf_counter() - t_think0) * 1000.0, 1)
+                    event_cb({"type": "thinking_end", "step": step_idx, "elapsed_ms": think_ms})
+                tail_md, full_raw = demuxer.finish()
+                if tail_md:
+                    event_cb({"type": "content_delta", "delta": tail_md})
+                used_prov = str(ev.get("provider_name") or "")
+                used_mdl = str(ev.get("model") or "")
+                full_content = full_raw or str(ev.get("content") or "")
+                full_reasoning = str(ev.get("reasoning") or "")
+                was_cancelled = bool(ev.get("cancelled"))
+
+        return (
+            full_content,
+            full_reasoning,
+            think_ms,
+            used_prov,
+            used_mdl,
+            demuxer.emitted_markdown,
+            was_cancelled,
+        )
+
     def chat_turn(
         self,
         *,
@@ -712,6 +1123,7 @@ class AiAssistantService(AssistantStorageMixin):
         task_mode: str = "auto",
         provider_id: str = "",
         model: str = "",
+        thinking_mode: str = "auto",
         max_steps: int = 6,
         sample_limit: int = 100,
         clarification_reply: Optional[Dict[str, Any]] = None,
@@ -720,6 +1132,7 @@ class AiAssistantService(AssistantStorageMixin):
         batch_start_chunk: int = 0,
         batch_max_chunks: int = DEFAULT_BATCH_MAX_CHUNKS,
         progress_cb: Optional[ProgressCallback] = None,
+        event_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
         req_aids: List[str] = []
@@ -749,7 +1162,12 @@ class AiAssistantService(AssistantStorageMixin):
         cb = progress_cb or noop_progress
         t_start = time.perf_counter()
 
-        # 1. 先校验大模型配置可用性（避免空会话消息被错误污染）
+        def _emit_status(pct: int, stage: str, detail: str, done_n: int = 0, total_n: int = 0) -> None:
+            cb(pct, stage, detail, done_n, total_n)
+            if event_cb:
+                event_cb({"type": "status", "stage": stage, "detail": detail, "percent": pct})
+
+        # 1. 先校验大模型配置可用性并推断模型上下文与 Thinking 规格
         eff_provider_id = (provider_id or "").strip()
         eff_model = (model or "").strip()
 
@@ -758,8 +1176,24 @@ class AiAssistantService(AssistantStorageMixin):
             eff_provider_id = (eff_provider_id or sess.get("provider_id") or "").strip()
             eff_model = (eff_model or sess.get("model") or "").strip()
 
-        self.ctx.llm_hub.resolve_provider_and_model(
+        resolved_llm = self.ctx.llm_hub.resolve_provider_and_model(
             provider_id=eff_provider_id, model=eff_model, require_ready=True
+        )
+        assert resolved_llm is not None
+        llm_prof, eff_llm_model = resolved_llm
+        model_caps = infer_model_capabilities(
+            eff_llm_model, llm_prof.provider_type, llm_prof.base_url, llm_prof.extra
+        )
+        model_ctx_window = int(model_caps["context_window"])
+        model_attach_budget = int(model_caps["attachment_budget"])
+
+        req_tmode = (thinking_mode or "auto").strip().lower()
+        if req_tmode not in ("auto", "enabled", "disabled"):
+            req_tmode = "auto"
+        eff_thinking_mode = (
+            req_tmode
+            if req_tmode != "auto" or sess is None
+            else (sess.get("thinking_mode") or "auto")
         )
 
         # 2. 创建或加载更新会话
@@ -785,6 +1219,7 @@ class AiAssistantService(AssistantStorageMixin):
                 task_mode=task_mode,
                 provider_id=eff_provider_id,
                 model=eff_model,
+                thinking_mode=eff_thinking_mode,
             )
             sid = sess["session_id"]
         else:
@@ -811,9 +1246,12 @@ class AiAssistantService(AssistantStorageMixin):
                     task_mode=task_mode if task_mode != "auto" else sess["task_mode"],
                     provider_id=eff_provider_id or sess["provider_id"],
                     model=eff_model or sess["model"],
+                    thinking_mode=req_tmode if req_tmode != "auto" or thinking_mode == "auto" else None,
                 )
                 or sess
             )
+            if thinking_mode in ("auto", "enabled", "disabled"):
+                eff_thinking_mode = thinking_mode
 
         # 将本轮附件绑定至当前会话并汇集全会话附件 Manifest
         if req_aids:
@@ -840,7 +1278,7 @@ class AiAssistantService(AssistantStorageMixin):
         safe_max_steps = max(1, min(MAX_STEPS_CAP, int(max_steps or 6)))
         safe_sample_limit = max(10, min(200, int(sample_limit or 100)))
 
-        cb(6, "准备上下文", f"正在组装 {eff_dialect} 语法基线、元数据与附件清单...", 0, safe_max_steps)
+        _emit_status(6, "准备上下文", f"正在组装 {eff_dialect} 语法基线、元数据与附件清单...", 0, safe_max_steps)
         context_block = self._build_context_block(
             work_mode=eff_mode,
             profile=prof,
@@ -859,25 +1297,37 @@ class AiAssistantService(AssistantStorageMixin):
             has_attachments=bool(bound_session_atts),
         )
 
-        # 3. 确定本轮附件防爆窗策略（inline | on_demand | stepped_batch | none）
+        # 3. 模型感知的现代长上下文附件策略（full_context | agentic_explore | stepped_batch | none）
         total_att_tokens = sum(int(a.get("estimated_tokens") or 0) for a in turn_attachments)
         req_strategy = (large_payload_strategy or "auto").strip().lower()
+        if req_strategy == "inline":
+            req_strategy = "full_context"
+        elif req_strategy == "on_demand":
+            req_strategy = "agentic_explore"
+
+        all_csv = bool(turn_attachments) and all(a.get("file_kind") == "csv" for a in turn_attachments)
+        has_oversized_csv = any(
+            a.get("file_kind") == "csv" and int(a.get("estimated_tokens") or 0) > CSV_INLINE_TOKEN_BUDGET
+            for a in turn_attachments
+        )
         if not turn_attachments:
             eff_strategy = "none"
-        elif req_strategy == "on_demand":
-            eff_strategy = "on_demand"
+        elif req_strategy == "full_context":
+            eff_strategy = "agentic_explore" if (all_csv and total_att_tokens > CSV_INLINE_TOKEN_BUDGET) else "full_context"
+        elif req_strategy == "agentic_explore":
+            eff_strategy = "agentic_explore"
         elif req_strategy == "stepped_batch" and (
             total_att_tokens > INLINE_TOKEN_BUDGET
             or any(int(a.get("chunk_count") or 0) > 1 for a in turn_attachments)
             or batch_start_chunk > 0
         ):
             eff_strategy = "stepped_batch"
-        elif total_att_tokens <= INLINE_TOKEN_BUDGET:
-            eff_strategy = "inline"
-        elif all(a.get("file_kind") == "csv" for a in turn_attachments):
-            eff_strategy = "on_demand"
+        elif has_oversized_csv:
+            eff_strategy = "agentic_explore"
+        elif total_att_tokens <= model_attach_budget:
+            eff_strategy = "full_context"
         else:
-            eff_strategy = "stepped_batch"
+            eff_strategy = "agentic_explore"
 
         attachments_meta = [self._build_attachment_metadata(a) for a in turn_attachments]
         next_turn = int(sess.get("turn_count") or 0) + 1
@@ -890,6 +1340,19 @@ class AiAssistantService(AssistantStorageMixin):
             content=clean_prompt,
             attachments=attachments_meta,
         )
+
+        if event_cb:
+            event_cb(
+                {
+                    "type": "session_init",
+                    "session": {k: v for k, v in sess.items() if k != "messages"},
+                    "user_message": user_msg,
+                    "strategy": eff_strategy,
+                    "context_window": model_ctx_window,
+                    "attachment_budget": model_attach_budget,
+                    "thinking_mode": eff_thinking_mode,
+                }
+            )
 
         toolbox = AssistantToolbox(
             ctx=self.ctx,
@@ -907,24 +1370,7 @@ class AiAssistantService(AssistantStorageMixin):
         used_model = ""
         continuation_chip: Optional[Dict[str, Any]] = None
 
-        llm_user_prompt = clean_prompt
-        if eff_strategy == "inline":
-            inline_blocks = []
-            for a in turn_attachments:
-                inline_blocks.append(
-                    f"--- 附件 `{a['filename']}` [id={a['attachment_id']}, {a['summary']}] ---\n"
-                    f"```\n{a.get('raw_text', '')}\n```"
-                )
-            llm_user_prompt = f"{clean_prompt}\n\n【用户本轮附带文件全文】\n" + "\n\n".join(inline_blocks)
-        elif eff_strategy == "on_demand":
-            att_hints = "、".join(f"`{a['filename']}` (id={a['attachment_id']})" for a in turn_attachments)
-            llm_user_prompt = (
-                f"{clean_prompt}\n\n"
-                f"【防爆窗按需探索指引】用户本轮附带大体积文件（{att_hints}，共 ~{total_att_tokens} tokens），"
-                "为避免超出上下文窗口，原文已切片保存。CSV 请优先直接利用全局上下文中的字段画像并使用 `query_csv_attachment` 工具执行 SQLite 只读 SQL（表名固定 `csv_data`），"
-                "文本/SQL 可调用 `search_attachment` 与 `inspect_attachment_chunk` 精准阅读相关片区。"
-            )
-        elif eff_strategy == "stepped_batch":
+        if eff_strategy == "stepped_batch":
             batch_digest, continuation_chip, mp_prov, mp_mdl = self._run_stepped_batch_analysis(
                 turn_attachments=turn_attachments,
                 clean_prompt=clean_prompt,
@@ -933,7 +1379,9 @@ class AiAssistantService(AssistantStorageMixin):
                 batch_max_chunks=batch_max_chunks,
                 provider_id=eff_provider_id,
                 model=eff_model,
+                thinking_mode=eff_thinking_mode,
                 cb=cb,
+                event_cb=event_cb,
                 cancel_check=cancel_check,
                 t_start=t_start,
                 trace_steps=trace_steps,
@@ -941,52 +1389,184 @@ class AiAssistantService(AssistantStorageMixin):
             used_provider_name = mp_prov or used_provider_name
             used_model = mp_mdl or used_model
             llm_user_prompt = f"{clean_prompt}\n\n{batch_digest}" if batch_digest else clean_prompt
+        else:
+            llm_user_prompt = self._build_attachment_prompt_text(
+                turn_attachments=turn_attachments,
+                clean_prompt=clean_prompt,
+                eff_strategy=eff_strategy,
+                total_att_tokens=total_att_tokens,
+                model_ctx_window=model_ctx_window,
+            )
 
-        convo = self._build_conversation_messages(sess, llm_user_prompt, clarification_reply)
+        sys_tokens = estimate_tokens(system_prompt)
+        cur_user_tokens = estimate_tokens(llm_user_prompt)
+        reserve_out = min(16384, max(4096, int(model_ctx_window * 0.12)))
+        history_budget = max(2000, model_ctx_window - sys_tokens - cur_user_tokens - reserve_out)
+
+        # 若本轮是追问且未附带新文件，自动为大小在剩余窗口 50% 以内的最近非 CSV 会话附件保留带行号全文
+        carry_over_context = ""
+        if not turn_attachments and bound_session_atts:
+            non_csv_atts = [sa for sa in bound_session_atts if sa.get("file_kind") != "csv"]
+            if non_csv_atts:
+                carry_limit = min(model_attach_budget, int(history_budget * 0.5))
+                carry_parts: List[str] = []
+                carry_tok = 0
+                for sa in reversed(non_csv_atts):
+                    sa_tok = int(sa.get("estimated_tokens") or 0)
+                    if sa_tok <= 0 or carry_tok + sa_tok > carry_limit:
+                        continue
+                    full_sa = self.get_attachment(sa["attachment_id"], include_raw=True, include_chunks=False)
+                    if full_sa and full_sa.get("raw_text"):
+                        carry_parts.append(
+                            f"--- 会话已关联文件 `{full_sa['filename']}` [id={full_sa['attachment_id']}] ---\n"
+                            f"```\n{format_with_line_numbers(full_sa['raw_text'], start_line=1)}\n```"
+                        )
+                        carry_tok += sa_tok
+                if carry_parts:
+                    carry_parts.reverse()
+                    carry_over_context = (
+                        "【本会话已关联附件源码对照（带行号，供本轮追问直接参考）】\n"
+                        + "\n\n".join(carry_parts)
+                    )
+                    history_budget = max(2000, history_budget - carry_tok)
+
+        convo = self._build_conversation_messages(
+            sess,
+            llm_user_prompt,
+            clarification_reply,
+            history_budget_tokens=history_budget,
+            carry_over_context=carry_over_context,
+        )
         llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}] + convo
 
         final_obj: Optional[Dict[str, Any]] = None
         fallback_plain_text = ""
+        reasoning_segments: List[str] = []
+        total_reasoning_ms = 0.0
+        context_fallback_done = False
+        history_trim_done = False
+        streamed_final_md = ""
+        was_cancelled = False
+        step_idx = 0
 
         # 4. 多轮循序渐进工具推理循环
-        for step_idx in range(1, safe_max_steps + 1):
+        while step_idx < safe_max_steps:
+            step_idx += 1
             if cancel_check and cancel_check():
-                raise RuntimeError("用户已取消本次智能会话任务")
+                if event_cb is None:
+                    raise RuntimeError("用户已取消本次智能会话任务")
+                was_cancelled = True
+                break
             if (time.perf_counter() - t_start) > LOOP_WALLCLOCK_BUDGET_SEC:
                 break
 
             base_pct = 75 if eff_strategy == "stepped_batch" else 15
             span_pct = 15 if eff_strategy == "stepped_batch" else 65
             pct = min(90, base_pct + int((step_idx - 1) / max(1, safe_max_steps) * span_pct))
-            cb(pct, "智能推理中", f"步骤 {step_idx}/{safe_max_steps} · 正在分析与规划下一步...", step_idx - 1, safe_max_steps)
-
-            llm_res = self.ctx.llm_hub.chat_completion(
-                messages=llm_messages,
-                provider_id=eff_provider_id,
-                model=eff_model,
-                temperature=0.1,
-                timeout_sec=50.0,
+            _emit_status(
+                pct,
+                "智能推理中",
+                f"步骤 {step_idx}/{safe_max_steps} · 正在分析与规划下一步...",
+                step_idx - 1,
+                safe_max_steps,
             )
-            used_provider_name = str(llm_res.get("provider_name") or "")
-            used_model = str(llm_res.get("model") or "")
-            raw_reply = str(llm_res.get("content") or "")
 
-            parsed, parse_err = self._parse_agent_payload(raw_reply)
-            if parsed is None:
-                # 若第一次返回非 JSON，给予一次温和纠偏机会，不立刻失败
+            try:
+                (
+                    raw_reply,
+                    step_reasoning,
+                    step_think_ms,
+                    step_prov,
+                    step_mdl,
+                    emitted_md,
+                    step_cancelled,
+                ) = self._invoke_llm_step(
+                    messages=llm_messages,
+                    provider_id=eff_provider_id,
+                    model=eff_model,
+                    thinking_mode=eff_thinking_mode,
+                    step_idx=step_idx,
+                    timeout_sec=60.0,
+                    event_cb=event_cb,
+                    cancel_check=cancel_check,
+                )
+            except ContextLengthExceededError:
+                if eff_strategy == "full_context" and turn_attachments and not context_fallback_done:
+                    context_fallback_done = True
+                    eff_strategy = "agentic_explore"
+                    _emit_status(
+                        pct,
+                        "上下文自适应降级",
+                        "全文超出网关实际上下文窗口，自动切换为结构大纲 + 按行精准探索模式...",
+                        step_idx - 1,
+                        safe_max_steps,
+                    )
+                    llm_user_prompt = self._build_attachment_prompt_text(
+                        turn_attachments=turn_attachments,
+                        clean_prompt=clean_prompt,
+                        eff_strategy="agentic_explore",
+                        total_att_tokens=total_att_tokens,
+                        model_ctx_window=model_ctx_window,
+                    )
+                    convo = self._build_conversation_messages(
+                        sess,
+                        llm_user_prompt,
+                        clarification_reply,
+                        history_budget_tokens=max(2000, history_budget // 2),
+                    )
+                    llm_messages = [{"role": "system", "content": system_prompt}] + convo
+                    step_idx -= 1
+                    continue
+                if len(llm_messages) > 2 and not history_trim_done:
+                    history_trim_done = True
+                    llm_messages = [llm_messages[0], llm_messages[-1]]
+                    step_idx -= 1
+                    continue
+                raise
+
+            used_provider_name = step_prov or used_provider_name
+            used_model = step_mdl or used_model
+            if step_reasoning.strip():
+                reasoning_segments.append(step_reasoning.strip())
+            total_reasoning_ms += float(step_think_ms or 0.0)
+
+            if step_cancelled:
+                was_cancelled = True
+                if emitted_md.strip():
+                    streamed_final_md = emitted_md.strip()
+                    fallback_plain_text = emitted_md.strip()
+                elif raw_reply.strip():
+                    _, clean_partial = strip_think_tags(raw_reply)
+                    fallback_plain_text = (clean_partial or raw_reply).strip()
+                break
+
+            resp_mode, parsed, outer_md, parse_err = self._parse_agent_response(raw_reply)
+            if resp_mode == "malformed_action":
                 if step_idx == 1 and len(raw_reply.strip()) > 0:
                     fallback_plain_text = raw_reply.strip()
                     llm_messages.append({"role": "assistant", "content": raw_reply})
                     llm_messages.append(
                         {
                             "role": "user",
-                            "content": f"格式纠偏提示：上一步未能解析为 JSON ({parse_err})。请严格仅输出一个合法 JSON 对象。",
+                            "content": f"格式纠偏提示：上一步控制块 JSON 解析失败 ({parse_err})。如需调用工具请输出完整合法的 ```dataog_action JSON；若要回答请直接输出纯净 Markdown。",
                         }
                     )
                     continue
                 fallback_plain_text = raw_reply.strip()
                 break
 
+            if resp_mode == "markdown_answer":
+                streamed_final_md = emitted_md or outer_md
+                final_obj = {
+                    "action": "answer",
+                    "summary": str((parsed or {}).get("summary") or "").strip(),
+                    "content": outer_md,
+                    "citations": (parsed or {}).get("citations") or [],
+                    "next_steps": (parsed or {}).get("next_steps") or [],
+                }
+                break
+
+            assert parsed is not None
             action = str(parsed.get("action") or "").strip().lower()
             if action == "conclude":
                 action = "answer"
@@ -1000,44 +1580,59 @@ class AiAssistantService(AssistantStorageMixin):
                 action = "tool"
 
             if action == "tool":
+                if event_cb and emitted_md:
+                    event_cb({"type": "content_reset"})
                 tool_name = str(parsed.get("tool") or "").strip()
                 tool_args = parsed.get("args") if isinstance(parsed.get("args"), dict) else {}
                 purpose = str(parsed.get("purpose") or tool_name).strip()[:80]
-                cb(
+                step_no = len(trace_steps) + 1
+                _emit_status(
                     min(88, pct + 6),
                     "执行探索工具",
                     f"步骤 {step_idx}/{safe_max_steps} · {purpose}",
                     step_idx,
                     safe_max_steps,
                 )
+                if event_cb:
+                    event_cb(
+                        {
+                            "type": "tool_start",
+                            "step": step_no,
+                            "tool": tool_name,
+                            "purpose": purpose,
+                            "args": tool_args,
+                        }
+                    )
                 t_tool = time.perf_counter()
                 tool_out = toolbox.dispatch(tool_name, tool_args)
                 tool_ms = round((time.perf_counter() - t_tool) * 1000.0, 1)
 
-                trace_steps.append(
-                    {
-                        "step": len(trace_steps) + 1,
-                        "tool": tool_name,
-                        "purpose": purpose,
-                        "args": tool_args,
-                        "ok": bool(tool_out.get("ok")),
-                        "elapsed_ms": tool_ms,
-                        "summary": str(
-                            tool_out.get("note")
-                            or tool_out.get("error")
-                            or (f"命中 {tool_out.get('hit_count')} 条知识" if "hit_count" in tool_out else "")
-                            or (f"发现 {tool_out.get('count')} 个对象" if "count" in tool_out else "")
-                            or "完成"
-                        )[:180],
-                    }
-                )
+                step_rec = {
+                    "step": step_no,
+                    "tool": tool_name,
+                    "purpose": purpose,
+                    "args": tool_args,
+                    "ok": bool(tool_out.get("ok")),
+                    "elapsed_ms": tool_ms,
+                    "summary": str(
+                        tool_out.get("note")
+                        or tool_out.get("error")
+                        or (f"命中 {tool_out.get('hit_count')} 条知识" if "hit_count" in tool_out else "")
+                        or (f"发现 {tool_out.get('count')} 个对象" if "count" in tool_out else "")
+                        or "完成"
+                    )[:180],
+                }
+                trace_steps.append(step_rec)
+                if event_cb:
+                    event_cb({"type": "tool_end", **step_rec})
+
                 llm_messages.append({"role": "assistant", "content": raw_reply})
                 llm_messages.append(
                     {
                         "role": "user",
                         "content": (
                             f"【工具 `{tool_name}` 返回结果】\n"
-                            + json.dumps(tool_out, ensure_ascii=False)[:6500]
+                            + json.dumps(tool_out, ensure_ascii=False)[:24000]
                         ),
                     }
                 )
@@ -1046,39 +1641,72 @@ class AiAssistantService(AssistantStorageMixin):
             if action in ("clarify", "propose_write", "answer"):
                 final_obj = parsed
                 final_obj["action"] = action
+                if outer_md and action == "propose_write" and not final_obj.get("_outer_md"):
+                    final_obj["_outer_md"] = outer_md
+                streamed_final_md = emitted_md
                 break
 
             fallback_plain_text = raw_reply.strip()
             break
 
-        # 若用尽工具步数仍未输出终结动作，追加一次强制汇总（禁止继续调工具）
-        if final_obj is None and trace_steps:
-            cb(90, "归纳结论", "正在基于已收集的探索证据汇总最终回复...", safe_max_steps, safe_max_steps)
+        # 若用尽工具步数仍未输出终结动作且未被取消，追加一次强制汇总
+        if final_obj is None and trace_steps and not was_cancelled:
+            _emit_status(90, "归纳结论", "正在基于已收集的探索证据汇总最终回复...", safe_max_steps, safe_max_steps)
             llm_messages.append(
                 {
                     "role": "user",
                     "content": (
-                        "探索步数已达上限，请立即停止调用工具，直接输出 `action=\"answer\"` 或 `action=\"propose_write\"` 的最终 JSON 结论。"
+                        "探索步数已达上限，请立即停止调用工具，直接输出完整清晰的 Markdown 最终分析结论"
+                        "（如需生成写操作提案，请在末尾附 ```dataog_action {\"action\":\"propose_write\",...} ```）。"
                     ),
                 }
             )
-            synth = self.ctx.llm_hub.chat_completion(
+            (
+                synth_raw,
+                synth_reasoning,
+                synth_think_ms,
+                synth_prov,
+                synth_mdl,
+                synth_emitted,
+                synth_cancelled,
+            ) = self._invoke_llm_step(
                 messages=llm_messages,
                 provider_id=eff_provider_id,
                 model=eff_model,
-                temperature=0.1,
-                timeout_sec=45.0,
+                thinking_mode=eff_thinking_mode,
+                step_idx=step_idx + 1,
+                timeout_sec=60.0,
+                event_cb=event_cb,
+                cancel_check=cancel_check,
             )
-            used_provider_name = str(synth.get("provider_name") or used_provider_name)
-            used_model = str(synth.get("model") or used_model)
-            parsed_synth, _ = self._parse_agent_payload(str(synth.get("content") or ""))
-            if parsed_synth:
-                final_obj = parsed_synth
-            else:
-                fallback_plain_text = str(synth.get("content") or fallback_plain_text).strip()
+            used_provider_name = synth_prov or used_provider_name
+            used_model = synth_mdl or used_model
+            if synth_reasoning.strip():
+                reasoning_segments.append(synth_reasoning.strip())
+            total_reasoning_ms += float(synth_think_ms or 0.0)
+            was_cancelled = was_cancelled or synth_cancelled
 
-        # 3. 处理最终响应并落盘
+            s_mode, s_obj, s_outer_md, _ = self._parse_agent_response(synth_raw)
+            if s_mode == "markdown_answer":
+                streamed_final_md = synth_emitted or s_outer_md
+                final_obj = {
+                    "action": "answer",
+                    "summary": str((s_obj or {}).get("summary") or "").strip(),
+                    "content": s_outer_md,
+                    "citations": (s_obj or {}).get("citations") or [],
+                    "next_steps": (s_obj or {}).get("next_steps") or [],
+                }
+            elif s_obj:
+                final_obj = s_obj
+                if s_outer_md and str(final_obj.get("action") or "").lower() == "propose_write":
+                    final_obj["_outer_md"] = s_outer_md
+                streamed_final_md = synth_emitted
+            else:
+                fallback_plain_text = (synth_emitted or synth_raw or fallback_plain_text).strip()
+
+        # 5. 处理最终响应并落盘
         total_ms = round((time.perf_counter() - t_start) * 1000.0, 1)
+        combined_reasoning = "\n\n---\n\n".join(reasoning_segments)
         response_type = "answer"
         content_md = ""
         clarification_payload: Dict[str, Any] = {}
@@ -1087,7 +1715,10 @@ class AiAssistantService(AssistantStorageMixin):
         citations_list: List[Dict[str, Any]] = []
 
         if final_obj is None:
-            content_md = fallback_plain_text or "已完成分析，但未能得到完整结构化输出，请尝试缩小问题范围或重试。"
+            if was_cancelled:
+                content_md = fallback_plain_text or "（已停止生成）"
+            else:
+                content_md = fallback_plain_text or "已完成分析，但未能得到完整结构化输出，请尝试缩小问题范围或重试。"
             citations_list = self._resolve_citations([], toolbox)
         else:
             act = str(final_obj.get("action") or "answer").lower()
@@ -1121,6 +1752,7 @@ class AiAssistantService(AssistantStorageMixin):
 
             elif act == "propose_write":
                 sql_candidate = str(final_obj.get("sql") or "").strip()
+                prop_err_md = ""
                 if sql_candidate:
                     prop_res = toolbox.tool_propose_write_sql(
                         {
@@ -1131,14 +1763,19 @@ class AiAssistantService(AssistantStorageMixin):
                         }
                     )
                     if not prop_res.get("ok") and not toolbox.pending_proposal:
-                        # 若 LLM 误把纯只读 SELECT 放进了 propose_write，降级展示普通回答
-                        content_md = (
+                        prop_err_md = (
                             str(final_obj.get("summary") or "")
                             + f"\n\n```sql\n{sql_candidate}\n```\n\n> 提示：{prop_res.get('error', '')}"
                         ).strip()
+                outer_txt = str(final_obj.get("_outer_md") or "").strip()
                 summary_txt = str(final_obj.get("summary") or "").strip()
                 rationale_txt = str(final_obj.get("rationale") or "").strip()
-                content_md = "\n\n".join(x for x in (summary_txt, rationale_txt) if x) or "已生成待确认 SQL 语句，请在下方卡片核对后决定是否执行。"
+                content_md = (
+                    prop_err_md
+                    or outer_txt
+                    or "\n\n".join(x for x in (summary_txt, rationale_txt) if x)
+                    or "已生成待确认 SQL 语句，请在下方卡片核对后决定是否执行。"
+                )
 
             else:
                 summary_txt = str(final_obj.get("summary") or "").strip()
@@ -1147,6 +1784,9 @@ class AiAssistantService(AssistantStorageMixin):
                     content_md = f"**{summary_txt}**\n\n{body_txt}"
                 else:
                     content_md = body_txt or summary_txt or fallback_plain_text or "处理完成。"
+
+        if event_cb and not streamed_final_md and content_md and not was_cancelled:
+            event_cb({"type": "content_delta", "delta": content_md})
 
         # 将接续拆解芯片置于下一步建议首位，方便用户一键分析下一批分片
         if continuation_chip is not None:
@@ -1181,14 +1821,16 @@ class AiAssistantService(AssistantStorageMixin):
             task_mode=eff_task_mode,
             response_type=response_type,
             content=content_md,
+            reasoning=combined_reasoning,
+            reasoning_ms=round(total_reasoning_ms, 1),
             steps=trace_steps,
             citations=citations_list,
             clarification=clarification_payload,
             next_steps=next_steps_list,
             result_table=result_table,
             proposal_id=proposal_id,
-            provider_name=used_provider_name,
-            model=used_model,
+            provider_name=used_provider_name or llm_prof.name,
+            model=used_model or eff_llm_model,
             total_elapsed_ms=total_ms,
         )
 
@@ -1213,11 +1855,15 @@ class AiAssistantService(AssistantStorageMixin):
         cb(100, "回答就绪", f"已完成多步分析与响应（耗时 {total_ms:.0f} ms）", safe_max_steps, safe_max_steps)
 
         updated_session = self.get_session_detail(sid)
-        return {
+        result_payload = {
             "session": updated_session,
             "user_message": user_msg,
             "assistant_message": assistant_msg,
+            "cancelled": was_cancelled,
         }
+        if event_cb:
+            event_cb({"type": "done", "ok": True, **result_payload})
+        return result_payload
 
     # =========================================================================
     # 写操作与 DDL 分级二次确认执行门禁 (Confirm / Reject)
