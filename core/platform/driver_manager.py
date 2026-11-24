@@ -28,6 +28,7 @@ import uuid
 import zipfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from core.platform.diagnostics_hub import trace_span
 from core.platform.inceptor_client import InceptorThriftClient
 from core.platform.models import ConnectionProfile, DriverPackage
 from core.platform.storage import PlatformStateStore
@@ -353,36 +354,37 @@ class DriverManager:
 
     def get_java_runtime_status(self) -> Dict[str, Any]:
         """无副作用探测本机 JPype1 与 Java JRE/JDK 可用状态（绝不在此阶段启动 JVM）."""
-        jpype_installed = False
-        jvm_path = ""
-        try:
-            import jpype  # type: ignore
-
-            jpype_installed = True
-            try:
-                jvm_path = str(jpype.getDefaultJVMPath() or "")
-            except Exception:
-                jvm_path = ""
-        except ImportError:
+        with trace_span("driver", "java_probe"):
             jpype_installed = False
+            jvm_path = ""
+            try:
+                import jpype  # type: ignore
 
-        java_bin = shutil.which("java") or ""
-        java_home = os.environ.get("JAVA_HOME", "")
-        available = bool(jpype_installed and (jvm_path or java_home or java_bin))
-        note = (
-            "自定义 JDBC 扩展通道就绪"
-            if available
-            else "未检测到本地 Java 运行环境 (JRE/JDK 8+)；内置原生通道 (DWS/PGSQL/Inceptor/MySQL/SQLite) 不受影响可正常使用。"
-        )
-        return {
-            "jdbc_extension_ready": available,
-            "available": available,
-            "jpype_installed": jpype_installed,
-            "jvm_detected": bool(jvm_path or java_home or java_bin),
-            "java_home": java_home,
-            "note": note,
-            "message": note,
-        }
+                jpype_installed = True
+                try:
+                    jvm_path = str(jpype.getDefaultJVMPath() or "")
+                except Exception:
+                    jvm_path = ""
+            except ImportError:
+                jpype_installed = False
+
+            java_bin = shutil.which("java") or ""
+            java_home = os.environ.get("JAVA_HOME", "")
+            available = bool(jpype_installed and (jvm_path or java_home or java_bin))
+            note = (
+                "自定义 JDBC 扩展通道就绪"
+                if available
+                else "未检测到本地 Java 运行环境 (JRE/JDK 8+)；内置原生通道 (DWS/PGSQL/Inceptor/MySQL/SQLite) 不受影响可正常使用。"
+            )
+            return {
+                "jdbc_extension_ready": available,
+                "available": available,
+                "jpype_installed": jpype_installed,
+                "jvm_detected": bool(jvm_path or java_home or java_bin),
+                "java_home": java_home,
+                "note": note,
+                "message": note,
+            }
 
     # =========================================================================
     # 自定义 JDBC .jar 驱动包安全上传、指纹校验与隔离存储
@@ -503,27 +505,28 @@ class DriverManager:
         return True
 
     def resolve_driver_jar_path(self, driver_id: str) -> Tuple[DriverPackage, str]:
-        pkg = self.store.get_jdbc_driver(driver_id)
-        if not pkg:
-            raise ValueError(f"未找到指定的 JDBC 驱动包档案 ({driver_id})，请先在驱动中心上传 .jar 驱动")
-        abs_path = os.path.join(self.drivers_dir, os.path.basename(pkg.stored_rel_path))
-        if not os.path.isfile(abs_path):
-            raise FileNotFoundError(f"JDBC 驱动文件不存在或已被移除: {pkg.file_name}")
-        # 二次完整性校验：核验磁盘文件魔数与 SHA-256 指纹未被篡改
-        h = hashlib.sha256()
-        with open(abs_path, "rb") as fh:
-            head = fh.read(4)
-            if head != JAR_MAGIC_BYTES:
-                raise ValueError("本地 JDBC 驱动文件头校验失败")
-            h.update(head)
-            while True:
-                chunk = fh.read(65536)
-                if not chunk:
-                    break
-                h.update(chunk)
-        if h.hexdigest() != pkg.sha256:
-            raise ValueError("本地 JDBC 驱动文件 SHA-256 指纹校验不匹配，拒绝加载")
-        return pkg, abs_path
+        with trace_span("driver", "jar_sha256_verify", {"driver_id": driver_id}):
+            pkg = self.store.get_jdbc_driver(driver_id)
+            if not pkg:
+                raise ValueError(f"未找到指定的 JDBC 驱动包档案 ({driver_id})，请先在驱动中心上传 .jar 驱动")
+            abs_path = os.path.join(self.drivers_dir, os.path.basename(pkg.stored_rel_path))
+            if not os.path.isfile(abs_path):
+                raise FileNotFoundError(f"JDBC 驱动文件不存在或已被移除: {pkg.file_name}")
+            # 二次完整性校验：核验磁盘文件魔数与 SHA-256 指纹未被篡改
+            h = hashlib.sha256()
+            with open(abs_path, "rb") as fh:
+                head = fh.read(4)
+                if head != JAR_MAGIC_BYTES:
+                    raise ValueError("本地 JDBC 驱动文件头校验失败")
+                h.update(head)
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            if h.hexdigest() != pkg.sha256:
+                raise ValueError("本地 JDBC 驱动文件 SHA-256 指纹校验不匹配，拒绝加载")
+            return pkg, abs_path
 
     # =========================================================================
     # 双轨数据库连接建立 (Native & Lazy JPype JDBC)
@@ -543,33 +546,34 @@ class DriverManager:
         )
 
     def _ensure_jvm_started(self) -> Any:
-        try:
-            import jpype  # type: ignore
-        except ImportError as exc:
-            raise RuntimeError(
-                "当前环境未安装 JPype1 依赖，无法启用自定义 JDBC .jar 驱动扩展通道。"
-            ) from exc
-
-        with self._jvm_lock:
-            if not jpype.isJVMStarted():
-                try:
-                    jvm_path = jpype.getDefaultJVMPath()
-                except Exception as exc:
-                    raise RuntimeError(
-                        "未检测到本地 Java 运行环境 (JRE/JDK 8+)。请安装 JRE 或配置 JAVA_HOME 后再使用自定义 JDBC 驱动连接；内置原生驱动 (DWS/PGSQL/Inceptor/MySQL/SQLite) 无需 Java 可直接使用。"
-                    ) from exc
-                try:
-                    jpype.startJVM(jvm_path, "-Djava.awt.headless=true", convertStrings=True)
-                except Exception as exc:
-                    raise RuntimeError(f"启动本地 Java 虚拟机失败: {exc}") from exc
-
-        if hasattr(jpype, "isThreadAttachedToJVM") and hasattr(jpype, "attachThreadToJVM"):
+        with trace_span("jvm", "ensure_started"):
             try:
-                if not jpype.isThreadAttachedToJVM():
-                    jpype.attachThreadToJVM()
-            except Exception as exc:
-                raise RuntimeError(f"将当前工作线程挂载至 JVM 失败: {exc}") from exc
-        return jpype
+                import jpype  # type: ignore
+            except ImportError as exc:
+                raise RuntimeError(
+                    "当前环境未安装 JPype1 依赖，无法启用自定义 JDBC .jar 驱动扩展通道。"
+                ) from exc
+
+            with self._jvm_lock:
+                if not jpype.isJVMStarted():
+                    try:
+                        jvm_path = jpype.getDefaultJVMPath()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "未检测到本地 Java 运行环境 (JRE/JDK 8+)。请安装 JRE 或配置 JAVA_HOME 后再使用自定义 JDBC 驱动连接；内置原生驱动 (DWS/PGSQL/Inceptor/MySQL/SQLite) 无需 Java 可直接使用。"
+                        ) from exc
+                    try:
+                        jpype.startJVM(jvm_path, "-Djava.awt.headless=true", convertStrings=True)
+                    except Exception as exc:
+                        raise RuntimeError(f"启动本地 Java 虚拟机失败: {exc}") from exc
+
+            if hasattr(jpype, "isThreadAttachedToJVM") and hasattr(jpype, "attachThreadToJVM"):
+                try:
+                    if not jpype.isThreadAttachedToJVM():
+                        jpype.attachThreadToJVM()
+                except Exception as exc:
+                    raise RuntimeError(f"将当前工作线程挂载至 JVM 失败: {exc}") from exc
+            return jpype
 
     def _open_jdbc_connection(self, profile: ConnectionProfile, timeout_sec: int = 10) -> JdbcConnectionAdapter:
         if not profile.jdbc_driver_id:
@@ -635,6 +639,22 @@ class DriverManager:
         readonly: bool = False,
     ) -> Any:
         """根据 ConnectionProfile 打开对应驱动连接（readonly=True 时强制开启数据库会话级硬件只读锁）."""
+        track = (profile.driver_track or "NATIVE").strip().upper()
+        db_type = (profile.db_type or "DWS").strip().upper()
+        with trace_span(
+            "db",
+            "open_connection",
+            {"db_type": db_type, "driver_track": track, "readonly": bool(readonly)},
+        ):
+            return self._open_connection_impl(profile, timeout_sec, readonly=readonly)
+
+    def _open_connection_impl(
+        self,
+        profile: ConnectionProfile,
+        timeout_sec: int = 10,
+        *,
+        readonly: bool = False,
+    ) -> Any:
         track = (profile.driver_track or "NATIVE").strip().upper()
         db_type = (profile.db_type or "DWS").strip().upper()
 

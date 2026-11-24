@@ -8,6 +8,26 @@
 
 ---
 
+## [3.2.0] - 2026-11-24
+
+> **全链路性能剖析、全栈基准压测 (`Benchmark`) 与脱敏诊断日志包导出中枢**：针对内网/企业终端偶发的整体响应卡顿与无法定位阻塞环节的痛点，新增零写盘全内存链路追踪、端到端环回基准压测、自动瓶颈研判与一键脱敏 `.json` 诊断包导出，贯通「浏览器 → 本地环回/代理 → Gate 1 鉴权 → 事件循环/线程池 → SQLite 锁与开关库 → 远端 DB/AI」。
+
+### Added
+- **平台全链路诊断与基准压测中枢 (`core/platform/diagnostics_hub.py`, `core/platform/routes/diagnostics.py`, `core/platform/schemas.py`, `core/platform/router.py`)**：
+  - **零扰动 ContextVar Span 追踪**：采用内存环形缓冲（最近 500 条 Trace / 200 条慢请求）与 `_ActiveRequestTrace` 聚合各类别耗时，绝不在采样链路写入 SQLite 放大磁盘/EDR 扫描开销；内置递归脱敏引擎，严格剥离私有存储物理路径、混淆文件名、DB 密码、LLM API Key、Bearer Token 与激活码。
+  - **一键全栈基准测试 (`POST /api/platform/diagnostics/benchmark`)**：自动测量 FastAPI 事件循环唤醒抖动、AnyIO 线程池调度排队、Ed25519 CPU 算力、本机网卡/设备指纹探针（缓存态 vs 强制刷新）、主机名/DNS/`localhost` 解析、本地 4KB `fsync` 与 1MB 读写吞吐（临时文件自动清除）、SQLite 私有/工作区库开关耗时与临时 WAL 事务提交、`bootstrap` 子阶段剖面，以及可选的已配置数据库连接（DNS / TCP / 握手）和 AI 端点（DNS / TCP / TLS 上下文 / `/models`）逐段耗时探测。
+  - **脱敏运行环境快照与自动瓶颈研判**：自动识别存储盘类型（含 Windows `GetDriveTypeW` 与 UNC 判定）、系统/环境代理与 `NO_PROXY` 对 `127.0.0.1`/`localhost`/`<local>` 环回豁免状态、SQLite WAL 状态，并自动生成 `CLIENT_LOOPBACK_OVERHEAD`、`PROXY_NO_BYPASS_LOOPBACK`、`AUTH_GATE1_SLOW`、`DISK_OR_EDR_IO_SLOW`、`SQLITE_LOCK_CONTENTION`、`EVENT_LOOP_OR_THREADPOOL_LAG`、`BOOTSTRAP_HEAVY`、`REMOTE_DB_OR_LLM_SLOW` 诊断结论。
+  - **诊断接口路由**：新增 `/api/platform/diagnostics/{ping,overview,traces/{trace_id},benchmark,export,clear,config}`（全量受 Gate 1/2 保护），支持一键下载 `DataOG_Diagnostics_YYYYMMDD_HHMMSS.json`（含前后端 `trace_id` 合并 `traces_merged`、客户端资源/长任务快照、最近 200 条执行日志及服务日志尾部 300 行）。
+- **全底座零耦合耗时埋点 (`app.py`, `core/platform/{context.py,storage/base.py,license_hub.py,driver_manager.py,connection_hub.py,metadata_hub.py,query_engine.py,llm_hub.py,http_utils.py}`)**：
+  - `app.py` 中间件自动记录每条 API 请求 `auth_gate1_ms` / `handler_ms` / `total_ms` 并下发 `X-DataOG-Trace-Id`、`X-DataOG-Server-Ms`、`X-DataOG-Auth-Ms`、`X-DataOG-Handler-Ms` 与 `Server-Timing` 响应头（同时静默 `/diagnostics/ping` 正常 200 访问日志）。
+  - `storage/base.py` 新增 `_TimedRLock` 统计外层锁等待/持锁峰值，并分别测量私有库与工作区库 `open_ms`/`close_ms`/`session_ms`；各中枢同步接入 `license` / `bootstrap` / `driver` / `jvm` / `db` / `metadata` / `query` / `llm` / `threadpool` / `task` 分类 Span。
+- **前端全链路遥测与「系统配置 → 性能诊断」面板 (`static/js/core/{perf_monitor.js,http.js,platform_api.js,dom.js}`, `static/js/views/{diagnostics_view.js,settings_view.js}`, `static/index.html`, `static/js/main.js`, `static/css/workbench.css`)**：
+  - `perf_monitor.js` 与 `http.js` 自动记录每次 `fetch`/上传/下载的客户端总耗时、网络/代理差值 (`network_gap_ms`)、主线程 `longtask` 与慢静态资源清单，并提供 10 串行 + 6 并发本地环回 RTT 基准测试。
+  - 新增 **「系统配置 → 性能诊断」** 分区与顶部 **「执行日志」** 弹窗快捷 **「性能诊断」/「导出诊断包」** 按钮，支持 6 格 KPI 看板、自动瓶颈卡片、全栈压测及点击请求行弹出 `<dialog>` Span 瀑布详情。
+- **全链路诊断与脱敏导出回归测试 (`tests/test_diagnostics_benchmark.py`, `tests/test_modular_architecture.py`)**：新增 4 项自动化测试覆盖 Gate 1/2 拦截、响应头与 Span 瀑布、`_TimedRLock` 锁竞争、SQLite/Mock LLM 分段探测、零路径/零密钥脱敏防线及 Node.js 前端真实交互闭环。
+
+---
+
 ## [3.1.0] - 2026-11-24
 
 > **AI 助手聊天纯文本/SQL 粘贴、受限 CSV 上传与超长内容防爆窗分步拆解引擎**：聊天输入框原生支持剪贴板文本/文件粘贴（`.txt`/`.sql` 等）与受限 `.csv`/`.tsv` 文件上传/拖拽，并在超出大模型上下文预算时通过语义智能分片、CSV 内存只读 SQLite 沙箱探查、按需检索工具及 Map-Reduce 分步批处理彻底防止爆窗。

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -18,6 +19,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from core.platform.context import PlatformContext
+from core.platform.diagnostics_hub import record_instant_metric, trace_span
 from core.platform.import_progress import ImportProgressHub
 
 MEDIA_TYPE_XLSX = (
@@ -96,7 +98,17 @@ async def run_tracked_task(
             call_kwargs["cancel_check"] = (
                 (lambda: ctx.task_progress.is_cancelled(tid)) if tid else None
             )
-        res = await run_in_threadpool(fn, *args, **call_kwargs)
+        dispatch_t0 = time.perf_counter()
+
+        def _timed_worker():
+            queue_ms = max(0.0, (time.perf_counter() - dispatch_t0) * 1000.0)
+            record_instant_metric(
+                "threadpool", "queue_wait", queue_ms, {"title": title}, min_span_ms=2.0
+            )
+            with trace_span("task", title):
+                return fn(*args, **call_kwargs)
+
+        res = await run_in_threadpool(_timed_worker)
         if tid and not ctx.task_progress.is_cancelled(tid):
             processed, total = count_fn(res) if count_fn else (0, 0)
             if detail_fn is not None:
@@ -146,7 +158,17 @@ async def run_tracked_upload(
         reporter = ctx.import_progress.make_reporter(pid)
         call_kwargs = dict(kwargs or {})
         call_kwargs["progress_cb"] = reporter
-        res = await run_in_threadpool(fn, *args, **call_kwargs)
+        dispatch_t0 = time.perf_counter()
+
+        def _timed_upload_worker():
+            queue_ms = max(0.0, (time.perf_counter() - dispatch_t0) * 1000.0)
+            record_instant_metric(
+                "threadpool", "queue_wait", queue_ms, {"title": title}, min_span_ms=2.0
+            )
+            with trace_span("task", title):
+                return fn(*args, **call_kwargs)
+
+        res = await run_in_threadpool(_timed_upload_worker)
         processed, total = count_fn(res) if count_fn else (0, 0)
         detail = (
             detail_fn(res)

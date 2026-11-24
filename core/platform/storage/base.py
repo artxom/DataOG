@@ -9,7 +9,10 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+from core.platform.diagnostics_hub import record_instant_metric
 
 from core.platform.storage.schema import (
     PRIVATE_ONLY_TABLES,
@@ -21,6 +24,63 @@ from core.platform.storage.schema import (
 )
 
 _SAFE_SQL_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+
+
+class _TimedRLock:
+    """兼容 threading.RLock 接口并统计外层锁等待与持锁耗时的轻量化计时包装器."""
+
+    def __init__(self, owner: Any = None) -> None:
+        self._rlock = threading.RLock()
+        self._owner = owner
+        self._local = threading.local()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        t0 = time.perf_counter()
+        ok = (
+            self._rlock.acquire(blocking=blocking, timeout=timeout)
+            if timeout != -1
+            else self._rlock.acquire(blocking=blocking)
+        )
+        if not ok:
+            return False
+        depth = int(getattr(self._local, "depth", 0))
+        if depth == 0:
+            wait_ms = (time.perf_counter() - t0) * 1000.0
+            self._local.depth = 1
+            self._local.acquired_at = time.perf_counter()
+            record_instant_metric("sqlite_lock", "acquire", wait_ms, min_span_ms=1.0)
+            hub = getattr(self._owner, "_diag_hub", None) if self._owner is not None else None
+            if hub is not None:
+                hub.record_sqlite_stat("lock", wait_ms=wait_ms)
+        else:
+            self._local.depth = depth + 1
+        return True
+
+    def release(self) -> None:
+        depth = int(getattr(self._local, "depth", 0))
+        if depth == 1:
+            acq_at = getattr(self._local, "acquired_at", None)
+            self._local.depth = 0
+            self._local.acquired_at = None
+            try:
+                self._rlock.release()
+            finally:
+                if acq_at is not None:
+                    hold_ms = (time.perf_counter() - float(acq_at)) * 1000.0
+                    hub = getattr(self._owner, "_diag_hub", None) if self._owner is not None else None
+                    if hub is not None:
+                        hub.record_sqlite_stat("lock", hold_ms=hold_ms)
+            return
+        if depth > 1:
+            self._local.depth = depth - 1
+        self._rlock.release()
+
+    def __enter__(self) -> "_TimedRLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
 
 
 class _BaseStateStore(_SchemaColumnMixin):
@@ -44,7 +104,8 @@ class _BaseStateStore(_SchemaColumnMixin):
         os.makedirs(os.path.dirname(self.private_db_path), exist_ok=True)
         os.makedirs(os.path.dirname(self.workspace_db_path), exist_ok=True)
 
-        self._lock = threading.RLock()
+        self._diag_hub: Any = None
+        self._lock = _TimedRLock(owner=self)
         self._registered_schemas: Dict[str, List[Tuple[str, str, List[Tuple[str, str]]]]] = {
             "private": [],
             "workspace": [],
@@ -69,19 +130,53 @@ class _BaseStateStore(_SchemaColumnMixin):
 
     @contextlib.contextmanager
     def _get_private_conn(self):
+        t0 = time.perf_counter()
         conn = self._connect_sqlite(self.private_db_path)
+        open_ms = (time.perf_counter() - t0) * 1000.0
+        hub = getattr(self, "_diag_hub", None)
+        if hub is not None:
+            hub.record_sqlite_stat("private_open", open_ms=open_ms)
+        if open_ms >= 2.0:
+            record_instant_metric("sqlite_private", "open", open_ms, min_span_ms=2.0)
         try:
             yield conn
         finally:
+            t_close = time.perf_counter()
             conn.close()
+            close_ms = (time.perf_counter() - t_close) * 1000.0
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            record_instant_metric(
+                "sqlite_private",
+                "session",
+                total_ms,
+                {"open_ms": round(open_ms, 2), "close_ms": round(close_ms, 2)},
+                min_span_ms=5.0,
+            )
 
     @contextlib.contextmanager
     def _get_workspace_conn(self):
+        t0 = time.perf_counter()
         conn = self._connect_sqlite(self.workspace_db_path)
+        open_ms = (time.perf_counter() - t0) * 1000.0
+        hub = getattr(self, "_diag_hub", None)
+        if hub is not None:
+            hub.record_sqlite_stat("workspace_open", open_ms=open_ms)
+        if open_ms >= 2.0:
+            record_instant_metric("sqlite_workspace", "open", open_ms, min_span_ms=2.0)
         try:
             yield conn
         finally:
+            t_close = time.perf_counter()
             conn.close()
+            close_ms = (time.perf_counter() - t_close) * 1000.0
+            total_ms = (time.perf_counter() - t0) * 1000.0
+            record_instant_metric(
+                "sqlite_workspace",
+                "session",
+                total_ms,
+                {"open_ms": round(open_ms, 2), "close_ms": round(close_ms, 2)},
+                min_span_ms=5.0,
+            )
 
     @contextlib.contextmanager
     def _get_conn(self):

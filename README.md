@@ -1,4 +1,4 @@
-# Data.O.G v3.1.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.2.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -32,6 +32,7 @@
    - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——无密码连接拓扑随工作区协同共享，个人账号与密码严格落盘于本机私有凭据库并支持按 `(db_type, host, port, dbname)` / `jdbc_url` 端点指纹跨工作区自动匹配；免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
    - **参考知识库 (`KnowledgeHub`)**：零新增依赖离线知识库管理中心，内置 11 篇主流数据库方言速查卡并支持上传 `.md` / `.txt` / `.sql` / `.html` / `.json` / `.csv` / `.docx` / `.xlsx` 参考资料，借助 SQLite FTS5 + BM25 实现中英文与报错码毫秒级离线检索，支持按方言导出/导入轻量 `.json.gz` 知识包与团队分享，并可选接入 OpenAI 兼容 `/embeddings` 接口做混合排序（离线自动退回纯 FTS5）。
    - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
+   - **性能诊断 (`DiagnosticsHub`)**：零写盘全内存链路追踪、端到端环回与磁盘/SQLite/DNS/鉴权/DB/AI 全栈基准压测 (`Benchmark`)、自动瓶颈研判（识别企业代理未豁免环回、EDR/慢盘 `fsync`、锁竞争、事件循环阻塞等）以及一键导出全量脱敏 `.json` 诊断日志包（顶部「执行日志」弹窗亦可快捷一键导出）。
 2. **数据探查 (`explorer`)**
    - 顶栏分段切换 **`SQL 查询` | `AI 探查`**，左侧统一维持 **DataGrip 风格四级已连接数据库目录树**（`连接` → `Schema` → `表/视图` → `字段`）。
    - **`SQL 查询`**：双击表快速抽样预览 + 沉浸式自由 SQL 编辑器（`⌘+Enter` 执行）+ `结果` / `结构` / `DDL` 三合一面板，支持一键导出 CSV / Excel `.xlsx` 或送入「多邻国」。
@@ -57,12 +58,13 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 3.1.0 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
+├── app.py                        # FastAPI 3.2.0 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、Server-Timing 遥测与全链路中间件追踪、自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
-│   │   ├── routes/               # 平台领域子路由包（auth_and_system / data_sources / appearance_and_llm / knowledge / standards / workspaces）
+│   │   ├── diagnostics_hub.py    # 全内存零写盘链路追踪、全栈环境 Benchmark、自动瓶颈研判与严格脱敏诊断日志导出中枢
+│   │   ├── routes/               # 平台领域子路由包（auth_and_system / data_sources / appearance_and_llm / knowledge / standards / workspaces / diagnostics）
 │   │   ├── storage/              # 双库分离 WAL 引擎包（schema / base / legacy_migration / platform_repos / governance_repos，支持 3.0 插件表自动随工作区流转）
 │   │   ├── storage_paths.py      # 三层分离混淆私有路径解析器（OS 用户隐藏目录、时钟锚点混淆编码与 DATAOG_HOME 隔离）
 │   │   ├── workspace_hub.py      # 团队共享工作区生命周期管理、零密钥 .dataog.db 导出与三步引导式增量合并引擎
@@ -93,12 +95,12 @@ DataOG/
 │   └── ai_assistant/             # /api/modules/ai_assistant      Data.O.G 3.0 旗舰多轮渐进式数据库智能助手（含写确认门禁）
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css（已清理 392 行废弃死样式）
-│   └── js/                       # main.js（零业务视图静态依赖）、core/（http / platform_api / app_registry / dom / state / type_compat）、apps/（3.0 独立懒加载应用含 ai_assistant/）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图含 knowledge_view.js）
+│   └── js/                       # main.js（零业务视图静态依赖）、core/（http / perf_monitor / platform_api / app_registry / dom / state / type_compat）、apps/（3.0 独立懒加载应用含 ai_assistant/）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图含 knowledge_view.js 与 diagnostics_view.js）
 ├── docs/                         # 3.0 模块化开发指南 (MODULE_SDK_3_0.md)
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 88 项全量自动化测试（聊天附件与防爆窗分步拆解 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
+├── tests/                        # 92 项全量自动化测试（全链路性能诊断、全栈 Benchmark 与严格脱敏导出 / 聊天附件与防爆窗分步拆解 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -136,7 +138,8 @@ DataOG/
 | **`v3.0.0`** | `feat/v3.0.0-ai-assistant-knowledge-hub` → `main` | **独立 Dock 旗舰应用 `Data.O.G`（智能数据助手）与零依赖离线知识库 (`KnowledgeHub`)**：新增第五个独立懒加载 Dock 应用，支持在线连库与离线纯方言双模式、场景模式芯片与歧义澄清卡、7 工具渐进自主探索（含只读 SQL 报错自修正、`EXPLAIN` 诊断与引用溯源）、DDL/写操作分级二次确认卡片（常规一键确认 / 高危影响行数估算 + `CONFIRM` 门禁 + 服务端重定级防篡改 + 批执行闭环），配套 0 KB 新增依赖 FTS5 离线知识库（9 格式解析、11 篇内置方言速查卡、`.json.gz` 分享包与可选 Embedding 混合排序）（86 项测试全绿） |
 | **`v3.0.1`** | `fix/v3.0.1-no-cache-and-reload` → `main` | **前端静态资源强制 `no-cache`、桌面顶部「一键重载」按钮与静态目录版本校验**：为非 `/api/*` 的 `.html`/`.js`/`.css` 下发 `Cache-Control: no-store, no-cache, must-revalidate`、`Pragma: no-cache` 与 `Expires: 0` 彻底解决升级后浏览器锁死旧模块问题；顶部菜单栏新增 **「重载」** 按钮支持清理 Cache Storage 并无缓存刷新页面；启动时校验 `_internal/static` 内 `dataog-ui-version` 与 `APP_VERSION` 一致性并在仅替换 `.exe` 时给出醒目提示；同步在 `knowledge_packs/` 提供 DWS 9.1 / Inceptor 9.x / PostgreSQL 19 初始化离线知识库自助下载（87 项测试全绿） |
 | **`v3.0.2`** | `fix/v3.0.2-ai-assistant-activitybar-and-e2e-tests` → `main` | **修复 AI 助手与知识库 `activityBar.track` 调用错误、交互体验补全与前端端到端交互测试升级**：将 `AiAssistantView.sendUserMessage()` 与 `KnowledgeSettingsView` 重建向量索引误用的 `this.activityBar.run(...)` 修正为 `this.activityBar.track(...)` 根治发消息阻断崩溃；优先自动选中已就绪 AI 模型、补齐发送中用户气泡占位并修复抽屉库表刷新响应结构读取；在 `test_ai_assistant_and_kb.py` 新增 `.activityBar.run(` 全库静态防线及覆盖发送/提案确认/抽屉/知识库全交互的 Node.js 端到端验证（87 项测试全绿） |
-| **`v3.1.0`**（当前正式版） | `feat/v3.1.0-chat-attachments-and-chunking` → `main` | **AI 助手聊天窗口纯文本/SQL 粘贴、受限 CSV 上传与超长内容防爆窗分步拆解引擎**：聊天输入框支持剪贴板粘贴文件或超长文本（自动转为 `.txt`/`.sql` 附件胶囊）、拖拽与按钮上传（文本/SQL `<=5MB`、CSV/TSV `<=2MB`、二进制零字节拦截及编码自适应）；落地语义智能分片（`CHUNK_HARD_MAX_TOKENS=2800`）、CSV 零 Token 画像 + `:memory:` 只读 SQLite `csv_data` 内存查询沙箱、按需检索与 `stepped_batch` Map-Reduce 滚动摘要接续拆解闭环，配套 `<dialog>` 分片/画像预览弹窗与后端/Node 端到端回归测试（88 项测试全绿） |
+| **`v3.1.0`** | `feat/v3.1.0-chat-attachments-and-chunking` → `main` | **AI 助手聊天窗口纯文本/SQL 粘贴、受限 CSV 上传与超长内容防爆窗分步拆解引擎**：聊天输入框支持剪贴板粘贴文件或超长文本（自动转为 `.txt`/`.sql` 附件胶囊）、拖拽与按钮上传（文本/SQL `<=5MB`、CSV/TSV `<=2MB`、二进制零字节拦截及编码自适应）；落地语义智能分片（`CHUNK_HARD_MAX_TOKENS=2800`）、CSV 零 Token 画像 + `:memory:` 只读 SQLite `csv_data` 内存查询沙箱、按需检索与 `stepped_batch` Map-Reduce 滚动摘要接续拆解闭环，配套 `<dialog>` 分片/画像预览弹窗与后端/Node 端到端回归测试（88 项测试全绿） |
+| **`v3.2.0`**（当前正式版） | `feat/diagnostics-benchmark-v3.2` → `main` | **全链路性能剖析、全栈基准压测 (`Benchmark`) 与脱敏诊断日志包导出中枢**：新增 `DiagnosticsHub` 全内存零写盘 Span 链路追踪、`_TimedRLock` 与 SQLite 开关库计时、全底座热点埋点及 `Server-Timing` / `X-DataOG-*` 响应头；新增「系统配置 → 性能诊断」与「执行日志」快捷导出入口，支持浏览器 10 串行 + 6 并发环回 RTT 测试、事件循环/线程池/设备探针/DNS/4KB `fsync`/SQLite/Bootstrap/可选 DB 与 AI 端点逐段基准压测、自动瓶颈研判以及 100% 零路径零密钥脱敏 `.json` 诊断包导出（92 项测试全绿） |
 
 ---
 
@@ -147,7 +150,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（88 项）
+# 运行全量自动化单元测试（92 项）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检

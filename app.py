@@ -172,6 +172,7 @@ class _QuietImportProgressAccessFilter(logging.Filter):
             if (
                 "/api/platform/import-progress/" in msg
                 or "/api/platform/tasks/" in msg
+                or "/api/platform/diagnostics/ping" in msg
             ) and '" 200' in msg:
                 return False
         except Exception:
@@ -221,7 +222,7 @@ def setup_console_logging() -> logging.Logger:
 
 logger = setup_console_logging()
 
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 _NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
 _UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
 
@@ -335,24 +336,84 @@ def create_app(
     @app.middleware("http")
     async def security_headers_and_csrf_middleware(request: Request, call_next):
         req_path = request.url.path
-        if request.method in ("POST", "PUT", "PATCH", "DELETE") and req_path.startswith("/api/"):
-            sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
-            if sec_fetch_site and sec_fetch_site not in ("same-origin", "same-site", "none"):
-                return _apply_security_headers(
-                    JSONResponse(
+        diag_hub = ctx.diagnostics_hub
+        trace_obj, trace_tok = diag_hub.begin_request(
+            request.method,
+            req_path,
+            list(request.query_params.keys()),
+            is_api=req_path.startswith("/api/"),
+        )
+        request.state.diag_trace = trace_obj
+        finished = False
+        status_code = 500
+        auth_gate1_ms = 0.0
+        handler_ms = 0.0
+        error_redact_ms = 0.0
+        response_bytes: Optional[int] = None
+        error_text = ""
+
+        def _finalize_and_attach_headers(resp: Response) -> Response:
+            nonlocal finished, status_code, response_bytes
+            status_code = int(getattr(resp, "status_code", status_code) or status_code)
+            if response_bytes is None:
+                body_attr = getattr(resp, "body", None)
+                if isinstance(body_attr, (bytes, bytearray)):
+                    response_bytes = len(body_attr)
+                else:
+                    cl_hdr = resp.headers.get("content-length")
+                    if cl_hdr and cl_hdr.isdigit():
+                        response_bytes = int(cl_hdr)
+            if not finished:
+                rec = diag_hub.finish_request(
+                    trace_obj,
+                    trace_tok,
+                    status_code=status_code,
+                    auth_gate1_ms=auth_gate1_ms,
+                    handler_ms=handler_ms,
+                    error_redact_ms=error_redact_ms,
+                    response_bytes=response_bytes,
+                    error_text=error_text,
+                )
+                finished = True
+            else:
+                rec = {
+                    "trace_id": trace_obj.trace_id,
+                    "total_ms": round((time.perf_counter() - trace_obj.start_mono) * 1000.0, 2),
+                    "auth_gate1_ms": round(auth_gate1_ms, 2),
+                    "handler_ms": round(handler_ms, 2),
+                }
+            resp.headers["X-DataOG-Trace-Id"] = str(rec["trace_id"])
+            resp.headers["X-DataOG-Server-Ms"] = f"{float(rec['total_ms']):.2f}"
+            resp.headers["X-DataOG-Auth-Ms"] = f"{float(rec['auth_gate1_ms']):.2f}"
+            resp.headers["X-DataOG-Handler-Ms"] = f"{float(rec['handler_ms']):.2f}"
+            resp.headers["Server-Timing"] = (
+                f"auth;dur={float(rec['auth_gate1_ms']):.2f}, "
+                f"handler;dur={float(rec['handler_ms']):.2f}, "
+                f"total;dur={float(rec['total_ms']):.2f}"
+            )
+            return resp
+
+        try:
+            if request.method in ("POST", "PUT", "PATCH", "DELETE") and req_path.startswith("/api/"):
+                sec_fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+                if sec_fetch_site and sec_fetch_site not in ("same-origin", "same-site", "none"):
+                    error_text = "Cross-Site Request Blocked"
+                    blocked_resp = JSONResponse(
                         status_code=403,
                         content={"ok": False, "error": "禁止跨站伪造请求 (Cross-Site Request Blocked)"},
                     )
-                )
+                    return _apply_security_headers(_finalize_and_attach_headers(blocked_resp))
 
-        # Gate 1: 全量 /api/* 请求离线非对称激活码鉴权拦截（仅放行公开认证与外观静态图片读取）
-        if req_path.startswith("/api/") and not any(
-            req_path.startswith(pref) for pref in AUTH_PUBLIC_EXEMPT_PREFIXES
-        ):
-            ok_auth, auth_info = ctx.license_hub.check_and_stamp_request(request)
-            if not ok_auth:
-                return _apply_security_headers(
-                    JSONResponse(
+            # Gate 1: 全量 /api/* 请求离线非对称激活码鉴权拦截（仅放行公开认证与外观静态图片读取）
+            if req_path.startswith("/api/") and not any(
+                req_path.startswith(pref) for pref in AUTH_PUBLIC_EXEMPT_PREFIXES
+            ):
+                t_auth0 = time.perf_counter()
+                ok_auth, auth_info = ctx.license_hub.check_and_stamp_request(request)
+                auth_gate1_ms = (time.perf_counter() - t_auth0) * 1000.0
+                if not ok_auth:
+                    error_text = str(auth_info.get("status") or "LICENSE_REQUIRED")
+                    unauth_resp = JSONResponse(
                         status_code=401,
                         content={
                             "ok": False,
@@ -362,39 +423,65 @@ def create_app(
                             or "系统尚未激活或授权已过期，请先输入有效激活码",
                         },
                     )
-                )
+                    return _apply_security_headers(_finalize_and_attach_headers(unauth_resp))
 
-        response = await call_next(request)
-        # 全平台错误响应兜底脱敏：确保任意平台/模块路由报错均绝不向前端暴露本地私有保险箱物理路径或内部文件名
-        if (
-            req_path.startswith("/api/")
-            and response.status_code >= 400
-            and "application/json" in (response.headers.get("content-type") or "").lower()
-        ):
-            try:
-                raw_chunks: List[bytes] = []
-                if hasattr(response, "body_iterator") and response.body_iterator is not None:
-                    async for chunk in response.body_iterator:
-                        raw_chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
-                    raw_body = b"".join(raw_chunks)
-                else:
-                    raw_body = bytes(getattr(response, "body", b"") or b"")
-                raw_text = raw_body.decode("utf-8", errors="replace")
-                redacted_text = redact_private_storage_paths(raw_text, ctx=ctx)
-                passthrough_headers = {
-                    k: v
-                    for k, v in response.headers.items()
-                    if k.lower() not in ("content-length", "content-type")
-                }
-                response = Response(
-                    content=redacted_text.encode("utf-8"),
-                    status_code=response.status_code,
-                    headers=passthrough_headers,
-                    media_type="application/json",
+            t_handler0 = time.perf_counter()
+            response = await call_next(request)
+            handler_ms = (time.perf_counter() - t_handler0) * 1000.0
+
+            # 全平台错误响应兜底脱敏：确保任意平台/模块路由报错均绝不向前端暴露本地私有保险箱物理路径或内部文件名
+            if (
+                req_path.startswith("/api/")
+                and response.status_code >= 400
+                and "application/json" in (response.headers.get("content-type") or "").lower()
+            ):
+                t_red0 = time.perf_counter()
+                try:
+                    raw_chunks: List[bytes] = []
+                    if hasattr(response, "body_iterator") and response.body_iterator is not None:
+                        async for chunk in response.body_iterator:
+                            raw_chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
+                        raw_body = b"".join(raw_chunks)
+                    else:
+                        raw_body = bytes(getattr(response, "body", b"") or b"")
+                    raw_text = raw_body.decode("utf-8", errors="replace")
+                    redacted_text = redact_private_storage_paths(raw_text, ctx=ctx)
+                    redacted_bytes = redacted_text.encode("utf-8")
+                    response_bytes = len(redacted_bytes)
+                    error_text = redacted_text[:300]
+                    passthrough_headers = {
+                        k: v
+                        for k, v in response.headers.items()
+                        if k.lower() not in ("content-length", "content-type")
+                    }
+                    response = Response(
+                        content=redacted_bytes,
+                        status_code=response.status_code,
+                        headers=passthrough_headers,
+                        media_type="application/json",
+                    )
+                except Exception:
+                    pass
+                error_redact_ms = (time.perf_counter() - t_red0) * 1000.0
+
+            return _apply_security_headers(
+                _apply_frontend_no_cache_headers(req_path, _finalize_and_attach_headers(response))
+            )
+        except BaseException as exc:
+            error_text = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            if not finished:
+                diag_hub.finish_request(
+                    trace_obj,
+                    trace_tok,
+                    status_code=status_code,
+                    auth_gate1_ms=auth_gate1_ms,
+                    handler_ms=handler_ms,
+                    error_redact_ms=error_redact_ms,
+                    response_bytes=response_bytes,
+                    error_text=error_text,
                 )
-            except Exception:
-                pass
-        return _apply_security_headers(_apply_frontend_no_cache_headers(req_path, response))
 
     # 注册平台公共底座路由并自动发现挂载 modules/* 全部独立插件模块
     app.include_router(platform_router)

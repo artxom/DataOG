@@ -320,3 +320,34 @@ export const knowledgeApi = {
     );
   },
 };
+
+export const diagnosticsApi = {
+  ping: () =>
+    requestJson("/api/platform/diagnostics/ping", {
+      cache: "no-store",
+      trackInRing: false,
+    }),
+  overview: () =>
+    requestJson("/api/platform/diagnostics/overview", { cache: "no-store" }),
+  getTrace: (traceId) =>
+    requestJson(`/api/platform/diagnostics/traces/${encodeURIComponent(traceId)}`, {
+      cache: "no-store",
+    }),
+  runBenchmark: (payload = {}) =>
+    requestJson("/api/platform/diagnostics/benchmark", {
+      method: "POST",
+      body: payload,
+    }),
+  exportBundle: (payload = {}) =>
+    downloadApiFile("/api/platform/diagnostics/export", {
+      method: "POST",
+      body: payload,
+      fallbackName: "DataOG_Diagnostics.json",
+    }),
+  clear: () => requestJson("/api/platform/diagnostics/clear", { method: "POST" }),
+  updateConfig: (payload) =>
+    requestJson("/api/platform/diagnostics/config", {
+      method: "PUT",
+      body: payload,
+    }),
+};

@@ -17,6 +17,7 @@ import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 from core.platform.connection_hub import ConnectionHub
+from core.platform.diagnostics_hub import annotate_current_span, trace_span
 from core.platform.dialects import (
     quote_dialect_ident,
     strip_sql_comments_preserve_literals,
@@ -134,49 +135,51 @@ class QueryEngine:
             0,
             1,
         )
-        try:
-            with self.connection_hub.session(connection_id, timeout_sec=min(15, safe_timeout)) as conn:
-                progress_cb(
-                    45,
-                    "执行 SQL 查询",
-                    f"正在执行 SQL（上限 {safe_limit} 行 / 超时 {safe_timeout}s）...",
-                    0,
-                    1,
+        with trace_span("query", "execute_sql", {"db_type": profile.db_type, "limit": safe_limit}):
+            try:
+                with self.connection_hub.session(connection_id, timeout_sec=min(15, safe_timeout)) as conn:
+                    progress_cb(
+                        45,
+                        "执行 SQL 查询",
+                        f"正在执行 SQL（上限 {safe_limit} 行 / 超时 {safe_timeout}s）...",
+                        0,
+                        1,
+                    )
+                    if isinstance(conn, InceptorThriftClient):
+                        cols_meta, raw_rows, truncated = conn.execute_query_with_meta(
+                            clean_sql, max_rows=safe_limit
+                        )
+                        q_cols = [
+                            QueryColumn(name=c.column_name, data_type=c.data_type)
+                            for c in cols_meta
+                        ]
+                        rows = [
+                            [serialize_cell_value(cell) for cell in r]
+                            for r in raw_rows
+                        ]
+                        affected = 0
+                    elif isinstance(conn, JdbcConnectionAdapter):
+                        q_cols, rows, truncated, affected = self._exec_on_jdbc(
+                            conn, clean_sql, safe_limit, safe_timeout
+                        )
+                    elif profile.db_type == "SQLITE":
+                        q_cols, rows, truncated, affected = self._exec_on_sqlite(
+                            conn, clean_sql, safe_limit, safe_timeout
+                        )
+                    else:
+                        q_cols, rows, truncated, affected = self._exec_on_dbapi(
+                            conn, profile, clean_sql, safe_limit, safe_timeout
+                        )
+            except Exception as exc:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                self.store.add_log(
+                    "ERROR",
+                    f"SQL查询 [{profile.name}]",
+                    f"SQL 执行失败 ({elapsed_ms:.1f} ms): {exc}",
+                    sql_text=clean_sql[:2000],
                 )
-                if isinstance(conn, InceptorThriftClient):
-                    cols_meta, raw_rows, truncated = conn.execute_query_with_meta(
-                        clean_sql, max_rows=safe_limit
-                    )
-                    q_cols = [
-                        QueryColumn(name=c.column_name, data_type=c.data_type)
-                        for c in cols_meta
-                    ]
-                    rows = [
-                        [serialize_cell_value(cell) for cell in r]
-                        for r in raw_rows
-                    ]
-                    affected = 0
-                elif isinstance(conn, JdbcConnectionAdapter):
-                    q_cols, rows, truncated, affected = self._exec_on_jdbc(
-                        conn, clean_sql, safe_limit, safe_timeout
-                    )
-                elif profile.db_type == "SQLITE":
-                    q_cols, rows, truncated, affected = self._exec_on_sqlite(
-                        conn, clean_sql, safe_limit, safe_timeout
-                    )
-                else:
-                    q_cols, rows, truncated, affected = self._exec_on_dbapi(
-                        conn, profile, clean_sql, safe_limit, safe_timeout
-                    )
-        except Exception as exc:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            self.store.add_log(
-                "ERROR",
-                f"SQL查询 [{profile.name}]",
-                f"SQL 执行失败 ({elapsed_ms:.1f} ms): {exc}",
-                sql_text=clean_sql[:2000],
-            )
-            raise
+                raise
+            annotate_current_span(row_count=len(rows), truncated=bool(truncated))
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         progress_cb(
@@ -421,46 +424,48 @@ class QueryEngine:
         safe_timeout = max(2, min(25, int(timeout_sec or 12)))
 
         t0 = time.perf_counter()
-        try:
-            with self.connection_hub.readonly_session(
-                connection_id, timeout_sec=min(12, safe_timeout)
-            ) as conn:
-                if isinstance(conn, InceptorThriftClient):
-                    bounded_sql = self._build_bounded_select_sql(
-                        validated_sql, profile.db_type, safe_limit + 1
-                    )
-                    cols_meta, raw_rows, truncated = conn.execute_query_with_meta(
-                        bounded_sql, max_rows=safe_limit
-                    )
-                    q_cols = [
-                        QueryColumn(name=c.column_name, data_type=c.data_type)
-                        for c in cols_meta
-                    ]
-                    rows = [
-                        [serialize_cell_value(cell) for cell in r]
-                        for r in raw_rows
-                    ]
-                elif isinstance(conn, JdbcConnectionAdapter):
-                    q_cols, rows, truncated = self._exec_readonly_on_jdbc(
-                        conn, profile, validated_sql, safe_limit, safe_timeout
-                    )
-                elif profile.db_type == "SQLITE":
-                    q_cols, rows, truncated = self._exec_readonly_on_sqlite(
-                        conn, validated_sql, safe_limit, safe_timeout
-                    )
-                else:
-                    q_cols, rows, truncated = self._exec_readonly_on_dbapi(
-                        conn, profile, validated_sql, safe_limit, safe_timeout
-                    )
-        except Exception as exc:
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-            self.store.add_log(
-                "ERROR",
-                f"只读探查 [{profile.name}]",
-                f"只读 SQL 执行异常 ({elapsed_ms:.1f} ms): {exc}",
-                sql_text=validated_sql[:1500],
-            )
-            raise
+        with trace_span("query", "execute_readonly_sql", {"db_type": profile.db_type, "limit": safe_limit}):
+            try:
+                with self.connection_hub.readonly_session(
+                    connection_id, timeout_sec=min(12, safe_timeout)
+                ) as conn:
+                    if isinstance(conn, InceptorThriftClient):
+                        bounded_sql = self._build_bounded_select_sql(
+                            validated_sql, profile.db_type, safe_limit + 1
+                        )
+                        cols_meta, raw_rows, truncated = conn.execute_query_with_meta(
+                            bounded_sql, max_rows=safe_limit
+                        )
+                        q_cols = [
+                            QueryColumn(name=c.column_name, data_type=c.data_type)
+                            for c in cols_meta
+                        ]
+                        rows = [
+                            [serialize_cell_value(cell) for cell in r]
+                            for r in raw_rows
+                        ]
+                    elif isinstance(conn, JdbcConnectionAdapter):
+                        q_cols, rows, truncated = self._exec_readonly_on_jdbc(
+                            conn, profile, validated_sql, safe_limit, safe_timeout
+                        )
+                    elif profile.db_type == "SQLITE":
+                        q_cols, rows, truncated = self._exec_readonly_on_sqlite(
+                            conn, validated_sql, safe_limit, safe_timeout
+                        )
+                    else:
+                        q_cols, rows, truncated = self._exec_readonly_on_dbapi(
+                            conn, profile, validated_sql, safe_limit, safe_timeout
+                        )
+            except Exception as exc:
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                self.store.add_log(
+                    "ERROR",
+                    f"只读探查 [{profile.name}]",
+                    f"只读 SQL 执行异常 ({elapsed_ms:.1f} ms): {exc}",
+                    sql_text=validated_sql[:1500],
+                )
+                raise
+            annotate_current_span(row_count=len(rows), truncated=bool(truncated))
 
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         msg = (

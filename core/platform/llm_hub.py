@@ -21,6 +21,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from core.platform.diagnostics_hub import trace_span
 from core.platform.models import LLMProviderProfile
 from core.platform.storage import PlatformStateStore
 
@@ -45,68 +46,69 @@ def _try_build_truststore_context() -> Optional[ssl.SSLContext]:
 
 def build_llm_ssl_context() -> ssl.SSLContext:
     """构建跨平台 HTTPS TLS 校验上下文，解决 macOS 官方 Python 空白默认 CA 仓导致合法证书失败问题."""
-    if os.environ.get("SSL_CERT_FILE", "").strip() or os.environ.get("SSL_CERT_DIR", "").strip():
-        return ssl.create_default_context()
+    with trace_span("llm", "ssl_context"):
+        if os.environ.get("SSL_CERT_FILE", "").strip() or os.environ.get("SSL_CERT_DIR", "").strip():
+            return ssl.create_default_context()
 
-    # macOS 优先接入系统钥匙串（同时兼容苹果系统根证书与企业/代理自签根证书）
-    if sys.platform == "darwin":
+        # macOS 优先接入系统钥匙串（同时兼容苹果系统根证书与企业/代理自签根证书）
+        if sys.platform == "darwin":
+            ts_ctx = _try_build_truststore_context()
+            if ts_ctx is not None:
+                return ts_ctx
+
+        ctx = ssl.create_default_context()
+        try:
+            ca_count = int((ctx.cert_store_stats() or {}).get("x509_ca", 0))
+        except Exception:
+            ca_count = 0
+        if ca_count > 0:
+            return ctx
+
+        # 若默认 OpenSSL CA 仓为空，依次回退系统信任库、常见系统 CA Bundle、certifi 及 macOS security 导出
         ts_ctx = _try_build_truststore_context()
         if ts_ctx is not None:
             return ts_ctx
 
-    ctx = ssl.create_default_context()
-    try:
-        ca_count = int((ctx.cert_store_stats() or {}).get("x509_ca", 0))
-    except Exception:
-        ca_count = 0
-    if ca_count > 0:
-        return ctx
+        for ca_path in _COMMON_SYSTEM_CA_FILES:
+            if os.path.isfile(ca_path):
+                try:
+                    ctx.load_verify_locations(cafile=ca_path)
+                    if int((ctx.cert_store_stats() or {}).get("x509_ca", 0)) > 0:
+                        return ctx
+                except Exception:
+                    continue
 
-    # 若默认 OpenSSL CA 仓为空，依次回退系统信任库、常见系统 CA Bundle、certifi 及 macOS security 导出
-    ts_ctx = _try_build_truststore_context()
-    if ts_ctx is not None:
-        return ts_ctx
-
-    for ca_path in _COMMON_SYSTEM_CA_FILES:
-        if os.path.isfile(ca_path):
-            try:
-                ctx.load_verify_locations(cafile=ca_path)
-                if int((ctx.cert_store_stats() or {}).get("x509_ca", 0)) > 0:
-                    return ctx
-            except Exception:
-                continue
-
-    try:
-        import certifi  # type: ignore[import-not-found]
-
-        certifi_ca = certifi.where()
-        if certifi_ca and os.path.isfile(certifi_ca):
-            ctx.load_verify_locations(cafile=certifi_ca)
-            return ctx
-    except Exception:
-        pass
-
-    if sys.platform == "darwin":
         try:
-            proc = subprocess.run(
-                [
-                    "/usr/bin/security",
-                    "find-certificate",
-                    "-a",
-                    "-p",
-                    "/System/Library/Keychains/SystemRootCertificates.keychain",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-            if proc.returncode == 0 and "BEGIN CERTIFICATE" in (proc.stdout or ""):
-                ctx.load_verify_locations(cadata=proc.stdout)
+            import certifi  # type: ignore[import-not-found]
+
+            certifi_ca = certifi.where()
+            if certifi_ca and os.path.isfile(certifi_ca):
+                ctx.load_verify_locations(cafile=certifi_ca)
                 return ctx
         except Exception:
             pass
 
-    return ctx
+        if sys.platform == "darwin":
+            try:
+                proc = subprocess.run(
+                    [
+                        "/usr/bin/security",
+                        "find-certificate",
+                        "-a",
+                        "-p",
+                        "/System/Library/Keychains/SystemRootCertificates.keychain",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+                if proc.returncode == 0 and "BEGIN CERTIFICATE" in (proc.stdout or ""):
+                    ctx.load_verify_locations(cadata=proc.stdout)
+                    return ctx
+            except Exception:
+                pass
+
+        return ctx
 
 BUILTIN_PROVIDER_PRESETS: Tuple[Dict[str, Any], ...] = (
     {
@@ -493,31 +495,41 @@ class LLMHub:
             headers=headers,
             method=method.upper(),
         )
-        try:
-            with opener.open(req, timeout=max(1.0, float(timeout_sec))) as resp:
-                raw = resp.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
-        except urllib.error.HTTPError as exc:
-            err_raw = ""
+        parsed_ep = urlparse(safe_url)
+        with trace_span(
+            "llm",
+            "http_request",
+            {
+                "method": method.upper(),
+                "host": parsed_ep.hostname or "",
+                "path": parsed_ep.path or "/",
+            },
+        ):
             try:
-                err_raw = exc.read(4096).decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            err_detail = err_raw.strip()[:300]
-            try:
-                parsed_err = json.loads(err_raw)
-                if isinstance(parsed_err, dict) and isinstance(parsed_err.get("error"), dict):
-                    err_detail = str(parsed_err["error"].get("message") or err_detail)[:300]
-            except Exception:
-                pass
-            raise RuntimeError(f"HTTP {exc.code}: {err_detail or exc.reason}") from None
-        except urllib.error.URLError as exc:
-            if isinstance(exc.reason, ssl.SSLCertVerificationError):
-                raise RuntimeError(
-                    f"连接 AI 服务端失败: {exc.reason}"
-                    "（TLS 证书校验未通过：如处于企业代理或私有自签网关环境，"
-                    "请将根证书加入系统受信任根证书，或通过环境变量 SSL_CERT_FILE 指定 CA 证书文件）"
-                ) from None
-            raise RuntimeError(f"连接 AI 服务端失败: {exc.reason}") from None
+                with opener.open(req, timeout=max(1.0, float(timeout_sec))) as resp:
+                    raw = resp.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as exc:
+                err_raw = ""
+                try:
+                    err_raw = exc.read(4096).decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                err_detail = err_raw.strip()[:300]
+                try:
+                    parsed_err = json.loads(err_raw)
+                    if isinstance(parsed_err, dict) and isinstance(parsed_err.get("error"), dict):
+                        err_detail = str(parsed_err["error"].get("message") or err_detail)[:300]
+                except Exception:
+                    pass
+                raise RuntimeError(f"HTTP {exc.code}: {err_detail or exc.reason}") from None
+            except urllib.error.URLError as exc:
+                if isinstance(exc.reason, ssl.SSLCertVerificationError):
+                    raise RuntimeError(
+                        f"连接 AI 服务端失败: {exc.reason}"
+                        "（TLS 证书校验未通过：如处于企业代理或私有自签网关环境，"
+                        "请将根证书加入系统受信任根证书，或通过环境变量 SSL_CERT_FILE 指定 CA 证书文件）"
+                    ) from None
+                raise RuntimeError(f"连接 AI 服务端失败: {exc.reason}") from None
 
         try:
             parsed = json.loads(raw)

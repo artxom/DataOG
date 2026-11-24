@@ -11,6 +11,7 @@ from core.platform.http_utils import extract_task_id
 from core.platform.routes.appearance_and_llm import router as appearance_and_llm_router
 from core.platform.routes.auth_and_system import router as auth_and_system_router
 from core.platform.routes.data_sources import router as data_sources_router
+from core.platform.routes.diagnostics import router as diagnostics_router
 from core.platform.routes.knowledge import router as knowledge_router
 from core.platform.routes.standards import router as standards_router
 from core.platform.routes.workspaces import router as workspaces_router
@@ -22,5 +23,6 @@ router.include_router(appearance_and_llm_router)
 router.include_router(knowledge_router)
 router.include_router(standards_router)
 router.include_router(workspaces_router)
+router.include_router(diagnostics_router)
 
 __all__ = ["extract_task_id", "router"]

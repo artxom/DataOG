@@ -185,5 +185,21 @@ class KnowledgeEmbeddingConfigPayload(BaseModel):
     model: str = ""
 
 
+class DiagnosticsBenchmarkPayload(BaseModel):
+    include_connections: bool = False
+    include_llm: bool = False
+
+
+class DiagnosticsExportPayload(BaseModel):
+    client_snapshot: Optional[Dict[str, Any]] = None
+    include_service_log: bool = True
+    include_execution_logs: bool = True
+
+
+class DiagnosticsConfigPayload(BaseModel):
+    slow_threshold_ms: float = Field(default=300.0, ge=50.0, le=10000.0)
+
+
+
 
 

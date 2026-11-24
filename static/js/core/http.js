@@ -7,6 +7,7 @@
  */
 
 import { downloadBlob } from "./dom.js";
+import { perfMonitor } from "./perf_monitor.js";
 
 async function parseJsonOrThrow(resp) {
   let payload = null;
@@ -39,6 +40,7 @@ async function parseJsonOrThrow(resp) {
     err.status = resp.status;
     err.data = payload;
     err.code = payload?.code || "";
+    err._headers = resp.headers || null;
     throw err;
   }
   return payload;
@@ -50,6 +52,7 @@ export function withRequestOpts(base = {}, opts = {}) {
     if (opts.signal !== undefined) next.signal = opts.signal;
     if (opts.taskId) next.taskId = opts.taskId;
     if (opts.cache !== undefined && next.cache === undefined) next.cache = opts.cache;
+    if (opts.trackInRing !== undefined) next.trackInRing = opts.trackInRing;
   }
   return next;
 }
@@ -62,7 +65,14 @@ export function isAbortError(err) {
 
 export async function requestJson(
   url,
-  { method = "GET", body = undefined, cache = undefined, signal = undefined, taskId = "" } = {}
+  {
+    method = "GET",
+    body = undefined,
+    cache = undefined,
+    signal = undefined,
+    taskId = "",
+    trackInRing = true,
+  } = {}
 ) {
   const opts = {
     method,
@@ -82,14 +92,51 @@ export async function requestJson(
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const resp = await fetch(url, opts);
-  return parseJsonOrThrow(resp);
+  const reqId = perfMonitor.beginRequest({ method, url, kind: "fetch", trackInRing });
+  let fetchDoneMs = null;
+  let respHeaders = null;
+  let respStatus = 0;
+  try {
+    const resp = await fetch(url, opts);
+    fetchDoneMs = perfMonitor.now();
+    respHeaders = resp?.headers || null;
+    respStatus = Number(resp?.status || 0);
+    const parsed = await parseJsonOrThrow(resp);
+    perfMonitor.finishRequest(reqId, {
+      status: respStatus,
+      ok: true,
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: respHeaders,
+    });
+    return parsed;
+  } catch (err) {
+    perfMonitor.finishRequest(reqId, {
+      status: err?.status || respStatus,
+      ok: false,
+      error: err?.message || String(err),
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: err?._headers || respHeaders,
+    });
+    throw err;
+  }
 }
 
 export async function uploadFormData(url, formData, { onUploadProgress = null } = {}) {
   if (typeof XMLHttpRequest !== "undefined") {
+    const reqId = perfMonitor.beginRequest({ method: "POST", url, kind: "xhr_upload" });
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
+      const collectXhrHeaders = () => ({
+        get: (name) => {
+          try {
+            return xhr.getResponseHeader(name);
+          } catch (_e) {
+            return null;
+          }
+        },
+      });
       xhr.open("POST", url, true);
       xhr.setRequestHeader("Accept", "application/json");
       if (typeof onUploadProgress === "function" && xhr.upload) {
@@ -108,6 +155,7 @@ export async function uploadFormData(url, formData, { onUploadProgress = null } 
         });
       }
       xhr.addEventListener("load", () => {
+        const doneMs = perfMonitor.now();
         const rawText = xhr.responseText || "";
         let payload = null;
         try {
@@ -119,6 +167,7 @@ export async function uploadFormData(url, formData, { onUploadProgress = null } 
           };
         }
         const httpOk = xhr.status >= 200 && xhr.status < 300;
+        const hdrs = collectXhrHeaders();
         if (!httpOk || (payload && payload.ok === false)) {
           if (
             xhr.status === 401 ||
@@ -133,26 +182,73 @@ export async function uploadFormData(url, formData, { onUploadProgress = null } 
           const msg =
             (payload && (payload.error || payload.detail || payload.message)) ||
             `请求失败 (HTTP ${xhr.status})`;
-          reject(new Error(typeof msg === "string" ? msg : JSON.stringify(msg)));
+          const errMsg = typeof msg === "string" ? msg : JSON.stringify(msg);
+          perfMonitor.finishRequest(reqId, {
+            status: xhr.status,
+            ok: false,
+            error: errMsg,
+            fetchDoneMs: doneMs,
+            bodyDoneMs: doneMs,
+            headers: hdrs,
+          });
+          reject(new Error(errMsg));
           return;
         }
+        perfMonitor.finishRequest(reqId, {
+          status: xhr.status,
+          ok: true,
+          fetchDoneMs: doneMs,
+          bodyDoneMs: doneMs,
+          headers: hdrs,
+        });
         resolve(payload);
       });
       xhr.addEventListener("error", () => {
-        reject(new Error("网络请求中断，请检查本地服务是否正在运行"));
+        const errMsg = "网络请求中断，请检查本地服务是否正在运行";
+        perfMonitor.finishRequest(reqId, { status: 0, ok: false, error: errMsg });
+        reject(new Error(errMsg));
       });
       xhr.addEventListener("abort", () => {
-        reject(new Error("上传已取消"));
+        const errMsg = "上传已取消";
+        perfMonitor.finishRequest(reqId, { status: 0, ok: false, error: errMsg });
+        reject(new Error(errMsg));
       });
       xhr.send(formData);
     });
   }
 
-  const resp = await fetch(url, {
-    method: "POST",
-    body: formData,
-  });
-  return parseJsonOrThrow(resp);
+  const reqId = perfMonitor.beginRequest({ method: "POST", url, kind: "fetch_upload" });
+  let fetchDoneMs = null;
+  let respHeaders = null;
+  let respStatus = 0;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      body: formData,
+    });
+    fetchDoneMs = perfMonitor.now();
+    respHeaders = resp?.headers || null;
+    respStatus = Number(resp?.status || 0);
+    const parsed = await parseJsonOrThrow(resp);
+    perfMonitor.finishRequest(reqId, {
+      status: respStatus,
+      ok: true,
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: respHeaders,
+    });
+    return parsed;
+  } catch (err) {
+    perfMonitor.finishRequest(reqId, {
+      status: err?.status || respStatus,
+      ok: false,
+      error: err?.message || String(err),
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: err?._headers || respHeaders,
+    });
+    throw err;
+  }
 }
 
 export async function downloadApiFile(
@@ -176,20 +272,47 @@ export async function downloadApiFile(
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
-  const resp = await fetch(url, opts);
-  if (!resp.ok) {
-    await parseJsonOrThrow(resp);
+  const reqId = perfMonitor.beginRequest({ method, url, kind: "download" });
+  let fetchDoneMs = null;
+  let respHeaders = null;
+  let respStatus = 0;
+  try {
+    const resp = await fetch(url, opts);
+    fetchDoneMs = perfMonitor.now();
+    respHeaders = resp?.headers || null;
+    respStatus = Number(resp?.status || 0);
+    if (!resp.ok) {
+      await parseJsonOrThrow(resp);
+    }
+    const disp = resp.headers?.get("content-disposition") || "";
+    let filename = fallbackName;
+    const utfMatch = disp.match(/filename\*=UTF-8''([^;]+)/i);
+    const plainMatch = disp.match(/filename="?([^";]+)"?/i);
+    if (utfMatch && utfMatch[1]) {
+      filename = decodeURIComponent(utfMatch[1]);
+    } else if (plainMatch && plainMatch[1]) {
+      filename = plainMatch[1];
+    }
+    const blob = await resp.blob();
+    perfMonitor.finishRequest(reqId, {
+      status: respStatus,
+      ok: true,
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: respHeaders,
+      responseBytes: Number(blob?.size || 0) || null,
+    });
+    downloadBlob(blob, filename);
+    return filename;
+  } catch (err) {
+    perfMonitor.finishRequest(reqId, {
+      status: err?.status || respStatus,
+      ok: false,
+      error: err?.message || String(err),
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: err?._headers || respHeaders,
+    });
+    throw err;
   }
-  const disp = resp.headers.get("content-disposition") || "";
-  let filename = fallbackName;
-  const utfMatch = disp.match(/filename\*=UTF-8''([^;]+)/i);
-  const plainMatch = disp.match(/filename="?([^";]+)"?/i);
-  if (utfMatch && utfMatch[1]) {
-    filename = decodeURIComponent(utfMatch[1]);
-  } else if (plainMatch && plainMatch[1]) {
-    filename = plainMatch[1];
-  }
-  const blob = await resp.blob();
-  downloadBlob(blob, filename);
-  return filename;
 }
