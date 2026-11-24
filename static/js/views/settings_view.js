@@ -21,6 +21,7 @@ import { DESKTOP_APPS, store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
 import { Toast } from "../ui/toast.js";
 import { ConnectionsView, renderDriversSection } from "./connections_view.js";
+import { DiagnosticsView } from "./diagnostics_view.js";
 import { KnowledgeSettingsView } from "./knowledge_view.js";
 import { WorkspaceView } from "./workspace_view.js";
 
@@ -38,6 +39,7 @@ const SECTIONS = [
   { id: "drivers", label: "JDBC 驱动" },
   { id: "knowledge", label: "参考知识库" },
   { id: "llm", label: "AI 模型" },
+  { id: "diagnostics", label: "性能诊断" },
 ];
 
 export class SettingsView {
@@ -46,6 +48,7 @@ export class SettingsView {
     this.connectionsPane = new ConnectionsView({ onChange: () => this.render() });
     this.workspacePane = new WorkspaceView({ onChange: () => this.render() });
     this.knowledgePane = new KnowledgeSettingsView({ onChange: () => this.render() });
+    this.diagnosticsPane = new DiagnosticsView({ onChange: () => this.render() });
     this.selectedProviderId = "deepseek";
     this.llmDraft = null;
     this.newModelInputText = "";
@@ -64,6 +67,7 @@ export class SettingsView {
 
   destroy() {
     this.knowledgePane?.destroy();
+    this.diagnosticsPane?.destroy();
     this._unsub?.();
   }
 
@@ -91,6 +95,8 @@ export class SettingsView {
       this.workspacePane.refreshFromServer();
     } else if (this.activeSection === "knowledge") {
       this.knowledgePane.refreshFromServer();
+    } else if (this.activeSection === "diagnostics") {
+      this.diagnosticsPane.refreshFromServer();
     }
     this.render();
     this.refreshHeader?.();
@@ -683,6 +689,8 @@ export class SettingsView {
                 this.workspacePane.refreshFromServer();
               } else if (s.id === "knowledge") {
                 this.knowledgePane.refreshFromServer();
+              } else if (s.id === "diagnostics") {
+                this.diagnosticsPane.refreshFromServer();
               }
               this.render();
               this.refreshHeader?.();
@@ -712,6 +720,9 @@ export class SettingsView {
     } else if (this.activeSection === "knowledge") {
       this.knowledgePane.render();
       paneBody = this.knowledgePane.root;
+    } else if (this.activeSection === "diagnostics") {
+      this.diagnosticsPane.render();
+      paneBody = this.diagnosticsPane.root;
     } else {
       paneBody = this._renderLlmSection();
     }

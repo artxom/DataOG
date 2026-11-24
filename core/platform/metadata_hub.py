@@ -17,6 +17,7 @@ import time
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from core.platform.connection_hub import ConnectionHub
+from core.platform.diagnostics_hub import annotate_current_span, trace_span
 from core.platform.dialects import (
     SYSTEM_SCHEMAS,
     clean_identifier_input,
@@ -59,6 +60,13 @@ class MetadataHub:
             doomed = [k for k in self._missing_table_cache if k[0] == connection_id]
             for k in doomed:
                 self._missing_table_cache.pop(k, None)
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        with self._neg_lock:
+            return {
+                "negative_cache_entries": len(self._missing_table_cache),
+                "negative_cache_ttl_sec": self._neg_ttl_sec,
+            }
 
     @staticmethod
     def _finalize_table_meta(meta: TableMeta) -> TableMeta:
@@ -132,13 +140,20 @@ class MetadataHub:
     def get_catalog_tree(
         self, connection_id: str, auto_refresh: bool = False
     ) -> Dict[str, Any]:
-        cached = self.store.get_cached_catalog(connection_id)
-        if auto_refresh and not cached["schemas"] and not cached["tables"]:
-            return self.refresh_catalog(connection_id)
-        profile = self.connection_hub.get_profile(connection_id)
-        cached["default_schema"] = profile.effective_default_schema() if profile else "public"
-        cached["db_type"] = profile.db_type if profile else ""
-        return cached
+        with trace_span(
+            "metadata",
+            "get_catalog_tree",
+            {"connection_id": connection_id, "auto_refresh": bool(auto_refresh)},
+        ):
+            cached = self.store.get_cached_catalog(connection_id)
+            if auto_refresh and not cached["schemas"] and not cached["tables"]:
+                annotate_current_span(cache_hit=False)
+                return self.refresh_catalog(connection_id)
+            annotate_current_span(cache_hit=True, table_count=len(cached["tables"]))
+            profile = self.connection_hub.get_profile(connection_id)
+            cached["default_schema"] = profile.effective_default_schema() if profile else "public"
+            cached["db_type"] = profile.db_type if profile else ""
+            return cached
 
     def refresh_catalog(
         self,
@@ -146,57 +161,92 @@ class MetadataHub:
         schema_name: Optional[str] = None,
         progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
-        profile = self.connection_hub.require_profile(connection_id)
-        clean_schema = clean_identifier_input(schema_name or "") or None
-        self.invalidate_negative_cache(connection_id)
+        with trace_span(
+            "metadata",
+            "refresh_catalog",
+            {"connection_id": connection_id, "schema_name": schema_name or ""},
+        ):
+            profile = self.connection_hub.require_profile(connection_id)
+            clean_schema = clean_identifier_input(schema_name or "") or None
+            self.invalidate_negative_cache(connection_id)
 
-        progress_cb(
-            18,
-            "连接数据源",
-            f"正在建立到 {profile.name} ({profile.db_type}) 的探查会话...",
-            0,
-            1,
-        )
-        with self.connection_hub.probe_session(connection_id, timeout_sec=15) as conn:
             progress_cb(
-                45,
-                "扫描系统目录",
-                f"正在扫描 {clean_schema or '全部模式'} 表与视图清单...",
+                18,
+                "连接数据源",
+                f"正在建立到 {profile.name} ({profile.db_type}) 的探查会话...",
                 0,
                 1,
             )
-            if isinstance(conn, InceptorThriftClient):
-                schemas, tables = self._probe_inceptor_catalog(conn, profile, clean_schema)
-            elif isinstance(conn, JdbcConnectionAdapter):
-                schemas, tables = self._probe_jdbc_catalog(conn, profile, clean_schema)
-            elif profile.db_type == "SQLITE":
-                schemas, tables = self._probe_sqlite_catalog(conn)
-            elif profile.db_type in ("MYSQL", "MARIADB", "OCEANBASE", "DORIS", "STARROCKS", "TIDB"):
-                schemas, tables = self._probe_mysql_catalog(conn, profile, clean_schema)
-            else:
-                schemas, tables = self._probe_pg_dws_catalog(conn, profile, clean_schema)
+            with self.connection_hub.probe_session(connection_id, timeout_sec=15) as conn:
+                progress_cb(
+                    45,
+                    "扫描系统目录",
+                    f"正在扫描 {clean_schema or '全部模式'} 表与视图清单...",
+                    0,
+                    1,
+                )
+                if isinstance(conn, InceptorThriftClient):
+                    schemas, tables = self._probe_inceptor_catalog(conn, profile, clean_schema)
+                elif isinstance(conn, JdbcConnectionAdapter):
+                    schemas, tables = self._probe_jdbc_catalog(conn, profile, clean_schema)
+                elif profile.db_type == "SQLITE":
+                    schemas, tables = self._probe_sqlite_catalog(conn)
+                elif profile.db_type in ("MYSQL", "MARIADB", "OCEANBASE", "DORIS", "STARROCKS", "TIDB"):
+                    schemas, tables = self._probe_mysql_catalog(conn, profile, clean_schema)
+                else:
+                    schemas, tables = self._probe_pg_dws_catalog(conn, profile, clean_schema)
 
-        progress_cb(
-            82,
-            "写入本地缓存",
-            f"发现 {len(schemas)} 个模式、{len(tables)} 个对象，正在落盘缓存...",
-            len(tables),
-            len(tables),
-        )
-        self.store.save_catalog_snapshot(
-            connection_id,
-            schemas=schemas,
-            tables=tables,
-            target_schema=clean_schema,
-        )
-        self.store.add_log(
-            "INFO",
-            "元数据中枢",
-            f"已刷新数据源 [{profile.name}] 目录缓存：{len(schemas)} 个模式，{len(tables)} 个表/视图对象",
-        )
-        return self.get_catalog_tree(connection_id, auto_refresh=False)
+            progress_cb(
+                82,
+                "写入本地缓存",
+                f"发现 {len(schemas)} 个模式、{len(tables)} 个对象，正在落盘缓存...",
+                len(tables),
+                len(tables),
+            )
+            self.store.save_catalog_snapshot(
+                connection_id,
+                schemas=schemas,
+                tables=tables,
+                target_schema=clean_schema,
+            )
+            self.store.add_log(
+                "INFO",
+                "元数据中枢",
+                f"已刷新数据源 [{profile.name}] 目录缓存：{len(schemas)} 个模式，{len(tables)} 个表/视图对象",
+            )
+            annotate_current_span(schema_count=len(schemas), table_count=len(tables))
+            return self.get_catalog_tree(connection_id, auto_refresh=False)
 
     def get_table_metadata(
+        self,
+        connection_id: str,
+        schema_name: str,
+        table_name: str,
+        *,
+        force_refresh: bool = False,
+        penetrate_views: bool = True,
+        progress_cb: ProgressCallback = noop_progress,
+        _shared_conn: Any = None,
+    ) -> TableMeta:
+        with trace_span(
+            "metadata",
+            "get_table_metadata",
+            {
+                "connection_id": connection_id,
+                "force_refresh": bool(force_refresh),
+            },
+        ):
+            return self._get_table_metadata_impl(
+                connection_id,
+                schema_name,
+                table_name,
+                force_refresh=force_refresh,
+                penetrate_views=penetrate_views,
+                progress_cb=progress_cb,
+                _shared_conn=_shared_conn,
+            )
+
+    def _get_table_metadata_impl(
         self,
         connection_id: str,
         schema_name: str,
@@ -240,6 +290,7 @@ class MetadataHub:
         if not force_refresh:
             cached = self.store.get_cached_table_meta(connection_id, eff_schema, eff_table)
             if cached is not None:
+                annotate_current_span(cache_hit=True, neg_cache_hit=False)
                 progress_cb(
                     100,
                     "命中缓存",
@@ -275,6 +326,7 @@ class MetadataHub:
                     else:
                         self._missing_table_cache.pop(neg_key, None)
             if hit_missing:
+                annotate_current_span(cache_hit=False, neg_cache_hit=True)
                 progress_cb(
                     100,
                     "命中缓存",

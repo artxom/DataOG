@@ -9,7 +9,8 @@
  *    - 绿色最大化 (+): 在留白桌面窗口与全屏沉浸画布间平滑切换
  */
 
-import { authApi, platformApi } from "./core/platform_api.js";
+import { authApi, diagnosticsApi, platformApi } from "./core/platform_api.js";
+import { perfMonitor } from "./core/perf_monitor.js";
 import {
   getDefaultAppSummary,
   getDesktopApp,
@@ -622,6 +623,8 @@ function initLogsDialog() {
   const dialog = document.getElementById("logs-modal");
   const listEl = document.getElementById("drawer-log-list");
   const filterSelect = document.getElementById("log-level-filter");
+  const diagBtn = document.getElementById("btn-open-diagnostics");
+  const exportDiagBtn = document.getElementById("btn-export-diagnostics");
   const refreshBtn = document.getElementById("btn-refresh-logs");
   const clearBtn = document.getElementById("btn-clear-logs");
   const closeBtn = document.getElementById("logs-modal-close");
@@ -629,6 +632,29 @@ function initLogsDialog() {
 
   bindDialogLightDismissFallback(dialog);
   closeBtn?.addEventListener("click", () => dialog.close("cancel"));
+  diagBtn?.addEventListener("click", () => {
+    if (dialog.open) dialog.close("diagnostics");
+    if (isAuthorized) {
+      store.openApp("settings", { section: "diagnostics" });
+    }
+  });
+  exportDiagBtn?.addEventListener("click", async () => {
+    if (!isAuthorized) return;
+    exportDiagBtn.disabled = true;
+    try {
+      const clientSnapshot = perfMonitor.collectClientSnapshot();
+      const fname = await diagnosticsApi.exportBundle({
+        client_snapshot: clientSnapshot,
+        include_service_log: true,
+        include_execution_logs: true,
+      });
+      Toast.success(`已导出脱敏诊断日志包：${fname}`);
+    } catch (err) {
+      Toast.error(err.message || "导出诊断日志包失败");
+    } finally {
+      exportDiagBtn.disabled = false;
+    }
+  });
 
   const renderLogItems = () => {
     const lvl = filterSelect?.value || "ALL";

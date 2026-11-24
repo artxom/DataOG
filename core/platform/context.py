@@ -9,6 +9,7 @@ from fastapi import HTTPException, Request
 
 from core.platform.asset_store import AssetStore
 from core.platform.connection_hub import ConnectionHub
+from core.platform.diagnostics_hub import DiagnosticsHub, trace_span
 from core.platform.driver_manager import DriverManager
 from core.platform.import_progress import ImportProgressHub
 from core.platform.knowledge_hub import KnowledgeHub
@@ -120,6 +121,8 @@ class PlatformContext:
         self.task_progress = self.import_progress
         self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
+        self.app_version = "3.2.0"
+        self.diagnostics_hub = DiagnosticsHub(self)
 
     def register_module_manifest(
         self,
@@ -143,37 +146,61 @@ class PlatformContext:
         self._registered_modules.append(entry)
 
     def build_platform_bootstrap(self) -> Dict[str, Any]:
-        connections = self.connection_hub.list_profiles()
+        with trace_span("bootstrap", "connections"):
+            connections = self.connection_hub.list_profiles()
         trees_summary: Dict[str, Any] = {}
-        for c in connections:
-            cid = c["connection_id"]
-            cat = self.metadata_hub.get_catalog_tree(cid, auto_refresh=False)
-            trees_summary[cid] = {
-                "schema_count": len(cat["schemas"]),
-                "table_count": len(cat["tables"]),
-                "schemas": cat["schemas"],
-                "tables": cat["tables"],
-            }
+        with trace_span("bootstrap", "catalog_trees", {"connection_count": len(connections)}):
+            for c in connections:
+                cid = c["connection_id"]
+                cat = self.metadata_hub.get_catalog_tree(cid, auto_refresh=False)
+                trees_summary[cid] = {
+                    "schema_count": len(cat["schemas"]),
+                    "table_count": len(cat["tables"]),
+                    "schemas": cat["schemas"],
+                    "tables": cat["tables"],
+                }
+        with trace_span("bootstrap", "license"):
+            license_info = self.license_hub.get_auth_status()
+        with trace_span("bootstrap", "workspaces"):
+            active_ws = self.workspace_hub.get_active_workspace_summary()
+            workspaces = self.workspace_hub.list_workspaces()
+        with trace_span("bootstrap", "appearance"):
+            appearance = self.asset_store.get_public_appearance()
+        with trace_span("bootstrap", "drivers"):
+            drivers = [d.to_dict() for d in self.store.list_jdbc_drivers()]
+            driver_templates = self.driver_manager.list_templates()
+        with trace_span("bootstrap", "java_runtime"):
+            java_runtime = self.driver_manager.get_java_runtime_status()
+        with trace_span("bootstrap", "llm"):
+            llm_providers = self.llm_hub.list_providers()
+            llm_models = self.llm_hub.list_available_models()
+        with trace_span("bootstrap", "knowledge"):
+            knowledge_summary = self.knowledge_hub.get_summary()
+        with trace_span("bootstrap", "standards"):
+            standard_dict_summary = self.standard_catalog.get_summary()
+        with trace_span("bootstrap", "logs"):
+            logs = self.store.list_logs(limit=150)
+
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "3.1.0",
+            "version": "3.2.0",
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
-            "license": self.license_hub.get_auth_status(),
-            "active_workspace": self.workspace_hub.get_active_workspace_summary(),
-            "workspaces": self.workspace_hub.list_workspaces(),
-            "appearance": self.asset_store.get_public_appearance(),
+            "license": license_info,
+            "active_workspace": active_ws,
+            "workspaces": workspaces,
+            "appearance": appearance,
             "connections": connections,
             "catalog_trees": trees_summary,
-            "drivers": [d.to_dict() for d in self.store.list_jdbc_drivers()],
-            "driver_templates": self.driver_manager.list_templates(),
-            "java_runtime": self.driver_manager.get_java_runtime_status(),
-            "llm_providers": self.llm_hub.list_providers(),
-            "llm_models": self.llm_hub.list_available_models(),
-            "knowledge_summary": self.knowledge_hub.get_summary(),
-            "standard_dict_summary": self.standard_catalog.get_summary(),
+            "drivers": drivers,
+            "driver_templates": driver_templates,
+            "java_runtime": java_runtime,
+            "llm_providers": llm_providers,
+            "llm_models": llm_models,
+            "knowledge_summary": knowledge_summary,
+            "standard_dict_summary": standard_dict_summary,
             "modules": list(self._registered_modules),
-            "logs": self.store.list_logs(limit=150),
+            "logs": logs,
         }
 
 
@@ -182,7 +209,8 @@ def get_platform_context(request: Request) -> PlatformContext:
     ctx: Optional[PlatformContext] = getattr(request.app.state, "platform_ctx", None)
     if ctx is None:
         raise RuntimeError("PlatformContext 尚未绑定至 FastAPI 应用实例")
-    ok, auth_info = ctx.license_hub.verify_request_capability(request)
+    with trace_span("license", "gate2_capability"):
+        ok, auth_info = ctx.license_hub.verify_request_capability(request)
     if not ok:
         raise HTTPException(
             status_code=401,

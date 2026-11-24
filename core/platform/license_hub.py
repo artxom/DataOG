@@ -35,6 +35,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 from fastapi import Request
 
+from core.platform.diagnostics_hub import annotate_current_span, trace_span
 from core.platform.storage import PlatformStateStore
 from core.platform.storage_paths import (
     decode_obfuscated_anchor,
@@ -444,31 +445,34 @@ def _ip_priority_py(ip_str: str) -> Tuple[int, str]:
 def collect_local_ips_py() -> Tuple[str, List[str]]:
     candidates: set[str] = set()
     # 1. UDP routing probe (no actual packet sent)
-    for target in ("192.168.1.1", "10.0.0.1", "172.16.0.1", "8.8.8.8"):
+    with trace_span("license", "py_ip_udp_probe"):
+        for target in ("192.168.1.1", "10.0.0.1", "172.16.0.1", "8.8.8.8"):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect((target, 9))
+                    ip = s.getsockname()[0]
+                    if _is_usable_ipv4_py(ip):
+                        candidates.add(ip)
+            except OSError:
+                pass
+    # 2. Hostname resolution
+    with trace_span("license", "py_ip_gethostbyname"):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect((target, 9))
-                ip = s.getsockname()[0]
+            _, _, ip_list = socket.gethostbyname_ex(socket.gethostname())
+            for ip in ip_list:
                 if _is_usable_ipv4_py(ip):
                     candidates.add(ip)
         except OSError:
             pass
-    # 2. Hostname resolution
-    try:
-        _, _, ip_list = socket.gethostbyname_ex(socket.gethostname())
-        for ip in ip_list:
-            if _is_usable_ipv4_py(ip):
-                candidates.add(ip)
-    except OSError:
-        pass
     # 3. addrinfo
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ip = info[4][0]
-            if _is_usable_ipv4_py(ip):
-                candidates.add(ip)
-    except OSError:
-        pass
+    with trace_span("license", "py_ip_getaddrinfo"):
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = info[4][0]
+                if _is_usable_ipv4_py(ip):
+                    candidates.add(ip)
+        except OSError:
+            pass
 
     sorted_ips = sorted(candidates, key=_ip_priority_py)
     if not sorted_ips:
@@ -989,50 +993,56 @@ class LicenseHub:
         return datetime.datetime.fromtimestamp(self._now_ts()).date()
 
     def get_device_info(self, *, force_refresh: bool = False) -> Dict[str, Any]:
-        if self._custom_device_probe_fn is not None:
-            info = dict(self._custom_device_probe_fn())
-            mc = str(info.get("machine_code") or get_machine_code_py())
-            all_ips = list(info.get("all_ips") or [])
-            pri = str(info.get("primary_ip") or (all_ips[0] if all_ips else "127.0.0.1"))
-            if pri and pri not in all_ips:
-                all_ips.insert(0, pri)
-            host = str(info.get("hostname") or socket.gethostname() or "LOCAL-HOST")
-            return {
+        with trace_span("license", "device_probe", {"force_refresh": bool(force_refresh)}):
+            if self._custom_device_probe_fn is not None:
+                annotate_current_span(custom_probe=True)
+                info = dict(self._custom_device_probe_fn())
+                mc = str(info.get("machine_code") or get_machine_code_py())
+                all_ips = list(info.get("all_ips") or [])
+                pri = str(info.get("primary_ip") or (all_ips[0] if all_ips else "127.0.0.1"))
+                if pri and pri not in all_ips:
+                    all_ips.insert(0, pri)
+                host = str(info.get("hostname") or socket.gethostname() or "LOCAL-HOST")
+                return {
+                    "machine_code": mc,
+                    "primary_ip": pri,
+                    "all_ips": all_ips or ["127.0.0.1"],
+                    "hostname": host,
+                    "request_code": encode_request_code(mc, pri, host),
+                }
+
+            now_mono = time.monotonic()
+            with self._lock:
+                if (
+                    not force_refresh
+                    and self._cached_device is not None
+                    and (now_mono - self._cached_device_ts) < 20.0
+                ):
+                    annotate_current_span(cache_hit=True)
+                    return dict(self._cached_device)
+
+            annotate_current_span(cache_hit=False)
+            probed = self._shield.probe_device()
+            if probed is not None:
+                annotate_current_span(via_shield=True)
+                mc, pri, all_ips = probed
+            else:
+                annotate_current_span(via_shield=False)
+                mc = get_machine_code_py()
+                pri, all_ips = collect_local_ips_py()
+
+            host = socket.gethostname() or "LOCAL-HOST"
+            device = {
                 "machine_code": mc,
                 "primary_ip": pri,
-                "all_ips": all_ips or ["127.0.0.1"],
+                "all_ips": all_ips,
                 "hostname": host,
                 "request_code": encode_request_code(mc, pri, host),
             }
-
-        now_mono = time.monotonic()
-        with self._lock:
-            if (
-                not force_refresh
-                and self._cached_device is not None
-                and (now_mono - self._cached_device_ts) < 20.0
-            ):
-                return dict(self._cached_device)
-
-        probed = self._shield.probe_device()
-        if probed is not None:
-            mc, pri, all_ips = probed
-        else:
-            mc = get_machine_code_py()
-            pri, all_ips = collect_local_ips_py()
-
-        host = socket.gethostname() or "LOCAL-HOST"
-        device = {
-            "machine_code": mc,
-            "primary_ip": pri,
-            "all_ips": all_ips,
-            "hostname": host,
-            "request_code": encode_request_code(mc, pri, host),
-        }
-        with self._lock:
-            self._cached_device = dict(device)
-            self._cached_device_ts = time.monotonic()
-        return device
+            with self._lock:
+                self._cached_device = dict(device)
+                self._cached_device_ts = time.monotonic()
+            return device
 
     def _clock_seal_hmac(self, max_ts: float, machine_code: str) -> str:
         msg = f"{int(max_ts)}|{machine_code}".encode("utf-8")
@@ -1094,26 +1104,27 @@ class LicenseHub:
                 and 0.0 <= (now_ts - self._last_watermark_write_ts) < 60.0
             ):
                 return
-            existing = (
-                existing_watermark
-                if existing_watermark is not None
-                else (self._read_clock_watermark(machine_code) or 0.0)
-            )
-            target_ts = max(existing, now_ts)
-            seal_obj = {
-                "ts": int(target_ts),
-                "sig": self._clock_seal_hmac(target_ts, machine_code),
-            }
-            self.store.save_meta("license_clock_seal", seal_obj)
-            try:
-                anchor_dir = os.path.dirname(self._anchor_file)
-                if anchor_dir:
-                    os.makedirs(anchor_dir, exist_ok=True)
-                with open(self._anchor_file, "w", encoding="utf-8") as fh:
-                    fh.write(encode_obfuscated_anchor(seal_obj))
-            except OSError:
-                pass
-            self._last_watermark_write_ts = now_ts
+            with trace_span("license", "advance_clock_watermark", {"force_persist": bool(force_persist), "persisted": True}):
+                existing = (
+                    existing_watermark
+                    if existing_watermark is not None
+                    else (self._read_clock_watermark(machine_code) or 0.0)
+                )
+                target_ts = max(existing, now_ts)
+                seal_obj = {
+                    "ts": int(target_ts),
+                    "sig": self._clock_seal_hmac(target_ts, machine_code),
+                }
+                self.store.save_meta("license_clock_seal", seal_obj)
+                try:
+                    anchor_dir = os.path.dirname(self._anchor_file)
+                    if anchor_dir:
+                        os.makedirs(anchor_dir, exist_ok=True)
+                    with open(self._anchor_file, "w", encoding="utf-8") as fh:
+                        fh.write(encode_obfuscated_anchor(seal_obj))
+                except OSError:
+                    pass
+                self._last_watermark_write_ts = now_ts
 
     @staticmethod
     def _mask_activation_code(code_str: str) -> str:
@@ -1131,134 +1142,140 @@ class LicenseHub:
         use_cache: bool = True,
     ) -> Tuple[str, int, int, int, str]:
         """返回 `(status_code, scope, duration_days, expiry_day, error_message)`."""
-        today_day = date_to_epoch_day(today)
-        cache_key = (
-            code_str,
-            self._verifier_pubkey,
-            today_day,
-            device["machine_code"],
-            tuple(device.get("all_ips") or ()),
-        )
-        if use_cache:
-            with self._lock:
-                cached = self._verify_cache
-                if (
-                    cached is not None
-                    and cached[0] == cache_key
-                    and (time.monotonic() - cached[2]) < 60.0
-                ):
-                    return cached[1]
+        with trace_span("license", "verify_token", {"use_cache": bool(use_cache)}):
+            today_day = date_to_epoch_day(today)
+            cache_key = (
+                code_str,
+                self._verifier_pubkey,
+                today_day,
+                device["machine_code"],
+                tuple(device.get("all_ips") or ()),
+            )
+            if use_cache:
+                with self._lock:
+                    cached = self._verify_cache
+                    if (
+                        cached is not None
+                        and cached[0] == cache_key
+                        and (time.monotonic() - cached[2]) < 60.0
+                    ):
+                        annotate_current_span(cache_hit=True)
+                        return cached[1]
+            annotate_current_span(cache_hit=False)
 
-        try:
-            payload, sig, ver, scope, duration_days, expiry_day = decode_activation_token(code_str)
-        except ValueError as exc:
-            return "INVALID", 0, 0, 0, str(exc)
+            try:
+                payload, sig, ver, scope, duration_days, expiry_day = decode_activation_token(code_str)
+            except ValueError as exc:
+                return "INVALID", 0, 0, 0, str(exc)
 
-        if ver != LICENSE_VERSION or duration_days == 0:
-            return "INVALID", 0, 0, 0, "激活码版本或有效天数格式异常"
-        if scope not in (SCOPE_MACHINE, SCOPE_GLOBAL):
-            return "INVALID", 0, 0, 0, "未知的激活码授权类型"
+            if ver != LICENSE_VERSION or duration_days == 0:
+                return "INVALID", 0, 0, 0, "激活码版本或有效天数格式异常"
+            if scope not in (SCOPE_MACHINE, SCOPE_GLOBAL):
+                return "INVALID", 0, 0, 0, "未知的激活码授权类型"
 
-        py_sig_ok = ed25519_verify(_SIG_DOMAIN + payload, sig, self._verifier_pubkey)
+            py_sig_ok = ed25519_verify(_SIG_DOMAIN + payload, sig, self._verifier_pubkey)
 
-        shield_res = self._shield.verify_with_challenge(
-            code_str=code_str,
-            machine_code=device["machine_code"],
-            ips=device["all_ips"],
-            today_day=today_day,
-            effective_pubkey=self._verifier_pubkey,
-            using_custom_pubkey=self._using_custom_pubkey,
-        )
-        if shield_res is not None:
-            st_c, s_scope, s_dur, s_exp = shield_res
-            if st_c == -99:
-                return "INVALID", 0, 0, 0, "安全校验模块完整性异常"
-            if not py_sig_ok:
-                return "INVALID", 0, 0, 0, "激活码数字签名无效"
-            if st_c == -1 or st_c == -2 or st_c == -6:
-                return "INVALID", s_scope, s_dur, s_exp, "激活码数字签名或格式校验失败"
-            if st_c == -5:
-                return (
-                    "DEVICE_MISMATCH",
-                    s_scope,
-                    s_dur,
-                    s_exp,
-                    "当前设备机器码或本机 IP 与该专属激活码不匹配，请联系管理员重新签发或使用全局通用激活码",
-                )
-            if st_c == -3:
-                exp_str = epoch_day_to_date(s_exp).isoformat()
-                return (
-                    "EXPIRED",
-                    s_scope,
-                    s_dur,
-                    s_exp,
-                    f"激活码已于 {exp_str} 过期，请联系管理员获取续期激活码",
-                )
-            if st_c == -4:
+            shield_res = self._shield.verify_with_challenge(
+                code_str=code_str,
+                machine_code=device["machine_code"],
+                ips=device["all_ips"],
+                today_day=today_day,
+                effective_pubkey=self._verifier_pubkey,
+                using_custom_pubkey=self._using_custom_pubkey,
+            )
+            annotate_current_span(native_shield=shield_res is not None)
+            if shield_res is not None:
+                st_c, s_scope, s_dur, s_exp = shield_res
+                if st_c == -99:
+                    return "INVALID", 0, 0, 0, "安全校验模块完整性异常"
+                if not py_sig_ok:
+                    return "INVALID", 0, 0, 0, "激活码数字签名无效"
+                if st_c == -1 or st_c == -2 or st_c == -6:
+                    return "INVALID", s_scope, s_dur, s_exp, "激活码数字签名或格式校验失败"
+                if st_c == -5:
+                    return (
+                        "DEVICE_MISMATCH",
+                        s_scope,
+                        s_dur,
+                        s_exp,
+                        "当前设备机器码或本机 IP 与该专属激活码不匹配，请联系管理员重新签发或使用全局通用激活码",
+                    )
+                if st_c == -3:
+                    exp_str = epoch_day_to_date(s_exp).isoformat()
+                    return (
+                        "EXPIRED",
+                        s_scope,
+                        s_dur,
+                        s_exp,
+                        f"激活码已于 {exp_str} 过期，请联系管理员获取续期激活码",
+                    )
+                if st_c == -4:
+                    return (
+                        "CLOCK_ROLLBACK",
+                        s_scope,
+                        s_dur,
+                        s_exp,
+                        "当前系统日期早于该激活码生效时间，请校准本机系统时间后重试",
+                    )
+            else:
+                if not py_sig_ok:
+                    return "INVALID", 0, 0, 0, "激活码数字签名校验失败，请确认未被篡改"
+
+            # Python 侧独立再次校验证书范围与日期（纵深防御）
+            if scope == SCOPE_MACHINE:
+                mc_tag = compute_machine_tag(device["machine_code"])
+                if mc_tag != payload[6:12]:
+                    return (
+                        "DEVICE_MISMATCH",
+                        scope,
+                        duration_days,
+                        expiry_day,
+                        "当前设备机器码与激活码绑定设备不一致",
+                    )
+                ip_tags = {compute_ip_tag(ip) for ip in device["all_ips"]}
+                if payload[12:16] not in ip_tags:
+                    return (
+                        "DEVICE_MISMATCH",
+                        scope,
+                        duration_days,
+                        expiry_day,
+                        "当前设备 IP 与激活码绑定 IP 不一致",
+                    )
+
+            if today_day > expiry_day:
+                exp_str = epoch_day_to_date(expiry_day).isoformat()
+                return "EXPIRED", scope, duration_days, expiry_day, f"激活码已于 {exp_str} 过期"
+            not_before = expiry_day - duration_days
+            if not_before > 1 and today_day < (not_before - 1):
                 return (
                     "CLOCK_ROLLBACK",
-                    s_scope,
-                    s_dur,
-                    s_exp,
-                    "当前系统日期早于该激活码生效时间，请校准本机系统时间后重试",
-                )
-        else:
-            if not py_sig_ok:
-                return "INVALID", 0, 0, 0, "激活码数字签名校验失败，请确认未被篡改"
-
-        # Python 侧独立再次校验证书范围与日期（纵深防御）
-        if scope == SCOPE_MACHINE:
-            mc_tag = compute_machine_tag(device["machine_code"])
-            if mc_tag != payload[6:12]:
-                return (
-                    "DEVICE_MISMATCH",
                     scope,
                     duration_days,
                     expiry_day,
-                    "当前设备机器码与激活码绑定设备不一致",
-                )
-            ip_tags = {compute_ip_tag(ip) for ip in device["all_ips"]}
-            if payload[12:16] not in ip_tags:
-                return (
-                    "DEVICE_MISMATCH",
-                    scope,
-                    duration_days,
-                    expiry_day,
-                    "当前设备 IP 与激活码绑定 IP 不一致",
+                    "检测到当前系统日期早于激活码签发有效期，请校准系统时间",
                 )
 
-        if today_day > expiry_day:
-            exp_str = epoch_day_to_date(expiry_day).isoformat()
-            return "EXPIRED", scope, duration_days, expiry_day, f"激活码已于 {exp_str} 过期"
-        not_before = expiry_day - duration_days
-        if not_before > 1 and today_day < (not_before - 1):
-            return (
-                "CLOCK_ROLLBACK",
-                scope,
-                duration_days,
-                expiry_day,
-                "检测到当前系统日期早于激活码签发有效期，请校准系统时间",
-            )
-
-        result = ("ACTIVE", scope, duration_days, expiry_day, "")
-        with self._lock:
-            self._verify_cache = (cache_key, result, time.monotonic())
-        return result
+            result = ("ACTIVE", scope, duration_days, expiry_day, "")
+            with self._lock:
+                self._verify_cache = (cache_key, result, time.monotonic())
+            return result
 
     def get_auth_status(self, *, force_refresh_ip: bool = False) -> Dict[str, Any]:
         device = self.get_device_info(force_refresh=force_refresh_ip)
         now_ts = self._now_ts()
         today = self._today_date()
 
-        meta_vals = self.store.get_meta_batch(
-            ("license_activation_code", "license_locked", "license_clock_seal")
-        )
+        with trace_span("license", "meta_batch_read"):
+            meta_vals = self.store.get_meta_batch(
+                ("license_activation_code", "license_locked", "license_clock_seal")
+            )
         saved_code = str(meta_vals.get("license_activation_code") or "").strip()
         is_locked = str(meta_vals.get("license_locked") or "0") == "1"
 
-        watermark = self._read_clock_watermark(
-            device["machine_code"], preloaded_seal=meta_vals.get("license_clock_seal")
-        )
+        with trace_span("license", "read_clock_watermark"):
+            watermark = self._read_clock_watermark(
+                device["machine_code"], preloaded_seal=meta_vals.get("license_clock_seal")
+            )
         clock_rollback = watermark is not None and (now_ts + CLOCK_ROLLBACK_TOLERANCE_SEC) < watermark
 
         status = "UNACTIVATED"

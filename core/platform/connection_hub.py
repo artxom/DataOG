@@ -12,6 +12,7 @@ import time
 import uuid
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
+from core.platform.diagnostics_hub import annotate_current_span, trace_span
 from core.platform.driver_manager import DriverManager, JdbcConnectionAdapter
 from core.platform.inceptor_client import InceptorThriftClient
 from core.platform.models import ConnectionProfile
@@ -34,6 +35,17 @@ class ConnectionHub:
         self.warm_ttl_sec = max(0.0, float(warm_ttl_sec))
         self._warm_lock = threading.Lock()
         self._warm_pool: Dict[str, Dict[str, Any]] = {}
+        self._pool_hits = 0
+        self._pool_misses = 0
+
+    def get_pool_stats(self) -> Dict[str, Any]:
+        with self._warm_lock:
+            return {
+                "warm_ttl_sec": self.warm_ttl_sec,
+                "active_pooled_connections": len(self._warm_pool),
+                "pool_hits": int(self._pool_hits),
+                "pool_misses": int(self._pool_misses),
+            }
 
     @staticmethod
     def _profile_fingerprint(profile: ConnectionProfile) -> Tuple[Any, ...]:
@@ -285,7 +297,8 @@ class ConnectionHub:
     def session(self, connection_id: str, timeout_sec: int = 12) -> Generator[Any, None, None]:
         """按 connection_id 获取安全托管的数据库连接上下文，退出时自动关闭."""
         profile = self.require_profile(connection_id)
-        conn = self.driver_manager.open_connection(profile, timeout_sec=timeout_sec)
+        with trace_span("db", "session_open", {"connection_id": connection_id, "db_type": profile.db_type}):
+            conn = self.driver_manager.open_connection(profile, timeout_sec=timeout_sec)
         try:
             yield conn
         finally:
@@ -303,40 +316,53 @@ class ConnectionHub:
                 yield conn
             return
 
-        fp = self._profile_fingerprint(profile)
-        cur_open_fn = self.driver_manager.open_connection
-        now = time.monotonic()
-        stale_conns: List[Any] = []
-        pooled_conn: Any = None
+        with trace_span(
+            "db",
+            "probe_session_acquire",
+            {"connection_id": connection_id, "db_type": profile.db_type},
+        ):
+            fp = self._profile_fingerprint(profile)
+            cur_open_fn = self.driver_manager.open_connection
+            now = time.monotonic()
+            stale_conns: List[Any] = []
+            pooled_conn: Any = None
 
-        with self._warm_lock:
-            expired_ids = [
-                cid
-                for cid, entry in self._warm_pool.items()
-                if (now - float(entry.get("last_used", 0.0))) > self.warm_ttl_sec
-            ]
-            for cid in expired_ids:
-                exp_entry = self._warm_pool.pop(cid, None)
-                if exp_entry and exp_entry.get("conn") is not None:
-                    stale_conns.append(exp_entry["conn"])
+            with self._warm_lock:
+                expired_ids = [
+                    cid
+                    for cid, entry in self._warm_pool.items()
+                    if (now - float(entry.get("last_used", 0.0))) > self.warm_ttl_sec
+                ]
+                for cid in expired_ids:
+                    exp_entry = self._warm_pool.pop(cid, None)
+                    if exp_entry and exp_entry.get("conn") is not None:
+                        stale_conns.append(exp_entry["conn"])
 
-            entry = self._warm_pool.pop(connection_id, None)
-            if entry is not None:
-                if entry.get("fingerprint") == fp and entry.get("open_fn") == cur_open_fn:
-                    pooled_conn = entry.get("conn")
-                elif entry.get("conn") is not None:
-                    stale_conns.append(entry["conn"])
+                entry = self._warm_pool.pop(connection_id, None)
+                if entry is not None:
+                    if entry.get("fingerprint") == fp and entry.get("open_fn") == cur_open_fn:
+                        pooled_conn = entry.get("conn")
+                    elif entry.get("conn") is not None:
+                        stale_conns.append(entry["conn"])
 
-        for stale in stale_conns:
-            self._safe_close_conn(stale)
+            for stale in stale_conns:
+                self._safe_close_conn(stale)
 
-        conn = pooled_conn
-        if conn is not None and not self._is_conn_alive(conn):
-            self._safe_close_conn(conn)
-            conn = None
+            conn = pooled_conn
+            if conn is not None and not self._is_conn_alive(conn):
+                self._safe_close_conn(conn)
+                conn = None
 
-        if conn is None:
-            conn = cur_open_fn(profile, timeout_sec=timeout_sec)
+            pool_hit = conn is not None
+            with self._warm_lock:
+                if pool_hit:
+                    self._pool_hits += 1
+                else:
+                    self._pool_misses += 1
+            annotate_current_span(pool_hit=pool_hit)
+
+            if conn is None:
+                conn = cur_open_fn(profile, timeout_sec=timeout_sec)
 
         try:
             yield conn
@@ -374,9 +400,14 @@ class ConnectionHub:
     ) -> Generator[Any, None, None]:
         """按 connection_id 获取硬件级只读隔离会话上下文，退出时无条件执行 rollback() 并关闭连接."""
         profile = self.require_profile(connection_id)
-        conn = self.driver_manager.open_connection(
-            profile, timeout_sec=timeout_sec, readonly=True
-        )
+        with trace_span(
+            "db",
+            "readonly_session_open",
+            {"connection_id": connection_id, "db_type": profile.db_type},
+        ):
+            conn = self.driver_manager.open_connection(
+                profile, timeout_sec=timeout_sec, readonly=True
+            )
         try:
             yield conn
         finally:
@@ -392,47 +423,52 @@ class ConnectionHub:
 
     def test_profile(self, profile: ConnectionProfile) -> Dict[str, Any]:
         """执行真实数据库握手与版本/探针查询（绝不记录或返回明文密码）."""
-        t0 = time.perf_counter()
-        conn = self.driver_manager.open_connection(profile, timeout_sec=10)
-        server_version = ""
-        try:
-            if isinstance(conn, InceptorThriftClient):
-                rows = conn.execute_query("SHOW DATABASES", max_rows=20)
-                server_version = f"Inceptor/HiveServer2 (可见库 {len(rows)} 个)"
-            elif isinstance(conn, JdbcConnectionAdapter):
-                dbmd = conn.raw_jdbc_conn.getMetaData()
-                prod = str(dbmd.getDatabaseProductName() or profile.db_type)
-                ver = str(dbmd.getDatabaseProductVersion() or "")
-                server_version = f"{prod} {ver}".strip()
-            elif profile.db_type == "SQLITE":
-                cur = conn.execute("SELECT sqlite_version()")
-                row = cur.fetchone()
-                server_version = f"SQLite {row[0] if row else ''}".strip()
-            else:
-                cur = conn.cursor()
-                try:
-                    cur.execute("SELECT VERSION()")
-                    row = cur.fetchone()
-                    server_version = str(row[0] if row else "").splitlines()[0][:120]
-                finally:
-                    cur.close()
-        finally:
+        with trace_span(
+            "db",
+            "test_profile",
+            {"connection_id": profile.connection_id, "db_type": profile.db_type},
+        ):
+            t0 = time.perf_counter()
+            conn = self.driver_manager.open_connection(profile, timeout_sec=10)
+            server_version = ""
             try:
-                conn.close()
-            except Exception:
-                pass
+                if isinstance(conn, InceptorThriftClient):
+                    rows = conn.execute_query("SHOW DATABASES", max_rows=20)
+                    server_version = f"Inceptor/HiveServer2 (可见库 {len(rows)} 个)"
+                elif isinstance(conn, JdbcConnectionAdapter):
+                    dbmd = conn.raw_jdbc_conn.getMetaData()
+                    prod = str(dbmd.getDatabaseProductName() or profile.db_type)
+                    ver = str(dbmd.getDatabaseProductVersion() or "")
+                    server_version = f"{prod} {ver}".strip()
+                elif profile.db_type == "SQLITE":
+                    cur = conn.execute("SELECT sqlite_version()")
+                    row = cur.fetchone()
+                    server_version = f"SQLite {row[0] if row else ''}".strip()
+                else:
+                    cur = conn.cursor()
+                    try:
+                        cur.execute("SELECT VERSION()")
+                        row = cur.fetchone()
+                        server_version = str(row[0] if row else "").splitlines()[0][:120]
+                    finally:
+                        cur.close()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        return {
-            "ok": True,
-            "connection_id": profile.connection_id,
-            "name": profile.name,
-            "db_type": profile.db_type,
-            "driver_track": profile.driver_track,
-            "server_version": server_version,
-            "elapsed_ms": elapsed_ms,
-            "message": f"连接成功 ({elapsed_ms} ms)" + (f" · {server_version}" if server_version else ""),
-        }
+            elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            return {
+                "ok": True,
+                "connection_id": profile.connection_id,
+                "name": profile.name,
+                "db_type": profile.db_type,
+                "driver_track": profile.driver_track,
+                "server_version": server_version,
+                "elapsed_ms": elapsed_ms,
+                "message": f"连接成功 ({elapsed_ms} ms)" + (f" · {server_version}" if server_version else ""),
+            }
 
     def test_connection_by_id(self, connection_id: str) -> Dict[str, Any]:
         profile = self.require_profile(connection_id)

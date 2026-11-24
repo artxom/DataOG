@@ -5546,3 +5546,179 @@ dialog::backdrop {
 .ws-conn-prev-item .mono {
   overflow-wrap: anywhere;
 }
+
+/* =========================================================================
+   系统配置 · 全链路性能诊断与基准压测 (DiagnosticsView)
+   ========================================================================= */
+
+.diag-view-root {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.diag-options-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  padding-top: 4px;
+}
+
+.diag-check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--os-text-secondary);
+  cursor: pointer;
+}
+
+.diag-finding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.diag-finding-card {
+  padding: 9px 11px;
+  border-radius: 9px;
+  border: 0.5px solid var(--os-border);
+  background: var(--os-subtle-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.diag-finding-card.is-critical {
+  border-color: color-mix(in srgb, var(--status-danger) 42%, var(--os-border));
+  background: color-mix(in srgb, var(--status-danger) 6%, var(--os-win-bg));
+}
+
+.diag-finding-card.is-warn {
+  border-color: color-mix(in srgb, var(--status-warn) 42%, var(--os-border));
+  background: color-mix(in srgb, var(--status-warn) 6%, var(--os-win-bg));
+}
+
+.diag-finding-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.diag-finding-evidence {
+  font-size: 11.5px;
+  color: var(--os-text-secondary);
+  line-height: 1.45;
+}
+
+.diag-finding-suggestion {
+  font-size: 11.5px;
+  color: var(--os-text);
+  line-height: 1.45;
+}
+
+.diag-bench-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+@media (max-width: 960px) {
+  .diag-bench-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.diag-kv-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.diag-kv-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11.5px;
+  padding: 4px 0;
+  border-bottom: 0.5px solid var(--os-border);
+}
+
+.diag-kv-row:last-child {
+  border-bottom: none;
+}
+
+.diag-kv-lbl {
+  color: var(--os-text-secondary);
+}
+
+.diag-kv-val {
+  font-weight: 600;
+  color: var(--os-text);
+}
+
+.diag-table-wrap {
+  max-height: 340px;
+  overflow: auto;
+  border: 0.5px solid var(--os-border);
+  border-radius: 8px;
+  background: var(--os-subtle-bg);
+}
+
+.diag-trace-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.diag-trace-table th,
+.diag-trace-table td {
+  padding: 6px 8px;
+  text-align: left;
+  border-bottom: 0.5px solid var(--os-border);
+  vertical-align: middle;
+}
+
+.diag-trace-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--os-toolbar-bg);
+  color: var(--os-text-secondary);
+  font-weight: 600;
+}
+
+.diag-trace-table.is-interactive tbody tr {
+  cursor: pointer;
+}
+
+.diag-trace-table.is-interactive tbody tr:hover {
+  background: color-mix(in srgb, var(--os-accent) 8%, transparent);
+}
+
+.diag-trace-table tbody tr.is-slow-row {
+  background: color-mix(in srgb, var(--status-warn) 6%, transparent);
+}
+
+.diag-meta-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.diag-span-bar {
+  height: 3px;
+  margin-top: 3px;
+  border-radius: 999px;
+  background: var(--os-accent);
+  opacity: 0.75;
+}
+
+.diag-span-bar.is-hot {
+  background: var(--status-danger);
+  opacity: 0.9;
+}
