@@ -8,6 +8,28 @@
 
 ---
 
+## [3.3.0] - 2026-11-24
+
+> **Ed25519 签名同系列累积增量升级体系与 GitHub Release 双产物自动化发版**：围绕极速无痛升级痛点，正式确立 `3.3.0` 基线，在原有完整客户端 `DataOG-Windows-x64-vX.Y.Z.zip` 之外同步自动化构建 ~875 KB 的签名增量更新包 `DataOG-Update-vX.Y.Z.zip`——凡同二级版本（如 `3.3.0+` 均适用后续 `3.3.x` 增量包）均可跨修订号累积直接升级，并支持系统目录覆盖投放与应用内「系统配置 → 版本与升级」双渠道导入、防篡改鉴权、断电/崩溃自动回退与一键版本回滚。
+
+### Added
+- **纯标准库签名增量引导器与 PyInstaller 内核热挂载 (`update_bootstrap.py`, `core/app_kernel.py`, `app.py`)**：
+  - 将 `app.py` 拆解为极薄冻结启动壳 (`BASE_APP_VERSION`) 与可热更新的 FastAPI 内核 `core/app_kernel.py`（`APP_VERSION`，保持全部历史公开导出符号 100% 兼容）；
+  - 启动极早期执行零第三方依赖 `update_bootstrap.bootstrap_runtime_patch()`：复用内嵌混淆生产 Ed25519 公钥（与激活码及盾牌应答严格使用独立签名域前缀 `b"DataOG-Update-v1:"` 隔离）+ 全量 `code.zip`/`static/` SHA-256 清单双核验；
+  - 针对 PyInstaller `PyiFrozenImporter` 先于 `PathFinder` 机制，在 `sys.meta_path[0]` 挂载 `_VerifiedPatchMetaPathFinder` + `zipimport` 优先加载经签名的 `core.*` 与 `modules.*` 模块，配合 `resolve_static_dir()` 优先切换已验签补丁前端静态目录；
+  - 内置「同二级版本（`min_base_version = X.Y.0`）累积增量兼容、跨二级版本拒绝引导全量包」校验，ZIP-Slip/符号链接/Zip-Bomb/未签名多余文件与 `.py` 白名单防御，以及基于 `boot_guard.json`（连续启动异常阈值 `MAX_BOOT_FAILURES = 2`）、盘上篡改重验与 `rollback_active_patch_and_unload()` 启动期异常自愈回退与高底座自动退役。
+- **平台增量升级管理中枢与前端控制台 (`core/platform/{update_hub.py,routes/updates.py,storage_paths.py,context.py,router.py}`, `static/js/views/{updates_view.js,settings_view.js}`, `static/js/core/platform_api.js`)**：
+  - 所有增量包落盘至 Layer 2 混淆私有保险箱 `<private_root>/rt_upd/`（`storage_paths.py` 纳入 `rt_upd` 脱敏防线），对外 API 零物理路径泄露；
+  - 新增受 Gate 1/2 双门禁保护的 `/api/platform/updates/{status,inspect,upload,scan,rollback,reset-base,releases/{version}}` 路由；
+  - 新增 **「系统配置 → 版本与升级」** (`UpdatesView`，零 `innerHTML` 与 `<dialog>` 确认)：统一支持上传 `DataOG-Update-vX.Y.Z.zip` / `.dgp`、一键扫描 `<install_dir>/updates/`、查看待重启/兼容系列状态、一键回退至上一稳定补丁、恢复内置基础版本及清理非活动缓存补丁。
+- **确定性增量包构建器与 GitHub Release 双产物流水线 (`build_update_pack.py`, `build_exe.py`, `.github/workflows/ci.yml`, `.gitignore`)**：
+  - 新增 `build_update_pack.py` 确定性抽取纯业务代码 (`core/**/*.py` + `modules/**/*.py`) 与 `static/` 前端资源，严格剔除 `tests/`/`tools/`/`demo_sandbox/`/`.keygen_secrets/` 与原生源/二进制，输出 < 1 MB 的 `DataOG-Update-vX.Y.Z.zip`（含 `updates/DataOG-Update-vX.Y.Z.dgp` + `UPDATE_README.txt`）并在落盘前完成闭环验签自检；
+  - `.github/workflows/ci.yml` 在每次 `v*` 发版自动使用 `${{ secrets.DATAOG_UPDATE_SIGNING_KEY }}` 构建 `DataOG-Update-$version.zip`，追加 2 秒「增量包覆盖解压到 `DataOG.exe` 同级目录并以 `--smoke-test` 验证 `patch_active=True`」冻结态实测后，同步上传并发布 **完整客户端 + 签名增量包** 双产物至 GitHub Release；同步在 `build_exe.py` 注册 `--hidden-import=update_bootstrap`/`core.app_kernel` 并排除 `build_update_pack`。
+- **增量升级端到端与安全对抗回归测试 (`tests/test_incremental_updates.py`, `tests/test_modular_architecture.py`)**：
+  - 新增 6 项全面测试覆盖混淆路径与公钥字节一致性、同系列累积/跨系列拒绝策略、Ed25519 域隔离与单字节/多余文件/路径穿越/Zip-Bomb/白名单防篡改、真实子进程双渠道 `sys.meta_path` 加载/崩溃自愈/盘上篡改/`boot_guard` 自动回退、Gate 2 零路径泄露 API 闭环与 Node.js 前端 DOM 渲染（全套自动化测试扩展至 **103 项**）。
+
+---
+
 ## [3.2.4] - 2026-11-24
 
 > **数据标准对标「部分落标 (`PARTIAL_COMPLIANT`)」状态区分与满足标准展示**：在对标核验时，若字段英文名符合数据标准但物理类型不满足当前所选落标标准、却符合同一标准下其他可选落标标准（如仓库DWS、集市、ArgoDB、Oracle、达梦、MySQL、OceanBase、GoldenDB 等）的物理类型要求，系统将其精准区分为「部分落标」并列出所满足的具体标准名称及物理类型。

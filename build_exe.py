@@ -263,10 +263,11 @@ def build_executable(skip_tests: Optional[bool] = None) -> None:
         "uvicorn.protocols.websockets",
         "anyio._backends._trio",
         "anyio.pytest_plugin",
-        # 严禁将单元测试、激活码生成器构建工具与本地演示沙箱打入客户版安装包
+        # 严禁将单元测试、激活码生成器构建工具、本地演示沙箱与增量包构建脚本打入客户版安装包
         "tests",
         "tools",
         "demo_sandbox",
+        "build_update_pack",
     ]
 
     pyinstaller_args = [
@@ -292,6 +293,8 @@ def build_executable(skip_tests: Optional[bool] = None) -> None:
         "--collect-submodules=psycopg2",
         "--collect-submodules=core",
         "--collect-submodules=modules",
+        "--hidden-import=update_bootstrap",
+        "--hidden-import=core.app_kernel",
         "--hidden-import=h11",
         "--hidden-import=et_xmlfile",
     ]

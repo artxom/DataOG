@@ -24,9 +24,9 @@ description: >-
 
 ## 2. 同步版本声明（必查清单）
 
-将新版本号 `X.Y.Z` 精确同步到以下 6 个位置：
+将新版本号 `X.Y.Z` 精确同步到以下 6 个位置（CI 会在每次 `v*` 标签同时打包发布完整客户端 `DataOG-Windows-x64-vX.Y.Z.zip` 与签名同系列累积增量更新包 `DataOG-Update-vX.Y.Z.zip`）：
 
-1. `app.py`：FastAPI 实例参数 `version="X.Y.Z"`、`APP_VERSION = "X.Y.Z"` 与启动横幅中的 `Data.O.G vX.Y.Z`。
+1. `app.py` 与 `core/app_kernel.py`：`app.py` 中的 `BASE_APP_VERSION = "X.Y.Z"`，以及 `core/app_kernel.py` 中的 `APP_VERSION = "X.Y.Z"`（`FastAPI(version=APP_VERSION)` 与启动横幅共用该常量）。
 2. `core/platform/context.py`：`self.app_version = "X.Y.Z"` 及 `build_platform_bootstrap()` 返回字典中的 `"version": "X.Y.Z"`。
 3. `static/index.html`：`<meta name="dataog-ui-version" content="X.Y.Z" />`。
 4. `CHANGELOG.md`：将 `## [Unreleased]` 下已完成的变更归并至新建章节 `## [X.Y.Z] - YYYY-MM-DD`（同类型 `### Added` / `### Changed` / `### Fixed` / `### Security` 合并去重），并保留空的 `## [Unreleased]` 标题供下一次迭代使用。

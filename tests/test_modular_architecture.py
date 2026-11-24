@@ -676,6 +676,7 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
             "core.platform.routes.standards",
             "core.platform.routes.workspaces",
             "core.platform.routes.diagnostics",
+            "core.platform.routes.updates",
             "modules.standard_migrator.router",
             "modules.cross_comparator.router",
             "modules.ddl_translator.router",
