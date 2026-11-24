@@ -2611,6 +2611,153 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             self.assertEqual(after_swap["col_b"]["std_code"], "QM_SWAP_A")
             self.assertEqual(after_swap["col_a"]["std_code"], "QM_SWAP_B")
 
+    def test_evaluate_column_compliance_partial_alt_standard(self) -> None:
+        """验证字段名符合但物理类型不符当前落标标准、却满足其他可选落标标准时区分判定为 PARTIAL_COMPLIANT."""
+        from core.platform.context import PlatformContext
+        from core.platform.models import ColumnMeta, TableMeta
+        from core.platform.standard_catalog import StandardCatalog
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            try:
+                cat = ctx.standard_catalog
+                std_item = cat.upsert_item(
+                    {
+                        "std_code": "STD_PART_001",
+                        "cn_name": "客户账号",
+                        "en_abbr": "CUST_ACCT_NO",
+                        "type_dws": "NVARCHAR2(50)",
+                        "type_dw_mart": "VARCHAR2(50)",
+                        "type_argodb": "VARCHAR(20)",
+                        "type_mysql": "VARCHAR(32)",
+                        "type_oracle": "VARCHAR2(40)",
+                        "type_dameng": "VARCHAR(40)",
+                        "type_ob_oracle": "/",
+                        "type_ob_mysql": "",
+                    }
+                )
+
+                # 1. 字段名与注释一致，类型不符当前 DWS(NVARCHAR2(50))，但满足 Oracle(VARCHAR2(40)) 与 达梦(VARCHAR(40))
+                ev_partial = StandardCatalog.evaluate_column_compliance(
+                    col_name="cust_acct_no",
+                    col_type="VARCHAR2(40)",
+                    col_comment="客户账号",
+                    std_item=std_item,
+                    std_code="STD_PART_001",
+                    db_type="DWS",
+                    format_profile="type_dws",
+                )
+                self.assertEqual(ev_partial["status"], "PARTIAL_COMPLIANT")
+                self.assertEqual(ev_partial["label"], "部分落标")
+                self.assertTrue(ev_partial["name_ok"])
+                self.assertFalse(ev_partial["type_ok"])
+                self.assertTrue(ev_partial["comment_ok"])
+                self.assertEqual(ev_partial["target_type"], "NVARCHAR2(50)")
+                self.assertEqual(ev_partial["resolved_format_profile"], "type_dws")
+                matched_vals = [p["value"] for p in ev_partial["matched_alt_profiles"]]
+                self.assertEqual(matched_vals, ["type_oracle", "type_dameng"])
+                self.assertIn("符合其他落标", ev_partial["detail"])
+                self.assertIn("Oracle物理类型(VARCHAR2(40))", ev_partial["detail"])
+                self.assertIn("DaMeng数据格式(VARCHAR(40))", ev_partial["detail"])
+
+                # 2. 注释缺失但类型仍命中其他标准 -> 仍判定为 PARTIAL_COMPLIANT 并标注差注释
+                ev_partial_no_comm = StandardCatalog.evaluate_column_compliance(
+                    col_name="cust_acct_no",
+                    col_type="VARCHAR(40)",
+                    col_comment="账号",
+                    std_item=std_item,
+                    std_code="STD_PART_001",
+                    db_type="DWS",
+                    format_profile="type_dws",
+                )
+                self.assertEqual(ev_partial_no_comm["status"], "PARTIAL_COMPLIANT")
+                self.assertFalse(ev_partial_no_comm["comment_ok"])
+                self.assertIn("注释缺失标准名「客户账号」", ev_partial_no_comm["current_diff"])
+                self.assertIn("符合其他落标类型（仅差注释）", ev_partial_no_comm["detail"])
+
+                # 3. 字段名不符时即使类型命中其他标准也必须维持 NON_COMPLIANT
+                ev_bad_name = StandardCatalog.evaluate_column_compliance(
+                    col_name="legacy_acct_col",
+                    col_type="VARCHAR2(40)",
+                    col_comment="客户账号",
+                    std_item=std_item,
+                    std_code="STD_PART_001",
+                    db_type="DWS",
+                    format_profile="type_dws",
+                )
+                self.assertEqual(ev_bad_name["status"], "NON_COMPLIANT")
+                self.assertEqual(ev_bad_name["matched_alt_profiles"], [])
+
+                # 4. 字段名一致但任何标准均不匹配 -> NON_COMPLIANT
+                ev_bad_type = StandardCatalog.evaluate_column_compliance(
+                    col_name="cust_acct_no",
+                    col_type="VARCHAR(15)",
+                    col_comment="客户账号",
+                    std_item=std_item,
+                    std_code="STD_PART_001",
+                    db_type="DWS",
+                    format_profile="type_dws",
+                )
+                self.assertEqual(ev_bad_type["status"], "NON_COMPLIANT")
+                self.assertEqual(ev_bad_type["matched_alt_profiles"], [])
+
+                # 5. AUTO 模式下自动解析到 type_dws 时，满足 type_argodb 应返回 PARTIAL_COMPLIANT 且排除 type_dws
+                ev_auto = StandardCatalog.evaluate_column_compliance(
+                    col_name="CUST_ACCT_NO",
+                    col_type="VARCHAR(20)",
+                    col_comment="客户账号",
+                    std_item=std_item,
+                    std_code="STD_PART_001",
+                    db_type="DWS",
+                    format_profile="AUTO",
+                )
+                self.assertEqual(ev_auto["status"], "PARTIAL_COMPLIANT")
+                self.assertEqual(ev_auto["resolved_format_profile"], "type_dws")
+                self.assertEqual(
+                    [p["value"] for p in ev_auto["matched_alt_profiles"]],
+                    ["type_argodb"],
+                )
+
+                # 6. get_connection_binding_stats 正确聚合并返回 partial_compliant_count
+                cid = "conn_partial_stats"
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name="dwd",
+                        table_name="t_mix",
+                        columns=[
+                            ColumnMeta(column_name="c_ok", data_type="varchar(32)", ordinal_position=1),
+                            ColumnMeta(column_name="c_part", data_type="varchar(40)", ordinal_position=2),
+                            ColumnMeta(column_name="c_comm", data_type="varchar(32)", ordinal_position=3),
+                            ColumnMeta(column_name="c_bad", data_type="int", ordinal_position=4),
+                        ],
+                    ),
+                )
+                cat.upsert_field_bindings(
+                    cid,
+                    [
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": c, "std_code": "STD_PART_001"}
+                        for c in ("c_ok", "c_part", "c_comm", "c_bad")
+                    ],
+                )
+                cat.update_binding_compliance_batch(
+                    cid,
+                    [
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": "c_ok", "compliance_status": "COMPLIANT", "compliance_detail": "ok"},
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": "c_part", "compliance_status": "PARTIAL_COMPLIANT", "compliance_detail": "part"},
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": "c_comm", "compliance_status": "COMMENT_ONLY", "compliance_detail": "comm"},
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": "c_bad", "compliance_status": "NON_COMPLIANT", "compliance_detail": "bad"},
+                    ],
+                )
+                stats = cat.get_connection_binding_stats(cid)["dwd.t_mix"]
+                self.assertEqual(stats["bound_count"], 4)
+                self.assertEqual(stats["compliant_count"], 1)
+                self.assertEqual(stats["partial_compliant_count"], 1)
+                self.assertEqual(stats["comment_only_count"], 1)
+                self.assertEqual(stats["non_compliant_count"], 1)
+            finally:
+                ctx.close()
+
 
 if __name__ == "__main__":
     unittest.main()

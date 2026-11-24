@@ -5044,6 +5044,187 @@ view.destroy();
                 self.assertIn("onlyBoundTables", m_txt)
                 self.assertIn("defaultChecked: true", m_txt)
 
+    def test_partial_compliance_api_switch_format_and_offline_reports(self) -> None:
+        """端到端验证 PARTIAL_COMPLIANT（部分落标）核验、切换落标标准转正、入队、离线报告及跨环境比对透传."""
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src_sqlite = os.path.join(tmpdir, "src.db")
+            tgt_sqlite = os.path.join(tmpdir, "tgt.db")
+            with contextlib.closing(sqlite3.connect(src_sqlite)) as c:
+                c.execute("CREATE TABLE ods_acct (acct_no VARCHAR(50), bad_col INT)")
+                c.commit()
+            with contextlib.closing(sqlite3.connect(tgt_sqlite)) as c:
+                c.execute("CREATE TABLE dwd_acct (acct_no VARCHAR(40), bad_col INT)")
+                c.commit()
+
+            ctx = PlatformContext(
+                db_path=os.path.join(tmpdir, "dataog_state.db"),
+                drivers_dir=os.path.join(tmpdir, "drivers"),
+                assets_dir=os.path.join(tmpdir, "assets"),
+            )
+            try:
+                app = create_app(ctx=ctx)
+                client = TestClient(app)
+
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_ACCT_01",
+                        "cn_name": "账号",
+                        "en_abbr": "ACCT_NO",
+                        "type_dws": "NVARCHAR2(50)",
+                        "type_oracle": "VARCHAR2(40)",
+                        "type_mysql": "VARCHAR(20)",
+                    }
+                )
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_BAD_01",
+                        "cn_name": "状态码",
+                        "en_abbr": "STATUS_CD",
+                        "type_dws": "CHAR(1)",
+                        "type_oracle": "CHAR(1)",
+                    }
+                )
+
+                src_cid = client.post(
+                    "/api/platform/connections",
+                    json={
+                        "name": "源端库",
+                        "driver_track": "NATIVE",
+                        "db_type": "SQLITE",
+                        "sqlite_path": src_sqlite,
+                        "standard_format": "type_dws",
+                        "auto_refresh_metadata": True,
+                    },
+                ).json()["connection"]["connection_id"]
+                tgt_cid = client.post(
+                    "/api/platform/connections",
+                    json={
+                        "name": "目标库",
+                        "driver_track": "NATIVE",
+                        "db_type": "SQLITE",
+                        "sqlite_path": tgt_sqlite,
+                        "standard_format": "type_dws",
+                        "auto_refresh_metadata": True,
+                    },
+                ).json()["connection"]["connection_id"]
+
+                r_save = client.post(
+                    "/api/modules/standard_migrator/bindings/save",
+                    json={
+                        "connection_id": tgt_cid,
+                        "format_profile": "type_dws",
+                        "active_schema": "main",
+                        "active_table": "dwd_acct",
+                        "bindings": [
+                            {"schema_name": "main", "table_name": "dwd_acct", "column_name": "acct_no", "std_code": "STD_ACCT_01"},
+                            {"schema_name": "main", "table_name": "dwd_acct", "column_name": "bad_col", "std_code": "STD_BAD_01"},
+                        ],
+                    },
+                ).json()
+                self.assertTrue(r_save["ok"])
+                self.assertEqual(r_save["summary"]["partial_compliant_cols"], 1)
+                self.assertEqual(r_save["summary"]["non_compliant_cols"], 1)
+                self.assertEqual(r_save["table_stats"]["main.dwd_acct"]["partial_compliant_count"], 1)
+
+                cols = {c["column_name"]: c for c in r_save["columns"]}
+                self.assertEqual(cols["acct_no"]["compliance_status"], "PARTIAL_COMPLIANT")
+                self.assertEqual(cols["acct_no"]["compliance_label"], "部分落标")
+                self.assertEqual(
+                    [p["value"] for p in cols["acct_no"]["matched_alt_profiles"]],
+                    ["type_oracle"],
+                )
+                self.assertEqual(cols["bad_col"]["compliance_status"], "NON_COMPLIANT")
+
+                # 单库离线 Excel 与 HTML 报告正确呈现「部分落标」及命中的落标标准
+                r_xlsx = client.get(
+                    f"/api/modules/standard_migrator/bindings/report.xlsx?connection_id={tgt_cid}&format_profile=type_dws"
+                )
+                self.assertEqual(r_xlsx.status_code, 200)
+                wb = openpyxl.load_workbook(io.BytesIO(r_xlsx.content))
+                sheet_rows = list(wb.active.iter_rows(min_row=2, values_only=True))
+                acct_row = next(row for row in sheet_rows if row[6] == "acct_no")
+                self.assertEqual(acct_row[14], "部分落标")
+                self.assertIn("Oracle物理类型(VARCHAR2(40))", acct_row[15])
+                wb.close()
+
+                r_html = client.get(
+                    f"/api/modules/standard_migrator/bindings/report.html?connection_id={tgt_cid}&format_profile=type_dws"
+                )
+                self.assertEqual(r_html.status_code, 200)
+                self.assertIn("PARTIAL_COMPLIANT", r_html.text)
+                self.assertIn("部分落标", r_html.text)
+                self.assertIn("Oracle物理类型", r_html.text)
+
+                # PARTIAL_COMPLIANT 字段可正常纳入贯标队列向当前选择标准改造
+                r_stage = client.post(
+                    "/api/modules/standard_migrator/bindings/stage-migration",
+                    json={
+                        "connection_id": tgt_cid,
+                        "schema_name": "main",
+                        "table_name": "dwd_acct",
+                        "column_names": ["acct_no"],
+                        "format_profile": "type_dws",
+                    },
+                ).json()
+                self.assertTrue(r_stage["ok"])
+                self.assertEqual(r_stage["staged_count"], 1)
+                self.assertEqual(r_stage["items"][0]["new_col_type"], "NVARCHAR2(50)")
+
+                # 跨环境比对透传 target_compliance.status == PARTIAL_COMPLIANT 且离线报告正确输出
+                client.post("/api/modules/cross_comparator/bind-role", json={"role": "source", "connection_id": src_cid, "auto_refresh": True})
+                client.post("/api/modules/cross_comparator/bind-role", json={"role": "target", "connection_id": tgt_cid, "auto_refresh": True})
+                client.post(
+                    "/api/modules/cross_comparator/pairings/save",
+                    json={
+                        "std_table_key": "main.dwd_acct",
+                        "source_schema": "main",
+                        "source_table": "ods_acct",
+                        "target_schema": "main",
+                        "target_table": "dwd_acct",
+                        "sync_to_field_bindings": False,
+                        "pairings": [
+                            {
+                                "source_col": "acct_no",
+                                "target_col": "acct_no",
+                                "source_std_code": "STD_ACCT_01",
+                                "target_std_code": "STD_ACCT_01",
+                            }
+                        ],
+                    },
+                )
+                r_cross = client.get(
+                    "/api/modules/cross_comparator/overview"
+                    "?source_schema=main&source_table=ods_acct"
+                    "&target_schema=main&target_table=dwd_acct"
+                ).json()
+                dual_by_tgt = {
+                    (r["target_col"]["column_name"] if r["target_col"] else ""): r
+                    for r in r_cross["active_comparison"]["dual_rows"]
+                }
+                self.assertEqual(dual_by_tgt["acct_no"]["target_compliance"]["status"], "PARTIAL_COMPLIANT")
+                self.assertTrue(dual_by_tgt["acct_no"]["target_needs_migration"])
+
+                r_cross_html = client.get("/api/modules/cross_comparator/report.html")
+                self.assertEqual(r_cross_html.status_code, 200)
+                self.assertIn("PARTIAL_COMPLIANT", r_cross_html.text)
+                self.assertIn("部分落标", r_cross_html.text)
+
+                # 切换目标库落标标准为 type_oracle 后，acct_no 自动脱离 PARTIAL_COMPLIANT
+                client.put(
+                    f"/api/platform/connections/{tgt_cid}/standard-format",
+                    json={"standard_format": "type_oracle"},
+                )
+                r_after = client.get(
+                    f"/api/modules/standard_migrator/bindings/table?connection_id={tgt_cid}&schema_name=main&table_name=dwd_acct"
+                ).json()
+                cols_after = {c["column_name"]: c for c in r_after["columns"]}
+                self.assertEqual(cols_after["acct_no"]["compliance_status"], "COMMENT_ONLY")
+                self.assertEqual(r_after["summary"]["partial_compliant_cols"], 0)
+            finally:
+                ctx.close()
+
 
 if __name__ == "__main__":
     unittest.main()

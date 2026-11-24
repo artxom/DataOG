@@ -37,6 +37,7 @@ const MIG_STATUS_META = {
 const COMP_STATUS_META = {
   COMPLIANT: { label: "已落标", tone: "success" },
   COMMENT_ONLY: { label: "仅差注释", tone: "info" },
+  PARTIAL_COMPLIANT: { label: "部分落标", tone: "warn" },
   NON_COMPLIANT: { label: "未落标", tone: "danger" },
   STD_MISSING: { label: "标准缺失", tone: "warn" },
   UNBOUND: { label: "未绑标", tone: "muted" },
@@ -84,7 +85,7 @@ export class StandardMigratorView {
     this.formatProfiles = DEFAULT_FORMAT_PROFILES;
     this.tableStats = {};
     this.tableCheck = null;
-    this.bindingFilter = "ALL"; // ALL | COMPLIANT | COMMENT_ONLY | NON_COMPLIANT | UNBOUND
+    this.bindingFilter = "ALL"; // ALL | COMPLIANT | COMMENT_ONLY | PARTIAL_COMPLIANT | NON_COMPLIANT | UNBOUND
     this.bindingKeyword = "";
     this.selectedBindCols = new Set();
     this._stagingInFlight = false;
@@ -163,15 +164,17 @@ export class StandardMigratorView {
         const key = `${String(schemaName || "public").toLowerCase()}.${String(tbl.table_name || "").toLowerCase()}`;
         const st = this.tableStats[key];
         if (!st || !st.bound_count) return null;
+        const partialCnt = st.partial_compliant_count || 0;
         const tone =
-          st.non_compliant_count > 0
+          st.non_compliant_count > 0 || partialCnt > 0
             ? "warn"
             : st.compliant_count >= st.bound_count
             ? "success"
             : "info";
         const bEl = badge(`${st.compliant_count}/${st.bound_count}`, tone);
+        const partialHint = partialCnt > 0 ? `，含部分落标 ${partialCnt}` : "";
         const totalHint = st.total_cols ? `（物理表共 ${st.total_cols} 列）` : "";
-        bEl.title = `已落标 ${st.compliant_count} / 已绑标 ${st.bound_count}${totalHint}`;
+        bEl.title = `已落标 ${st.compliant_count} / 已绑标 ${st.bound_count}${partialHint}${totalHint}`;
         return bEl;
       },
     });
@@ -885,6 +888,9 @@ export class StandardMigratorView {
         return false;
       }
       if (!kw) return true;
+      const altTxt = (c.matched_alt_profiles || [])
+        .map((p) => `${p.label || ""} ${p.short_label || ""} ${p.target_type || ""}`)
+        .join(" ");
       return [
         c.column_name,
         c.column_comment,
@@ -892,6 +898,8 @@ export class StandardMigratorView {
         c.std_cn_name,
         c.std_en_abbr,
         c.std_domain_name,
+        c.compliance_detail,
+        altTxt,
       ].some((v) => String(v || "").toLowerCase().includes(kw));
     });
   }
@@ -1006,6 +1014,7 @@ export class StandardMigratorView {
       { key: "ALL", label: `全部 ${sum.total_cols ?? 0}` },
       { key: "COMPLIANT", label: `已落标 ${sum.compliant_cols ?? 0}` },
       { key: "COMMENT_ONLY", label: `仅差注释 ${sum.comment_only_cols ?? 0}` },
+      { key: "PARTIAL_COMPLIANT", label: `部分落标 ${sum.partial_compliant_cols ?? 0}` },
       { key: "NON_COMPLIANT", label: `未落标 ${sum.non_compliant_cols ?? 0}` },
       { key: "UNBOUND", label: `未绑标 ${sum.unbound_cols ?? 0}` },
     ];
@@ -1194,14 +1203,42 @@ export class StandardMigratorView {
           label: "落标核验结果",
           render: (r) => {
             const meta = COMP_STATUS_META[r.compliance_status] || { label: r.compliance_status, tone: "muted" };
+            const altProfiles = Array.isArray(r.matched_alt_profiles) ? r.matched_alt_profiles : [];
+            const isPartial = r.compliance_status === "PARTIAL_COMPLIANT" && altProfiles.length > 0;
+            const altTitle = isPartial
+              ? `符合其他落标：${altProfiles
+                  .map((p) => `${p.label || p.value}${p.target_type ? ` (${p.target_type})` : ""}`)
+                  .join("、")}`
+              : "";
+            const detailTxt = isPartial ? (r.compliance_current_diff || r.compliance_detail) : r.compliance_detail;
             return el(
               "div",
               {},
               statusDot(meta.label, meta.tone),
-              r.compliance_status !== "COMPLIANT" && r.compliance_detail
+              isPartial
+                ? el(
+                    "div",
+                    {
+                      style: {
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "4px",
+                        flexWrap: "wrap",
+                        marginTop: "3px",
+                      },
+                      title: altTitle,
+                    },
+                    el("span", { style: { fontSize: "10.5px", color: "var(--os-muted)" }, text: "满足:" }),
+                    altProfiles.slice(0, 2).map((p) =>
+                      badge(`${p.label || p.value}${p.target_type ? ` · ${p.target_type}` : ""}`, "warn")
+                    ),
+                    altProfiles.length > 2 ? badge(`+${altProfiles.length - 2} 项`, "neutral") : null
+                  )
+                : null,
+              r.compliance_status !== "COMPLIANT" && detailTxt
                 ? el("div", {
                     style: { fontSize: "11px", color: "var(--os-muted)", marginTop: "2px" },
-                    text: r.compliance_detail,
+                    text: detailTxt,
                   })
                 : null
             );

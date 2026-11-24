@@ -8,6 +8,22 @@
 
 ---
 
+## [3.2.4] - 2026-11-24
+
+> **数据标准对标「部分落标 (`PARTIAL_COMPLIANT`)」状态区分与满足标准展示**：在对标核验时，若字段英文名符合数据标准但物理类型不满足当前所选落标标准、却符合同一标准下其他可选落标标准（如仓库DWS、集市、ArgoDB、Oracle、达梦、MySQL、OceanBase、GoldenDB 等）的物理类型要求，系统将其精准区分为「部分落标」并列出所满足的具体标准名称及物理类型。
+
+### Added
+- **数据标准跨格式档「部分落标」核验判定与统计 (`core/platform/standard_catalog.py`, `modules/standard_migrator/{bindings_mixin.py,report_mixin.py}`, `modules/cross_comparator/service.py`)**：
+  - 新增 `StandardCatalog.resolve_physical_type_with_profile()` 与 `StandardCatalog.find_matching_alt_profiles()`，在严格排除当前选定/实际解析标准及空占位值（`/`、`#N/A`）后，基于归一化类型等价比对匹配同一标准下其他物理格式档。
+  - 升级 `StandardCatalog.evaluate_column_compliance()`：当字段名匹配、当前类型不匹配但命中至少一个其他可选落标标准时，返回 `status="PARTIAL_COMPLIANT"`、`label="部分落标"`、`matched_alt_profiles` 清单及 `current_diff` 当前差异；`get_connection_binding_stats()` 与单库核验统计新增 `partial_compliant_count` / `partial_compliant_cols` 聚合；允许 `PARTIAL_COMPLIANT` 字段按需纳入贯标队列向当前标准改造；跨环境比对 `target_compliance` 同步透传 `PARTIAL_COMPLIANT` 状态。
+- **前端工作台与离线报告全方位区分展示 (`static/js/views/{standard_migrator_view.js,cross_comparator_view.js}`, `core/platform/offline_report/{single_db.py,cross_env.py}`)**：
+  - 单库「字段落标绑定与核验」新增 **「部分落标」** 筛选胶囊与琥珀色圆点指示，在结果列安全展示 `满足:` 标准标签及类型（超出 2 项折叠 `+N 项` 悬浮展开全部）和当前差异；左侧目录树表徽标同步感知部分落标并附提示；跨环境目标字段芯片直接标注「部分落标」与满足标准详情。
+  - 单库离线 HTML 交互报告新增 `PARTIAL_COMPLIANT` 筛选项、汇总矩阵「部分落标」列、KPI 待整改计数及表/字段满足标准胶囊；单库 Excel 与跨环境离线 HTML/Excel 报告均完整呈现「部分落标」状态、黄色高亮标签与满足的标准名称明细。
+- **单元与端到端回归测试 (`tests/test_platform.py`, `tests/test_modules_and_api.py`)**：
+  - 新增 `test_evaluate_column_compliance_partial_alt_standard` 与 `test_partial_compliance_api_switch_format_and_offline_reports`（总测试增至 97 项）。
+
+---
+
 ## [3.2.3] - 2026-11-24
 
 > **内网环境「落标/跨环境比对」全链路性能核爆级治理（消灭 77s 端到端卡顿、214ms SQLite 反复开关库、684ms 锁竞争与 244ms Gate 1 主线程阻塞）**：基于内网诊断面板实测线索，一次性根除 `get_connection_binding_stats()` 引发的 SQLite O(N×M) 平方级扫描、每次操作重复开闭 SQLite 触发的 EDR 扫描风暴、Gate 1 同步阻塞 FastAPI 事件循环及落标核验/跨环境报告内部的 N+1 逐表读写循环。

@@ -3,7 +3,7 @@
 核心职责：
 1. 统一维护平台级唯一一套最新「标准字典」（以 `数据项编号` `std_code` 为主键），完整兼容 46 列银行/金融行业数据字典 Excel 格式；
 2. 采用流式只读解析与单事务批量 Upsert，秒级导入 2.6 万+ 条数据标准并保留既有表字段绑定关系；
-3. 根据目标数据库方言 (`db_type`) 与用户选择的物理格式档 (`format_profile`) 智能解析标准目标类型，并提供三级落标核验 (`COMPLIANT` / `COMMENT_ONLY` / `NON_COMPLIANT` / `UNBOUND`)；
+3. 根据目标数据库方言 (`db_type`) 与用户选择的物理格式档 (`format_profile`) 智能解析标准目标类型，并提供分级落标核验 (`COMPLIANT` / `COMMENT_ONLY` / `PARTIAL_COMPLIANT` / `NON_COMPLIANT` / `UNBOUND` / `STD_MISSING`)；
 4. 按数据源持久化字段级数标绑定 (`field_standard_bindings`)，无缝供给「2. 落标绑定与贯标」与「3. 跨环境比对」共享复用。
 """
 
@@ -22,7 +22,11 @@ from openpyxl.utils import get_column_letter
 from core.excel_formula import EXCEL_ERROR_TOKENS, ResolvedWorkbook, clean_excel_cell_str
 from core.excel_handler import validate_xlsx_bytes
 from core.platform.diagnostics_hub import trace_span
-from core.platform.dialects import clean_identifier_input, is_cross_type_compatible
+from core.platform.dialects import (
+    clean_identifier_input,
+    is_cross_type_compatible,
+    normalize_cross_type,
+)
 from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.storage import PlatformStateStore
 
@@ -91,6 +95,20 @@ FORMAT_PROFILES: Tuple[Dict[str, str], ...] = (
 )
 
 VALID_FORMAT_PROFILE_VALUES = {p["value"] for p in FORMAT_PROFILES}
+
+FORMAT_PROFILE_SHORT_LABELS: Dict[str, str] = {
+    "AUTO": "自动",
+    "type_dws": "DWS",
+    "type_dw_mart": "集市",
+    "type_argodb": "Argo",
+    "type_mysql": "MySQL",
+    "type_oracle": "Oracle",
+    "type_ob_oracle": "OB-O",
+    "type_ob_mysql": "OB-M",
+    "type_oceanbase": "OB",
+    "type_dameng": "达梦",
+    "type_goldendb": "Golden",
+}
 
 # SQLite 表专用列清单（与 storage.py standard_dictionary 对齐）
 DICT_COLUMNS: Tuple[str, ...] = (
@@ -1145,18 +1163,18 @@ class StandardCatalog:
         return buf.getvalue()
 
     @staticmethod
-    def resolve_physical_type(
+    def resolve_physical_type_with_profile(
         std_item: Dict[str, Any],
         *,
         db_type: str = "DWS",
         format_profile: str = "AUTO",
-    ) -> str:
-        """按数据源类型与指定格式档智能解析标准目标物理数据类型."""
+    ) -> Tuple[str, str]:
+        """按数据源类型与指定格式档智能解析标准目标物理数据类型，并返回 (目标类型, 命中格式档键)."""
         prof = (format_profile or "AUTO").strip()
         if prof in VALID_FORMAT_PROFILE_VALUES and prof != "AUTO":
             picked = _clean_cell(std_item.get(prof), treat_slash_empty=True)
             if picked:
-                return picked
+                return picked, prof
 
         dt = (db_type or "DWS").strip().upper()
         if dt in ("DWS", "PGSQL", "KINGBASE"):
@@ -1175,22 +1193,70 @@ class StandardCatalog:
         for k in chain:
             val = _clean_cell(std_item.get(k), treat_slash_empty=True)
             if val:
-                return val
+                return val, k
 
         # 若物理格式列全空，按最大长度与精度兜底推导
         dcat = str(std_item.get("data_category") or "")
         max_len = _clean_cell(std_item.get("max_length"), treat_slash_empty=True)
         min_scale = _clean_cell(std_item.get("min_scale"), treat_slash_empty=True)
         if "日期" in dcat:
-            return "DATE"
+            return "DATE", ""
         if "时间" in dcat:
-            return "TIMESTAMP"
+            return "TIMESTAMP", ""
         if any(k in dcat for k in ("金额", "数值", "比例")) and max_len.isdigit():
             sc = min_scale if min_scale.isdigit() else "2"
-            return f"DECIMAL({max_len},{sc})"
+            return f"DECIMAL({max_len},{sc})", ""
         if max_len.isdigit():
-            return f"VARCHAR({max_len})"
-        return "VARCHAR(64)"
+            return f"VARCHAR({max_len})", ""
+        return "VARCHAR(64)", ""
+
+    @staticmethod
+    def resolve_physical_type(
+        std_item: Dict[str, Any],
+        *,
+        db_type: str = "DWS",
+        format_profile: str = "AUTO",
+    ) -> str:
+        """按数据源类型与指定格式档智能解析标准目标物理数据类型."""
+        return StandardCatalog.resolve_physical_type_with_profile(
+            std_item, db_type=db_type, format_profile=format_profile
+        )[0]
+
+    @staticmethod
+    def find_matching_alt_profiles(
+        std_item: Optional[Dict[str, Any]],
+        *,
+        col_type: str,
+        exclude_profiles: Iterable[str] = (),
+    ) -> List[Dict[str, str]]:
+        """检查实际字段物理类型是否符合同一数据标准下其他物理格式档要求."""
+        if not std_item:
+            return []
+        norm_actual = normalize_cross_type(col_type or "")
+        if not norm_actual:
+            return []
+        excluded = {
+            str(p or "").strip() for p in (exclude_profiles or ()) if str(p or "").strip()
+        }
+        matched: List[Dict[str, str]] = []
+        for prof in FORMAT_PROFILES:
+            pval = prof["value"]
+            if pval == "AUTO" or pval in excluded:
+                continue
+            cand_type = _clean_cell(std_item.get(pval), treat_slash_empty=True)
+            if not cand_type:
+                continue
+            norm_cand = normalize_cross_type(cand_type)
+            if norm_cand and norm_actual == norm_cand:
+                matched.append(
+                    {
+                        "value": pval,
+                        "label": prof["label"],
+                        "short_label": FORMAT_PROFILE_SHORT_LABELS.get(pval, prof["label"]),
+                        "target_type": cand_type,
+                    }
+                )
+        return matched
 
     @classmethod
     def evaluate_column_compliance(
@@ -1204,30 +1270,37 @@ class StandardCatalog:
         db_type: str = "DWS",
         format_profile: str = "AUTO",
     ) -> Dict[str, Any]:
-        """三维分级落标核验（字段英文名 + 物理类型归一化为硬指标，中文注释包含为次级指标）."""
+        """分级落标核验（字段英文名 + 物理类型归一化为硬指标，中文注释包含为次级指标；不符当前标准但命中其他标准时标为部分落标）."""
         code = _clean_cell(std_code, treat_slash_empty=True)
         if not code:
             return {
                 "status": "UNBOUND",
                 "label": "未绑标",
                 "detail": "尚未绑定数据标准",
+                "current_diff": "",
                 "target_type": "",
+                "resolved_format_profile": "",
+                "matched_alt_profiles": [],
                 "name_ok": False,
                 "type_ok": False,
                 "comment_ok": False,
             }
         if not std_item:
+            missing_msg = f"标准字典中未找到编号 [{code}]"
             return {
                 "status": "STD_MISSING",
                 "label": "标准缺失",
-                "detail": f"标准字典中未找到编号 [{code}]",
+                "detail": missing_msg,
+                "current_diff": missing_msg,
                 "target_type": "",
+                "resolved_format_profile": "",
+                "matched_alt_profiles": [],
                 "name_ok": False,
                 "type_ok": False,
                 "comment_ok": False,
             }
 
-        target_type = cls.resolve_physical_type(
+        target_type, resolved_profile = cls.resolve_physical_type_with_profile(
             std_item, db_type=db_type, format_profile=format_profile
         )
         std_en = clean_identifier_input(_clean_cell(std_item.get("en_abbr"), treat_slash_empty=True))
@@ -1257,26 +1330,65 @@ class StandardCatalog:
                 "status": "COMPLIANT",
                 "label": "已落标",
                 "detail": "字段名、物理类型与注释均符合数据标准",
+                "current_diff": "",
                 "target_type": target_type,
+                "resolved_format_profile": resolved_profile,
+                "matched_alt_profiles": [],
                 "name_ok": True,
                 "type_ok": True,
                 "comment_ok": True,
             }
         if name_ok and type_ok and not comment_ok:
+            curr_diff = "；".join(diffs)
             return {
                 "status": "COMMENT_ONLY",
                 "label": "仅差注释",
-                "detail": "；".join(diffs),
+                "detail": curr_diff,
+                "current_diff": curr_diff,
                 "target_type": target_type,
+                "resolved_format_profile": resolved_profile,
+                "matched_alt_profiles": [],
                 "name_ok": True,
                 "type_ok": True,
                 "comment_ok": False,
             }
+
+        curr_diff = "；".join(diffs)
+        if name_ok and not type_ok:
+            matched_alt = cls.find_matching_alt_profiles(
+                std_item,
+                col_type=col_type or "",
+                exclude_profiles=(format_profile, resolved_profile),
+            )
+            if matched_alt:
+                alt_names = [f"{p['label']}({p['target_type']})" for p in matched_alt]
+                alt_clause = (
+                    f"符合其他落标：{'、'.join(alt_names)}"
+                    if comment_ok
+                    else f"符合其他落标类型（仅差注释）：{'、'.join(alt_names)}"
+                )
+                detail = f"{curr_diff}；{alt_clause}" if curr_diff else alt_clause
+                return {
+                    "status": "PARTIAL_COMPLIANT",
+                    "label": "部分落标",
+                    "detail": detail,
+                    "current_diff": curr_diff,
+                    "target_type": target_type,
+                    "resolved_format_profile": resolved_profile,
+                    "matched_alt_profiles": matched_alt,
+                    "name_ok": True,
+                    "type_ok": False,
+                    "comment_ok": comment_ok,
+                }
+
         return {
             "status": "NON_COMPLIANT",
             "label": "未落标",
-            "detail": "；".join(diffs),
+            "detail": curr_diff,
+            "current_diff": curr_diff,
             "target_type": target_type,
+            "resolved_format_profile": resolved_profile,
+            "matched_alt_profiles": [],
             "name_ok": name_ok,
             "type_ok": type_ok,
             "comment_ok": comment_ok,
@@ -2065,6 +2177,7 @@ class StandardCatalog:
                     entry = {
                         "bound_count": 0,
                         "compliant_count": 0,
+                        "partial_compliant_count": 0,
                         "comment_only_count": 0,
                         "non_compliant_count": 0,
                         "total_cols": len(live_cols) if live_cols is not None else 0,
@@ -2074,6 +2187,8 @@ class StandardCatalog:
                 st = str(fr["compliance_status"] or "")
                 if st == "COMPLIANT":
                     entry["compliant_count"] += 1
+                elif st == "PARTIAL_COMPLIANT":
+                    entry["partial_compliant_count"] += 1
                 elif st == "COMMENT_ONLY":
                     entry["comment_only_count"] += 1
                 elif st in ("NON_COMPLIANT", "STD_MISSING"):

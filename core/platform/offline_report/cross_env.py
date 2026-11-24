@@ -361,7 +361,7 @@ def build_cross_env_excel_bytes(report_data: Dict[str, Any]) -> bytes:
         elif bk == "SPLIT_DIFF":
             row_tags.append("RED")
         elif bk == "UNIFIED":
-            if t_comp == "NON_COMPLIANT" or cap_st == "INSUFFICIENT":
+            if t_comp in ("NON_COMPLIANT", "PARTIAL_COMPLIANT") or cap_st == "INSUFFICIENT":
                 row_tags.append("YELLOW")
             else:
                 row_tags.append("GREEN")
@@ -484,7 +484,7 @@ _CROSS_ENV_APP_JS = r"""
 
       let excelTone = "BLUE";
       if (bk === "SPLIT_DIFF") excelTone = "RED";
-      else if (bk === "UNIFIED") excelTone = (tcStatus === "NON_COMPLIANT" || capStatus === "INSUFFICIENT") ? "YELLOW" : "GREEN";
+      else if (bk === "UNIFIED") excelTone = (tcStatus === "NON_COMPLIANT" || tcStatus === "PARTIAL_COMPLIANT" || capStatus === "INSUFFICIENT") ? "YELLOW" : "GREEN";
 
       out.push({
         tone: excelTone,
@@ -873,7 +873,7 @@ _CROSS_ENV_APP_JS = r"""
         el("td", { className: "mono", style: { fontWeight: "600" }, text: r.target_col_name || "-" }),
         el("td", { className: "mono", text: r.target_col_type || "-" }),
         el("td", {}, r.target_compliance_status
-          ? badge(r.target_compliance_label, r.target_compliance_status === "COMPLIANT" ? "ok" : (r.target_compliance_status === "NON_COMPLIANT" ? "bad" : (r.target_compliance_status === "COMMENT_ONLY" ? "info" : "")))
+          ? badge(r.target_compliance_label, r.target_compliance_status === "COMPLIANT" ? "ok" : (r.target_compliance_status === "NON_COMPLIANT" ? "bad" : (r.target_compliance_status === "PARTIAL_COMPLIANT" ? "warn" : (r.target_compliance_status === "COMMENT_ONLY" ? "info" : ""))))
           : el("span", { style: { color: "var(--muted)" }, text: "-" })),
         el("td", { title: r.capacity_detail || "" }, r.capacity_status && r.capacity_status !== "N/A"
           ? badge(r.capacity_label || "-", capTone(r.capacity_status))
@@ -942,7 +942,9 @@ _CROSS_ENV_APP_JS = r"""
         el("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "4px" } },
           el("span", { className: "mono", style: { fontWeight: "600" }, text: col.column_name || "" }),
           isTgt && row.target_needs_migration
-            ? badge("待贯标", "warn")
+            ? ((row.target_compliance || {}).status === "PARTIAL_COMPLIANT"
+                ? el("span", { title: (row.target_compliance || {}).detail || "符合其他落标标准" }, badge("部分落标", "warn"))
+                : badge("待贯标", "warn"))
             : (isTgt && (row.target_compliance || {}).status === "COMPLIANT" ? badge("已落标", "ok") : null)
         ),
         el("div", { style: { display: "flex", justifyContent: "space-between", gap: "6px", fontSize: "11px", color: "var(--muted)" } },
