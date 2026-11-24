@@ -50,9 +50,10 @@ ALLOWED_ATTACHMENT_EXTENSIONS = TEXT_EXTENSIONS | CSV_EXTENSIONS
 MAX_CSV_BYTES = 2 * 1024 * 1024
 MAX_TEXT_BYTES = 5 * 1024 * 1024
 
-INLINE_TOKEN_BUDGET = 3500
-CHUNK_TARGET_TOKENS = 2200
-CHUNK_HARD_MAX_TOKENS = 2800
+INLINE_TOKEN_BUDGET = 32000
+CSV_INLINE_TOKEN_BUDGET = 8000
+CHUNK_TARGET_TOKENS = 12000
+CHUNK_HARD_MAX_TOKENS = 16000
 DEFAULT_BATCH_MAX_CHUNKS = 8
 MAX_BATCH_CHUNKS_CAP = 12
 MAX_ATTACHMENTS_PER_TURN = 5
@@ -64,6 +65,64 @@ _MD_HEADING_RE = re.compile(r"^#{1,4}\s+(.+)$")
 _SQL_HINT_RE = re.compile(
     r"(?is)\b(?:SELECT\b[\s\S]{1,200}\bFROM|CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|INDEX|PROCEDURE|FUNCTION)|ALTER\s+TABLE|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|MERGE\s+INTO|DROP\s+TABLE|WITH\s+\w+\s+AS\s*\()"
 )
+_SQL_OBJECT_RE = re.compile(
+    r"(?im)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?"
+    r"(PROCEDURE|FUNCTION|PACKAGE\s+BODY|PACKAGE|TRIGGER|MATERIALIZED\s+VIEW|VIEW|TABLE)\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_\"`\[\]][A-Za-z0-9_$.\"`\[\]]*)"
+)
+_SQL_BANNER_RE = re.compile(
+    r"^\s*(?:--\s*(?:={2,}|-{3,}|#{1,4}|\*{2,})?\s*((?:Step|阶段|步骤|Part|第[一二三四五六七八九十0-9]+[步章节段]?|[0-9]+[\.、\)])\s*[^\n]{2,76}|[^\n=\-\*]{4,76})\s*(?:={2,}|-{3,}|\*{2,})?)\s*$"
+)
+_SQL_PROC_KEYWORD_RE = re.compile(
+    r"(?im)^\s*(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|PACKAGE|TRIGGER)|DECLARE|BEGIN|EXCEPTION)\b"
+)
+_SQL_TABLE_REF_RE = re.compile(
+    r"(?is)\b(?:FROM|JOIN|INTO|UPDATE|TRUNCATE\s+TABLE|DELETE\s+FROM|MERGE\s+INTO|CREATE\s+(?:OR\s+REPLACE\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?|ALTER\s+TABLE)\s+"
+    r"(?:ONLY\s+)?([A-Za-z_\"`\[\]][A-Za-z0-9_$.\"`\[\]]*)"
+)
+_SQL_REF_STOPWORDS = frozenset(
+    {
+        "SELECT",
+        "WHERE",
+        "SET",
+        "VALUES",
+        "DUAL",
+        "LATERAL",
+        "UNNEST",
+        "TABLE",
+        "ONLY",
+        "AS",
+        "ON",
+        "AND",
+        "OR",
+        "NULL",
+        "INTO",
+        "FROM",
+        "JOIN",
+        "USING",
+        "THEN",
+        "ELSE",
+        "END",
+        "CASE",
+        "WHEN",
+        "IF",
+        "LOOP",
+        "BEGIN",
+        "RETURN",
+        "CALL",
+        "EXEC",
+        "EXECUTE",
+        "CURSOR",
+        "OPEN",
+        "FETCH",
+        "CLOSE",
+        "ROWCOUNT",
+        "FOUND",
+        "NOTFOUND",
+    }
+)
+_CODE_DEF_RE = re.compile(r"^\s*(?:async\s+def|def|class|function)\s+([A-Za-z_][A-Za-z0-9_]*)")
+_LOG_ERR_RE = re.compile(r"(?i)\b(?:ERROR|FATAL|EXCEPTION|ORA-\d+|SQLSTATE|TRACEBACK)\b")
 
 
 def get_attachment_limits() -> Dict[str, Any]:
@@ -72,6 +131,7 @@ def get_attachment_limits() -> Dict[str, Any]:
         "max_csv_bytes": MAX_CSV_BYTES,
         "max_text_bytes": MAX_TEXT_BYTES,
         "inline_token_budget": INLINE_TOKEN_BUDGET,
+        "csv_inline_token_budget": CSV_INLINE_TOKEN_BUDGET,
         "chunk_target_tokens": CHUNK_TARGET_TOKENS,
         "chunk_hard_max_tokens": CHUNK_HARD_MAX_TOKENS,
         "default_batch_max_chunks": DEFAULT_BATCH_MAX_CHUNKS,
@@ -79,6 +139,160 @@ def get_attachment_limits() -> Dict[str, Any]:
         "allowed_extensions": sorted(ALLOWED_ATTACHMENT_EXTENSIONS),
         "csv_extensions": sorted(CSV_EXTENSIONS),
         "text_extensions": sorted(TEXT_EXTENSIONS),
+    }
+
+
+def format_with_line_numbers(text: str, start_line: int = 1) -> str:
+    """为文本或代码添加紧凑行号前缀 (`L| line`)，便于大模型精确引用位置."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    return "\n".join(f"{start_line + idx}| {ln}" for idx, ln in enumerate(lines))
+
+
+def extract_attachment_outline(text: str, file_kind: str) -> Dict[str, Any]:
+    """提取附件零 Token 成本结构化大纲（存储过程名、逻辑章节行号、涉及表及代码符号）."""
+    if not text or file_kind == "csv":
+        return {
+            "is_stored_procedure": False,
+            "objects": [],
+            "sections": [],
+            "referenced_tables": [],
+            "summary_line": "",
+        }
+
+    lines = text.splitlines()
+    objects: List[Dict[str, Any]] = []
+    sections: List[Dict[str, Any]] = []
+
+    if file_kind == "sql":
+        has_proc_ddl = False
+        has_begin = False
+        has_proc_body_kw = False
+
+        for line_no, raw_ln in enumerate(lines, start=1):
+            stripped = raw_ln.strip()
+            if not stripped:
+                continue
+            upper_s = stripped.upper()
+
+            obj_m = _SQL_OBJECT_RE.match(raw_ln)
+            if obj_m:
+                kind = re.sub(r"\s+", " ", obj_m.group(1).upper())
+                name = obj_m.group(2).strip().strip('"`[]')
+                objects.append({"kind": kind, "name": name, "line": line_no})
+                if kind in ("PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE BODY", "TRIGGER"):
+                    has_proc_ddl = True
+                sections.append({"line": line_no, "title": f"CREATE {kind} {name}"[:80], "kind": "object"})
+                continue
+
+            if re.match(r"^(?:BEGIN)\b", upper_s):
+                has_begin = True
+                if len(sections) < 60:
+                    sections.append({"line": line_no, "title": "BEGIN 主体块", "kind": "block"})
+                continue
+            if re.match(r"^(?:DECLARE|EXCEPTION)\b", upper_s):
+                has_proc_body_kw = True
+                kw = upper_s.split()[0]
+                if len(sections) < 60:
+                    sections.append({"line": line_no, "title": f"{kw} 声明/异常处理段", "kind": "block"})
+                continue
+            if re.search(r"\b(?:CURSOR\s+\w+\s+IS|FOR\s+\w+\s+IN|WHILE\s+.*\s+LOOP|END\s+LOOP|ELSIF)\b", upper_s):
+                has_proc_body_kw = True
+
+            if stripped.startswith("--") and len(sections) < 60:
+                bm = _SQL_BANNER_RE.match(raw_ln)
+                is_strong_comment = (
+                    "===" in stripped
+                    or "---" in stripped
+                    or "***" in stripped
+                    or bool(
+                        re.match(
+                            r"^--\s*(?:Step|阶段|步骤|Part|第[一二三四五六七八九十0-9]+|[0-9]+[\.、\)])",
+                            stripped,
+                            re.IGNORECASE,
+                        )
+                    )
+                )
+                if bm and is_strong_comment:
+                    title_txt = re.sub(r"^[\-\=\*#\s]+|[\-\=\*#\s]+$", "", bm.group(1)).strip()
+                    if len(title_txt) >= 2:
+                        sections.append({"line": line_no, "title": title_txt[:80], "kind": "section"})
+
+        # 剥离单引号字符串与行注释后提取涉及表名
+        cleaned_for_tables = re.sub(r"'(?:''|[^'])*'", "''", text)
+        cleaned_for_tables = re.sub(r"--[^\n]*", "", cleaned_for_tables)
+        ref_tables: List[str] = []
+        seen_tables: set[str] = set()
+        for tm in _SQL_TABLE_REF_RE.finditer(cleaned_for_tables):
+            raw_tbl = tm.group(1).strip().strip('"`[]').rstrip(",;")
+            if not raw_tbl or raw_tbl.startswith((":", "@", "&", "$")):
+                continue
+            upper_t = raw_tbl.upper()
+            if upper_t in _SQL_REF_STOPWORDS or len(raw_tbl) < 2:
+                continue
+            if "." in raw_tbl:
+                parts = [p.strip('"`[]') for p in raw_tbl.split(".") if p.strip('"`[]')]
+                raw_tbl = ".".join(parts)
+            low_k = raw_tbl.lower()
+            if low_k not in seen_tables:
+                seen_tables.add(low_k)
+                ref_tables.append(raw_tbl)
+            if len(ref_tables) >= 30:
+                break
+
+        is_proc = bool(has_proc_ddl or (has_begin and has_proc_body_kw))
+        obj_desc = "、".join(f"{o['kind']} {o['name']}" for o in objects[:4])
+        parts_sum: List[str] = []
+        if obj_desc:
+            parts_sum.append(obj_desc)
+        elif is_proc:
+            parts_sum.append("存储过程/PL-SQL 代码块")
+        if sections:
+            parts_sum.append(f"{len(sections)} 个结构锚点")
+        if ref_tables:
+            parts_sum.append(f"涉及 {len(ref_tables)} 张表 ({', '.join(ref_tables[:5])}{'…' if len(ref_tables) > 5 else ''})")
+        return {
+            "is_stored_procedure": is_proc,
+            "objects": objects[:25],
+            "sections": sections[:60],
+            "referenced_tables": ref_tables,
+            "summary_line": " | ".join(parts_sum),
+        }
+
+    # 非 SQL 纯文本/Markdown/代码/日志大纲
+    err_lines = 0
+    for line_no, raw_ln in enumerate(lines, start=1):
+        stripped = raw_ln.strip()
+        if not stripped:
+            continue
+        hm = _MD_HEADING_RE.match(stripped)
+        if hm and len(sections) < 60:
+            sections.append({"line": line_no, "title": hm.group(1).strip()[:80], "kind": "heading"})
+            continue
+        cm = _CODE_DEF_RE.match(raw_ln)
+        if cm and len(objects) < 30:
+            objects.append({"kind": "SYMBOL", "name": cm.group(1), "line": line_no})
+            sections.append({"line": line_no, "title": stripped[:80], "kind": "symbol"})
+            continue
+        if _LOG_ERR_RE.search(stripped):
+            err_lines += 1
+            if len(sections) < 40:
+                sections.append({"line": line_no, "title": _truncate_line_preview(stripped, 64), "kind": "log_alert"})
+
+    summary_parts: List[str] = []
+    if objects:
+        summary_parts.append(f"{len(objects)} 个符号定义")
+    if sections:
+        summary_parts.append(f"{len(sections)} 个章节/定位点")
+    if err_lines:
+        summary_parts.append(f"{err_lines} 行异常/报错信号")
+    return {
+        "is_stored_procedure": False,
+        "objects": objects,
+        "sections": sections[:60],
+        "referenced_tables": [],
+        "summary_line": " | ".join(summary_parts),
     }
 
 
@@ -305,7 +519,95 @@ def _chunk_plain_text(text: str, *, label_prefix: str = "文本片段") -> List[
     return raw_chunks
 
 
-def _chunk_sql_text(text: str) -> List[Dict[str, Any]]:
+def _chunk_stored_procedure_lines(
+    text: str, outline: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """按存储过程逻辑区块边界聚合切分为大语义段 (~12K tokens/段)，避免被分号拆成海量碎片."""
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return []
+
+    section_by_line: Dict[int, str] = {}
+    for sec in outline.get("sections") or []:
+        ln = int(sec.get("line") or 0)
+        title = str(sec.get("title") or "").strip()
+        if ln > 0 and title and ln not in section_by_line:
+            section_by_line[ln] = title
+
+    raw_chunks: List[Dict[str, Any]] = []
+    buf: List[str] = []
+    buf_tokens = 0
+    chunk_start_line = 1
+    first_label = ""
+
+    def _flush(end_line_no: int) -> None:
+        nonlocal buf, buf_tokens, first_label
+        if not buf:
+            return
+        joined = "".join(buf)
+        sub_pieces = _force_split_text_to_budget(joined, hard_max_tokens=CHUNK_HARD_MAX_TOKENS)
+        label = first_label or _truncate_line_preview(
+            next((ln for ln in buf if ln.strip()), ""), 36
+        )
+        if len(sub_pieces) == 1:
+            raw_chunks.append(
+                {
+                    "title": f"过程段 · {label}"[:80] if label else "存储过程片段",
+                    "range_label": f"L{chunk_start_line}-L{end_line_no}",
+                    "start_line": chunk_start_line,
+                    "end_line": end_line_no,
+                    "estimated_tokens": estimate_tokens(joined),
+                    "content": joined,
+                }
+            )
+        else:
+            cur_line = chunk_start_line
+            for s_idx, sp in enumerate(sub_pieces, start=1):
+                sp_lines = sp.count("\n")
+                sp_end = min(end_line_no, cur_line + max(0, sp_lines))
+                raw_chunks.append(
+                    {
+                        "title": f"过程段 · {label} [子段 {s_idx}/{len(sub_pieces)}]"[:80],
+                        "range_label": f"L{cur_line}-L{sp_end}",
+                        "start_line": cur_line,
+                        "end_line": sp_end,
+                        "estimated_tokens": estimate_tokens(sp),
+                        "content": sp,
+                    }
+                )
+                cur_line = sp_end + (1 if sp.endswith("\n") and sp_end < end_line_no else 0)
+        buf = []
+        buf_tokens = 0
+        first_label = ""
+
+    for line_no, ln in enumerate(lines, start=1):
+        ln_tokens = estimate_tokens(ln)
+        sec_title = section_by_line.get(line_no, "")
+        if buf and (
+            (buf_tokens + ln_tokens > CHUNK_TARGET_TOKENS)
+            or (sec_title and buf_tokens >= int(CHUNK_TARGET_TOKENS * 0.55))
+            or (not ln.strip() and buf_tokens >= int(CHUNK_TARGET_TOKENS * 0.80))
+        ):
+            _flush(line_no - 1)
+            chunk_start_line = line_no
+        if sec_title and not first_label:
+            first_label = sec_title
+        buf.append(ln)
+        buf_tokens += ln_tokens
+
+    _flush(len(lines))
+    for i, ch in enumerate(raw_chunks):
+        ch["chunk_index"] = i
+    return raw_chunks
+
+
+def _chunk_sql_text(
+    text: str, *, outline: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    eff_outline = outline if isinstance(outline, dict) else extract_attachment_outline(text, "sql")
+    if eff_outline.get("is_stored_procedure"):
+        return _chunk_stored_procedure_lines(text, eff_outline)
+
     try:
         stmts = split_sql_statements(text, max_statements=5000)
     except Exception:
@@ -592,19 +894,23 @@ def _chunk_csv_rows(
     return raw_chunks
 
 
-def recommend_strategy(file_kind: str, estimated_tokens: int) -> str:
-    if estimated_tokens <= INLINE_TOKEN_BUDGET:
-        return "inline"
+def recommend_strategy(
+    file_kind: str,
+    estimated_tokens: int,
+    *,
+    inline_budget: int = INLINE_TOKEN_BUDGET,
+) -> str:
     if file_kind == "csv":
-        return "on_demand"
-    return "stepped_batch"
+        return "full_context" if estimated_tokens <= CSV_INLINE_TOKEN_BUDGET else "agentic_explore"
+    return "full_context" if estimated_tokens <= inline_budget else "agentic_explore"
 
 
 def process_attachment_payload(filename: str, raw_bytes: bytes) -> Dict[str, Any]:
-    """统一入口：校验、解码、计算 Token、生成 CSV 画像与语义分块清单."""
+    """统一入口：校验、解码、计算 Token、提取结构大纲、生成 CSV 画像与大粒度语义分块."""
     safe_name, ext, text, enc, file_kind = validate_and_decode_attachment(filename, raw_bytes)
     lines_cnt = len(text.splitlines())
     est_tokens = estimate_tokens(text)
+    outline = extract_attachment_outline(text, file_kind)
 
     row_count = 0
     csv_profile: Dict[str, Any] = {}
@@ -615,15 +921,19 @@ def process_attachment_payload(filename: str, raw_bytes: bytes) -> Dict[str, Any
         summary = (
             f"CSV 数据表：{row_count} 行 × {len(headers)} 列 | 估算 ~{est_tokens} tokens | 切分为 {len(chunks)} 片"
         )
+        eff_budget = CSV_INLINE_TOKEN_BUDGET
     elif file_kind == "sql":
-        chunks = _chunk_sql_text(text)
-        summary = f"SQL 脚本：{lines_cnt} 行 | 估算 ~{est_tokens} tokens | 切分为 {len(chunks)} 个语义块"
+        chunks = _chunk_sql_text(text, outline=outline)
+        kind_lbl = "存储过程/SQL" if outline.get("is_stored_procedure") else "SQL 脚本"
+        summary = f"{kind_lbl}：{lines_cnt} 行 | 估算 ~{est_tokens} tokens | {len(chunks)} 个语义段"
+        eff_budget = INLINE_TOKEN_BUDGET
     else:
         chunks = _chunk_plain_text(text, label_prefix="文本段落")
-        summary = f"纯文本文档：{lines_cnt} 行 | 估算 ~{est_tokens} tokens | 切分为 {len(chunks)} 段"
+        summary = f"纯文本文档：{lines_cnt} 行 | 估算 ~{est_tokens} tokens | {len(chunks)} 段"
+        eff_budget = INLINE_TOKEN_BUDGET
 
-    oversized = est_tokens > INLINE_TOKEN_BUDGET
-    strategy = recommend_strategy(file_kind, est_tokens)
+    oversized = est_tokens > eff_budget
+    strategy = recommend_strategy(file_kind, est_tokens, inline_budget=eff_budget)
     return {
         "filename": safe_name,
         "file_ext": ext,
@@ -639,16 +949,36 @@ def process_attachment_payload(filename: str, raw_bytes: bytes) -> Dict[str, Any
         "summary": summary,
         "raw_text": text,
         "csv_profile": csv_profile,
+        "outline": outline,
         "chunks": chunks,
     }
 
 
 def format_attachment_manifest(att: Dict[str, Any]) -> str:
-    """生成极致紧凑的文件总览地图（< 450 tokens），绝不把大文件正文全量塞进 Prompt."""
+    """生成极致紧凑的文件总览地图（含存储过程结构大纲），供 Agent 按需精准定位阅读."""
     lines = [
         f"附件 `{att.get('filename')}` [id={att.get('attachment_id')}, 类型={att.get('file_kind')}, "
-        f"{att.get('line_count', 0)} 行, ~{att.get('estimated_tokens', 0)} tokens, 共 {att.get('chunk_count', 0)} 片]"
+        f"{att.get('line_count', 0)} 行, ~{att.get('estimated_tokens', 0)} tokens, 共 {att.get('chunk_count', 0)} 段]"
     ]
+    outline = att.get("outline")
+    if isinstance(outline, dict):
+        if outline.get("summary_line"):
+            lines.append(f"  结构大纲: {outline['summary_line']}")
+        objs = outline.get("objects") or []
+        if objs:
+            obj_str = "；".join(f"{o.get('kind')} {o.get('name')} (L{o.get('line')})" for o in objs[:8])
+            lines.append(f"  主要对象: {obj_str}")
+        secs = outline.get("sections") or []
+        if secs:
+            lines.append("  逻辑锚点（可用 `read_attachment_lines` 指定 start_line/end_line 精读）:")
+            for sec in secs[:20]:
+                lines.append(f"    - L{sec.get('line')}: {sec.get('title')}")
+            if len(secs) > 20:
+                lines.append(f"    - ... 其余 {len(secs) - 20} 个锚点可通过 `search_attachment` 搜索")
+        refs = outline.get("referenced_tables") or []
+        if refs:
+            lines.append(f"  涉及表清单: {', '.join(refs[:24])}")
+
     if att.get("file_kind") == "csv" and isinstance(att.get("csv_profile"), dict):
         prof = att["csv_profile"]
         cols = prof.get("columns") or []
@@ -679,13 +1009,13 @@ def format_attachment_manifest(att: Dict[str, Any]) -> str:
 
     chunks = att.get("chunks") or []
     if chunks:
-        lines.append("  分片目录（可用 `inspect_attachment_chunk` 按 chunk_index 读取正文）:")
-        for ch in chunks[:18]:
+        lines.append("  语义分片目录（可用 `read_attachment_lines` 或 `inspect_attachment_chunk` 读取）:")
+        for ch in chunks[:16]:
             lines.append(
                 f"    - chunk_index={ch['chunk_index']}: {ch['title']} [{ch['range_label']}] (~{ch['estimated_tokens']} tok)"
             )
-        if len(chunks) > 18:
-            lines.append(f"    - ... 共 {len(chunks)} 片，后续可通过 `search_attachment` 检索定位")
+        if len(chunks) > 16:
+            lines.append(f"    - ... 共 {len(chunks)} 段，可通过 `search_attachment` 检索定位")
     return "\n".join(lines)
 
 

@@ -5,14 +5,27 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import asyncio
+import json
+import threading
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.platform.context import PlatformContext, get_platform_context
-from core.platform.http_utils import file_download_response, json_error, run_tracked_task
-from modules.ai_assistant.attachments import MAX_TEXT_BYTES, get_attachment_limits
+from core.platform.http_utils import (
+    extract_task_id,
+    file_download_response,
+    json_error,
+    run_tracked_task,
+)
+from core.platform.storage_paths import redact_private_storage_paths
+from modules.ai_assistant.attachments import (
+    MAX_ATTACHMENTS_PER_TURN,
+    MAX_TEXT_BYTES,
+    get_attachment_limits,
+)
 from modules.ai_assistant.schemas import (
     AssistantChatPayload,
     AssistantExportResultPayload,
@@ -133,6 +146,7 @@ def api_create_assistant_session(
             task_mode=payload.task_mode,
             provider_id=payload.provider_id,
             model=payload.model,
+            thinking_mode=payload.thinking_mode,
         )
         return {
             "ok": True,
@@ -172,6 +186,7 @@ def api_update_assistant_session(
         task_mode=payload.task_mode,
         provider_id=payload.provider_id,
         model=payload.model,
+        thinking_mode=payload.thinking_mode,
     )
     if updated is None:
         return json_error("未找到指定的智能助手会话", 404)
@@ -218,6 +233,7 @@ async def api_assistant_chat(
             "task_mode": payload.task_mode,
             "provider_id": payload.provider_id,
             "model": payload.model,
+            "thinking_mode": payload.thinking_mode,
             "max_steps": payload.max_steps,
             "sample_limit": payload.sample_limit,
             "clarification_reply": payload.clarification_reply,
@@ -237,6 +253,128 @@ async def api_assistant_chat(
             len(((r.get("assistant_message") or {}).get("steps") or [])),
         ),
         response_fn=lambda r: {"ok": True, **r},
+    )
+
+
+@router.post("/chat/stream")
+async def api_assistant_chat_stream(
+    payload: AssistantChatPayload,
+    request: Request,
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    svc = AiAssistantService(ctx)
+    clean_prompt = (payload.prompt or "").strip()
+    if not clean_prompt and not payload.attachment_ids:
+        return json_error("请输入要咨询或探查的数据库问题，或先粘贴/上传文本/SQL/CSV 文件", 400)
+
+    for raw_aid in (payload.attachment_ids or [])[:MAX_ATTACHMENTS_PER_TURN]:
+        aid = str(raw_aid or "").strip()
+        if aid and svc.get_attachment(aid, include_raw=False, include_chunks=False) is None:
+            return json_error(f"找不到指定附件 `{aid}`（可能已被移除或过期）", 400)
+
+    eff_provider_id = (payload.provider_id or "").strip()
+    eff_model = (payload.model or "").strip()
+    if payload.session_id:
+        existing_sess = svc.get_session_detail(payload.session_id)
+        if existing_sess is not None:
+            eff_provider_id = (eff_provider_id or existing_sess.get("provider_id") or "").strip()
+            eff_model = (eff_model or existing_sess.get("model") or "").strip()
+
+    try:
+        ctx.llm_hub.resolve_provider_and_model(
+            provider_id=eff_provider_id, model=eff_model, require_ready=True
+        )
+    except Exception as exc:
+        return json_error(redact_private_storage_paths(str(exc), ctx=ctx), 400)
+
+    tid = extract_task_id(request, task_id)
+    if tid:
+        ctx.task_progress.start(tid, "Data.O.G 智能流式分析", detail="正在连接大模型与上下文...")
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+    cancel_ev = threading.Event()
+    progress_cb = ctx.task_progress.make_reporter(tid) if tid else None
+
+    def _is_cancelled() -> bool:
+        return cancel_ev.is_set() or bool(tid and ctx.task_progress.is_cancelled(tid))
+
+    def _enqueue(ev: Dict[str, Any]) -> None:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, ev)
+        except RuntimeError:
+            pass
+
+    def _worker() -> None:
+        try:
+            res = svc.chat_turn(
+                session_id=payload.session_id,
+                prompt=payload.prompt,
+                work_mode=payload.work_mode,
+                connection_id=payload.connection_id,
+                dialect=payload.dialect,
+                schema_name=payload.schema_name,
+                focus_tables=payload.focus_tables,
+                task_mode=payload.task_mode,
+                provider_id=payload.provider_id,
+                model=payload.model,
+                thinking_mode=payload.thinking_mode,
+                max_steps=payload.max_steps,
+                sample_limit=payload.sample_limit,
+                clarification_reply=payload.clarification_reply,
+                attachment_ids=payload.attachment_ids,
+                large_payload_strategy=payload.large_payload_strategy,
+                batch_start_chunk=payload.batch_start_chunk,
+                batch_max_chunks=payload.batch_max_chunks,
+                progress_cb=progress_cb,
+                event_cb=_enqueue,
+                cancel_check=_is_cancelled,
+            )
+            if tid and not _is_cancelled():
+                steps_cnt = len(((res.get("assistant_message") or {}).get("steps") or []))
+                ctx.task_progress.finish(
+                    tid,
+                    stage="分析完成",
+                    detail=f"已完成流式分析（共 {steps_cnt} 步探索）",
+                    processed=steps_cnt,
+                    total=steps_cnt,
+                )
+        except Exception as exc:
+            safe_err = redact_private_storage_paths(str(exc) or "流式分析失败", ctx=ctx)
+            if tid and not _is_cancelled():
+                ctx.task_progress.fail(tid, safe_err)
+            _enqueue({"type": "error", "ok": False, "error": safe_err})
+        finally:
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+            except RuntimeError:
+                pass
+
+    threading.Thread(target=_worker, name="ai_assistant_stream", daemon=True).start()
+
+    async def _sse_generator():
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if item is None:
+                    break
+                ev_name = str(item.get("type") or "message")
+                yield f"event: {ev_name}\ndata: {json.dumps(item, ensure_ascii=False)}\n\n"
+        finally:
+            cancel_ev.set()
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

@@ -90,6 +90,7 @@ class LLMProviderPayload(BaseModel):
     default_model: Optional[str] = None
     models: Optional[List[str]] = None
     is_default: Optional[bool] = None
+    context_window: Optional[int] = Field(default=None, ge=0, le=10_000_000)
 
 
 class StandardDictItemPayload(BaseModel):

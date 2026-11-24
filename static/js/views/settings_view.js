@@ -126,6 +126,7 @@ export class SettingsView {
       default_model: found.default_model || "",
       models: [...(found.models || [])],
       is_default: Boolean(found.is_default),
+      context_window: found.extra?.context_window ? String(found.extra.context_window) : "",
     };
   }
 
@@ -418,24 +419,30 @@ export class SettingsView {
             default_model: "deepseek-ai/DeepSeek-V3",
             models: ["deepseek-ai/DeepSeek-V3"],
             is_default: false,
+            context_window: "",
           };
           this.render();
         },
       })
     );
 
-    const buildPayload = (extra = {}) => ({
-      provider_id: d.provider_id || undefined,
-      name: d.name.trim(),
-      provider_type: d.provider_type,
-      enabled: Boolean(d.enabled),
-      base_url: d.base_url.trim(),
-      api_key: d.api_key || undefined,
-      default_model: d.default_model.trim(),
-      models: d.models,
-      is_default: Boolean(d.is_default),
-      ...extra,
-    });
+    const buildPayload = (extra = {}) => {
+      const rawCw = String(d.context_window ?? "").trim();
+      const cwNum = rawCw === "" ? 0 : Number(rawCw);
+      return {
+        provider_id: d.provider_id || undefined,
+        name: d.name.trim(),
+        provider_type: d.provider_type,
+        enabled: Boolean(d.enabled),
+        base_url: d.base_url.trim(),
+        api_key: d.api_key || undefined,
+        default_model: d.default_model.trim(),
+        models: d.models,
+        is_default: Boolean(d.is_default),
+        context_window: Number.isFinite(cwNum) && cwNum >= 0 ? Math.floor(cwNum) : 0,
+        ...extra,
+      };
+    };
 
     const modelChips = (d.models || []).map((m) =>
       el(
@@ -625,6 +632,20 @@ export class SettingsView {
             value: d.default_model,
             placeholder: "deepseek-chat / gemini-2.5-flash",
             onInput: (e) => (d.default_model = e.target.value),
+          })
+        ),
+        el(
+          "div",
+          { className: "form-field span-2" },
+          el("label", { className: "form-label", text: "自定义上下文窗口 (Tokens，可选 · 留空按模型自动识别)" }),
+          el("input", {
+            className: "mac-input mono",
+            type: "number",
+            min: "0",
+            step: "1024",
+            value: d.context_window ?? "",
+            placeholder: "留空自动识别（DeepSeek 128K / Gemini 1M / 私有网关按需填如 32768）",
+            onInput: (e) => (d.context_window = e.target.value),
           })
         )
       ),
