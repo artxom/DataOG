@@ -207,7 +207,8 @@ html, body {
 
 #menubar-icon-workspace,
 #menubar-icon-search,
-#menubar-icon-logs {
+#menubar-icon-logs,
+#menubar-icon-reload {
   display: inline-flex;
   align-items: center;
   justify-content: center;

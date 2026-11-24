@@ -1,4 +1,4 @@
-# Data.O.G v3.0.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.0.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -56,7 +56,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 3.0.0 微内核入口（无状态程序目录、安全响应头、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
+├── app.py                        # FastAPI 3.0.1 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
@@ -97,7 +97,7 @@ DataOG/
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 86 项全量自动化测试（智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
+├── tests/                        # 87 项全量自动化测试（防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -132,7 +132,8 @@ DataOG/
 | **`v2.9.0`** | `refactor/v2.9.0-modular-slimming` → `main` | **2.X 终结规整瘦身与 3.0 模块化基石**：落地后端 `ModuleSpec` 插件自动发现与 `http_utils` 公共任务/下载 SDK、3.0 插件共享工作区表自动流转与动态图标槽位、前端 `app_registry.js` 懒加载注册中心与 HTTP/平台/模块 API 彻底分层；拆解 `storage/`、`routes/`、`offline_report/` 及巨型业务 Service/View 单体，去重 `dws_engine.py` 并清理 392 行死 CSS，配套 `docs/MODULE_SDK_3_0.md` 与 6 项模块化回归测试 |
 | **`v2.9.1`** | `fix/v2.9.1-ci-frozen-packaging` → `main` | **CI 零 `httpx` 依赖与 Windows `DataOG.exe` 冻结态自检打包修复**：移除 `test_modular_architecture.py` 对 `httpx` 的隐式依赖并补齐零 `httpx` 静态防线；`build_exe.py` 新增客户运行时测试纯净暂存与构建后泄露校验，剔除 `test_admin_console.py`/`test_demo_sandbox.py` 恢复云端 Windows `DataOG.exe` 编译与 GitHub Release 自动发布；同步加固冻结态 `__spec__.loader` 插件发现与私有表越权注册拦截 |
 | **`v2.9.2`** | `feat/v2.9.2-report-schema-bound-scope` → `main` | **单库与跨环境报告支持 Schema 筛选及表级落标范围收敛**：导出离线 HTML / Excel 报告与预填模板新增 Schema 多选过滤，默认启用「仅包含已绑定落标需求的表（表级落标范围）」在探查前剪枝零绑标表与无关 Schema（含探查后僵尸绑标兜底剔除与推荐/单侧清单同步收敛），并在导出弹窗与离线 HTML 顶栏实时标注筛选范围 |
-| **`v3.0.0`**（当前正式版） | `feat/v3.0.0-ai-assistant-knowledge-hub` → `main` | **独立 Dock 旗舰应用 `Data.O.G`（智能数据助手）与零依赖离线知识库 (`KnowledgeHub`)**：新增第五个独立懒加载 Dock 应用，支持在线连库与离线纯方言双模式、场景模式芯片与歧义澄清卡、7 工具渐进自主探索（含只读 SQL 报错自修正、`EXPLAIN` 诊断与引用溯源）、DDL/写操作分级二次确认卡片（常规一键确认 / 高危影响行数估算 + `CONFIRM` 门禁 + 服务端重定级防篡改 + 批执行闭环），配套 0 KB 新增依赖 FTS5 离线知识库（9 格式解析、11 篇内置方言速查卡、`.json.gz` 分享包与可选 Embedding 混合排序）（86 项测试全绿） |
+| **`v3.0.0`** | `feat/v3.0.0-ai-assistant-knowledge-hub` → `main` | **独立 Dock 旗舰应用 `Data.O.G`（智能数据助手）与零依赖离线知识库 (`KnowledgeHub`)**：新增第五个独立懒加载 Dock 应用，支持在线连库与离线纯方言双模式、场景模式芯片与歧义澄清卡、7 工具渐进自主探索（含只读 SQL 报错自修正、`EXPLAIN` 诊断与引用溯源）、DDL/写操作分级二次确认卡片（常规一键确认 / 高危影响行数估算 + `CONFIRM` 门禁 + 服务端重定级防篡改 + 批执行闭环），配套 0 KB 新增依赖 FTS5 离线知识库（9 格式解析、11 篇内置方言速查卡、`.json.gz` 分享包与可选 Embedding 混合排序）（86 项测试全绿） |
+| **`v3.0.1`**（当前正式版） | `fix/v3.0.1-no-cache-and-reload` → `main` | **前端静态资源强制 `no-cache`、桌面顶部「一键重载」按钮与静态目录版本校验**：为非 `/api/*` 的 `.html`/`.js`/`.css` 下发 `Cache-Control: no-store, no-cache, must-revalidate`、`Pragma: no-cache` 与 `Expires: 0` 彻底解决升级后浏览器锁死旧模块问题；顶部菜单栏新增 **「重载」** 按钮支持清理 Cache Storage 并无缓存刷新页面；启动时校验 `_internal/static` 内 `dataog-ui-version` 与 `APP_VERSION` 一致性并在仅替换 `.exe` 时给出醒目提示；同步在 `knowledge_packs/` 提供 DWS 9.1 / Inceptor 9.x / PostgreSQL 19 初始化离线知识库自助下载（87 项测试全绿） |
 
 ---
 
@@ -143,7 +144,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（86 项）
+# 运行全量自动化单元测试（87 项）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行应用启动与健康路由自检

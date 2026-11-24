@@ -19,7 +19,7 @@ export function registerBuiltinDesktopApps() {
   registerDesktopApp({
     id: "settings",
     title: "系统配置",
-    defaultSummary: "外观 · 工作区 · 连接 · AI",
+    defaultSummary: "外观 · 工作区 · 连接 · 知识库 · AI",
     iconName: "settings",
     order: 10,
     resetOnWorkspaceSwitch: false,

@@ -8,6 +8,26 @@
 
 ---
 
+## [3.0.1] - 2026-11-24
+
+> **热更新防缓存与桌面一键重载增强**：彻底解决客户端版本频繁覆盖升级或本地重启后，浏览器缓存锁死旧版 ES Modules（如看不到「参考知识库」或 3.0 新特性）的问题，同时在仓库 `knowledge_packs/` 补充华为 DWS 9.1 / 星环 Inceptor 9.x / 官方 PostgreSQL 19 离线初始化知识包与 GitHub 直连下载索引。
+
+### Added
+- **前端桌面顶部「一键重载」按钮与版本感知 (`static/index.html`, `static/js/main.js`, `static/js/core/state.js`, `static/js/core/platform_api.js`, `static/css/workbench.css`, `static/js/apps/index.js`)**：
+  - 在顶部毛玻璃菜单栏日志按钮右侧新增 **「重载」(`#btn-menubar-reload`)** 按钮，登录门禁页与桌面任意应用内均可随时点击：自动尝试清理浏览器 Cache Storage 并附带防缓存时间戳执行无缓存整页重载（随后静默还原干净 URL）。
+  - `bootstrapWorkbench` 与 `/api/platform/bootstrap` 强制采用 `cache: "no-store"`；`WorkbenchStore` 实时同步后端版本号并在菜单栏左上角品牌按钮与「重载」提示中展示当前运行版本；同步完善「系统配置」Dock 副标题为 `外观 · 工作区 · 连接 · 知识库 · AI`。
+- **前后端静态目录版本一致性校验 (`app.py`, `static/index.html`)**：
+  - 新增 `check_static_ui_version_sync()`，在 `<head>` 读取 `<meta name="dataog-ui-version" content="3.0.1" />` 并与 `APP_VERSION` 核对；若检测到用户升级时仅替换 `DataOG.exe` 而遗漏 `_internal/static/` 导致前后端版本不一致，启动台立即打印醒目警示与完整解压覆盖指引。
+- **三库离线初始化知识库独立下载中心 (`knowledge_packs/`)**：
+  - 新增面向华为 GaussDB(DWS) `9.1/8.3`、星环 Inceptor `9.3/9.4`（TDH 9.x & ArgoDB）与官方 PostgreSQL `19/18/17` 的 9 篇 Markdown 参考手册与 4 份轻量 `.json.gz` 离线知识包（严格独立存放于仓库不打入 `DataOG.exe`），并在 `knowledge_packs/README.md` 与 `README.md` 提供 GitHub 直连下载链接。
+- **回归测试补强 (`tests/test_modules_and_api.py`)**：新增 `test_frontend_no_cache_headers_reload_button_and_ui_version_sync` 验证静态防缓存响应头、重载按钮挂载、图标缓存豁免及目录版本错配检测（全量自动化测试扩充至 **87 项**）。
+
+### Fixed
+- **修复浏览器锁死旧版懒加载 JS/CSS 导致升级后界面仍显示老版本 (`app.py`)**：
+  - 在 `security_headers_and_csrf_middleware` 中为非 `/api/*` 的 `/`、目录入口与 `.html`/`.htm`/`.js`/`.mjs`/`.css` 静态资源统一下发 `Cache-Control: no-store, no-cache, must-revalidate`、`Pragma: no-cache` 与 `Expires: 0` 响应头（保留 `/dataog.ico` 与 `/api/platform/assets/*` 图标缓存性能），彻底消除跨版本覆盖升级后需要无痕模式或手动清除站点缓存的痛点。
+
+---
+
 ## [3.0.0] - 2026-11-23
 
 > **Data.O.G 3.0 正式版本**：基于 3.0 零耦合插件微内核体系，上线第五个独立 Dock 应用 **`Data.O.G`**（基于大模型的智能数据助手），配套平台级零新增依赖离线知识库 (`KnowledgeHub`) 与 DDL/写操作分级二次确认门禁 (`sql_risk_guard`)。

@@ -28,7 +28,7 @@ export const tasksApi = {
 };
 
 export const platformApi = {
-  bootstrap: () => requestJson("/api/platform/bootstrap"),
+  bootstrap: () => requestJson("/api/platform/bootstrap", { cache: "no-store" }),
 
   // 外观壁纸与软件/模块图标本地持久化 (AssetStore)
   getAppearance: () => requestJson("/api/platform/appearance"),

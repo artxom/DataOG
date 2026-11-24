@@ -12,13 +12,14 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import socket
 import sys
 import threading
 import time
 import traceback
 import webbrowser
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def disable_windows_console_quick_edit() -> None:
@@ -220,6 +221,41 @@ def setup_console_logging() -> logging.Logger:
 
 logger = setup_console_logging()
 
+APP_VERSION = "3.0.1"
+_NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
+_UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
+
+
+def check_static_ui_version_sync(static_dir: str, app_version: str = APP_VERSION) -> Tuple[bool, str]:
+    """校验静态目录 index.html 声明的前端版本号是否与当前后端版本一致."""
+    index_path = os.path.join(str(static_dir or ""), "index.html")
+    if not os.path.isfile(index_path):
+        return False, ""
+    try:
+        with open(index_path, "r", encoding="utf-8", errors="replace") as fh:
+            head_html = fh.read(4096)
+    except OSError:
+        return False, ""
+    matched = _UI_VERSION_META_RE.search(head_html)
+    if not matched:
+        return False, ""
+    ui_ver = matched.group(1).strip()
+    return (ui_ver == app_version), ui_ver
+
+
+def _apply_frontend_no_cache_headers(req_path: str, resp: Response) -> Response:
+    """对非 API 的 HTML/JS/CSS 前端静态资源强制禁止浏览器陈旧缓存."""
+    if not req_path.startswith("/api/") and (
+        req_path == "/"
+        or req_path.endswith("/")
+        or req_path.lower().endswith(_NO_CACHE_FRONTEND_EXTS)
+    ):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
+
 FAVICON_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
     '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
@@ -279,7 +315,7 @@ def create_app(
     app = FastAPI(
         title="Data.O.G",
         description="macOS 桌面级多功能数据工程与数据治理一体化工作台",
-        version="3.0.0",
+        version=APP_VERSION,
         docs_url="/api/docs",
         redoc_url=None,
         openapi_url="/api/openapi.json",
@@ -358,7 +394,7 @@ def create_app(
                 )
             except Exception:
                 pass
-        return _apply_security_headers(response)
+        return _apply_security_headers(_apply_frontend_no_cache_headers(req_path, response))
 
     # 注册平台公共底座路由并自动发现挂载 modules/* 全部独立插件模块
     app.include_router(platform_router)
@@ -500,7 +536,7 @@ def main() -> None:
     url = f"http://{host}:{port}"
 
     print("=" * 74)
-    print("  Data.O.G v3.0.0 — 多功能数据工程与数据治理一体化工作台")
+    print(f"  Data.O.G v{APP_VERSION} — 多功能数据工程与数据治理一体化工作台")
     print("=" * 74)
     if port != args.port:
         print(f"  [!] 提示: 默认端口 {args.port} 已被占用，已自动切换至端口 {port}")
@@ -508,6 +544,11 @@ def main() -> None:
     print("  [*] 数据存储架构       : 本地私有保险箱与团队共享工作区已分离就绪")
     print("  [*] 按 Ctrl + C 可安全停止服务并退出。")
     print("=" * 74)
+    ui_ok, ui_ver = check_static_ui_version_sync(resolve_static_dir(), APP_VERSION)
+    if not ui_ok:
+        detected = ui_ver or "旧版/未知"
+        print(f"  [!] 警告: 检测到前端静态资源版本 ({detected}) 与程序版本 (v{APP_VERSION}) 不一致！")
+        print("  [!] 提示: 请将压缩包中的 DataOG.exe 与 _internal 文件夹一起完整解压覆盖后重试。")
 
     app_instance = create_app()
 

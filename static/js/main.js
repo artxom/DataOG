@@ -310,6 +310,14 @@ function syncMenubarIndicators() {
       logBadge.hidden = true;
     }
   }
+
+  const ver = String(store.state.version || "").trim();
+  if (ver) {
+    const homeBtn = document.getElementById("btn-menubar-home");
+    if (homeBtn) homeBtn.title = `显示桌面 (Data.O.G v${ver})`;
+    const reloadBtn = document.getElementById("btn-menubar-reload");
+    if (reloadBtn) reloadBtn.title = `当前版本 v${ver} · 点击一键无缓存重载最新界面`;
+  }
 }
 
 /* =========================================================================
@@ -696,11 +704,43 @@ function initLogsDialog() {
   });
 }
 
+async function hardReloadWorkbench(triggerBtn = null) {
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+  }
+  try {
+    if (typeof window !== "undefined" && "caches" in window && window.caches?.keys) {
+      const cacheKeys = await window.caches.keys();
+      await Promise.all(cacheKeys.map((key) => window.caches.delete(key)));
+    }
+  } catch (_err) {
+    // 忽略部分浏览器或非安全上下文下的 Cache Storage 限制
+  }
+  const url = new URL(window.location.href);
+  url.searchParams.set("_reload", String(Date.now()));
+  window.location.replace(url.toString());
+}
+
 /* =========================================================================
    5. 启动引导 (bootstrapWorkbench)
    ========================================================================= */
 
 export async function bootstrapWorkbench() {
+  try {
+    if (typeof window !== "undefined" && window.location?.href) {
+      const cleanUrl = new URL(window.location.href);
+      if (cleanUrl.searchParams.has("_reload")) {
+        cleanUrl.searchParams.delete("_reload");
+        const nextHref = cleanUrl.search
+          ? `${cleanUrl.pathname}${cleanUrl.search}${cleanUrl.hash}`
+          : `${cleanUrl.pathname}${cleanUrl.hash}`;
+        window.history?.replaceState?.(null, "", nextHref);
+      }
+    }
+  } catch (_err) {
+    // 忽略受限历史 API 异常
+  }
+
   // 静态挂载菜单栏小图标
   const wsIconSlot = document.getElementById("menubar-icon-workspace");
   if (wsIconSlot) clearEl(wsIconSlot, svgIcon("layers", 12));
@@ -708,6 +748,13 @@ export async function bootstrapWorkbench() {
   if (searchIconSlot) clearEl(searchIconSlot, svgIcon("search", 13));
   const logsIconSlot = document.getElementById("menubar-icon-logs");
   if (logsIconSlot) clearEl(logsIconSlot, svgIcon("logs", 13));
+  const reloadIconSlot = document.getElementById("menubar-icon-reload");
+  if (reloadIconSlot) clearEl(reloadIconSlot, svgIcon("refresh", 13));
+
+  const reloadBtn = document.getElementById("btn-menubar-reload");
+  reloadBtn?.addEventListener("click", () => {
+    hardReloadWorkbench(reloadBtn);
+  });
 
   initThemeToggle();
   startMenubarClock();
