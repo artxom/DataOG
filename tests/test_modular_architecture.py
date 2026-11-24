@@ -22,7 +22,7 @@ from unittest import mock
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 
-from app import create_app, resolve_static_dir
+from app import APP_VERSION, create_app, resolve_static_dir, run_smoke_test
 from tests.test_modules_and_api import TestClient
 from core import dws_engine
 from core.platform import dialects
@@ -728,7 +728,7 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
                         missing_gate2.append(f"{os.path.relpath(rpath, project_root)}:{m.group(1)}")
             self.assertEqual(missing_gate2, [], f"以下 API 端点缺少 Gate 2 依赖 get_platform_context: {missing_gate2}")
 
-            # 4. 零 httpx 依赖与客户打包自检防线：严禁测试依赖被裁剪的 fastapi.testclient/httpx，且客户包必须剔除 dev-only 测试
+            # 4. 零 httpx 依赖与客户打包无测试自检防线：严禁测试依赖被裁剪的 fastapi.testclient/httpx，且客户包严禁携带 tests/
             httpx_test_violations = []
             for tpath in glob.glob(os.path.join(project_root, "tests", "test_*.py")):
                 with open(tpath, encoding="utf-8") as fh:
@@ -750,24 +750,38 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
 
             import build_exe
 
-            with tempfile.TemporaryDirectory() as stage_tmp:
-                staged = build_exe.stage_customer_tests_dir(
-                    os.path.join(project_root, "tests"),
-                    os.path.join(stage_tmp, "staged_tests"),
-                )
-                staged_files = set(os.listdir(staged))
-                self.assertNotIn("test_admin_console.py", staged_files)
-                self.assertNotIn("test_demo_sandbox.py", staged_files)
-                self.assertNotIn("__pycache__", staged_files)
-                for expected_test in (
-                    "test_core.py",
-                    "test_platform.py",
-                    "test_modules_and_api.py",
-                    "test_workspace_separation.py",
-                    "test_license_auth.py",
-                    "test_modular_architecture.py",
+            tests_dir = os.path.join(project_root, "tests")
+            with open(os.path.join(project_root, "build_exe.py"), encoding="utf-8") as bfh:
+                build_src = bfh.read()
+            self.assertIn('"--skip-tests"', build_src)
+            self.assertIn('"tests"', build_src)
+            self.assertNotIn("--add-data={add_tests_arg}", build_src)
+
+            with tempfile.TemporaryDirectory() as bundle_tmp:
+                clean_dir = os.path.join(bundle_tmp, "clean_bundle")
+                os.makedirs(os.path.join(clean_dir, "_internal", "static"), exist_ok=True)
+                with open(
+                    os.path.join(clean_dir, "_internal", "static", "index.html"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh:
+                    fh.write("ok")
+                self.assertEqual(build_exe.check_no_tests_bundled(clean_dir, tests_dir), [])
+
+                for idx, rel_leak in enumerate(
+                    (
+                        os.path.join("tests", "test_core.py"),
+                        os.path.join("_internal", "tests", "test_platform.py"),
+                        os.path.join("_internal", "test_admin_console.py"),
+                    )
                 ):
-                    self.assertIn(expected_test, staged_files)
+                    dirty_dir = os.path.join(bundle_tmp, f"dirty_{idx}")
+                    target_path = os.path.join(dirty_dir, rel_leak)
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    with open(target_path, "w", encoding="utf-8") as fh:
+                        fh.write("# leaked")
+                    leaks = build_exe.check_no_tests_bundled(dirty_dir, tests_dir)
+                    self.assertTrue(leaks, f"未能检出客户包内泄露的测试路径: {rel_leak}")
 
     def test_frontend_main_lazy_load_race_recovery_and_extracted_mixins_via_node(self) -> None:
         """Node.js 真实执行：验证 main.js 异步懒加载竞态/失败恢复/工作区切换，app_registry 严格校验与拆分 View Mixin 运行时完整性."""
@@ -1090,6 +1104,53 @@ process.exit(0);
             f"Node 前端竞态恢复与 Mixin 运行时验证失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
         )
         self.assertIn("FRONTEND_RACE_AND_MIXINS_OK", proc.stdout)
+
+    def test_smoke_test_and_fast_ci_packaging_pipeline(self) -> None:
+        """验证 2 秒极速 --smoke-test 冒烟自检与 GitHub Actions 纯打包流水线配置."""
+        res = run_smoke_test(require_native_shield=False)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["version"], APP_VERSION)
+        for mod_id in (
+            "standard_migrator",
+            "cross_comparator",
+            "ddl_translator",
+            "data_explorer",
+            "ai_assistant",
+        ):
+            self.assertIn(mod_id, res["modules"])
+        self.assertGreaterEqual(int(res["builtin_kb_docs"]), 1)
+
+        if not getattr(sys, "frozen", False):
+            project_root = os.path.dirname(resolve_static_dir())
+            smoke_env = dict(os.environ)
+            smoke_env.pop("DATAOG_HOME", None)
+            proc = subprocess.run(
+                [sys.executable, os.path.join(project_root, "app.py"), "--smoke-test"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=smoke_env,
+                timeout=30,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"app.py --smoke-test 执行失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            )
+            self.assertIn("[SMOKE] OK", proc.stdout)
+
+            ci_path = os.path.join(project_root, ".github", "workflows", "ci.yml")
+            with open(ci_path, encoding="utf-8") as fh:
+                ci_src = fh.read()
+            self.assertNotIn("unit-tests:", ci_src)
+            self.assertNotIn("app.py --test", ci_src)
+            self.assertNotIn("DataOG.exe --test", ci_src)
+            self.assertNotIn("branches:", ci_src)
+            self.assertIn("tags:", ci_src)
+            self.assertIn('"v*"', ci_src)
+            self.assertIn("build_exe.py --skip-tests", ci_src)
+            self.assertIn("DataOG.exe --smoke-test", ci_src)
 
 
 if __name__ == "__main__":

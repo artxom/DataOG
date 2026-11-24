@@ -10,11 +10,16 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import importlib
+import json
 import logging
 import os
 import re
+import shutil
 import socket
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -97,7 +102,7 @@ def get_runtime_data_dir() -> str:
 
 
 def _is_test_runtime() -> bool:
-    return "--test" in sys.argv or "unittest" in sys.modules
+    return "--test" in sys.argv or "--smoke-test" in sys.argv or "unittest" in sys.modules
 
 
 def _write_startup_crash_log(err_text: str) -> None:
@@ -222,7 +227,7 @@ def setup_console_logging() -> logging.Logger:
 
 logger = setup_console_logging()
 
-APP_VERSION = "3.2.1"
+APP_VERSION = "3.2.2"
 _NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
 _UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
 
@@ -593,6 +598,194 @@ def create_app(
     return app
 
 
+async def _asgi_smoke_get(app_inst: Any, path: str) -> Tuple[int, Dict[str, str], bytes]:
+    """零网络/零 httpx 依赖的内联 ASGI GET 探活器（供冻结态 --smoke-test 极速验证）."""
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "query_string": b"",
+        "headers": [
+            (b"host", b"127.0.0.1:18080"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+        "client": ("127.0.0.1", 54321),
+        "server": ("127.0.0.1", 18080),
+    }
+    sent = False
+    response_complete = asyncio.Event()
+    status_code = 500
+    resp_headers: List[Tuple[bytes, bytes]] = []
+    resp_chunks: List[bytes] = []
+
+    async def receive() -> Dict[str, Any]:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await response_complete.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(msg: Dict[str, Any]) -> None:
+        nonlocal status_code, resp_headers
+        if msg["type"] == "http.response.start":
+            status_code = int(msg["status"])
+            resp_headers = list(msg.get("headers") or [])
+        elif msg["type"] == "http.response.body":
+            resp_chunks.append(msg.get("body") or b"")
+            if not msg.get("more_body", False):
+                response_complete.set()
+
+    try:
+        await app_inst(scope, receive, send)
+    finally:
+        response_complete.set()
+
+    headers_map = {
+        k.decode("latin-1").lower(): v.decode("latin-1") for k, v in resp_headers
+    }
+    return status_code, headers_map, b"".join(resp_chunks)
+
+
+def run_smoke_test(require_native_shield: Optional[bool] = None) -> Dict[str, Any]:
+    """2 秒极速启动冒烟自检：验证冻结态核心依赖、原生护盾、静态资源、插件挂载与 ASGI 路由."""
+    t0 = time.perf_counter()
+
+    # 1. 核心运行时依赖可导入性校验
+    required_runtime_modules = (
+        "fastapi",
+        "pydantic_core",
+        "uvicorn",
+        "h11",
+        "anyio",
+        "openpyxl",
+        "et_xmlfile",
+        "multipart",
+        "psycopg2",
+        "pymysql",
+        "sqlite3",
+    )
+    for mod_name in required_runtime_modules:
+        importlib.import_module(mod_name)
+
+    # 2. 静态前端目录与版本号一致校验
+    static_dir = resolve_static_dir()
+    if not os.path.isdir(static_dir):
+        raise RuntimeError(f"静态资源目录不存在: {static_dir}")
+    for rel_asset in (
+        "index.html",
+        os.path.join("js", "main.js"),
+        os.path.join("css", "workbench.css"),
+        "dataog.ico",
+    ):
+        asset_path = os.path.join(static_dir, rel_asset)
+        if not os.path.isfile(asset_path):
+            raise RuntimeError(f"缺失关键静态资源文件: {rel_asset} ({static_dir})")
+
+    ui_ok, ui_ver = check_static_ui_version_sync(static_dir, APP_VERSION)
+    if not ui_ok:
+        raise RuntimeError(
+            f"前端版本声明 ({ui_ver or '未知'}) 与后端 APP_VERSION (v{APP_VERSION}) 不一致"
+        )
+
+    # 3. 隔离临时保险箱实例化 FastAPI 微内核并验证插件/知识库/原生护盾
+    smoke_tmp = tempfile.mkdtemp(prefix="dataog_smoke_")
+    try:
+        vault_root = os.path.join(smoke_tmp, "vault")
+        app_inst = create_app(private_root=vault_root)
+        if getattr(app_inst, "version", "") != APP_VERSION:
+            raise RuntimeError(
+                f"FastAPI app.version ({getattr(app_inst, 'version', '')}) != {APP_VERSION}"
+            )
+        ctx = getattr(getattr(app_inst, "state", None), "platform_ctx", None)
+        if ctx is None:
+            raise RuntimeError("PlatformContext 未正确挂载至 app.state.platform_ctx")
+
+        expected_modules = {
+            "standard_migrator",
+            "cross_comparator",
+            "ddl_translator",
+            "data_explorer",
+            "ai_assistant",
+        }
+        loaded_modules = {m["module_id"] for m in ctx.module_registry.list_manifests()}
+        missing_modules = sorted(expected_modules - loaded_modules)
+        if missing_modules:
+            raise RuntimeError(f"自动发现插件模块缺失: {missing_modules}")
+
+        builtin_kb_docs = len(ctx.knowledge_hub.list_documents())
+        if builtin_kb_docs < 1:
+            raise RuntimeError("内置方言参考知识库未自动种子化")
+
+        auth_status = ctx.license_hub.get_auth_status()
+        has_shield = bool(auth_status.get("native_shield"))
+        must_shield = (
+            bool(getattr(sys, "frozen", False))
+            if require_native_shield is None
+            else bool(require_native_shield)
+        )
+        if must_shield and not has_shield:
+            raise RuntimeError("原生防反编译护盾 (_license_shield) 未能加载")
+
+        # 4. 内存 ASGI 四路探活（静态首页防缓存 + 主模块 + 鉴权开放路由 + Gate 1 拦截）
+        async def _run_probes() -> None:
+            st_root, hdr_root, body_root = await _asgi_smoke_get(app_inst, "/")
+            if st_root != 200:
+                raise RuntimeError(f"GET / 返回异常状态码: {st_root}")
+            if "no-store" not in hdr_root.get("cache-control", ""):
+                raise RuntimeError(f"GET / 缺少防缓存响应头: {hdr_root.get('cache-control')}")
+            if "dataog-ui-version" not in body_root.decode("utf-8", "replace"):
+                raise RuntimeError("GET / 响应体缺少 dataog-ui-version 元标签")
+
+            st_js, _, body_js = await _asgi_smoke_get(app_inst, "/js/main.js")
+            if st_js != 200 or "bootstrapWorkbench" not in body_js.decode("utf-8", "replace"):
+                raise RuntimeError(f"GET /js/main.js 探活失败: status={st_js}")
+
+            st_auth, hdr_auth, body_auth = await _asgi_smoke_get(
+                app_inst, "/api/platform/auth/status"
+            )
+            if st_auth != 200:
+                raise RuntimeError(f"GET /api/platform/auth/status 返回异常状态码: {st_auth}")
+            if "x-dataog-trace-id" not in hdr_auth or "server-timing" not in hdr_auth:
+                raise RuntimeError("诊断响应头 X-DataOG-Trace-Id / Server-Timing 缺失")
+            auth_json = json.loads(body_auth.decode("utf-8"))
+            if (
+                auth_json.get("ok") is not True
+                or auth_json.get("authorized") is not False
+                or not auth_json.get("login_modes")
+            ):
+                raise RuntimeError(f"/api/platform/auth/status 响应负载异常: {auth_json}")
+
+            st_boot, _, _ = await _asgi_smoke_get(app_inst, "/api/platform/bootstrap")
+            if st_boot != 401:
+                raise RuntimeError(
+                    f"Gate 1 授权拦截失效: 未登录访问 /api/platform/bootstrap 返回 {st_boot}"
+                )
+
+        asyncio.run(_run_probes())
+    finally:
+        for attempt in range(4):
+            shutil.rmtree(smoke_tmp, ignore_errors=True)
+            if not os.path.exists(smoke_tmp):
+                break
+            time.sleep(0.1 * (attempt + 1))
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+    return {
+        "ok": True,
+        "elapsed_ms": elapsed_ms,
+        "version": APP_VERSION,
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "native_shield": has_shield,
+        "modules": sorted(loaded_modules),
+        "builtin_kb_docs": builtin_kb_docs,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="DataOG 多功能数据工程与数据治理一体化工作台")
     parser.add_argument(
@@ -602,16 +795,45 @@ def main() -> None:
         "--no-browser", action="store_true", help="启动时不自动打开浏览器"
     )
     parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="运行极速启动冒烟自检（验证冻结态依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）并退出",
+    )
+    parser.add_argument(
         "--test", action="store_true", help="运行内置自动化单元测试并退出"
     )
     args = parser.parse_args()
 
+    if args.smoke_test:
+        try:
+            summary = run_smoke_test()
+        except Exception as exc:
+            print(f"[SMOKE] FAILED: {exc}")
+            traceback.print_exc()
+            sys.exit(1)
+        mods_csv = ",".join(summary["modules"])
+        print(
+            f"[SMOKE] OK | version=v{summary['version']} | modules={mods_csv} "
+            f"| native_shield={summary['native_shield']} "
+            f"| builtin_kb={summary['builtin_kb_docs']} "
+            f"| elapsed={summary['elapsed_ms']}ms"
+        )
+        sys.exit(0)
+
     if args.test:
+        tests_dir = os.path.join(get_bundle_dir(), "tests")
+        if not os.path.isdir(tests_dir):
+            print(
+                "[INFO] 当前客户发行包未携带开发期单元测试目录 (tests/)；"
+                "如需验证打包运行完整性请使用 --smoke-test，"
+                '或请在源码仓库中运行 `python3 -m unittest discover -s tests -p "test_*.py" -v`。'
+            )
+            sys.exit(1)
         import unittest
 
         sys.modules.setdefault("app", sys.modules[__name__])
         suite = unittest.defaultTestLoader.discover(
-            start_dir=os.path.join(get_bundle_dir(), "tests"),
+            start_dir=tests_dir,
             pattern="test_*.py",
         )
         runner = unittest.TextTestRunner(verbosity=2)
@@ -662,7 +884,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[*] 已收到退出指令，服务已安全停止。")
     except SystemExit as sys_exit:
-        if sys_exit.code not in (0, None) and "--test" not in sys.argv:
+        if sys_exit.code not in (0, None) and "--test" not in sys.argv and "--smoke-test" not in sys.argv:
             pause_on_windows_console()
         raise
     except BaseException:

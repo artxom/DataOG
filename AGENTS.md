@@ -42,25 +42,25 @@
 2. **分支与提交规范**：
    - `main` 始终保持测试全绿、文档与版本号同步、可直接打包发布；工作分支一律从最新 `main` 切出（`feat/<name>` / `fix/<name>` / `refactor/<name>` / `docs/<name>` / `chore/<name>`）。
    - 遵循 Conventional Commits（`<type>(<scope>): <中文简明摘要>`），提交前运行 `git status` 与 `git diff` 核查，严禁混入 `.db`/日志/密钥。
-3. **双门禁校验、强制升版打 Tag 与自动编译发版（核心铁律）**：
-   - **合并门禁**：合入 `main` 前必须 100% 通过 `python3 -m unittest discover -s tests -p "test_*.py" -v` 与 `python3 app.py --test`。
-   - **每次变更强制升版并触发 GitHub Actions 编译发版**：`.github/workflows/ci.yml` 的 `build-windows-exe`（编译 Windows `DataOG.exe` 并自动发布 GitHub Release）仅在推送 `v*` 标签或手动调度时运行。因此，**任何涉及后端、前端、构建或运行时行为的变更合入 `main` 时，必须按 SemVer 递增版本号**（修复/优化/微调升 `PATCH` 如 `v2.7.1`，新特性升 `MINOR` 如 `v2.8.0`），按 [release-and-ship Skill](file:///Users/artxom/code/DataOG/.agents/skills/release-and-ship/SKILL.md) 同步 `app.py`、`core/platform/context.py`、`CHANGELOG.md`、`README.md`、`AGENTS.md`（**禁止改动 `WORKSPACE_FORMAT_VERSION`**），推送 `main` 后立即创建并推送附注标签 `git tag -a vX.Y.Z -m "..."` 与 `git push origin vX.Y.Z` 触发云端打包发布（仅纯规则/注释调整且用户明确要求不发版时例外）。
+3. **本地双门禁校验、强制升版打 Tag 与自动编译发版（核心铁律）**：
+   - **合并门禁**：全量单元测试严守**发布前本地完成**原则；合入 `main` 前必须在本地 100% 通过 `python3 -m unittest discover -s tests -p "test_*.py" -v` 与 `python3 app.py --smoke-test`。
+   - **每次变更强制升版并触发 GitHub Actions 纯打包发版**：`.github/workflows/ci.yml` 仅在推送 `v*` 标签或手动调度时运行，直接执行 `python build_exe.py --skip-tests` 编译 Windows `DataOG.exe` 并运行 `DataOG.exe --smoke-test`（2 秒冻结态冒烟，不重跑耗时单元测试且客户包不含 `tests/`）后发布 GitHub Release。因此，**任何涉及后端、前端、构建或运行时行为的变更合入 `main` 时，必须按 SemVer 递增版本号**（修复/优化/微调升 `PATCH`，新特性升 `MINOR`），按 [release-and-ship Skill](file:///Users/artxom/code/DataOG/.agents/skills/release-and-ship/SKILL.md) 同步 `app.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md`、`AGENTS.md`（**禁止改动 `WORKSPACE_FORMAT_VERSION`**），推送 `main` 后立即创建并推送附注标签 `git tag -a vX.Y.Z -m "..."` 与 `git push origin vX.Y.Z` 触发云端打包发布（仅纯规则/注释调整且用户明确要求不发版时例外）。
    - **分支清理**：合并与打标推送完成后及时删除已使命终结的临时工作分支，确认远端 `main` 与新标签就位。
 
 ## 5. 当前代码基线快照
-- **当前主干最新正式版本**：**`v3.2.1`**（在 `v3.2.0` 全内存链路追踪、全栈基准压测 `Benchmark`、自动瓶颈研判与脱敏 `.json` 诊断包导出基础上，修复诊断测试 SQLite 句柄关闭与 Windows 打包单测稳定性）。
+- **当前主干最新正式版本**：**`v3.2.2`**（在 `v3.2.1` 基础上移除 GitHub Actions 与 CI 打包阶段冗余全量单元测试，新增 2 秒极速 `--smoke-test` 冻结态启动冒烟校验，并彻底将 `tests/` 排除于客户版安装包之外）。
 - **核心入口、脚本与工具**：
-  - `app.py`（FastAPI `3.2.1` 微内核、`APP_VERSION`、前端 `.html/.js/.css` 防缓存头、`check_static_ui_version_sync`、Gate 1 全量 `/api/*` 拦截、中间件请求 Trace 与 `Server-Timing` 下发、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）、`knowledge_packs/`（DWS 9.1 / Inceptor 9.x / PGSQL 19 离线知识包 `.json.gz` 与源码 `.md`，不打入安装包，含 `build_packs.py` 与 GitHub 自助下载索引）。
+  - `app.py`（FastAPI `3.2.2` 微内核、`APP_VERSION`、前端 `.html/.js/.css` 防缓存头、`check_static_ui_version_sync`、Gate 1 全量 `/api/*` 拦截、中间件请求 Trace 与 `Server-Timing` 下发、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--smoke-test` 2 秒极速冒烟 & `--test` 源码自检）、`build_exe.py`（支持 `--skip-tests` / `DATAOG_SKIP_BUILD_TESTS`、`check_no_tests_bundled` 严防 `tests/` 入包） / `build_windows.bat` / `.github/workflows/ci.yml`（仅限 `v*` 标签/手动调度执行纯 Windows 打包与 `--smoke-test`）、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）、`knowledge_packs/`（DWS 9.1 / Inceptor 9.x / PGSQL 19 离线知识包 `.json.gz` 与源码 `.md`，不打入安装包，含 `build_packs.py` 与 GitHub 自助下载索引）。
   - `tools/admin_console/` & `DataOG_Console.command`、`tools/keygen_src/` & `tools/build_keygen.py`、`demo_sandbox/`（启明商业银行信创三引擎演示沙箱）：全部严格排除于客户安装包之外。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
-  - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.2.1"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（7 领域子路由含 `knowledge.py` 与 `diagnostics.py`）、`schemas.py`、`models.py`、`diagnostics_hub.py`（全链路 Span/Benchmark/自动瓶颈研判/递归脱敏导出）。
+  - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.2.2"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（7 领域子路由含 `knowledge.py` 与 `diagnostics.py`）、`schemas.py`、`models.py`、`diagnostics_hub.py`（全链路 Span/Benchmark/自动瓶颈研判/递归脱敏导出）。
   - `knowledge_hub.py` & `builtin_dialect_kb.py`（零新增依赖支持 `.md`/`.txt`/`.sql`/`.html`/`.json`/`.csv`/`.docx`/`.xlsx`，FTS5+BM25 中英/错误码切词、方言硬过滤、11 篇内置方言速查卡、`.json.gz` 知识包、可选 `/embeddings` RRF 与离线回退，Layer 2 私有隔离）、`sql_risk_guard.py`（词法多语句切分 + `READONLY`/`STANDARD_WRITE`/`HIGH_RISK` 定级 + 安全影响行数探针）。
   - `storage_paths.py`、`storage/`（含 `_TimedRLock` 与库开关计时）、`workspace_hub.py`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）、`license_hub.py` & `_license_native_src/`、`asset_store.py`、`standard_catalog.py`、`offline_report/`、`import_progress.py`、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`llm_hub.py`（含 `create_embeddings`）、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`、`core/dws_engine.py`。
 - **五大独立插件模块 (`modules/`, 导出 `MODULE_SPEC`, 严格零互引)**：
   - `modules/standard_migrator/`、`modules/cross_comparator/`、`modules/ddl_translator/`、`modules/data_explorer/`（`scope="private"`）、`modules/ai_assistant/`（`scope="private"`，在线连库/纯方言双模式、10 安全只读工具含 `attachments.py` CSV 内存只读 SQLite 沙箱与 `stepped_batch` Map-Reduce 防爆窗拆解、DDL/写提案分级确认执行闭环）。
 - **前端 ES Modules 工作台 (`static/`)**：
   - `index.html`、`css/tokens.css` & `workbench.css`、`js/main.js`（零静态 View 依赖，日志弹窗集成性能诊断与一键导出）、`js/core/`（含 `perf_monitor.js`）、`js/apps/`（`index.js` + `ai_assistant/` 独立懒加载应用，支持粘贴/拖拽/上传文本与 CSV 及 `<dialog>` 分片预览）、`js/api/`、`js/ui/`、`js/views/`（含 `knowledge_view.js`、`diagnostics_view.js`、`workspace_merge_wizard.js`、`standard_migrator/modals.js`、`cross_comparator/*.js`）。
-- **自动化测试套件 (`tests/`，共 92 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (21)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (6)、`test_ai_assistant_and_kb.py` (6)、`test_diagnostics_benchmark.py` (4)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
+- **自动化测试套件 (`tests/`，共 93 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (21)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (7)、`test_ai_assistant_and_kb.py` (6)、`test_diagnostics_benchmark.py` (4)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
 
 ## 6. AI 只读探查四道硬隔离铁律
 涉及 AI 自动查询必须复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束：

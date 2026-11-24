@@ -8,6 +8,26 @@
 
 ---
 
+## [3.2.2] - 2026-11-24
+
+> **CI 纯打包瘦身与 2 秒冻结态 `--smoke-test` 启动冒烟闭环**：将全量单元测试彻底收口至发布前本地执行，消除 GitHub Actions 与 `build_exe.py` 重复跑 4 次全量单测导致的耗时拖慢，将云端 Windows 构建发版链路压缩至纯打包 + 2 秒冻结态启动冒烟校验，同时把客户发行包内的 `tests/` 目录彻底剥离。
+
+### Added
+- **2 秒极速启动冒烟校验 (`app.py`: `--smoke-test` / `run_smoke_test`)**：
+  - 使用零第三方网络依赖的内联 ASGI 探活器验证核心运行时模块可导入性、`static/` 资源完整性与 `dataog-ui-version` 一致性、隔离保险箱中 `create_app()` 初始化、五大插件模块自动发现挂载、内置方言知识库自动种子化、冻结态原生 `_license_shield` 加载状态，以及 `GET /`（防缓存头）、`GET /js/main.js`、`GET /api/platform/auth/status`（`X-DataOG-Trace-Id` / `Server-Timing` 诊断头）和 `GET /api/platform/bootstrap`（Gate 1 拦截 `401`）四路核心链路。
+- **纯净无测试包防线 (`build_exe.py`: `check_no_tests_bundled`, `--skip-tests`)**：
+  - `build_exe.py` 新增 `--skip-tests` 参数与 `DATAOG_SKIP_BUILD_TESTS` 环境变量支持，并在 `excluded_modules` 显式排除 `"tests"`、打包后校验 `dist/DataOG` 中不存在任何 `tests/` 目录或测试脚本（配合 `build_windows.bat` 透传参数 `%*`）。
+- **流水线与打包门禁回归测试 (`tests/test_modular_architecture.py`)**：
+  - 新增 `test_smoke_test_and_fast_ci_packaging_pipeline` 验证 `--smoke-test` 冒烟闭环与 CI 精简流水线约束，并升级构建产物零测试防线断言（总测试增至 93 项）。
+
+### Changed
+- **GitHub Actions 专注纯打包与 Release 发布 (`.github/workflows/ci.yml`)**：
+  - 移除 `unit-tests` Job 与分支 `push`/`pull_request` 冗余触发，仅在推送 `v*` 版本标签或手动调度 `workflow_dispatch` 时运行 `build-windows-exe`；执行 `python build_exe.py --skip-tests` 后直接运行 `dist\DataOG\DataOG.exe --smoke-test` 验证冻结态运行包完整性并压缩发布至 GitHub Releases。
+- **精简 PyInstaller 打包体积与隐藏导入 (`build_exe.py`)**：
+  - 不再将 `tests/` 打包进客户发行包，并移除仅供单测 `TestClient`/标准库测试服务器使用的 `http.server`、`socketserver` 与 `unittest.mock` 隐藏导入。
+
+---
+
 ## [3.2.1] - 2026-11-24
 
 > **Windows CI 打包单测句柄泄露与时序竞态修复**：根治 `v3.2.0` 发布流水线在 Windows 打包阶段清理临时目录失败的问题，并加固临时压测文件清理、Windows 驱动盘符检测与冻结态测试依赖。

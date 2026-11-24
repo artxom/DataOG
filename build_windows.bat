@@ -33,7 +33,7 @@ if %errorlevel% neq 0 (
 )
 
 echo [STEP 3] Building standalone DataOG.exe via build_exe.py ...
-".venv\Scripts\python.exe" build_exe.py
+".venv\Scripts\python.exe" build_exe.py %*
 if %errorlevel% neq 0 (
     echo [ERROR] Packaging failed. Please check the error output above.
     pause
@@ -50,7 +50,7 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 echo [STEP 3] Building standalone DataOG.exe via build_exe.py ...
-python build_exe.py
+python build_exe.py %*
 if %errorlevel% neq 0 (
     echo [ERROR] Packaging failed.
     pause
