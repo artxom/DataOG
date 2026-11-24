@@ -2047,6 +2047,18 @@ export class CrossComparatorView {
       }
     }
 
+    let tgtStatusBadge = null;
+    if (isTgt && row.target_needs_migration) {
+      if (row.target_compliance?.status === "PARTIAL_COMPLIANT") {
+        tgtStatusBadge = badge("部分落标", "warn");
+        tgtStatusBadge.title = row.target_compliance.detail || "符合其他落标标准";
+      } else {
+        tgtStatusBadge = badge("待贯标", "warn");
+      }
+    } else if (isTgt && tgtCompliant) {
+      tgtStatusBadge = badge("已落标", "success");
+    }
+
     return el(
       "div",
       {
@@ -2089,11 +2101,7 @@ export class CrossComparatorView {
         el(
           "div",
           { className: "cross-bound-chip-actions" },
-          isTgt && row.target_needs_migration
-            ? badge("待贯标", "warn")
-            : isTgt && tgtCompliant
-            ? badge("已落标", "success")
-            : null,
+          tgtStatusBadge,
           el("button", {
             type: "button",
             className: "cross-chip-remove",

@@ -138,6 +138,7 @@ def build_single_db_excel_bytes(report_data: Dict[str, Any]) -> bytes:
             )
             tag_map = {
                 "COMPLIANT": "GREEN",
+                "PARTIAL_COMPLIANT": "YELLOW",
                 "COMMENT_ONLY": "BLUE",
                 "NON_COMPLIANT": "RED",
                 "STD_MISSING": "YELLOW",
@@ -180,7 +181,7 @@ _SINGLE_DB_APP_JS = r"""
     allViewMode: "tables", // tables | fields
     tableListFilter: "ALL", // ALL | NON_COMPLIANT | COMPLIANT | HAS_UNBOUND | UNBOUND_ALL
     tableKeyword: "",
-    colStatusFilter: "ALL", // ALL | COMPLIANT | COMMENT_ONLY | NON_COMPLIANT | STD_MISSING | UNBOUND | IN_QUEUE
+    colStatusFilter: "ALL", // ALL | COMPLIANT | COMMENT_ONLY | PARTIAL_COMPLIANT | NON_COMPLIANT | STD_MISSING | UNBOUND | IN_QUEUE
     colKeyword: "",
     page: 1,
     pageSize: 200,
@@ -201,6 +202,7 @@ _SINGLE_DB_APP_JS = r"""
 
   function statusTone(st) {
     if (st === "COMPLIANT") return "ok";
+    if (st === "PARTIAL_COMPLIANT") return "warn";
     if (st === "COMMENT_ONLY") return "info";
     if (st === "NON_COMPLIANT") return "bad";
     if (st === "STD_MISSING") return "warn";
@@ -209,6 +211,7 @@ _SINGLE_DB_APP_JS = r"""
 
   function excelTone(st) {
     if (st === "COMPLIANT") return "GREEN";
+    if (st === "PARTIAL_COMPLIANT") return "YELLOW";
     if (st === "COMMENT_ONLY") return "BLUE";
     if (st === "NON_COMPLIANT") return "RED";
     if (st === "STD_MISSING") return "YELLOW";
@@ -265,7 +268,10 @@ _SINGLE_DB_APP_JS = r"""
     }
     const kw = state.colKeyword.trim().toLowerCase();
     if (!kw) return true;
-    return [c.column_name, c.column_comment, c.data_type, c.std_code, c.std_cn_name, c.std_en_abbr, c.compliance_detail]
+    const altTxt = (c.matched_alt_profiles || [])
+      .map((p) => (p.label || "") + " " + (p.short_label || "") + " " + (p.target_type || ""))
+      .join(" ");
+    return [c.column_name, c.column_comment, c.data_type, c.std_code, c.std_cn_name, c.std_en_abbr, c.compliance_detail, altTxt]
       .some((v) => String(v || "").toLowerCase().includes(kw));
   }
 
@@ -295,7 +301,7 @@ _SINGLE_DB_APP_JS = r"""
       const ti = t.table || {};
       const s = t.summary || {};
       if (state.tableListFilter === "NON_COMPLIANT") {
-        if ((s.non_compliant_cols || 0) === 0 && (s.comment_only_cols || 0) === 0 && (s.std_missing_cols || 0) === 0) return false;
+        if ((s.non_compliant_cols || 0) === 0 && (s.partial_compliant_cols || 0) === 0 && (s.comment_only_cols || 0) === 0 && (s.std_missing_cols || 0) === 0) return false;
       } else if (state.tableListFilter === "COMPLIANT") {
         if ((s.total_cols || 0) === 0 || (s.compliant_cols || 0) < (s.total_cols || 0)) return false;
       } else if (state.tableListFilter === "HAS_UNBOUND") {
@@ -453,8 +459,8 @@ _SINGLE_DB_APP_JS = r"""
       { label: "库表总数", val: String(AGG.total_tables ?? TABLES.length), sub: "已绑标表 " + (AGG.bound_tables_count ?? 0) + " / 全达标表 " + (AGG.full_compliant_tables_count ?? 0) + (skipCnt > 0 ? "（已过滤 " + skipCnt + " 张未绑标表）" : "") },
       { label: "总字段数", val: String(AGG.total_cols ?? 0), sub: "已绑标 " + (AGG.bound_cols ?? 0) + " · 未绑标 " + (AGG.unbound_cols ?? 0) },
       { label: "绑标覆盖率", val: String(AGG.coverage_pct ?? 0) + "%", pct: Number(AGG.coverage_pct ?? 0), sub: (AGG.bound_cols ?? 0) + " / " + (AGG.total_cols ?? 0) + " 列" },
-      { label: "标准落标率", val: String(AGG.compliant_pct ?? 0) + "%", pct: Number(AGG.compliant_pct ?? 0), sub: "已落标 " + (AGG.compliant_cols ?? 0) + " · 仅差注释 " + (AGG.comment_only_cols ?? 0) },
-      { label: "待整改字段", val: String((AGG.non_compliant_cols ?? 0) + (AGG.comment_only_cols ?? 0) + (AGG.std_missing_cols ?? 0)), sub: "未落标 " + (AGG.non_compliant_cols ?? 0) + " · 标准缺失 " + (AGG.std_missing_cols ?? 0) },
+      { label: "标准落标率", val: String(AGG.compliant_pct ?? 0) + "%", pct: Number(AGG.compliant_pct ?? 0), sub: "已落标 " + (AGG.compliant_cols ?? 0) + ((AGG.partial_compliant_cols || 0) > 0 ? " · 部分落标 " + AGG.partial_compliant_cols : "") + " · 仅差注释 " + (AGG.comment_only_cols ?? 0) },
+      { label: "待整改字段", val: String((AGG.non_compliant_cols ?? 0) + (AGG.partial_compliant_cols ?? 0) + (AGG.comment_only_cols ?? 0) + (AGG.std_missing_cols ?? 0)), sub: "未落标 " + (AGG.non_compliant_cols ?? 0) + " · 部分落标 " + (AGG.partial_compliant_cols ?? 0) + " · 标准缺失 " + (AGG.std_missing_cols ?? 0) },
       { label: "贯标改造队列", val: String(MIG_ITEMS.length), sub: "待改 " + (AGG.queue_pending ?? 0) + " · 已达标 " + (AGG.queue_completed ?? 0) },
     ];
     return el("section", { className: "kpi-strip" },
@@ -492,6 +498,19 @@ _SINGLE_DB_APP_JS = r"""
       if (showTableCols) {
         cells.push(el("td", { className: "mono", text: (ti.schema_name || "") + "." + (ti.table_name || "") }));
       }
+      const altProfiles = Array.isArray(c.matched_alt_profiles) ? c.matched_alt_profiles : [];
+      const altNode = c.compliance_status === "PARTIAL_COMPLIANT" && altProfiles.length
+        ? el("div", {
+            style: { display: "flex", flexWrap: "wrap", gap: "3px", marginTop: "3px", alignItems: "center" },
+            title: "符合其他落标：" + altProfiles.map((p) => (p.label || p.value) + (p.target_type ? " (" + p.target_type + ")" : "")).join("、"),
+          },
+            el("span", { style: { fontSize: "10.5px", color: "var(--muted)" }, text: "满足:" }),
+            altProfiles.slice(0, 2).map((p) =>
+              badge((p.label || p.value) + (p.target_type ? " · " + p.target_type : ""), "warn")
+            ),
+            altProfiles.length > 2 ? badge("+" + (altProfiles.length - 2) + " 项") : null
+          )
+        : null;
       cells.push(
         el("td", { className: "mono", style: { fontWeight: "600" }, text: c.column_name || "" }),
         el("td", { className: "mono", text: c.data_type || "" }),
@@ -501,7 +520,7 @@ _SINGLE_DB_APP_JS = r"""
         el("td", { text: c.std_cn_name || "-" }),
         el("td", { className: "mono", text: c.std_en_abbr || "-" }),
         el("td", { className: "mono", text: c.std_target_type || "-" }),
-        el("td", {}, badge(c.compliance_label || c.compliance_status, statusTone(c.compliance_status))),
+        el("td", {}, badge(c.compliance_label || c.compliance_status, statusTone(c.compliance_status)), altNode),
         el("td", { style: { maxWidth: "280px" }, text: c.compliance_detail || "-" }),
         el("td", {}, c.queue_status ? badge(qTxt, c.queue_status === "COMPLETED" ? "ok" : "warn") : el("span", { style: { color: "var(--muted)" }, text: "-" }))
       );
@@ -563,7 +582,7 @@ _SINGLE_DB_APP_JS = r"""
         const k = tblKey(t);
         let bNode = badge(String(s.total_cols || 0) + "列");
         if (s.bound_cols > 0) {
-          const tone = s.non_compliant_cols > 0 ? "bad" : (s.compliant_cols >= s.bound_cols ? "ok" : "info");
+          const tone = s.non_compliant_cols > 0 ? "bad" : ((s.partial_compliant_cols || 0) > 0 ? "warn" : (s.compliant_cols >= s.bound_cols ? "ok" : "info"));
           bNode = badge(String(s.compliant_cols || 0) + "/" + String(s.bound_cols || 0), tone);
         } else if (ti.exists === false) {
           bNode = badge("缺表", "bad");
@@ -597,6 +616,7 @@ _SINGLE_DB_APP_JS = r"""
       { k: "ALL", l: "全部" },
       { k: "COMPLIANT", l: "已落标" },
       { k: "COMMENT_ONLY", l: "仅差注释" },
+      { k: "PARTIAL_COMPLIANT", l: "部分落标" },
       { k: "NON_COMPLIANT", l: "未落标" },
       { k: "STD_MISSING", l: "标准缺失" },
       { k: "UNBOUND", l: "未绑标" },
@@ -661,7 +681,7 @@ _SINGLE_DB_APP_JS = r"""
         badge(ti.object_type || "TABLE", "info"),
         ti.exists === false
           ? badge("库内缺表", "bad")
-          : badge("落标率 " + String(s.compliant_pct ?? 0) + "%", (s.non_compliant_cols || 0) > 0 ? "warn" : "ok"),
+          : badge("落标率 " + String(s.compliant_pct ?? 0) + "%", ((s.non_compliant_cols || 0) > 0 || (s.partial_compliant_cols || 0) > 0) ? "warn" : "ok"),
         el("div", { className: "pills" }, filterPillsDef.map((fp) => el("button", {
           type: "button", className: "pill " + (state.colStatusFilter === fp.k ? "is-active" : ""),
           text: fp.l,
@@ -692,7 +712,7 @@ _SINGLE_DB_APP_JS = r"""
             ? el("div", { className: "table-wrap" },
                 el("table", { className: "grid" },
                   el("thead", {}, el("tr", {},
-                    ["模式名", "表名", "类型", "表注释", "总列数", "已绑标", "已落标", "仅差注释", "未落标", "未绑标", "绑标率", "落标率"].map((h) => el("th", { text: h }))
+                    ["模式名", "表名", "类型", "表注释", "总列数", "已绑标", "已落标", "仅差注释", "部分落标", "未落标", "未绑标", "绑标率", "落标率"].map((h) => el("th", { text: h }))
                   )),
                   el("tbody", {}, tblList.map((t) => {
                     const ti = t.table || {};
@@ -716,6 +736,7 @@ _SINGLE_DB_APP_JS = r"""
                       el("td", { className: "mono", text: String(s.bound_cols || 0) }),
                       el("td", {}, badge(String(s.compliant_cols || 0), (s.compliant_cols || 0) > 0 ? "ok" : "")),
                       el("td", {}, badge(String(s.comment_only_cols || 0), (s.comment_only_cols || 0) > 0 ? "info" : "")),
+                      el("td", {}, badge(String(s.partial_compliant_cols || 0), (s.partial_compliant_cols || 0) > 0 ? "warn" : "")),
                       el("td", {}, badge(String(s.non_compliant_cols || 0), (s.non_compliant_cols || 0) > 0 ? "bad" : "")),
                       el("td", { className: "mono", text: String(s.unbound_cols || 0) }),
                       el("td", { className: "mono", text: String(s.coverage_pct ?? 0) + "%" }),
@@ -778,7 +799,7 @@ _SINGLE_DB_APP_JS = r"""
     },
       [
         { v: "ALL", t: "全部库表 (" + TABLES.length + ")" },
-        { v: "NON_COMPLIANT", t: "含未落标/差注释" },
+        { v: "NON_COMPLIANT", t: "含未落标/部分落标/差注释" },
         { v: "COMPLIANT", t: "全字段已落标" },
         { v: "HAS_UNBOUND", t: "含未绑标字段" },
         { v: "UNBOUND_ALL", t: "整表均未绑标" },

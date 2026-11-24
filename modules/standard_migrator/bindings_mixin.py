@@ -204,6 +204,7 @@ class _StandardBindingsMixin:
             "total_cols": len(t_meta.columns),
             "bound_cols": 0,
             "compliant_cols": 0,
+            "partial_compliant_cols": 0,
             "comment_only_cols": 0,
             "non_compliant_cols": 0,
             "std_missing_cols": 0,
@@ -246,6 +247,8 @@ class _StandardBindingsMixin:
                     )
             if st == "COMPLIANT":
                 counts["compliant_cols"] += 1
+            elif st == "PARTIAL_COMPLIANT":
+                counts["partial_compliant_cols"] += 1
             elif st == "COMMENT_ONLY":
                 counts["comment_only_cols"] += 1
             elif st == "NON_COMPLIANT":
@@ -259,7 +262,7 @@ class _StandardBindingsMixin:
             is_part = col_lower in part_set
             is_pk = bool(col.is_primary_key) or (col_lower in pk_set)
             needs_rebuild = bool(
-                st == "NON_COMPLIANT"
+                st in ("NON_COMPLIANT", "PARTIAL_COMPLIANT")
                 and prof.db_type in ("DWS", "PGSQL", "KINGBASE")
                 and ((is_dist or is_part) or (is_col_store and not ev["type_ok"]))
             )
@@ -287,6 +290,9 @@ class _StandardBindingsMixin:
                     "compliance_status": st,
                     "compliance_label": ev["label"],
                     "compliance_detail": ev["detail"],
+                    "compliance_current_diff": ev.get("current_diff", ""),
+                    "resolved_format_profile": ev.get("resolved_format_profile", ""),
+                    "matched_alt_profiles": ev.get("matched_alt_profiles") or [],
                     "name_ok": ev["name_ok"],
                     "type_ok": ev["type_ok"],
                     "comment_ok": ev["comment_ok"],
@@ -784,6 +790,7 @@ class _StandardBindingsMixin:
             "total_cols": 0,
             "bound_cols": 0,
             "compliant_cols": 0,
+            "partial_compliant_cols": 0,
             "comment_only_cols": 0,
             "non_compliant_cols": 0,
             "std_missing_cols": 0,
@@ -877,6 +884,7 @@ class _StandardBindingsMixin:
                 "total_cols",
                 "bound_cols",
                 "compliant_cols",
+                "partial_compliant_cols",
                 "comment_only_cols",
                 "non_compliant_cols",
                 "std_missing_cols",
@@ -922,7 +930,7 @@ class _StandardBindingsMixin:
         self.ctx.store.add_log(
             "INFO",
             "落标核验",
-            f"已完成 [{prof.name}] 共 {agg['checked_tables']} 张表 {agg['total_cols']} 个字段落标核验（已落标 {agg['compliant_cols']} / 仅差注释 {agg['comment_only_cols']} / 未落标 {agg['non_compliant_cols']} / 未绑标 {agg['unbound_cols']}）",
+            f"已完成 [{prof.name}] 共 {agg['checked_tables']} 张表 {agg['total_cols']} 个字段落标核验（已落标 {agg['compliant_cols']} / 部分落标 {agg['partial_compliant_cols']} / 仅差注释 {agg['comment_only_cols']} / 未落标 {agg['non_compliant_cols']} / 未绑标 {agg['unbound_cols']}）",
         )
         table_stats = self.ctx.standard_catalog.get_connection_binding_stats(prof.connection_id)
         out: Dict[str, Any] = {
@@ -932,7 +940,7 @@ class _StandardBindingsMixin:
             "aggregate": agg,
             "tables": table_results,
             "table_stats": table_stats,
-            "message": f"核验完成：{agg['checked_tables']} 张表共 {agg['total_cols']} 列，已落标 {agg['compliant_cols']} 列、未落标 {agg['non_compliant_cols']} 列、仅差注释 {agg['comment_only_cols']} 列",
+            "message": f"核验完成：{agg['checked_tables']} 张表共 {agg['total_cols']} 列，已落标 {agg['compliant_cols']} 列、部分落标 {agg['partial_compliant_cols']} 列、未落标 {agg['non_compliant_cols']} 列、仅差注释 {agg['comment_only_cols']} 列",
         }
         if probe_warning and skipped_probe_tables:
             out["warning"] = (

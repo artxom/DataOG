@@ -228,7 +228,7 @@ def setup_console_logging() -> logging.Logger:
 
 logger = setup_console_logging()
 
-APP_VERSION = "3.2.3"
+APP_VERSION = "3.2.4"
 _NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
 _UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
 

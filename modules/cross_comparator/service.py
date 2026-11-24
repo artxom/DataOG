@@ -1455,7 +1455,7 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
                     db_type=tgt_db_type,
                     format_profile=eff_tgt_fmt,
                 )
-                if target_compliance["status"] in ("NON_COMPLIANT", "COMMENT_ONLY", "STD_MISSING"):
+                if target_compliance["status"] in ("NON_COMPLIANT", "PARTIAL_COMPLIANT", "COMMENT_ONLY", "STD_MISSING"):
                     target_needs_migration = True
                     bk_summary["target_needs_migration"] += 1
 
