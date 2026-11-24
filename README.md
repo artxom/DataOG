@@ -1,4 +1,4 @@
-# Data.O.G v3.2.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.2.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -58,7 +58,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 3.2.0 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、Server-Timing 遥测与全链路中间件追踪、自动发现插件装配）
+├── app.py                        # FastAPI 3.2.1 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、Server-Timing 遥测与全链路中间件追踪、自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
@@ -139,7 +139,8 @@ DataOG/
 | **`v3.0.1`** | `fix/v3.0.1-no-cache-and-reload` → `main` | **前端静态资源强制 `no-cache`、桌面顶部「一键重载」按钮与静态目录版本校验**：为非 `/api/*` 的 `.html`/`.js`/`.css` 下发 `Cache-Control: no-store, no-cache, must-revalidate`、`Pragma: no-cache` 与 `Expires: 0` 彻底解决升级后浏览器锁死旧模块问题；顶部菜单栏新增 **「重载」** 按钮支持清理 Cache Storage 并无缓存刷新页面；启动时校验 `_internal/static` 内 `dataog-ui-version` 与 `APP_VERSION` 一致性并在仅替换 `.exe` 时给出醒目提示；同步在 `knowledge_packs/` 提供 DWS 9.1 / Inceptor 9.x / PostgreSQL 19 初始化离线知识库自助下载（87 项测试全绿） |
 | **`v3.0.2`** | `fix/v3.0.2-ai-assistant-activitybar-and-e2e-tests` → `main` | **修复 AI 助手与知识库 `activityBar.track` 调用错误、交互体验补全与前端端到端交互测试升级**：将 `AiAssistantView.sendUserMessage()` 与 `KnowledgeSettingsView` 重建向量索引误用的 `this.activityBar.run(...)` 修正为 `this.activityBar.track(...)` 根治发消息阻断崩溃；优先自动选中已就绪 AI 模型、补齐发送中用户气泡占位并修复抽屉库表刷新响应结构读取；在 `test_ai_assistant_and_kb.py` 新增 `.activityBar.run(` 全库静态防线及覆盖发送/提案确认/抽屉/知识库全交互的 Node.js 端到端验证（87 项测试全绿） |
 | **`v3.1.0`** | `feat/v3.1.0-chat-attachments-and-chunking` → `main` | **AI 助手聊天窗口纯文本/SQL 粘贴、受限 CSV 上传与超长内容防爆窗分步拆解引擎**：聊天输入框支持剪贴板粘贴文件或超长文本（自动转为 `.txt`/`.sql` 附件胶囊）、拖拽与按钮上传（文本/SQL `<=5MB`、CSV/TSV `<=2MB`、二进制零字节拦截及编码自适应）；落地语义智能分片（`CHUNK_HARD_MAX_TOKENS=2800`）、CSV 零 Token 画像 + `:memory:` 只读 SQLite `csv_data` 内存查询沙箱、按需检索与 `stepped_batch` Map-Reduce 滚动摘要接续拆解闭环，配套 `<dialog>` 分片/画像预览弹窗与后端/Node 端到端回归测试（88 项测试全绿） |
-| **`v3.2.0`**（当前正式版） | `feat/diagnostics-benchmark-v3.2` → `main` | **全链路性能剖析、全栈基准压测 (`Benchmark`) 与脱敏诊断日志包导出中枢**：新增 `DiagnosticsHub` 全内存零写盘 Span 链路追踪、`_TimedRLock` 与 SQLite 开关库计时、全底座热点埋点及 `Server-Timing` / `X-DataOG-*` 响应头；新增「系统配置 → 性能诊断」与「执行日志」快捷导出入口，支持浏览器 10 串行 + 6 并发环回 RTT 测试、事件循环/线程池/设备探针/DNS/4KB `fsync`/SQLite/Bootstrap/可选 DB 与 AI 端点逐段基准压测、自动瓶颈研判以及 100% 零路径零密钥脱敏 `.json` 诊断包导出（92 项测试全绿） |
+| **`v3.2.0`** | `feat/diagnostics-benchmark-v3.2` → `main` | **全链路性能剖析、全栈基准压测 (`Benchmark`) 与脱敏诊断日志包导出中枢**：新增 `DiagnosticsHub` 全内存零写盘 Span 链路追踪、`_TimedRLock` 与 SQLite 开关库计时、全底座热点埋点及 `Server-Timing` / `X-DataOG-*` 响应头；新增「系统配置 → 性能诊断」与「执行日志」快捷导出入口，支持浏览器 10 串行 + 6 并发环回 RTT 测试、事件循环/线程池/设备探针/DNS/4KB `fsync`/SQLite/Bootstrap/可选 DB 与 AI 端点逐段基准压测、自动瓶颈研判以及 100% 零路径零密钥脱敏 `.json` 诊断包导出（92 项测试全绿） |
+| **`v3.2.1`**（当前正式版） | `fix/v3.2.1-windows-ci-diagnostics-tests` → `main` | **Windows 打包单测 SQLite 句柄泄露与时序竞态修复**：使用 `contextlib.closing` 彻底关闭诊断测试临时 SQLite 句柄避免 Windows `[WinError 32]` 清理失败、消除跨线程锁争用定时器竞态，并加固 `GetDriveTypeW` ctypes 签名、临时压测库 WAL 回收与 `socketserver` 冻结态导入（92 项测试全绿） |
 
 ---
 

@@ -286,6 +286,7 @@ def build_executable() -> None:
         "--hidden-import=h11",
         "--hidden-import=et_xmlfile",
         "--hidden-import=http.server",
+        "--hidden-import=socketserver",
         "--hidden-import=unittest.mock",
     ]
     if shield_bin_path and os.path.isfile(shield_bin_path):

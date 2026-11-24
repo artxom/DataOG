@@ -8,6 +8,20 @@
 
 ---
 
+## [3.2.1] - 2026-11-24
+
+> **Windows CI 打包单测句柄泄露与时序竞态修复**：根治 `v3.2.0` 发布流水线在 Windows 打包阶段清理临时目录失败的问题，并加固临时压测文件清理、Windows 驱动盘符检测与冻结态测试依赖。
+
+### Fixed
+- **修复诊断测试未关闭 SQLite 连接句柄导致 Windows 清理报 `[WinError 32]` (`tests/test_diagnostics_benchmark.py`)**：
+  - 将构造本地测试 SQLite 文件的 `with sqlite3.connect(...)` 改为 `with contextlib.closing(sqlite3.connect(...))`，确保临时数据库句柄在目录销毁前即时关闭（`-W error::ResourceWarning` 零警告通过）；
+  - 将跨线程锁争用验证改为后台持锁 `0.15s` + 主线程确定性抢锁 (`lock_wait_max_ms >= 20.0`)，消除 Windows 定时器粒度造成的偶发竞态；补齐 `no_proxy` 环境变量清理及 Node 测试中原生 `URL` 构造器保留。
+- **加固 Windows 磁盘检测与临时压测清理 (`core/platform/diagnostics_hub.py`, `build_exe.py`)**：
+  - 为 `ctypes.windll.kernel32.GetDriveTypeW` 显式声明 `argtypes`/`restype`；
+  - 临时 WAL 压测库清理前执行 `PRAGMA wal_checkpoint(TRUNCATE)` 与 `PRAGMA journal_mode = DELETE`，并在临时压测文件删除增加短退避重试以兼容杀软实时扫描短暂句柄锁；`build_exe.py` 补充 `--hidden-import=socketserver`。
+
+---
+
 ## [3.2.0] - 2026-11-24
 
 > **全链路性能剖析、全栈基准压测 (`Benchmark`) 与脱敏诊断日志包导出中枢**：针对内网/企业终端偶发的整体响应卡顿与无法定位阻塞环节的痛点，新增零写盘全内存链路追踪、端到端环回基准压测、自动瓶颈研判与一键脱敏 `.json` 诊断包导出，贯通「浏览器 → 本地环回/代理 → Gate 1 鉴权 → 事件循环/线程池 → SQLite 锁与开关库 → 远端 DB/AI」。

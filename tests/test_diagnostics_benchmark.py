@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import os
@@ -82,24 +83,26 @@ class TestDiagnosticsAndBenchmark(unittest.TestCase):
                 404,
             )
 
-            # 3. 验证 _TimedRLock 锁竞争计时
+            # 3. 验证 _TimedRLock 锁竞争计时（后台持锁 0.15s，确保在 Windows 定时器粒度下产生确定性等待）
             held = threading.Event()
 
             def _hold_store_lock() -> None:
                 with ctx.store._lock:
                     held.set()
-                    time.sleep(0.03)
+                    time.sleep(0.15)
 
             thr = threading.Thread(target=_hold_store_lock)
             thr.start()
             self.assertTrue(held.wait(timeout=2.0))
+            with ctx.store._lock:
+                pass
             _ = client.get("/api/platform/connections")
             thr.join(timeout=2.0)
 
             ov = client.get("/api/platform/diagnostics/overview").json()
             self.assertTrue(ov["ok"])
             self.assertGreater(ov["sqlite_stats"]["lock_acquires"], 0)
-            self.assertGreaterEqual(ov["sqlite_stats"]["lock_wait_max_ms"], 10.0)
+            self.assertGreaterEqual(ov["sqlite_stats"]["lock_wait_max_ms"], 20.0)
             self.assertGreater(ov["sqlite_stats"]["private_opens"], 0)
             self.assertGreater(ov["sqlite_stats"]["workspace_opens"], 0)
 
@@ -139,7 +142,7 @@ class TestDiagnosticsAndBenchmark(unittest.TestCase):
 
             # 写入 SQLite 连接与含密凭据 + AI API Key + 含敏感信息服务日志行
             sqlite_file = os.path.join(tmp, "sample_local.db")
-            with sqlite3.connect(sqlite_file) as sconn:
+            with contextlib.closing(sqlite3.connect(sqlite_file)) as sconn:
                 sconn.execute("CREATE TABLE t_demo (id INTEGER PRIMARY KEY, val TEXT)")
                 sconn.commit()
 
@@ -242,7 +245,11 @@ class TestDiagnosticsAndBenchmark(unittest.TestCase):
 
             with mock.patch.dict(
                 os.environ,
-                {"HTTP_PROXY": "http://proxy_user:proxy_pass@10.10.1.5:8080", "NO_PROXY": ""},
+                {
+                    "HTTP_PROXY": "http://proxy_user:proxy_pass@10.10.1.5:8080",
+                    "NO_PROXY": "",
+                    "no_proxy": "",
+                },
                 clear=False,
             ):
                 exp_resp = client.post(
@@ -374,10 +381,11 @@ for (const id of ["global-modal", "global-modal-title", "global-modal-body", "gl
 let blobDownloaded = false;
 globalThis.Node = MockNode;
 globalThis.HTMLDialogElement = class HTMLDialogElement {};
-globalThis.URL = {
-  createObjectURL: () => "blob:mock-diag",
-  revokeObjectURL: () => {},
-};
+if (!globalThis.URL) {
+  globalThis.URL = class MockURL {};
+}
+globalThis.URL.createObjectURL = () => "blob:mock-diag";
+globalThis.URL.revokeObjectURL = () => {};
 globalThis.Blob = class MockBlob {
   constructor(parts) { this.size = String(parts?.[0] || "").length; }
 };
@@ -561,7 +569,7 @@ console.log("DIAGNOSTICS_FRONTEND_E2E_OK");
             with tempfile.TemporaryDirectory() as tmp:
                 priv_root = os.path.join(tmp, "probe_priv_root")
                 sqlite_file = os.path.join(tmp, "probe_target_secret_dir.db")
-                with sqlite3.connect(sqlite_file) as sconn:
+                with contextlib.closing(sqlite3.connect(sqlite_file)) as sconn:
                     sconn.execute("CREATE TABLE t_probe (id INTEGER PRIMARY KEY)")
                     sconn.commit()
 
@@ -611,6 +619,7 @@ console.log("DIAGNOSTICS_FRONTEND_E2E_OK");
                 self.assertNotIn("sk-mockprobe-secret-12345", resp.text)
                 self.assertNotIn(priv_root, resp.text)
                 self.assertNotIn(sqlite_file, resp.text)
+                self.assertNotIn(os.path.basename(sqlite_file), resp.text)
         finally:
             server.shutdown()
             server.server_close()

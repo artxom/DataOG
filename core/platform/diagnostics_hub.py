@@ -294,7 +294,10 @@ def _detect_storage_drive_info(path_str: str) -> Tuple[str, bool]:
             drive, _ = os.path.splitdrive(os.path.abspath(raw))
             if drive:
                 root_path = drive.rstrip("\\/") + "\\"
-                dtype = int(ctypes.windll.kernel32.GetDriveTypeW(root_path))  # type: ignore[attr-defined]
+                get_drive_type = ctypes.windll.kernel32.GetDriveTypeW  # type: ignore[attr-defined]
+                get_drive_type.argtypes = [ctypes.c_wchar_p]
+                get_drive_type.restype = ctypes.c_uint32
+                dtype = int(get_drive_type(root_path))
                 mapping = {
                     0: "UNKNOWN",
                     1: "NO_ROOT_DIR",
@@ -871,6 +874,16 @@ class DiagnosticsHub:
         }
 
         # 4. 磁盘 I/O 与杀毒/EDR fsync 实时扫描耗时基准（全部临时文件于 finally 清除）
+        def _remove_file_retry(target_file: str) -> None:
+            for attempt in range(3):
+                try:
+                    if os.path.exists(target_file):
+                        os.remove(target_file)
+                    return
+                except OSError:
+                    if attempt < 2:
+                        time.sleep(0.02)
+
         tmp_dir = self._bench_tmp_dir()
         small_fsync_samples: List[float] = []
         small_read_samples: List[float] = []
@@ -890,11 +903,7 @@ class DiagnosticsHub:
                     _ = fh.read()
                 small_read_samples.append((time.perf_counter() - t_r) * 1000.0)
             finally:
-                try:
-                    if os.path.exists(fpath):
-                        os.remove(fpath)
-                except OSError:
-                    pass
+                _remove_file_retry(fpath)
 
         big_path = os.path.join(tmp_dir, f".diag_io_1mb_{uuid.uuid4().hex[:10]}.tmp")
         big_payload = (b"DATAOG_1MB_BENCHMARK_BLOCK_" * 40000)[: 1024 * 1024]
@@ -913,11 +922,7 @@ class DiagnosticsHub:
                 _ = fh.read()
             big_read_ms = (time.perf_counter() - t_br) * 1000.0
         finally:
-            try:
-                if os.path.exists(big_path):
-                    os.remove(big_path)
-            except OSError:
-                pass
+            _remove_file_retry(big_path)
 
         disk_io = {
             "fsync_4k_iterations": len(small_fsync_samples),
@@ -969,14 +974,14 @@ class DiagnosticsHub:
                         )
                         wconn.commit()
                         wal_samples.append((time.perf_counter() - tw) * 1000.0)
+                    try:
+                        wconn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        wconn.execute("PRAGMA journal_mode = DELETE;")
+                    except Exception:
+                        pass
             finally:
                 for suffix in ("", "-wal", "-shm", "-journal"):
-                    try:
-                        p = wal_db + suffix
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except OSError:
-                        pass
+                    _remove_file_retry(wal_db + suffix)
 
             sqlite_io = {
                 "private_open_close_avg_ms": _round_ms(sum(priv_samples) / len(priv_samples)),
