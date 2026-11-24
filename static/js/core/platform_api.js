@@ -83,6 +83,8 @@ export const platformApi = {
     requestJson("/api/platform/llm/test", { method: "POST", body: payload }),
   fetchLlmModels: (payload) =>
     requestJson("/api/platform/llm/models", { method: "POST", body: payload }),
+  probeLlmModel: (payload) =>
+    requestJson("/api/platform/llm/probe-model", { method: "POST", body: payload }),
 
   // 驱动管理 (DriverManager)
   listDrivers: () => requestJson("/api/platform/drivers"),

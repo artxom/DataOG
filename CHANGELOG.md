@@ -8,6 +8,34 @@
 
 ---
 
+## [3.4.0] - 2026-11-24
+
+> **AI 助手超长 SQL 弱模型增幅、四级动态模型能力探查、超时韧性重试与持久化 🎯 `/goal`「不达目的不结束」闭环引擎**：全面面向轻量/极速模型（如 `deepseek-v4-flash`、本地 7B/14B）分析数千行超长存储过程与上游慢速/偶发超时供应商场景，实现确定性 SQL 静态血缘/隐患预解剖与保行号语义压缩、四级动态模型能力实测与有效推理甜蜜区预算收敛、瞬态超时/5xx 指数退避重试+减载降级+`length` 自动续写、`ExecutionPlanner` 战前最优拆解规划，以及后台持久化 Checkpoint + `Last-Event-ID` 零丢帧断点续流 + 硬验收补救闭环。
+
+### Added
+- **Phase 1 · 确定性 SQL 静态解剖器与手术刀工具 (`modules/ai_assistant/{sql_static_analyzer.py,attachments.py,storage_mixin.py,tools.py}`)**:
+  - 新增零依赖 `sql_static_analyzer.py`：支持解包 `$$...$$` 存储过程体并严格保留 1-based 原行号，确定性输出语句表索引、多层临时表血缘 DAG (`source_only`/`temp_staging`/`final_target` + 边 + 摘要)、控制流骨架（参数/变量/游标/循环/动态 SQL/事务/异常）以及静态隐患雷达 (`LOOP_DML`、`UNBOUNDED_DML`、`DYNAMIC_SQL`、`MID_COMMIT`、`DIALECT_COMPAT`、`SELECT_STAR`、`DISTINCT_HEAVY`)；
+  - 新增 `compact_sql_for_llm()` 保行号语义压缩（折叠 >12 分支 `CASE WHEN`、>25 项 `IN (...)`、>=10 行长注释与装饰分割线，严格保留真实 `Lxxx|` 行号）；Layer 2 私有表 `ai_assistant_attachments` 幂等新增 `analysis_json` 列；
+  - 新增 3 个精准手术刀工具：`trace_attachment_lineage`、`read_attachment_statement` 与 `get_attachment_static_report`。
+- **Phase 2 · 四级模型动态能力探查、有效甜蜜区预算与超时韧性传输 (`core/platform/{llm_hub.py,schemas.py,routes/appearance_and_llm.py}`)**:
+  - 新增 L1 `/models` 元数据 + Ollama `/api/show` 解析、L2 活体 SQL 校准探针（实测 TTFT / `tok/s` / `token_ratio` / Thinking / SSE，24 小时持久化缓存在 `llm_providers.extra_json["model_probes"]`）、L3 HTTP 400 超限报错正则自校准写回，并新增受 Gate 2 保护的 `POST /api/platform/llm/probe-model`；
+  - 引入 `model_tier`（`flagship` / `standard` / `lightweight`）与 `effective_reasoning_budget` 有效推理甜蜜区收敛（如 `deepseek-v4-flash` 自动收敛至 `18K` 甜蜜区与 `5.5K` 分块，防止轻量模型「迷失在中间」）；
+  - 全链路升级 `chat_completion()` 与 `chat_completion_stream()`：按实测 TTFT 动态计算流间静默读超时、瞬态超时/5xx/429 指数退避重试 (`2s -> 5s -> 12s`) + 第 2 次重试自动减载降级（关闭 Thinking 并收敛 `max_tokens`）+ 流中途断线续接 + `finish_reason == "length"` 自动无缝续写与重叠去重拼接。
+- **Phase 3 · 战前 `ExecutionPlanner` 最优策略规划与弱模型护栏 (`modules/ai_assistant/{service.py,schemas.py}`)**:
+  - 每次拆解前综合「模型真实能力档案 × SQL 静态图纸 × 用户意图 × 运行模式」生成结构化执行计划并推送 `plan_ready` 事件，在 `full_context` / `lineage_sliced` / `goal_driven_staged` / `agentic_explore` / `stepped_batch` 间自动择优；
+  - 针对 `lightweight` 模型启用动态工具裁剪与精简系统 Prompt，并落地连续重复/高重叠工具调用防原地打转纠偏护栏 (`detect_tool_loop_and_build_steering`)。
+- **Phase 4 · 持久化后台任务与 🎯 `/goal` 硬验收状态机 (`modules/ai_assistant/{goal_runner.py,storage_mixin.py,router.py,__init__.py}`)**:
+  - Layer 2 私有库新增 `ai_assistant_runs` 与 `ai_assistant_run_events`（严格隔离不随 `.dataog.db` 导出，删除会话自动级联清理）；
+  - 实现 `probing -> planning -> running <-> verifying -> completed | paused_recoverable | cancelled | failed` 五态闭环引擎：后台线程与 HTTP 连接解耦，每阶段落盘 SQLite Checkpoint；`verifying` 强制校验语句覆盖率、HIGH/MEDIUM 静态隐患逐项判定与临时表血缘连续性，发现遗漏自动生成 `remedial_N` 定向补救任务（最多 3 轮），触及步数/时长护栏则优雅保存断点等待一键续跑；
+  - 新增 6 个受 Gate 2 保护端点：`POST /runs`、`GET /runs/{run_id}`、`GET /runs/{run_id}/events`（先订阅后追平防竞态漏帧，支持 `after_event_id` 与 `Last-Event-ID` 断点续流）、`POST /runs/{run_id}/resume`、`POST /runs/{run_id}/cancel` 与 `GET /sessions/{session_id}/active-run`。
+- **Phase 5 · macOS 桌面前端全面交互升级 (`static/js/core/{http.js,platform_api.js}`, `static/js/apps/ai_assistant/{api.js,view.js,style.css}`, `static/js/views/settings_view.js`)**:
+  - `http.js` 抽取共享 SSE 帧解析器并新增支持 `Last-Event-ID` 的 `streamSseGet()`；`platform_api.js` 新增 `probeLlmModel()`；
+  - AI 助手顶栏新增「标准对话 / 🎯 Goal 模式」切换与可点击的**模型能力探查胶囊**；实时对话流新增智能规划卡、阶段 Checklist 进度条、静默无红框 `retry_wait` 提示条、`verify_result` 验收徽标、断点恢复卡与「从断点继续执行」一键续跑（含切回会话自动 `/active-run` 恢复与附件静态血缘/隐患预览）；系统配置 AI 模型页新增推理档位选择与「探查能力与窗口」实测读数卡（全程严格零 `innerHTML`、零阻塞弹窗、零 `requestAnimationFrame`）。
+- **Phase 6 · 全面自动化与 Node.js E2E 回归测试 (`tests/test_platform.py`, `tests/test_ai_assistant_and_kb.py`)**:
+  - 新增 5 项深度测试及 Node.js 前端场景 7 E2E 验证，覆盖静态剖析/压缩/手术刀工具、动态探查/缓存/L3 400 自校准、瞬态重试/减载/续写、`ExecutionPlanner`/防打转、Goal 闭环硬验收补救/Checkpoint 断点续跑/`Last-Event-ID` 续流/工作区零泄露与完整前端交互（全套自动化测试扩充至 **110 项**）。
+
+---
+
 ## [3.3.1] - 2026-11-24
 
 > **AI 助手现代长上下文策略重构、Thinking 深度思考全面适配与 SSE 实时流式输出**：彻底解决几千行存储过程被机械切碎为 30+ 片段的痛点——依据大模型实际上下文窗口在「全量带行号直通」「结构大纲 + 按行/正则自主探索」与「大块语义分步拆解」间自适应切换；全面打通主流推理模型 Thinking 通道与非标准 `<think>`/`<thought>` 流式分离，并落地自然 Markdown 实时流式打字体验与随时停止生成能力。

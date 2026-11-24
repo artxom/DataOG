@@ -10,8 +10,10 @@ from core.platform.http_utils import json_error as _err
 from core.platform.schemas import (
     AppearanceResetPayload,
     AppearanceUpdatePayload,
+    LLMProbeModelPayload,
     LLMProviderPayload,
 )
+from core.platform.storage_paths import redact_private_storage_paths
 
 router = APIRouter()
 
@@ -196,6 +198,31 @@ def api_fetch_llm_models(
     try:
         return ctx.llm_hub.fetch_models(payload.model_dump(exclude_unset=True))
     except Exception as exc:
-        return _err(str(exc), 400)
+        return _err(redact_private_storage_paths(str(exc), ctx=ctx), 400)
+
+
+@router.post("/llm/probe-model")
+def api_probe_llm_model(
+    payload: LLMProbeModelPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        raw = payload.model_dump(exclude_unset=True)
+        has_draft_override = any(k in raw for k in ("base_url", "api_key", "provider_type", "context_window"))
+        target_model = str(payload.model or payload.default_model or "").strip()
+        res = ctx.llm_hub.probe_model_capabilities(
+            provider_id=str(payload.provider_id or "").strip(),
+            model=target_model,
+            force_refresh=bool(payload.force_refresh),
+            allow_fallback=True,
+            payload_override=raw if has_draft_override else None,
+        )
+        return {
+            **res,
+            "providers": ctx.llm_hub.list_providers(),
+            "available_models": ctx.llm_hub.list_available_models(),
+        }
+    except Exception as exc:
+        return _err(redact_private_storage_paths(str(exc), ctx=ctx), 400)
 
 

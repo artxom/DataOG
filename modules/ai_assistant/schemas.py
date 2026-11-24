@@ -56,9 +56,19 @@ class AssistantChatPayload(BaseModel):
     sample_limit: int = Field(default=100, ge=10, le=200)
     clarification_reply: Optional[Dict[str, Any]] = None
     attachment_ids: List[str] = Field(default_factory=list)
-    large_payload_strategy: str = "auto"  # auto | full_context | agentic_explore | stepped_batch (legacy: inline | on_demand)
+    large_payload_strategy: str = "auto"  # auto | full_context | lineage_sliced | goal_driven_staged | agentic_explore | stepped_batch
     batch_start_chunk: int = Field(default=0, ge=0)
     batch_max_chunks: int = Field(default=8, ge=1, le=12)
+    run_mode: str = "standard"  # standard | goal
+
+
+class AssistantRunCreatePayload(AssistantChatPayload):
+    run_mode: str = "goal"  # goal | standard
+    max_goal_steps: int = Field(default=25, ge=1, le=40)
+
+
+class AssistantRunResumePayload(BaseModel):
+    extra_steps: int = Field(default=15, ge=1, le=30)
 
 
 class ProposalConfirmPayload(BaseModel):

@@ -1436,6 +1436,733 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             err_payload = [d for t, d in err_events if t == "error"][-1]
             self.assertNotIn(vault_path, err_payload["error"])
 
+    def test_sql_static_analyzer_lineage_compression_and_scalpel_tools(self) -> None:
+        """验证确定性 SQL 静态解剖器（血缘 DAG、控制流骨架、全类隐患雷达、保行号语义压缩）及 3 个手术刀工具."""
+        from modules.ai_assistant.sql_static_analyzer import (
+            analyze_sql_static,
+            compact_sql_for_llm,
+            extract_lineage_subgraph,
+            extract_statement_source,
+        )
+        from modules.ai_assistant.service import AiAssistantService
+        from modules.ai_assistant.tools import AssistantToolbox
+
+        # 构造 ~3,050 行带存储过程体、多层临时表血缘、全类高危/中危/低危隐患及长 CASE/IN 的真实 DWS SQL
+        sp_lines: List[str] = [
+            "/* " + ("=" * 60),
+            *[f" * 批量月结存储过程历史变更日志第 {i} 行" for i in range(1, 16)],
+            " " + ("=" * 60) + " */",
+            "CREATE OR REPLACE PROCEDURE dwd.sp_monthly_settle(IN p_biz_date VARCHAR, OUT p_cnt INT)",
+            "AS $$",
+            "DECLARE",
+            "    v_sql TEXT;",
+            "    v_amt NUMERIC(18,2);",
+            "    cur_acct CURSOR FOR SELECT acct_id FROM dwd.acct_bal WHERE status = 'A';",
+            "BEGIN",
+            "    -- 阶段 1: 清洗原始交易至一级临时表",
+            "    CREATE TEMP TABLE tmp_stage_txn AS",
+            "    SELECT *",
+            "    FROM ods.raw_txn a, dim.branch b",
+            "    WHERE a.branch_id = b.branch_id(+)",
+            "      AND ROWNUM <= 100000",
+            "      AND NVL(a.txn_amt, 0) > 0",
+            "      AND a.biz_date = p_biz_date;",
+            "",
+            "    -- 阶段 2: 汇总至二级临时表（含超长 CASE 与超长 IN 枚举，用于验证保行号语义压缩）",
+            "    CREATE TEMP TABLE tmp_agg_txn AS",
+            "    SELECT cust_id,",
+            "           CASE prod_code",
+            *[f"                WHEN 'P{i:02d}' THEN 'CAT_{i:02d}'" for i in range(1, 29)],
+            "                ELSE 'OTHER'",
+            "           END AS prod_cat,",
+            "           SUM(txn_amt) AS total_amt",
+            "    FROM tmp_stage_txn",
+            "    WHERE biz_code IN (" + ", ".join(f"'B{i:02d}'" for i in range(1, 39)) + ")",
+            "    GROUP BY 1, 2;",
+            "",
+            "    -- 阶段 3: 清空并写入最终目标表（故意埋入 UNBOUNDED_DML 无 WHERE 删全表）",
+            "    DELETE FROM dm.rpt_monthly_settle;",
+            "    INSERT INTO dm.rpt_monthly_settle (cust_id, prod_cat, total_amt)",
+            "    SELECT cust_id, prod_cat, total_amt FROM tmp_agg_txn;",
+            "",
+            "    -- 阶段 4: 游标循环内逐行 UPDATE + MID_COMMIT + 动态 SQL",
+            "    FOR rec IN cur_acct LOOP",
+            "        UPDATE dwd.acct_bal SET last_settle = p_biz_date WHERE acct_id = rec.acct_id;",
+            "        COMMIT;",
+            "    END LOOP;",
+            "    v_sql := 'ANALYZE dm.rpt_monthly_settle';",
+            "    EXECUTE IMMEDIATE v_sql;",
+        ]
+        # 填充至 ~3,050 行以模拟真实数千行批处理过程
+        for blk_no in range(1, 151):
+            sp_lines.append(f"    -- 阶段 {blk_no + 4}: 指标加工明细块 #{blk_no}")
+            sp_lines.append(
+                f"    INSERT INTO dm.rpt_sub_{blk_no % 5} SELECT cust_id, total_amt FROM tmp_agg_txn WHERE total_amt > {blk_no};"
+            )
+            for k in range(17):
+                sp_lines.append(f"    -- 注释校验说明 {blk_no}_{k}")
+        sp_lines.extend(
+            [
+                "EXCEPTION",
+                "    WHEN OTHERS THEN",
+                "        RAISE NOTICE 'settle err';",
+                "END;",
+                "$$ LANGUAGE plpgsql;",
+            ]
+        )
+        sp_text = "\n".join(sp_lines)
+        self.assertGreater(len(sp_lines), 2900)
+
+        # 1. 静态剖析校验：语句、多层血缘 DAG、控制流与全类隐患
+        an = analyze_sql_static(sp_text, dialect="DWS")
+        self.assertGreater(len(an["statements"]), 100)
+        dag = an["lineage_dag"]
+        nodes_by_tbl = {n["table"].lower(): n for n in dag["nodes"]}
+        self.assertIn("ods.raw_txn", nodes_by_tbl)
+        self.assertIn("tmp_stage_txn", nodes_by_tbl)
+        self.assertIn("tmp_agg_txn", nodes_by_tbl)
+        self.assertIn("dm.rpt_monthly_settle", nodes_by_tbl)
+        self.assertEqual(nodes_by_tbl["ods.raw_txn"]["role"], "source_only")
+        self.assertEqual(nodes_by_tbl["tmp_stage_txn"]["role"], "temp_staging")
+        self.assertEqual(nodes_by_tbl["tmp_agg_txn"]["role"], "temp_staging")
+        self.assertEqual(nodes_by_tbl["dm.rpt_monthly_settle"]["role"], "final_target")
+        self.assertTrue(len(dag["summary_lines"]) >= 1)
+
+        cf = an["control_flow"]
+        self.assertGreaterEqual(len(cf["cursors"]), 1)
+        self.assertGreaterEqual(len(cf["loops"]), 1)
+        self.assertGreaterEqual(len(cf["dynamic_sql"]), 1)
+        self.assertGreaterEqual(len(cf["transactions"]), 1)
+        self.assertGreaterEqual(len(cf["exceptions"]), 1)
+
+        findings = an["static_findings"]
+        codes = {f["code"] for f in findings}
+        for req_code in ("UNBOUNDED_DML", "LOOP_DML", "DYNAMIC_SQL", "MID_COMMIT", "DIALECT_COMPAT", "SELECT_STAR"):
+            self.assertIn(req_code, codes, f"Missing static finding {req_code}, got {codes}")
+
+        # 精确核验 UNBOUNDED_DML 行号与源码一致
+        unb = next(f for f in findings if f["code"] == "UNBOUNDED_DML")
+        self.assertEqual(unb["severity"], "HIGH")
+        self.assertIn("DELETE FROM dm.rpt_monthly_settle", sp_lines[unb["line"] - 1])
+
+        loop_f = next(f for f in findings if f["code"] == "LOOP_DML")
+        self.assertEqual(loop_f["severity"], "HIGH")
+        self.assertIn("UPDATE dwd.acct_bal", sp_lines[loop_f["line"] - 1])
+
+        # 2. 语义压缩校验：大幅压缩体量同时严格保留原始真实行号 Lxxx|
+        comp = compact_sql_for_llm(sp_text, start_line=1)
+        self.assertLess(comp["compacted_tokens"], comp["original_tokens"])
+        self.assertGreater(comp["saved_tokens"], 0)
+        folded_kinds = {b["kind"] for b in comp["folded_blocks"]}
+        self.assertIn("CASE_WHEN", folded_kinds)
+        self.assertIn("IN_LIST", folded_kinds)
+        del_line_no = unb["line"]
+        self.assertIn(f"L{del_line_no}|", comp["text"])
+
+        # 3. 血缘子图穿透 + 单语句精准抽取
+        sub = extract_lineage_subgraph(an, sp_text, "dm.rpt_monthly_settle", depth=5)
+        self.assertTrue(sub["matched"])
+        sub_tables = {t.lower() for t in sub["related_tables"]}
+        for exp_t in ("dm.rpt_monthly_settle", "tmp_agg_txn", "tmp_stage_txn", "ods.raw_txn", "dim.branch"):
+            self.assertIn(exp_t, sub_tables)
+
+        first_sid = sub["blocks"][0]["stmt_id"]
+        ext = extract_statement_source(an, sp_text, first_sid, compact=True)
+        self.assertIsNotNone(ext)
+        self.assertIn(f"L{ext['start_line']}|", ext["content"])
+
+        # 4. 上传落盘 analysis_json + 3 个新手术刀工具端到端验证
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(private_root=os.path.join(tmp, "vault"))
+            ctx: PlatformContext = app.state.platform_ctx
+            try:
+                _activate_ctx(ctx)
+                client = TestClient(app)
+                up = client.post(
+                    "/api/modules/ai_assistant/attachments/upload",
+                    files={"file": ("sp_monthly_settle.sql", sp_text.encode("utf-8"), "text/plain")},
+                ).json()
+                self.assertTrue(up["ok"])
+                att = up["attachment"]
+                self.assertIn("analysis", att)
+                self.assertGreaterEqual(len(att["analysis"]["static_findings"]), 5)
+
+                got = client.get(f"/api/modules/ai_assistant/attachments/{att['attachment_id']}").json()
+                self.assertTrue(got["ok"])
+                self.assertIn("lineage_dag", got["attachment"]["analysis"])
+
+                svc = AiAssistantService(ctx)
+                full_att = svc.get_attachment(att["attachment_id"], include_raw=True, include_chunks=True)
+                tb = AssistantToolbox(
+                    ctx=ctx,
+                    work_mode="dialect",
+                    profile=None,
+                    dialect="DWS",
+                    default_schema="dwd",
+                    attachments=[full_att],
+                    storage=svc,
+                )
+
+                r_lin = tb.tool_trace_attachment_lineage(
+                    {"attachment_id": att["attachment_id"], "table_name": "dm.rpt_monthly_settle", "direction": "upstream"}
+                )
+                self.assertTrue(r_lin["ok"])
+                self.assertIn("tmp_stage_txn", [t.lower() for t in r_lin["related_tables"]])
+
+                r_stmt = tb.tool_read_attachment_statement(
+                    {"attachment_id": att["attachment_id"], "stmt_id": unb["stmt_id"], "compact": True}
+                )
+                self.assertTrue(r_stmt["ok"])
+                self.assertIn("DELETE FROM dm.rpt_monthly_settle", r_stmt["content"])
+
+                r_rep = tb.tool_get_attachment_static_report(
+                    {"attachment_id": att["attachment_id"], "severity": "HIGH"}
+                )
+                self.assertTrue(r_rep["ok"])
+                self.assertTrue(all(f["severity"] == "HIGH" for f in r_rep["static_findings"]))
+                self.assertIn("UNBOUNDED_DML", {f["code"] for f in r_rep["static_findings"]})
+            finally:
+                ctx.close()
+
+    def test_execution_planner_lightweight_pruning_and_anti_loop_guardrail(self) -> None:
+        """验证 ExecutionPlanner 在 lightweight 模型下的血缘切片/分段决策、工具裁剪与防原地打转护栏."""
+        from core.platform.llm_hub import infer_model_capabilities
+        from modules.ai_assistant.attachments import process_attachment_payload
+        from modules.ai_assistant.service import (
+            AiAssistantService,
+            ExecutionPlanner,
+            detect_tool_loop_and_build_steering,
+        )
+
+        # 构造 ~25K tokens 存储过程 SQL（超出 deepseek-v4-flash 18K 甜蜜区，位于 deepseek-chat 80K 甜蜜区内）
+        sql_lines = [
+            "CREATE OR REPLACE PROCEDURE dwd.sp_risk_calc() AS $$ BEGIN",
+            "  CREATE TEMP TABLE tmp_r1 AS SELECT cust_id, amt FROM ods.src_risk;",
+            "  CREATE TEMP TABLE tmp_r2 AS SELECT cust_id, SUM(amt) AS s_amt FROM tmp_r1 GROUP BY cust_id;",
+            "  DELETE FROM dm.rpt_risk_final;",
+            "  INSERT INTO dm.rpt_risk_final SELECT cust_id, s_amt FROM tmp_r2;",
+        ]
+        for i in range(1, 950):
+            sql_lines.append(
+                f"  INSERT INTO dm.rpt_misc_{i % 4} SELECT a.id, a.val_{i % 7}, 'LONG_PADDING_PAYLOAD_BUSINESS_RULE_DESC_{i:04d}' FROM ods.other_tbl_{i % 6} a WHERE a.flag = {i};"
+            )
+        sql_lines.append("END; $$ LANGUAGE plpgsql;")
+        raw_sql = "\n".join(sql_lines)
+        att = process_attachment_payload(filename="sp_risk_calc.sql", raw_bytes=raw_sql.encode("utf-8"), dialect="DWS")
+        self.assertGreater(att["estimated_tokens"], 20000)
+        self.assertLess(att["estimated_tokens"], 65000)
+
+        caps_flash = infer_model_capabilities("deepseek-v4-flash", "DEEPSEEK", "https://api.deepseek.com")
+        caps_std = infer_model_capabilities("deepseek-chat", "DEEPSEEK", "https://api.deepseek.com")
+
+        # 1a. lightweight 模型 + 指定单表追因 -> 自动择优 lineage_sliced + 语义压缩
+        plan_lin = ExecutionPlanner.plan(
+            model_caps=caps_flash,
+            turn_attachments=[att],
+            clean_prompt="请排查 dm.rpt_risk_final 汇总金额偏小的上游血缘原因",
+            req_strategy="auto",
+            run_mode="standard",
+            dialect="DWS",
+        )
+        self.assertEqual(plan_lin["strategy"], "lineage_sliced")
+        self.assertTrue(plan_lin["use_compact_view"])
+        self.assertIn("dm.rpt_risk_final", [t.lower() for t in plan_lin["matched_target_tables"]])
+
+        # 1b. lightweight 模型 + 全局审计 -> 自动择优 goal_driven_staged 分段计划（每段 <= 甜蜜区分块上限）
+        plan_staged = ExecutionPlanner.plan(
+            model_caps=caps_flash,
+            turn_attachments=[att],
+            clean_prompt="请全量审计这个存储过程，逐段梳理逻辑与所有高危隐患",
+            req_strategy="auto",
+            run_mode="standard",
+            dialect="DWS",
+        )
+        self.assertEqual(plan_staged["strategy"], "goal_driven_staged")
+        self.assertGreaterEqual(len(plan_staged["stages"]), 2)
+        self.assertTrue(plan_staged["use_compact_view"])
+
+        # 1c. standard 模型 (deepseek-chat 80K 甜蜜区) -> 全量直通 full_context
+        plan_full = ExecutionPlanner.plan(
+            model_caps=caps_std,
+            turn_attachments=[att],
+            clean_prompt="梳理这个存储过程的整体逻辑",
+            req_strategy="auto",
+            run_mode="standard",
+            dialect="DWS",
+        )
+        self.assertEqual(plan_full["strategy"], "full_context")
+
+        # 2. 防原地打转规则单测（重复完全一致调用 & 行号高度重叠调用）
+        steer_dup = detect_tool_loop_and_build_steering(
+            [
+                ("search_attachment", {"attachment_id": "a1", "keyword": "DELETE"}),
+                ("search_attachment", {"attachment_id": "a1", "keyword": "DELETE"}),
+            ]
+        )
+        self.assertTrue(bool(steer_dup))
+
+        steer_overlap = detect_tool_loop_and_build_steering(
+            [
+                ("read_attachment_lines", {"attachment_id": "a1", "start_line": 100, "end_line": 200}),
+                ("read_attachment_lines", {"attachment_id": "a1", "start_line": 110, "end_line": 200}),
+            ]
+        )
+        self.assertTrue(bool(steer_overlap))
+
+        # 3. 轻量模型动态工具裁剪 + chat_turn 实测防打转纠偏注入
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(private_root=os.path.join(tmp, "vault"))
+            ctx: PlatformContext = app.state.platform_ctx
+            try:
+                _activate_ctx(ctx)
+                ctx.llm_hub.save_provider(
+                    {
+                        "provider_id": "ds_flash",
+                        "name": "DeepSeekFlash",
+                        "provider_type": "DEEPSEEK",
+                        "base_url": "https://api.deepseek.com",
+                        "enabled": True,
+                        "api_key": "sk-flash-123456",
+                        "default_model": "deepseek-v4-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "is_default": True,
+                    }
+                )
+                client = TestClient(app)
+                up = client.post(
+                    "/api/modules/ai_assistant/attachments/upload",
+                    files={"file": ("sp_risk_calc.sql", raw_sql.encode("utf-8"), "text/plain")},
+                ).json()["attachment"]
+
+                captured_msgs: List[List[Dict[str, str]]] = []
+                turn_step = {"n": 0}
+
+                def _looping_flash_llm(**kwargs):
+                    turn_step["n"] += 1
+                    msgs = kwargs.get("messages") or []
+                    captured_msgs.append(list(msgs))
+                    if turn_step["n"] in (1, 2):
+                        # 故意连续两次调用完全相同的 search_attachment 触发防打转护栏
+                        return {
+                            "provider_name": "DeepSeekFlash",
+                            "model": "deepseek-v4-flash",
+                            "content": json.dumps(
+                                {
+                                    "action": "tool",
+                                    "tool": "search_attachment",
+                                    "args": {"attachment_id": up["attachment_id"], "pattern": "rpt_risk_final"},
+                                    "purpose": "查找目标表",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    # 第 3 步收到系统纠偏后输出最终结论
+                    return {
+                        "provider_name": "DeepSeekFlash",
+                        "model": "deepseek-v4-flash",
+                        "content": "### 血缘与排查结论\n\n已完成 `dm.rpt_risk_final` 排查，发现 L4 无 WHERE 删除隐患。",
+                    }
+
+                with unittest.mock.patch.object(ctx.llm_hub, "chat_completion", side_effect=_looping_flash_llm):
+                    res = client.post(
+                        "/api/modules/ai_assistant/chat",
+                        json={
+                            "prompt": "查看第 100 行附近逻辑",
+                            "dialect": "DWS",
+                            "provider_id": "ds_flash",
+                            "model": "deepseek-v4-flash",
+                            "attachment_ids": [up["attachment_id"]],
+                            "large_payload_strategy": "agentic_explore",
+                        },
+                    ).json()
+
+                self.assertTrue(res["ok"])
+                # 确认轻量模式裁剪掉了不相关的 propose_write_sql / query_csv_attachment 工具
+                sys_prompt_0 = captured_msgs[0][0]["content"]
+                self.assertNotIn("propose_write_sql", sys_prompt_0)
+                self.assertNotIn("query_csv_attachment", sys_prompt_0)
+                self.assertIn("trace_attachment_lineage", sys_prompt_0)
+                # 确认第 3 步前注入了防打转纠偏提示
+                step3_text = "\n".join(m.get("content", "") for m in captured_msgs[2])
+                self.assertIn("纠偏", step3_text)
+            finally:
+                ctx.close()
+
+    def test_goal_runner_closed_loop_verify_remedial_checkpoint_resume_and_isolation(self) -> None:
+        """端到端验证 🎯 /goal 状态机（探查->规划->分段->瞬态重试->硬验收拦截->自动补救->断点续跑->Last-Event-ID 续流->隐私零泄露）."""
+        sp_lines = [
+            "CREATE OR REPLACE PROCEDURE dwd.sp_goal_audit() AS $$",
+            "DECLARE",
+            "    cur_x CURSOR FOR SELECT id FROM dwd.orders;",
+            "BEGIN",
+            "    -- 阶段 1: 构建临时表并全表删除目标表 (HIGH UNBOUNDED_DML)",
+            "    CREATE TEMP TABLE tmp_orders AS SELECT id, amt FROM ods.orders_src;",
+            "    DELETE FROM dm.rpt_orders;",
+            "    INSERT INTO dm.rpt_orders SELECT id, amt FROM tmp_orders;",
+        ]
+        # 填充足够语句 (>22K tokens) 以确保在 lightweight 18K 甜蜜区下自动切出 >= 3 个阶段
+        for i in range(1, 950):
+            sp_lines.append(
+                f"    INSERT INTO dm.rpt_detail_{i % 3} SELECT id, amt, 'BUSINESS_RULE_AUDIT_DESCRIPTION_SEGMENT_{i:04d}_PAYLOAD_EXTRA_CONTEXT' FROM tmp_orders WHERE id = {i};"
+            )
+        sp_lines.extend(
+            [
+                "    -- 阶段 2: 游标循环内更新 (HIGH LOOP_DML)",
+                "    FOR rec IN cur_x LOOP",
+                "        UPDATE dwd.orders SET status = 'DONE' WHERE id = rec.id;",
+                "    END LOOP;",
+                "END;",
+                "$$ LANGUAGE plpgsql;",
+            ]
+        )
+        sp_bytes = "\n".join(sp_lines).encode("utf-8")
+
+        def _parse_id_sse(raw_text: str):
+            out = []
+            for frame in raw_text.split("\n\n"):
+                frame = frame.strip()
+                if not frame:
+                    continue
+                ev_id = 0
+                ev_name = "message"
+                data_lines = []
+                for ln in frame.splitlines():
+                    if ln.startswith(":"):
+                        continue
+                    if ln.startswith("id:"):
+                        raw_id = ln.split(":", 1)[1].strip()
+                        if raw_id.isdigit():
+                            ev_id = int(raw_id)
+                    elif ln.startswith("event:"):
+                        ev_name = ln.split(":", 1)[1].strip()
+                    elif ln.startswith("data:"):
+                        data_lines.append(ln.split(":", 1)[1].strip())
+                if data_lines:
+                    out.append((ev_id, ev_name, json.loads("\n".join(data_lines))))
+            return out
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(private_root=os.path.join(tmp, "vault"))
+            ctx: PlatformContext = app.state.platform_ctx
+            try:
+                _activate_ctx(ctx)
+                ctx.llm_hub.save_provider(
+                    {
+                        "provider_id": "ds_flash",
+                        "name": "DeepSeekFlash",
+                        "provider_type": "DEEPSEEK",
+                        "base_url": "https://api.deepseek.com",
+                        "enabled": True,
+                        "api_key": "sk-goal-flash-123456",
+                        "default_model": "deepseek-v4-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "is_default": True,
+                    }
+                )
+                client = TestClient(app)
+
+                up = client.post(
+                    "/api/modules/ai_assistant/attachments/upload",
+                    files={"file": ("sp_goal_audit.sql", sp_bytes, "text/plain")},
+                ).json()["attachment"]
+                high_findings = [
+                    f for f in up["analysis"]["static_findings"] if f["severity"] == "HIGH"
+                ]
+                self.assertGreaterEqual(len(high_findings), 2)
+                unb_fid = next(f["finding_id"] for f in high_findings if f["code"] == "UNBOUNDED_DML")
+                loop_fid = next(f["finding_id"] for f in high_findings if f["code"] == "LOOP_DML")
+
+                # Mock probe_model_capabilities 以返回稳定轻量探查档案（免外网）
+                fake_probe = {
+                    "ok": True,
+                    "cached": True,
+                    "probe_ok": True,
+                    "capabilities": {
+                        "context_window": 64000,
+                        "effective_reasoning_budget": 18000,
+                        "attachment_budget": 18000,
+                        "recommended_chunk_tokens": 5500,
+                        "model_tier": "lightweight",
+                        "supports_thinking": False,
+                        "token_ratio": 1.0,
+                        "ttft_ms": 420.0,
+                        "source": "live_probe",
+                    },
+                }
+
+                # --- 场景 A：完整闭环 + retry_wait + 硬验收抓漏 + 自动生成 remedial_1 补救 -> completed ---
+                stage_calls: List[str] = []
+
+                def _mock_goal_stream(**kwargs):
+                    msgs = kwargs.get("messages") or []
+                    sys_txt = msgs[0]["content"] if msgs else ""
+                    usr_txt = msgs[-1]["content"] if msgs else ""
+                    stage_calls.append(usr_txt[:200])
+
+                    if "合成最终分析报告" in sys_txt or "全景 Markdown 分析报告" in sys_txt:
+                        md = f"### 🎯 Goal 全景审计报告\n\n已逐项确认高危隐患 `{unb_fid}` 与 `{loop_fid}`，并给出补全 WHERE 与批量改写方案。"
+                        yield {"type": "content", "delta": md}
+                        yield {
+                            "type": "done",
+                            "provider_name": "DeepSeekFlash",
+                            "model": "deepseek-v4-flash",
+                            "reasoning": "",
+                            "content": md,
+                            "cancelled": False,
+                        }
+                        return
+
+                    if "定向补救核验阶段" in sys_txt:
+                        # 补救阶段明确核验之前遗漏的 UNBOUNDED_DML 隐患
+                        rem_json = json.dumps(
+                            {
+                                "summary": f"补救核验确认 {unb_fid} 为真实无 WHERE 全表删除高危隐患",
+                                "finding_verdicts": {
+                                    unb_fid: {
+                                        "status": "confirmed",
+                                        "reason": "DELETE FROM dm.rpt_orders 缺少 WHERE 条件",
+                                        "fix": "增加 biz_date 过滤或改为 TRUNCATE PARTITION",
+                                    }
+                                },
+                                "confirmed_issues": [f"{unb_fid} 全表无条件删除"],
+                            },
+                            ensure_ascii=False,
+                        )
+                        yield {"type": "done", "provider_name": "DeepSeekFlash", "model": "deepseek-v4-flash", "reasoning": "", "content": rem_json, "cancelled": False}
+                        return
+
+                    # 常规分析阶段：首阶段故意触发一次 retry_wait，并故意遗漏 unb_fid（验证硬验收门禁拦截！）
+                    if len(stage_calls) == 1:
+                        yield {
+                            "type": "retry_wait",
+                            "attempt": 1,
+                            "max_retries": 3,
+                            "wait_sec": 2.0,
+                            "reason": "响应超时",
+                            "shed_load": False,
+                            "detail": "供应商响应超时，正在第 1/3 次自动退避重连...",
+                        }
+                    verdicts = {}
+                    if loop_fid in usr_txt:
+                        verdicts[loop_fid] = {
+                            "status": "confirmed",
+                            "reason": "游标循环内逐行 UPDATE 导致性能劣化",
+                            "fix": "改写为单条集合 UPDATE ... FROM",
+                        }
+                    st_json = json.dumps(
+                        {
+                            "summary": f"已完成第 {len(stage_calls)} 阶段源码核查",
+                            "finding_verdicts": verdicts,
+                            "lineage_notes": ["ods.orders_src -> tmp_orders -> dm.rpt_orders"],
+                        },
+                        ensure_ascii=False,
+                    )
+                    yield {"type": "done", "provider_name": "DeepSeekFlash", "model": "deepseek-v4-flash", "reasoning": "", "content": st_json, "cancelled": False}
+
+                with unittest.mock.patch.object(
+                    ctx.llm_hub, "probe_model_capabilities", return_value=fake_probe
+                ), unittest.mock.patch.object(
+                    ctx.llm_hub, "chat_completion_stream", side_effect=_mock_goal_stream
+                ):
+                    r_create = client.post(
+                        "/api/modules/ai_assistant/runs",
+                        json={
+                            "prompt": "请对这份存储过程做全量隐患审计，不遗漏任何高危问题",
+                            "dialect": "DWS",
+                            "provider_id": "ds_flash",
+                            "model": "deepseek-v4-flash",
+                            "attachment_ids": [up["attachment_id"]],
+                            "run_mode": "goal",
+                            "max_goal_steps": 15,
+                        },
+                    )
+                    self.assertEqual(r_create.status_code, 200)
+                    create_body = r_create.json()
+                    self.assertTrue(create_body["ok"])
+                    run_id_a = create_body["run"]["run_id"]
+                    sid_a = create_body["session"]["session_id"]
+
+                    ev_resp = client.get(f"/api/modules/ai_assistant/runs/{run_id_a}/events")
+                    self.assertEqual(ev_resp.status_code, 200)
+                    frames = _parse_id_sse(ev_resp.text)
+
+                ev_names = [nm for _, nm, _ in frames]
+                for must_ev in (
+                    "session_init",
+                    "probe_ready",
+                    "plan_ready",
+                    "stage_start",
+                    "retry_wait",
+                    "stage_done",
+                    "checkpoint_saved",
+                    "verify_result",
+                    "content_delta",
+                    "done",
+                ):
+                    self.assertIn(must_ev, ev_names, f"Missing SSE event {must_ev} in {ev_names}")
+
+                # 硬验收必须先拦截未核验的 UNBOUNDED_DML (passed=False)，补救后再通过 (passed=True)
+                verify_evs = [p for _, nm, p in frames if nm == "verify_result"]
+                self.assertGreaterEqual(len(verify_evs), 2)
+                self.assertFalse(verify_evs[0]["passed"])
+                self.assertTrue(verify_evs[-1]["passed"])
+                self.assertTrue(any(p.get("remedial_added") for _, nm, p in frames if nm == "plan_ready"))
+
+                # 校验单调递增 event_id 以及 query / Last-Event-ID 无损断点续流
+                all_ids = [eid for eid, _, _ in frames]
+                self.assertEqual(all_ids, sorted(all_ids))
+                self.assertGreater(all_ids[0], 0)
+                mid_id = all_ids[len(all_ids) // 2]
+
+                replay_q = _parse_id_sse(
+                    client.get(f"/api/modules/ai_assistant/runs/{run_id_a}/events?after_event_id={mid_id}").text
+                )
+                self.assertTrue(all(eid > mid_id for eid, _, _ in replay_q))
+                self.assertEqual([eid for eid, _, _ in replay_q], [eid for eid in all_ids if eid > mid_id])
+
+                replay_hdr = _parse_id_sse(
+                    client.get(
+                        f"/api/modules/ai_assistant/runs/{run_id_a}/events",
+                        headers={"Last-Event-ID": str(mid_id)},
+                    ).text
+                )
+                self.assertEqual([eid for eid, _, _ in replay_hdr], [eid for eid in all_ids if eid > mid_id])
+
+                run_a_detail = client.get(f"/api/modules/ai_assistant/runs/{run_id_a}").json()["run"]
+                self.assertEqual(run_a_detail["status"], "completed")
+                self.assertEqual(run_a_detail["progress_pct"], 100)
+
+                # --- 场景 B：步数护栏暂停 (paused_recoverable) -> active-run 发现 -> /resume 从断点接力完成 ---
+                resumed_stage_titles: List[str] = []
+
+                def _mock_pause_resume_stream(**kwargs):
+                    msgs = kwargs.get("messages") or []
+                    sys_txt = msgs[0]["content"] if msgs else ""
+                    usr_txt = msgs[-1]["content"] if msgs else ""
+                    if "全景 Markdown 分析报告" in sys_txt:
+                        yield {"type": "content", "delta": "### 断点续跑完成报告"}
+                        yield {"type": "done", "provider_name": "DeepSeekFlash", "model": "deepseek-v4-flash", "reasoning": "", "content": "### 断点续跑完成报告", "cancelled": False}
+                        return
+                    for ln in usr_txt.splitlines():
+                        if ln.startswith("当前阶段："):
+                            resumed_stage_titles.append(ln)
+                            break
+                    verdicts = {
+                        f["finding_id"]: {"status": "confirmed", "reason": "已核验", "fix": "优化"}
+                        for f in high_findings
+                    }
+                    yield {
+                        "type": "done",
+                        "provider_name": "DeepSeekFlash",
+                        "model": "deepseek-v4-flash",
+                        "reasoning": "",
+                        "content": json.dumps({"summary": "阶段通过", "finding_verdicts": verdicts}, ensure_ascii=False),
+                        "cancelled": False,
+                    }
+
+                with unittest.mock.patch.object(
+                    ctx.llm_hub, "probe_model_capabilities", return_value=fake_probe
+                ), unittest.mock.patch.object(
+                    ctx.llm_hub, "chat_completion_stream", side_effect=_mock_pause_resume_stream
+                ):
+                    r_b = client.post(
+                        "/api/modules/ai_assistant/runs",
+                        json={
+                            "prompt": "请全量逐段审计全部逻辑",
+                            "dialect": "DWS",
+                            "provider_id": "ds_flash",
+                            "model": "deepseek-v4-flash",
+                            "attachment_ids": [up["attachment_id"]],
+                            "run_mode": "goal",
+                            "max_goal_steps": 1,
+                        },
+                    ).json()
+                    run_id_b = r_b["run"]["run_id"]
+                    sid_b = r_b["session"]["session_id"]
+
+                    frames_b1 = _parse_id_sse(client.get(f"/api/modules/ai_assistant/runs/{run_id_b}/events").text)
+                    self.assertIn("run_paused", [nm for _, nm, _ in frames_b1])
+                    last_eid_b1 = frames_b1[-1][0]
+                    stages_before_resume = list(resumed_stage_titles)
+                    self.assertEqual(len(stages_before_resume), 1)
+
+                    # active-run 端点可发现可续跑任务
+                    active_b = client.get(f"/api/modules/ai_assistant/sessions/{sid_b}/active-run").json()
+                    self.assertTrue(active_b["ok"])
+                    self.assertEqual(active_b["run"]["run_id"], run_id_b)
+                    self.assertEqual(active_b["run"]["status"], "paused_recoverable")
+
+                    # 调用 /resume 接力推进，绝不重复跑阶段 1
+                    r_res = client.post(
+                        f"/api/modules/ai_assistant/runs/{run_id_b}/resume",
+                        json={"extra_steps": 10},
+                    )
+                    self.assertEqual(r_res.status_code, 200)
+                    frames_b2 = _parse_id_sse(
+                        client.get(
+                            f"/api/modules/ai_assistant/runs/{run_id_b}/events",
+                            headers={"Last-Event-ID": str(last_eid_b1)},
+                        ).text
+                    )
+                    self.assertIn("done", [nm for _, nm, _ in frames_b2])
+                    # 阶段 1 严禁被重复执行
+                    self.assertEqual(resumed_stage_titles.count(stages_before_resume[0]), 1)
+
+                    run_b_done = client.get(f"/api/modules/ai_assistant/runs/{run_id_b}").json()["run"]
+                    self.assertEqual(run_b_done["status"], "completed")
+
+                    # 显式 /cancel 验证：创建一个单步暂停任务后调用 /cancel 干净转入 cancelled
+                    r_c = client.post(
+                        "/api/modules/ai_assistant/runs",
+                        json={
+                            "prompt": "测试取消",
+                            "dialect": "DWS",
+                            "provider_id": "ds_flash",
+                            "model": "deepseek-v4-flash",
+                            "attachment_ids": [up["attachment_id"]],
+                            "run_mode": "goal",
+                            "max_goal_steps": 1,
+                        },
+                    ).json()
+                    run_id_c = r_c["run"]["run_id"]
+                    _parse_id_sse(client.get(f"/api/modules/ai_assistant/runs/{run_id_c}/events").text)
+                    c_res = client.post(f"/api/modules/ai_assistant/runs/{run_id_c}/cancel")
+                    self.assertEqual(c_res.status_code, 200)
+                    self.assertEqual(c_res.json()["run"]["status"], "cancelled")
+
+                # --- 场景 C：.dataog.db 工作区导出零私有泄露 + 删除会话级联清理 runs & run_events ---
+                ws_bytes, _ = ctx.workspace_hub.export_workspace_bytes()
+                ws_path = os.path.join(tmp, "goal_ws_isolation.dataog.db")
+                with open(ws_path, "wb") as fh:
+                    fh.write(ws_bytes)
+                with contextlib.closing(sqlite3.connect(ws_path)) as wconn:
+                    ws_tbls = {
+                        r[0]
+                        for r in wconn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                    }
+                self.assertNotIn("ai_assistant_runs", ws_tbls)
+                self.assertNotIn("ai_assistant_run_events", ws_tbls)
+                self.assertNotIn("ai_assistant_attachments", ws_tbls)
+                self.assertNotIn("llm_providers", ws_tbls)
+
+                del_a = client.delete(f"/api/modules/ai_assistant/sessions/{sid_a}")
+                self.assertEqual(del_a.status_code, 200)
+                with ctx.store.module_db(scope="private") as pconn:
+                    rem_runs = pconn.execute(
+                        "SELECT COUNT(*) FROM ai_assistant_runs WHERE run_id = ?", (run_id_a,)
+                    ).fetchone()[0]
+                    rem_evs = pconn.execute(
+                        "SELECT COUNT(*) FROM ai_assistant_run_events WHERE run_id = ?", (run_id_a,)
+                    ).fetchone()[0]
+                    keep_b = pconn.execute(
+                        "SELECT COUNT(*) FROM ai_assistant_runs WHERE run_id = ?", (run_id_b,)
+                    ).fetchone()[0]
+                self.assertEqual(rem_runs, 0)
+                self.assertEqual(rem_evs, 0)
+                self.assertEqual(keep_b, 1)
+            finally:
+                ctx.close()
+
     def test_frontend_ai_assistant_and_knowledge_modules_via_node(self) -> None:
         """全静态防呆扫描 + Node.js 运行时真实交互端到端验证 v3.1.0 AI 助手（含粘贴/上传/防爆窗拆解）、提案卡片、抽屉及参考知识库."""
         static_root = resolve_static_dir()
@@ -1452,6 +2179,13 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                     src,
                     f"{os.path.relpath(fpath, static_root)} 禁止调用不存在的 activityBar.run()，必须使用 TaskActivityBar.track()",
                 )
+                rel_js = os.path.relpath(fpath, static_root).replace("\\", "/")
+                if rel_js.startswith("js/apps/ai_assistant/") or rel_js in ("js/core/http.js", "js/views/settings_view.js"):
+                    self.assertNotIn(
+                        "requestAnimationFrame",
+                        src,
+                        f"{rel_js} 禁止使用 requestAnimationFrame（请使用 setTimeout 保证 Node 无头环境与后台标签页兼容）",
+                    )
 
         if getattr(sys, "frozen", False) or not shutil.which("node"):
             return
@@ -1946,6 +2680,223 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
     payload = { ok: true, embedded_chunks: 12, message: "向量索引重建完成" };
   } else if (url.startsWith("/api/platform/tasks/")) {
     payload = { ok: true, status: "running", stage: "执行中", percent: 50, logs: [] };
+  } else if (url === "/api/platform/llm/probe-model" && method === "POST") {
+    const probedModel = bodyObj?.model || "deepseek-v4-flash";
+    const probedProv = bodyObj?.provider_id || "custom";
+    const probedCaps = {
+      context_window: 65536,
+      effective_reasoning_budget: 18000,
+      attachment_budget: 18000,
+      recommended_chunk_tokens: 5500,
+      model_tier: "lightweight",
+      supports_thinking: false,
+      token_ratio: 1.08,
+      ttft_ms: 420.0,
+      stream_supported: true,
+      source: "live_probe",
+      probed_at: "2026-11-24T22:00:00",
+    };
+    const updatedModels = (store.state.llmModels || []).map((m) =>
+      m.provider_id === probedProv && m.model === probedModel
+        ? { ...m, ...probedCaps }
+        : m
+    );
+    const updatedProvs = (store.state.llmProviders || []).map((p) =>
+      p.provider_id === probedProv
+        ? {
+            ...p,
+            extra: {
+              ...(p.extra || {}),
+              model_probes: { ...((p.extra || {}).model_probes || {}), [probedModel]: probedCaps },
+            },
+          }
+        : p
+    );
+    payload = {
+      ok: true,
+      cached: false,
+      probe_ok: true,
+      provider_id: probedProv,
+      model: probedModel,
+      capabilities: probedCaps,
+      providers: updatedProvs,
+      available_models: updatedModels,
+      message: `已探查 ${probedModel}：窗口 65,536 · 甜蜜区 18,000 · TTFT 420ms`,
+    };
+  } else if (url === "/api/modules/ai_assistant/runs" && method === "POST") {
+    const goalSess = {
+      session_id: "sess_goal_1",
+      title: "Goal 全量审计",
+      work_mode: "connection",
+      connection_id: "conn_dws_1",
+      dialect: "DWS",
+      schema_name: "dwd",
+      focus_tables: [],
+      task_mode: "auto",
+      turn_count: 1,
+      messages: [
+        { id: "msg_goal_u1", role: "user", content: bodyObj?.prompt || "全量审计", attachments: [] },
+      ],
+    };
+    mockState.goalPhase = "first";
+    mockState.sessions = [goalSess];
+    payload = {
+      ok: true,
+      run: {
+        run_id: "run_goal_1",
+        session_id: "sess_goal_1",
+        run_mode: "goal",
+        status: "queued",
+        progress_pct: 5,
+        plan: {},
+        checkpoint: {},
+      },
+      session: goalSess,
+      user_message: goalSess.messages[0],
+    };
+  } else if (url === "/api/modules/ai_assistant/runs/run_goal_1/resume" && method === "POST") {
+    mockState.goalPhase = "resumed";
+    payload = {
+      ok: true,
+      run: {
+        run_id: "run_goal_1",
+        session_id: "sess_goal_1",
+        run_mode: "goal",
+        status: "running",
+        progress_pct: 55,
+      },
+    };
+  } else if (url.startsWith("/api/modules/ai_assistant/runs/run_goal_1/events")) {
+    const encoder = new TextEncoder();
+    const goalPlan = {
+      strategy: "goal_driven_staged",
+      strategy_label: "🎯 Goal 甜蜜区分段闭环",
+      reason: "全文超出轻量模型 18K 甜蜜区，已按语句边界拆分为 2 个阶段推进。",
+      model_tier: "lightweight",
+      effective_reasoning_budget: 18000,
+      high_medium_findings_count: 2,
+      lineage_summary: ["ods.raw_txn -> tmp_stage -> dm.rpt_final"],
+      stages: [
+        { stage_id: "stage_1", index: 1, title: "阶段 1/2 · 临时表加工 (L1-L400)", finding_ids: ["F001"], status: "pending", kind: "analysis" },
+        { stage_id: "stage_2", index: 2, title: "阶段 2/2 · 目标表写入 (L401-L900)", finding_ids: ["F002"], status: "pending", kind: "analysis" },
+      ],
+    };
+    const phase = mockState.goalPhase || "first";
+    const stream = new ReadableStream({
+      start(controller) {
+        const pushIdEv = (id, evObj) => {
+          const evName = evObj.type || "message";
+          controller.enqueue(encoder.encode(`id: ${id}\nevent: ${evName}\ndata: ${JSON.stringify(evObj)}\n\n`));
+        };
+        if (phase === "first") {
+          pushIdEv(1, { type: "plan_ready", plan: goalPlan });
+          pushIdEv(2, { type: "stage_start", stage_id: "stage_1", index: 1, total: 2, title: "阶段 1/2 · 临时表加工 (L1-L400)", progress_pct: 25 });
+          pushIdEv(3, { type: "retry_wait", attempt: 1, max_retries: 3, wait_sec: 2, reason: "响应超时", shed_load: false, detail: "供应商响应超时，正在第 1/3 次自动退避重连..." });
+          setTimeout(() => {
+            pushIdEv(4, { type: "stage_done", stage_id: "stage_1", index: 1, total: 2, title: "阶段 1/2 · 临时表加工 (L1-L400)", ok: true, elapsed_ms: 82.0, summary: "阶段 1 完成", progress_pct: 50 });
+            pushIdEv(5, { type: "verify_result", passed: false, coverage_pct: 50, detail: "阶段 2 待继续推进" });
+            pushIdEv(6, {
+              type: "run_paused",
+              run_id: "run_goal_1",
+              status: "paused_recoverable",
+              progress_pct: 50,
+              reason: "达到单轮步数护栏，已保存断点",
+              plan: goalPlan,
+              checkpoint: { completed_stage_ids: ["stage_1"], steps_executed: 1 },
+              run: {
+                run_id: "run_goal_1",
+                session_id: "sess_goal_1",
+                status: "paused_recoverable",
+                progress_pct: 50,
+                error_message: "达到单轮步数护栏，已保存断点",
+                plan: goalPlan,
+                checkpoint: { completed_stage_ids: ["stage_1"], steps_executed: 1 },
+              },
+            });
+            controller.close();
+          }, 35);
+        } else {
+          const finalAsst = {
+            id: "msg_goal_a1",
+            role: "assistant",
+            response_type: "answer",
+            content: "### 🎯 Goal 断点续跑全景报告\n\n已完成全部 2 个阶段与高危隐患核验。",
+            steps: [{ step: 1, tool: "goal_stage_analyze", purpose: "阶段 1/2", ok: true, elapsed_ms: 82.0, summary: "完成" }],
+            citations: [],
+            next_steps: [],
+            provider_name: "内网Qwen",
+            model: "qwen-coder",
+            created_at: "2026-11-24 22:01:00",
+            total_elapsed_ms: 140.0,
+          };
+          const doneSess = {
+            session_id: "sess_goal_1",
+            title: "Goal 全量审计",
+            work_mode: "connection",
+            connection_id: "conn_dws_1",
+            dialect: "DWS",
+            schema_name: "dwd",
+            focus_tables: [],
+            task_mode: "auto",
+            turn_count: 1,
+            messages: [
+              { id: "msg_goal_u1", role: "user", content: "全量审计存储过程", attachments: [] },
+              finalAsst,
+            ],
+          };
+          pushIdEv(7, { type: "stage_start", stage_id: "stage_2", index: 2, total: 2, title: "阶段 2/2 · 目标表写入 (L401-L900)", progress_pct: 70 });
+          pushIdEv(8, { type: "stage_done", stage_id: "stage_2", index: 2, total: 2, title: "阶段 2/2 · 目标表写入 (L401-L900)", ok: true, elapsed_ms: 60.0, summary: "阶段 2 完成", progress_pct: 85 });
+          pushIdEv(9, { type: "verify_result", passed: true, coverage_pct: 100, detail: "硬验收通过：覆盖率 100%，全部 2 项隐患已核验。" });
+          pushIdEv(10, { type: "content_delta", delta: finalAsst.content });
+          pushIdEv(11, { type: "done", ok: true, session: doneSess, assistant_message: finalAsst, run: { run_id: "run_goal_1", status: "completed", progress_pct: 100 } });
+          controller.close();
+        }
+      },
+    });
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([["content-type", "text/event-stream"]]),
+      body: stream,
+    };
+  } else if (url === "/api/modules/ai_assistant/sessions/sess_paused_recover") {
+    payload = {
+      ok: true,
+      session: {
+        session_id: "sess_paused_recover",
+        title: "恢复历史断点会话",
+        work_mode: "dialect",
+        connection_id: "",
+        dialect: "DWS",
+        schema_name: "",
+        focus_tables: [],
+        task_mode: "auto",
+        turn_count: 1,
+        messages: [{ id: "m_rec_1", role: "user", content: "继续分析旧断点", attachments: [] }],
+      },
+    };
+  } else if (url === "/api/modules/ai_assistant/sessions/sess_paused_recover/active-run") {
+    payload = {
+      ok: true,
+      run: {
+        run_id: "run_rec_9",
+        session_id: "sess_paused_recover",
+        status: "paused_recoverable",
+        progress_pct: 60,
+        error_message: "上次执行已保存断点，点击继续即可恢复",
+        plan: {
+          strategy: "goal_driven_staged",
+          strategy_label: "🎯 Goal 甜蜜区分段闭环",
+          stages: [
+            { stage_id: "stage_1", title: "阶段 1/2", status: "done" },
+            { stage_id: "stage_2", title: "阶段 2/2", status: "pending" },
+          ],
+        },
+        checkpoint: { completed_stage_ids: ["stage_1"] },
+      },
+    };
+  } else if (url.endsWith("/active-run")) {
+    payload = { ok: true, run: null };
   }
 
   return {
@@ -2304,6 +3255,116 @@ view.render();
 const bar32k = view.root.querySelector(".ai-asst-strategy-bar");
 if (!bar32k || !bar32k.classList.contains("is-warn")) {
   throw new Error("Expected warn .is-warn context meter bar for 25K attachment under 32K model");
+}
+
+// 场景 7：v3.4.0 模型能力探查胶囊 + SettingsView 探查按钮 + 🎯 Goal 模式（plan_ready / Checklist / 静默 retry_wait / paused_recoverable 断点续跑 + Last-Event-ID + active-run 恢复）
+toastRoot.replaceChildren();
+view.pendingAttachments = [];
+view.selectedModelKey = "custom::qwen-coder";
+store.state.llmProviders = [
+  {
+    provider_id: "custom",
+    name: "内网Qwen",
+    provider_type: "OPENAI_COMPATIBLE",
+    enabled: true,
+    base_url: "http://127.0.0.1:11434/v1",
+    has_api_key: true,
+    api_key_masked: "sk-••••",
+    default_model: "qwen-coder",
+    models: ["qwen-coder"],
+    is_default: true,
+    extra: {},
+  },
+];
+view.render();
+
+// 7a. 点击模型能力探查胶囊触发 /api/platform/llm/probe-model 并刷新胶囊读数
+const probeCapsuleBtn = view.root.querySelector(".ai-asst-probe-capsule");
+if (!probeCapsuleBtn) throw new Error("Model probe capsule button missing in AiAssistantView toolbar");
+probeCapsuleBtn.click();
+await flushAsync(4);
+const probeCall1 = fetchCalls.find((c) => c.url === "/api/platform/llm/probe-model");
+if (!probeCall1 || probeCall1.body?.force_refresh !== true) {
+  throw new Error(`Model probe capsule did not call /api/platform/llm/probe-model with force_refresh: ${JSON.stringify(probeCall1)}`);
+}
+const refreshedCapsule = view.root.querySelector(".ai-asst-probe-capsule");
+if (!refreshedCapsule || !getNodeText(refreshedCapsule).includes("实测") || !getNodeText(refreshedCapsule).includes("TTFT")) {
+  throw new Error(`Probe capsule did not refresh with live probe telemetry: ${getNodeText(refreshedCapsule)}`);
+}
+
+// 7b. SettingsView AI 模型页「探查能力与窗口」按钮与能力档案读数卡
+const { SettingsView } = await imp("static/js/views/settings_view.js");
+const settingsView = new SettingsView();
+const settingsHost = new MockNode("div");
+settingsView.mount(settingsHost, { section: "llm" });
+const settingsProbeBtn = settingsView.root.querySelector(".ai-llm-probe-btn");
+if (!settingsProbeBtn) throw new Error("SettingsView 探查能力与窗口 button missing");
+settingsProbeBtn.click();
+await flushAsync(4);
+const probeReadout = settingsView.root.querySelector(".ai-llm-probe-readout");
+if (!probeReadout || !getNodeText(probeReadout).includes("甜蜜区 18K") || !getNodeText(probeReadout).includes("live_probe")) {
+  throw new Error(`SettingsView probe readout missing expected values: ${getNodeText(probeReadout)}`);
+}
+settingsView.destroy();
+
+// 7c. 切换 🎯 Goal 模式 -> /runs -> streamSseGet(plan_ready / retry_wait / run_paused) -> 一键从断点继续执行 (Last-Event-ID)
+toastRoot.replaceChildren();
+const goalBtn = findNodes(view.root, (n) => n.tagName === "BUTTON" && getNodeText(n).includes("Goal 模式"))[0];
+if (!goalBtn) throw new Error("Goal mode toggle button missing");
+goalBtn.click();
+if (view.runMode !== "goal") throw new Error("Clicking Goal mode button did not switch view.runMode to goal");
+
+const goalPromise = view.sendUserMessage("全量审计存储过程");
+await new Promise((r) => setTimeout(r, 15));
+const livePlanCard = view.root.querySelector(".ai-asst-plan-card");
+const liveRetryBanner = view.root.querySelector(".ai-asst-retry-banner");
+if (!livePlanCard || !liveRetryBanner || !getNodeText(liveRetryBanner).includes("自动重试")) {
+  throw new Error(`Live Goal plan card or quiet retry_wait banner missing: ${getNodeText(livePlanCard)}`);
+}
+const retryErrToasts = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
+if (retryErrToasts.length > 0) {
+  throw new Error(`Quiet retry_wait must NOT emit toast-error, got: ${retryErrToasts.map(getNodeText).join("; ")}`);
+}
+
+await goalPromise;
+await flushAsync();
+const createRunCall = fetchCalls.find((c) => c.url === "/api/modules/ai_assistant/runs" && c.method === "POST");
+if (!createRunCall || createRunCall.body?.run_mode !== "goal") {
+  throw new Error("Goal mode sendUserMessage did not POST /api/modules/ai_assistant/runs");
+}
+const resumeBtn = view.root.querySelector(".ai-asst-resume-btn");
+if (!resumeBtn || !getNodeText(resumeBtn).includes("从断点继续执行")) {
+  throw new Error("Recoverable paused Goal run did not render 从断点继续执行 button");
+}
+
+// 点击「从断点继续执行」验证 POST /resume + streamSseGet 携带 Last-Event-ID=6 完成任务
+resumeBtn.click();
+await flushAsync(8);
+const resumeCall = fetchCalls.find((c) => c.url === "/api/modules/ai_assistant/runs/run_goal_1/resume" && c.method === "POST");
+if (!resumeCall) throw new Error("Clicking 从断点继续执行 did not POST /runs/run_goal_1/resume");
+const resumedEventsCall = fetchCalls.find(
+  (c) => c.url.includes("/api/modules/ai_assistant/runs/run_goal_1/events?after_event_id=6") && String(c.headers["Last-Event-ID"] || "") === "6"
+);
+if (!resumedEventsCall) {
+  throw new Error("Resume stream did not carry after_event_id=6 and Last-Event-ID=6 header");
+}
+if (!getNodeText(view.root).includes("断点续跑全景报告")) {
+  throw new Error("Resumed Goal run did not render final completed Markdown report");
+}
+
+// 7d. 切换至含断点任务的会话时自动调用 /active-run 恢复断点卡片
+await view.selectSession("sess_paused_recover");
+await flushAsync(4);
+if (!fetchCalls.some((c) => c.url === "/api/modules/ai_assistant/sessions/sess_paused_recover/active-run")) {
+  throw new Error("selectSession did not fetch /active-run for recovery");
+}
+if (!view.root.querySelector(".ai-asst-recoverable-card") || !view.root.querySelector(".ai-asst-resume-btn")) {
+  throw new Error("selectSession did not render recoverable checkpoint card for paused run");
+}
+
+const scene7Errs = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
+if (scene7Errs.length > 0) {
+  throw new Error(`Unexpected toast-error in Scene 7: ${scene7Errs.map(getNodeText).join("; ")}`);
 }
 
 kbView.destroy();

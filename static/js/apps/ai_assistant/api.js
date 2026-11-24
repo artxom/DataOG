@@ -3,7 +3,14 @@
  * 严格遵守 3.0 隔离规范：仅从 core/http.js 导入基础请求原语。
  */
 
-import { downloadApiFile, requestJson, streamSsePost, uploadFormData, withRequestOpts } from "../../core/http.js";
+import {
+  downloadApiFile,
+  requestJson,
+  streamSseGet,
+  streamSsePost,
+  uploadFormData,
+  withRequestOpts,
+} from "../../core/http.js";
 
 const BASE = "/api/modules/ai_assistant";
 
@@ -40,6 +47,44 @@ export const assistantApi = {
 
   streamChatTurn: (payload, { signal = undefined, taskId = "", onEvent = null } = {}) =>
     streamSsePost(`${BASE}/chat/stream`, { body: payload, signal, taskId, onEvent }),
+
+  createRun: (payload) =>
+    requestJson(`${BASE}/runs`, { method: "POST", body: payload }),
+
+  getRun: (runId, { includeEvents = true, afterEventId = 0 } = {}) => {
+    const qs = new URLSearchParams();
+    qs.set("include_events", includeEvents ? "true" : "false");
+    if (Number(afterEventId || 0) > 0) qs.set("after_event_id", String(afterEventId));
+    return requestJson(`${BASE}/runs/${encodeURIComponent(runId)}?${qs.toString()}`, {
+      cache: "no-store",
+    });
+  },
+
+  resumeRun: (runId, payload = { extra_steps: 15 }) =>
+    requestJson(`${BASE}/runs/${encodeURIComponent(runId)}/resume`, {
+      method: "POST",
+      body: payload,
+    }),
+
+  cancelRun: (runId) =>
+    requestJson(`${BASE}/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: "POST",
+    }),
+
+  getSessionActiveRun: (sessionId) =>
+    requestJson(`${BASE}/sessions/${encodeURIComponent(sessionId)}/active-run`, {
+      cache: "no-store",
+    }),
+
+  streamRunEvents: (runId, { afterEventId = 0, signal = undefined, onEvent = null } = {}) => {
+    const eid = Number(afterEventId || 0) || 0;
+    const qs = eid > 0 ? `?after_event_id=${encodeURIComponent(String(eid))}` : "";
+    return streamSseGet(`${BASE}/runs/${encodeURIComponent(runId)}/events${qs}`, {
+      signal,
+      lastEventId: eid,
+      onEvent,
+    });
+  },
 
   uploadAttachment: (file, sessionId = "") => {
     const fd = new FormData();

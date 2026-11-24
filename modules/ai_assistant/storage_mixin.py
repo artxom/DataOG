@@ -158,6 +158,7 @@ class AssistantStorageMixin:
                 raw_text TEXT NOT NULL DEFAULT '',
                 csv_profile_json TEXT NOT NULL DEFAULT '{}',
                 outline_json TEXT NOT NULL DEFAULT '{}',
+                analysis_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_ai_asst_att_sid
@@ -180,6 +181,7 @@ class AssistantStorageMixin:
                 ("raw_text", "TEXT NOT NULL DEFAULT ''"),
                 ("csv_profile_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("outline_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("analysis_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ],
             scope="private",
@@ -264,6 +266,76 @@ class AssistantStorageMixin:
             ],
             scope="private",
         )
+        store.register_table_schema(
+            "ai_assistant_runs",
+            """
+            CREATE TABLE IF NOT EXISTS ai_assistant_runs (
+                run_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL DEFAULT '',
+                user_message_id INTEGER NOT NULL DEFAULT 0,
+                assistant_message_id INTEGER NOT NULL DEFAULT 0,
+                run_mode TEXT NOT NULL DEFAULT 'goal',
+                status TEXT NOT NULL DEFAULT 'queued',
+                request_json TEXT NOT NULL DEFAULT '{}',
+                plan_json TEXT NOT NULL DEFAULT '{}',
+                checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                progress_pct INTEGER NOT NULL DEFAULT 0,
+                current_stage TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '',
+                provider_id TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                thinking_mode TEXT NOT NULL DEFAULT 'auto',
+                last_event_id INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                finished_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_asst_runs_sid
+                ON ai_assistant_runs(session_id, created_at DESC);
+            """,
+            [
+                ("session_id", "TEXT NOT NULL DEFAULT ''"),
+                ("user_message_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("assistant_message_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("run_mode", "TEXT NOT NULL DEFAULT 'goal'"),
+                ("status", "TEXT NOT NULL DEFAULT 'queued'"),
+                ("request_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("plan_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("checkpoint_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("progress_pct", "INTEGER NOT NULL DEFAULT 0"),
+                ("current_stage", "TEXT NOT NULL DEFAULT ''"),
+                ("error_message", "TEXT NOT NULL DEFAULT ''"),
+                ("provider_id", "TEXT NOT NULL DEFAULT ''"),
+                ("model", "TEXT NOT NULL DEFAULT ''"),
+                ("thinking_mode", "TEXT NOT NULL DEFAULT 'auto'"),
+                ("last_event_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+                ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+                ("finished_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            scope="private",
+        )
+        store.register_table_schema(
+            "ai_assistant_run_events",
+            """
+            CREATE TABLE IF NOT EXISTS ai_assistant_run_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL DEFAULT 'message',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_asst_run_ev_rid
+                ON ai_assistant_run_events(run_id, event_id ASC);
+            """,
+            [
+                ("run_id", "TEXT NOT NULL DEFAULT ''"),
+                ("event_type", "TEXT NOT NULL DEFAULT 'message'"),
+                ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            scope="private",
+        )
 
     @staticmethod
     def _row_to_session_dict(row: Any) -> Dict[str, Any]:
@@ -345,6 +417,7 @@ class AssistantStorageMixin:
     def _row_to_attachment_dict(row: Any, *, include_raw: bool = False) -> Dict[str, Any]:
         keys = set(row.keys())
         outline_raw = row["outline_json"] if "outline_json" in keys else "{}"
+        analysis_raw = row["analysis_json"] if "analysis_json" in keys else "{}"
         out: Dict[str, Any] = {
             "attachment_id": str(row["attachment_id"]),
             "session_id": str(row["session_id"] or ""),
@@ -362,11 +435,47 @@ class AssistantStorageMixin:
             "summary": str(row["summary"] or ""),
             "csv_profile": _safe_json_loads(row["csv_profile_json"], {}),
             "outline": _safe_json_loads(outline_raw, {}),
+            "analysis": _safe_json_loads(analysis_raw, {}),
             "created_at": str(row["created_at"] or ""),
         }
         if include_raw:
             out["raw_text"] = str(row["raw_text"] or "")
         return out
+
+    @staticmethod
+    def _row_to_run_dict(row: Any) -> Dict[str, Any]:
+        keys = set(row.keys())
+        return {
+            "run_id": str(row["run_id"]),
+            "session_id": str(row["session_id"] or ""),
+            "user_message_id": int(row["user_message_id"] or 0),
+            "assistant_message_id": int(row["assistant_message_id"] or 0) if "assistant_message_id" in keys else 0,
+            "run_mode": str(row["run_mode"] or "goal"),
+            "status": str(row["status"] or "queued"),
+            "request": _safe_json_loads(row["request_json"], {}) if "request_json" in keys else {},
+            "plan": _safe_json_loads(row["plan_json"], {}),
+            "checkpoint": _safe_json_loads(row["checkpoint_json"], {}),
+            "progress_pct": int(row["progress_pct"] or 0),
+            "current_stage": str(row["current_stage"] or ""),
+            "error_message": str(row["error_message"] or ""),
+            "provider_id": str(row["provider_id"] or ""),
+            "model": str(row["model"] or ""),
+            "thinking_mode": str(row["thinking_mode"] or "auto"),
+            "last_event_id": int(row["last_event_id"] or 0),
+            "created_at": str(row["created_at"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+            "finished_at": str(row["finished_at"] or ""),
+        }
+
+    @staticmethod
+    def _row_to_run_event_dict(row: Any) -> Dict[str, Any]:
+        return {
+            "event_id": int(row["event_id"]),
+            "run_id": str(row["run_id"] or ""),
+            "event_type": str(row["event_type"] or "message"),
+            "payload": _safe_json_loads(row["payload_json"], {}),
+            "created_at": str(row["created_at"] or ""),
+        }
 
     @staticmethod
     def _row_to_attachment_chunk_dict(row: Any, *, include_content: bool = True) -> Dict[str, Any]:
@@ -602,6 +711,16 @@ class AssistantStorageMixin:
                     (str(ar["attachment_id"]),),
                 )
             conn.execute("DELETE FROM ai_assistant_attachments WHERE session_id = ?", (sid,))
+            run_rows = conn.execute(
+                "SELECT run_id FROM ai_assistant_runs WHERE session_id = ?",
+                (sid,),
+            ).fetchall()
+            for rr in run_rows:
+                conn.execute(
+                    "DELETE FROM ai_assistant_run_events WHERE run_id = ?",
+                    (str(rr["run_id"]),),
+                )
+            conn.execute("DELETE FROM ai_assistant_runs WHERE session_id = ?", (sid,))
         return cur.rowcount > 0
 
     def _insert_message(
@@ -762,8 +881,8 @@ class AssistantStorageMixin:
                 INSERT INTO ai_assistant_attachments (
                     attachment_id, session_id, filename, file_ext, file_kind, encoding,
                     size_bytes, line_count, row_count, estimated_tokens, chunk_count,
-                    oversized, recommended_strategy, summary, raw_text, csv_profile_json, outline_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    oversized, recommended_strategy, summary, raw_text, csv_profile_json, outline_json, analysis_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     aid,
@@ -783,6 +902,7 @@ class AssistantStorageMixin:
                     str(parsed.get("raw_text") or ""),
                     json.dumps(parsed.get("csv_profile") or {}, ensure_ascii=False),
                     json.dumps(parsed.get("outline") or {}, ensure_ascii=False),
+                    json.dumps(parsed.get("analysis") or {}, ensure_ascii=False),
                     now,
                 ),
             )
@@ -1106,3 +1226,206 @@ class AssistantStorageMixin:
                 (aid,),
             )
         return cur.rowcount > 0
+
+    # =========================================================================
+    # 后台持久化 Run 与断点续流事件 (ai_assistant_runs / ai_assistant_run_events)
+    # =========================================================================
+
+    def create_run(
+        self,
+        *,
+        session_id: str,
+        user_message_id: int = 0,
+        run_mode: str = "goal",
+        request_payload: Optional[Dict[str, Any]] = None,
+        provider_id: str = "",
+        model: str = "",
+        thinking_mode: str = "auto",
+    ) -> Dict[str, Any]:
+        rid = f"run_{uuid.uuid4().hex[:14]}"
+        now = _now_str()
+        clean_mode = (run_mode or "goal").strip().lower()
+        if clean_mode not in ("standard", "goal"):
+            clean_mode = "goal"
+        with self.ctx.store.module_db(scope="private") as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_assistant_runs (
+                    run_id, session_id, user_message_id, assistant_message_id, run_mode, status,
+                    request_json, plan_json, checkpoint_json, progress_pct, current_stage,
+                    error_message, provider_id, model, thinking_mode, last_event_id,
+                    created_at, updated_at, finished_at
+                ) VALUES (?, ?, ?, 0, ?, 'queued', ?, '{}', '{}', 0, '准备中', '', ?, ?, ?, 0, ?, ?, '')
+                """,
+                (
+                    rid,
+                    (session_id or "").strip(),
+                    int(user_message_id or 0),
+                    clean_mode,
+                    json.dumps(request_payload or {}, ensure_ascii=False),
+                    (provider_id or "").strip(),
+                    (model or "").strip(),
+                    (thinking_mode or "auto").strip().lower(),
+                    now,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM ai_assistant_runs WHERE run_id = ?", (rid,)
+            ).fetchone()
+        return self._row_to_run_dict(row)
+
+    def get_run(self, run_id: str) -> Optional[Dict[str, Any]]:
+        rid = (run_id or "").strip()
+        if not rid:
+            return None
+        with self.ctx.store.module_db(scope="private") as conn:
+            row = conn.execute(
+                "SELECT * FROM ai_assistant_runs WHERE run_id = ?", (rid,)
+            ).fetchone()
+        return self._row_to_run_dict(row) if row is not None else None
+
+    def get_active_run_for_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        sid = (session_id or "").strip()
+        if not sid:
+            return None
+        with self.ctx.store.module_db(scope="private") as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM ai_assistant_runs
+                WHERE session_id = ?
+                  AND status IN ('queued', 'probing', 'planning', 'running', 'verifying', 'paused_recoverable', 'failed')
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (sid,),
+            ).fetchone()
+        return self._row_to_run_dict(row) if row is not None else None
+
+    def update_run(
+        self,
+        run_id: str,
+        *,
+        status: Optional[str] = None,
+        plan: Optional[Dict[str, Any]] = None,
+        checkpoint: Optional[Dict[str, Any]] = None,
+        request_payload: Optional[Dict[str, Any]] = None,
+        progress_pct: Optional[int] = None,
+        current_stage: Optional[str] = None,
+        error_message: Optional[str] = None,
+        assistant_message_id: Optional[int] = None,
+        provider_id: Optional[str] = None,
+        model: Optional[str] = None,
+        finished_at: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        rid = (run_id or "").strip()
+        if not rid:
+            return None
+        sets: List[str] = ["updated_at = ?"]
+        params: List[Any] = [_now_str()]
+        if status is not None:
+            sets.append("status = ?")
+            params.append(str(status).strip())
+        if plan is not None:
+            sets.append("plan_json = ?")
+            params.append(json.dumps(plan, ensure_ascii=False))
+        if checkpoint is not None:
+            sets.append("checkpoint_json = ?")
+            params.append(json.dumps(checkpoint, ensure_ascii=False))
+        if request_payload is not None:
+            sets.append("request_json = ?")
+            params.append(json.dumps(request_payload, ensure_ascii=False))
+        if progress_pct is not None:
+            sets.append("progress_pct = ?")
+            params.append(max(0, min(100, int(progress_pct))))
+        if current_stage is not None:
+            sets.append("current_stage = ?")
+            params.append(str(current_stage)[:120])
+        if error_message is not None:
+            sets.append("error_message = ?")
+            params.append(str(error_message)[:1000])
+        if assistant_message_id is not None:
+            sets.append("assistant_message_id = ?")
+            params.append(int(assistant_message_id))
+        if provider_id is not None:
+            sets.append("provider_id = ?")
+            params.append(str(provider_id).strip())
+        if model is not None:
+            sets.append("model = ?")
+            params.append(str(model).strip())
+        if finished_at is not None:
+            sets.append("finished_at = ?")
+            params.append(str(finished_at))
+
+        params.append(rid)
+        with self.ctx.store.module_db(scope="private") as conn:
+            conn.execute(
+                f"UPDATE ai_assistant_runs SET {', '.join(sets)} WHERE run_id = ?",
+                tuple(params),
+            )
+            row = conn.execute(
+                "SELECT * FROM ai_assistant_runs WHERE run_id = ?", (rid,)
+            ).fetchone()
+        return self._row_to_run_dict(row) if row is not None else None
+
+    def append_run_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        rid = (run_id or "").strip()
+        ev_t = (event_type or "message").strip()
+        now = _now_str()
+        ev_payload = dict(payload or {})
+        ev_payload.setdefault("type", ev_t)
+        ev_payload.setdefault("run_id", rid)
+        with self.ctx.store.module_db(scope="private") as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ai_assistant_run_events (run_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (rid, ev_t, json.dumps(ev_payload, ensure_ascii=False), now),
+            )
+            ev_id = int(cur.lastrowid or 0)
+            conn.execute(
+                "UPDATE ai_assistant_runs SET last_event_id = ?, updated_at = ? WHERE run_id = ?",
+                (ev_id, now, rid),
+            )
+        ev_payload["event_id"] = ev_id
+        return {
+            "event_id": ev_id,
+            "run_id": rid,
+            "event_type": ev_t,
+            "payload": ev_payload,
+            "created_at": now,
+        }
+
+    def list_run_events(
+        self,
+        run_id: str,
+        *,
+        after_event_id: int = 0,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        rid = (run_id or "").strip()
+        if not rid:
+            return []
+        cap = max(1, min(5000, int(limit or 1000)))
+        with self.ctx.store.module_db(scope="private") as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ai_assistant_run_events
+                WHERE run_id = ? AND event_id > ?
+                ORDER BY event_id ASC
+                LIMIT ?
+                """,
+                (rid, max(0, int(after_event_id or 0)), cap),
+            ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            d = self._row_to_run_event_dict(r)
+            d["payload"]["event_id"] = d["event_id"]
+            out.append(d)
+        return out

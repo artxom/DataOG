@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -31,11 +32,16 @@ from modules.ai_assistant.attachments import (
     INLINE_TOKEN_BUDGET,
     MAX_ATTACHMENTS_PER_TURN,
     MAX_BATCH_CHUNKS_CAP,
+    compact_sql_for_llm,
     estimate_tokens,
     format_attachment_manifest,
     format_with_line_numbers,
     infer_pasted_filename_and_ext,
     process_attachment_payload,
+)
+from modules.ai_assistant.sql_static_analyzer import (
+    analyze_sql_static,
+    extract_lineage_subgraph,
 )
 from modules.ai_assistant.storage_mixin import (
     AssistantStorageMixin,
@@ -296,6 +302,591 @@ class _StreamActionDemuxer:
         return "".join(self._emitted_parts)
 
 
+_GLOBAL_AUDIT_KEYWORDS: Tuple[str, ...] = (
+    "全量",
+    "全局",
+    "全面",
+    "逐段",
+    "逐行",
+    "审计",
+    "重构",
+    "迁移",
+    "完整梳理",
+    "全部问题",
+    "通篇",
+    "不遗漏",
+    "彻底排查",
+    "所有隐患",
+    "整体审查",
+    "全面检查",
+    "全部sql",
+    "全部逻辑",
+    "full audit",
+    "review all",
+)
+
+_STRATEGY_LABELS: Dict[str, str] = {
+    "none": "常规探索对话",
+    "full_context": "全量直通分析",
+    "lineage_sliced": "血缘手术刀精准切片",
+    "goal_driven_staged": "🎯 Goal 甜蜜区分段闭环",
+    "agentic_explore": "架构图纸 + 按需自主切片",
+    "stepped_batch": "大粒度逐片拆解",
+}
+
+
+class ExecutionPlanner:
+    """每次分析前根据 [模型真实能力档案 × SQL静态解剖图谱 × 用户意图 × 运行模式] 制定最优执行策略."""
+
+    @staticmethod
+    def _ensure_sql_analysis(att: Dict[str, Any], dialect: str = "") -> Dict[str, Any]:
+        analysis = att.get("analysis")
+        if isinstance(analysis, dict) and analysis.get("statements"):
+            return analysis
+        if att.get("file_kind") == "sql" and att.get("raw_text"):
+            try:
+                computed = analyze_sql_static(str(att["raw_text"]), dialect=dialect)
+                att["analysis"] = computed
+                return computed
+            except Exception:
+                return {}
+        return {}
+
+    @staticmethod
+    def _find_mentioned_tables(prompt: str, attachments: List[Dict[str, Any]]) -> List[str]:
+        low_p = (prompt or "").lower()
+        if not low_p:
+            return []
+        matched: List[str] = []
+        seen: set[str] = set()
+        for att in attachments:
+            analysis = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
+            dag_nodes = (analysis.get("lineage_dag") or {}).get("nodes") or []
+            candidates: List[str] = [str(n.get("table") or "") for n in dag_nodes if n.get("table")]
+            if not candidates:
+                outline = att.get("outline") if isinstance(att.get("outline"), dict) else {}
+                candidates = [str(t) for t in (outline.get("referenced_tables") or []) if t]
+            for tbl in candidates:
+                t_full = tbl.strip().lower()
+                t_bare = t_full.split(".")[-1]
+                if len(t_bare) < 3:
+                    continue
+                if (
+                    re.search(rf"(?<![a-z0-9_]){re.escape(t_full)}(?![a-z0-9_])", low_p)
+                    or re.search(rf"(?<![a-z0-9_]){re.escape(t_bare)}(?![a-z0-9_])", low_p)
+                ):
+                    if t_full not in seen:
+                        seen.add(t_full)
+                        matched.append(tbl)
+        return matched
+
+    @staticmethod
+    def _build_balanced_stages(
+        attachments: List[Dict[str, Any]],
+        *,
+        chunk_budget: int,
+        use_compact_view: bool,
+        strategy: str,
+        lineage_blocks: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        stages: List[Dict[str, Any]] = []
+        safe_chunk_budget = max(2500, int(chunk_budget or 6000))
+
+        if not attachments:
+            stages.append(
+                {
+                    "stage_id": "stage_1",
+                    "index": 1,
+                    "title": "阶段 1/1 · 深度目标探索与结论核验",
+                    "attachment_id": "",
+                    "filename": "",
+                    "start_line": 0,
+                    "end_line": 0,
+                    "stmt_ids": [],
+                    "target_tables": [],
+                    "finding_ids": [],
+                    "estimated_tokens": 0,
+                    "use_compact_view": False,
+                    "status": "pending",
+                    "kind": "analysis",
+                }
+            )
+            return stages
+
+        if strategy == "lineage_sliced" and lineage_blocks:
+            s_ids = [b["stmt_id"] for b in lineage_blocks if b.get("stmt_id")]
+            s_ids_set = set(s_ids)
+            s_ln = min(int(b.get("start_line") or 1) for b in lineage_blocks)
+            e_ln = max(int(b.get("end_line") or s_ln) for b in lineage_blocks)
+            tot_tok = sum(int(b.get("estimated_tokens") or 0) for b in lineage_blocks)
+            att0 = attachments[0]
+            an0 = att0.get("analysis") if isinstance(att0.get("analysis"), dict) else {}
+            lin_fids = [
+                f["finding_id"]
+                for f in (an0.get("static_findings") or [])
+                if f.get("severity") in ("HIGH", "MEDIUM") and f.get("stmt_id") in s_ids_set
+            ]
+            stages.append(
+                {
+                    "stage_id": "stage_1",
+                    "index": 1,
+                    "title": f"阶段 1/1 · 血缘精准切片分析 (L{s_ln}-L{e_ln} · {len(s_ids)} 条语句)",
+                    "attachment_id": att0.get("attachment_id", ""),
+                    "filename": att0.get("filename", ""),
+                    "start_line": s_ln,
+                    "end_line": e_ln,
+                    "stmt_ids": s_ids,
+                    "target_tables": sorted({str(b.get("target_table")) for b in lineage_blocks if b.get("target_table")}),
+                    "finding_ids": sorted(set(lin_fids)),
+                    "estimated_tokens": tot_tok,
+                    "use_compact_view": use_compact_view,
+                    "status": "pending",
+                    "kind": "lineage_slice",
+                }
+            )
+            return stages
+
+        if strategy == "full_context":
+            for att in attachments:
+                analysis = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
+                stmts = analysis.get("statements") or []
+                findings = analysis.get("static_findings") or []
+                hm_fids = [f["finding_id"] for f in findings if f.get("severity") in ("HIGH", "MEDIUM")]
+                stages.append(
+                    {
+                        "stage_id": f"stage_{len(stages) + 1}",
+                        "index": len(stages) + 1,
+                        "title": f"全文直通分析 · {att.get('filename', '')} (L1-L{att.get('line_count', 0)})",
+                        "attachment_id": att.get("attachment_id", ""),
+                        "filename": att.get("filename", ""),
+                        "start_line": 1,
+                        "end_line": int(att.get("line_count") or 1),
+                        "stmt_ids": [s["stmt_id"] for s in stmts if s.get("stmt_id")],
+                        "target_tables": sorted({s["target_table"] for s in stmts if s.get("target_table")})[:12],
+                        "finding_ids": hm_fids,
+                        "estimated_tokens": int(att.get("estimated_tokens") or 0),
+                        "use_compact_view": use_compact_view,
+                        "status": "pending",
+                        "kind": "analysis",
+                    }
+                )
+            total_s = len(stages)
+            for idx, st in enumerate(stages, start=1):
+                st["index"] = idx
+                st["title"] = f"阶段 {idx}/{total_s} · {st['title']}"
+            return stages
+
+        # 多阶段甜蜜区按完整 SQL 语句 / 章节边界打包
+        for att in attachments:
+            aid = att.get("attachment_id", "")
+            fname = att.get("filename", "")
+            line_cnt = max(1, int(att.get("line_count") or 1))
+            analysis = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
+            stmts = analysis.get("statements") or []
+            findings = analysis.get("static_findings") or []
+
+            if stmts:
+                cur_stmts: List[Dict[str, Any]] = []
+                cur_tok = 0
+
+                def _flush_stmt_group() -> None:
+                    nonlocal cur_stmts, cur_tok
+                    if not cur_stmts:
+                        return
+                    s_ln = min(int(s.get("start_line") or 1) for s in cur_stmts)
+                    e_ln = max(int(s.get("end_line") or s_ln) for s in cur_stmts)
+                    sec_label = next(
+                        (str(s.get("section_title") or "").strip() for s in cur_stmts if s.get("section_title")),
+                        "",
+                    )
+                    tgts = []
+                    for s in cur_stmts:
+                        t = str(s.get("target_table") or "").strip()
+                        if t and t not in tgts:
+                            tgts.append(t)
+                    grp_sids = [s["stmt_id"] for s in cur_stmts if s.get("stmt_id")]
+                    grp_fids = [
+                        f["finding_id"]
+                        for f in findings
+                        if (
+                            f.get("stmt_id") in grp_sids
+                            or (s_ln <= int(f.get("line") or 0) <= e_ln)
+                        )
+                        and f.get("severity") in ("HIGH", "MEDIUM")
+                    ]
+                    desc = sec_label or (f"写入 {', '.join(tgts[:2])}" if tgts else f"{cur_stmts[0].get('verb', 'SQL')} 逻辑段")
+                    stages.append(
+                        {
+                            "stage_id": f"stage_{len(stages) + 1}",
+                            "index": len(stages) + 1,
+                            "title": f"{desc[:36]} (L{s_ln}-L{e_ln})",
+                            "attachment_id": aid,
+                            "filename": fname,
+                            "start_line": s_ln,
+                            "end_line": e_ln,
+                            "stmt_ids": grp_sids,
+                            "target_tables": tgts[:10],
+                            "finding_ids": sorted(set(grp_fids)),
+                            "estimated_tokens": cur_tok,
+                            "use_compact_view": use_compact_view,
+                            "status": "pending",
+                            "kind": "analysis",
+                        }
+                    )
+                    cur_stmts = []
+                    cur_tok = 0
+
+                for st in stmts:
+                    st_tok = max(80, int(st.get("estimated_tokens") or 120))
+                    # 若加入当前语句会超过甜蜜区分段上限（且本组非空），先切段
+                    if cur_stmts and (cur_tok + st_tok > safe_chunk_budget):
+                        _flush_stmt_group()
+                    # 若进入新章节且当前组已过半载，自然在章节边界切段
+                    elif (
+                        cur_stmts
+                        and st.get("section_title")
+                        and cur_stmts[-1].get("section_title") != st.get("section_title")
+                        and cur_tok >= int(safe_chunk_budget * 0.55)
+                    ):
+                        _flush_stmt_group()
+                    cur_stmts.append(st)
+                    cur_tok += st_tok
+                _flush_stmt_group()
+                # 补齐首尾可能游离于 statements 之外的尾段隐患（如过程末尾 COMMIT/方言语法）
+                if stages:
+                    last_att_stage = stages[-1]
+                    if last_att_stage["end_line"] < line_cnt:
+                        last_att_stage["end_line"] = line_cnt
+                    covered_fids = {fid for st in stages if st["attachment_id"] == aid for fid in st["finding_ids"]}
+                    for f in findings:
+                        if f.get("severity") in ("HIGH", "MEDIUM") and f["finding_id"] not in covered_fids:
+                            # 挂靠到最接近行号的 stage
+                            fln = int(f.get("line") or 1)
+                            best_st = min(
+                                [st for st in stages if st["attachment_id"] == aid],
+                                key=lambda x: min(abs(x["start_line"] - fln), abs(x["end_line"] - fln)),
+                            )
+                            best_st["finding_ids"].append(f["finding_id"])
+            else:
+                chunks = att.get("chunks") or []
+                if chunks:
+                    for ch in chunks:
+                        stages.append(
+                            {
+                                "stage_id": f"stage_{len(stages) + 1}",
+                                "index": len(stages) + 1,
+                                "title": f"{ch.get('title') or fname} ({ch.get('range_label') or ''})".strip(),
+                                "attachment_id": aid,
+                                "filename": fname,
+                                "start_line": int(ch.get("start_line") or 1),
+                                "end_line": int(ch.get("end_line") or line_cnt),
+                                "stmt_ids": [],
+                                "target_tables": [],
+                                "finding_ids": [],
+                                "estimated_tokens": int(ch.get("estimated_tokens") or 0),
+                                "use_compact_view": False,
+                                "status": "pending",
+                                "kind": "analysis",
+                            }
+                        )
+                else:
+                    stages.append(
+                        {
+                            "stage_id": f"stage_{len(stages) + 1}",
+                            "index": len(stages) + 1,
+                            "title": f"{fname} (L1-L{line_cnt})",
+                            "attachment_id": aid,
+                            "filename": fname,
+                            "start_line": 1,
+                            "end_line": line_cnt,
+                            "stmt_ids": [],
+                            "target_tables": [],
+                            "finding_ids": [],
+                            "estimated_tokens": int(att.get("estimated_tokens") or 0),
+                            "use_compact_view": False,
+                            "status": "pending",
+                            "kind": "analysis",
+                        }
+                    )
+
+        total_s = len(stages)
+        for idx, st in enumerate(stages, start=1):
+            st["index"] = idx
+            st["stage_id"] = f"stage_{idx}"
+            if not st["title"].startswith("阶段 "):
+                st["title"] = f"阶段 {idx}/{total_s} · {st['title']}"
+        return stages
+
+    @classmethod
+    def plan(
+        cls,
+        *,
+        model_caps: Dict[str, Any],
+        turn_attachments: List[Dict[str, Any]],
+        clean_prompt: str,
+        req_strategy: str = "auto",
+        run_mode: str = "standard",
+        dialect: str = "",
+        batch_start_chunk: int = 0,
+    ) -> Dict[str, Any]:
+        """根据模型能力档案、SQL 静态解剖与用户意图输出透明最优执行计划."""
+        context_window = int(model_caps.get("context_window") or 64000)
+        eff_budget = int(
+            model_caps.get("effective_reasoning_budget")
+            or model_caps.get("attachment_budget")
+            or 32000
+        )
+        chunk_budget = int(model_caps.get("recommended_chunk_tokens") or 8000)
+        model_tier = str(model_caps.get("model_tier") or "standard")
+        token_ratio = float(model_caps.get("token_ratio") or 1.0)
+        token_ratio = max(0.6, min(2.2, token_ratio))
+
+        for att in turn_attachments:
+            if att.get("file_kind") == "sql":
+                cls._ensure_sql_analysis(att, dialect=dialect)
+
+        total_att_tokens = sum(int(a.get("estimated_tokens") or 0) for a in turn_attachments)
+        adjusted_tokens = int(math.ceil(total_att_tokens * token_ratio))
+
+        all_csv = bool(turn_attachments) and all(a.get("file_kind") == "csv" for a in turn_attachments)
+        has_sql = any(a.get("file_kind") == "sql" for a in turn_attachments)
+        has_oversized_csv = any(
+            a.get("file_kind") == "csv" and int(a.get("estimated_tokens") or 0) > CSV_INLINE_TOKEN_BUDGET
+            for a in turn_attachments
+        )
+
+        # 汇总静态解剖信息
+        lineage_summary: List[str] = []
+        all_findings: List[Dict[str, Any]] = []
+        total_stmts = 0
+        for att in turn_attachments:
+            an = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
+            if an:
+                total_stmts += len(an.get("statements") or [])
+                lineage_summary.extend((an.get("lineage_dag") or {}).get("summary_lines") or [])
+                all_findings.extend(an.get("static_findings") or [])
+        hm_findings = [f for f in all_findings if f.get("severity") in ("HIGH", "MEDIUM")]
+
+        matched_tables = cls._find_mentioned_tables(clean_prompt, turn_attachments) if has_sql else []
+        low_prompt = (clean_prompt or "").lower()
+        is_global_audit = any(kw in low_prompt for kw in _GLOBAL_AUDIT_KEYWORDS)
+
+        # 预先试算血缘精准切片规模
+        lineage_slice_info: Optional[Dict[str, Any]] = None
+        if matched_tables and has_sql:
+            for att in turn_attachments:
+                if att.get("file_kind") != "sql" or not att.get("raw_text"):
+                    continue
+                an = att.get("analysis") or {}
+                sub = extract_lineage_subgraph(
+                    an,
+                    str(att["raw_text"]),
+                    matched_tables[0],
+                    depth=3,
+                    include_downstream=True,
+                    compact=(model_tier == "lightweight"),
+                    max_tokens=eff_budget,
+                )
+                if sub.get("matched") and sub.get("blocks"):
+                    lineage_slice_info = {
+                        "attachment_id": att.get("attachment_id", ""),
+                        "filename": att.get("filename", ""),
+                        **sub,
+                    }
+                    break
+
+        norm_req = (req_strategy or "auto").strip().lower()
+        if norm_req == "inline":
+            norm_req = "full_context"
+        elif norm_req == "on_demand":
+            norm_req = "agentic_explore"
+
+        eff_run_mode = "goal" if str(run_mode or "standard").strip().lower() == "goal" else "standard"
+        use_compact = bool(model_tier == "lightweight" and has_sql)
+
+        strategy = "none"
+        reason = "常规交互模式，按需调用元数据与知识库工具探索。"
+
+        if not turn_attachments:
+            strategy = "none"
+            reason = (
+                "🎯 Goal 深度模式已启用：将执行模型能力探测、目标规划、自主探索与硬核结论验收。"
+                if eff_run_mode == "goal"
+                else "无附带大文件，采用常规多步自主探索模式。"
+            )
+        elif norm_req == "full_context":
+            if all_csv and total_att_tokens > CSV_INLINE_TOKEN_BUDGET:
+                strategy = "agentic_explore"
+                reason = "超大 CSV 不适合全文塞入上下文，已自动改走内存只读 SQLite 沙箱精准查询。"
+            else:
+                strategy = "full_context"
+                reason = f"按用户显式指定执行全量直通（估算 ~{adjusted_tokens:,} tokens）。"
+        elif norm_req == "lineage_sliced":
+            if lineage_slice_info:
+                strategy = "lineage_sliced"
+                reason = f"按用户指定提取 `{matched_tables[0]}` 关联血缘切片（{len(lineage_slice_info['blocks'])} 条核心语句）。"
+            else:
+                strategy = "agentic_explore"
+                reason = "未在提问中识别到特定目标表，已切换为架构图纸 + 按需血缘切片探索模式。"
+        elif norm_req == "goal_driven_staged":
+            strategy = "goal_driven_staged"
+            reason = f"按用户指定执行分段闭环审计（每段甜蜜区容量 ~{chunk_budget:,} tokens）。"
+        elif norm_req == "agentic_explore":
+            strategy = "agentic_explore"
+            reason = "按用户指定启用架构图纸 + 按需语句/行号切片探索模式。"
+        elif norm_req == "stepped_batch" and (
+            total_att_tokens > INLINE_TOKEN_BUDGET
+            or any(int(a.get("chunk_count") or 0) > 1 for a in turn_attachments)
+            or batch_start_chunk > 0
+        ):
+            strategy = "stepped_batch"
+            reason = f"按用户指定执行逐片 Map-Reduce 拆解（起始分片 #{batch_start_chunk + 1}）。"
+        elif has_oversized_csv:
+            strategy = "agentic_explore"
+            reason = f"CSV 附件体积较大（~{total_att_tokens:,} tok），启用画像 + 只读 SQL 沙箱精准聚合。"
+        elif adjusted_tokens <= eff_budget:
+            strategy = "full_context"
+            reason = (
+                f"文件估算 ~{adjusted_tokens:,} tok 位于当前模型 ({model_tier}) 有效推理甜蜜区 "
+                f"({eff_budget:,} tok / 窗口 {context_window:,}) 内，整篇带精确行号直通，连贯性最高。"
+            )
+        else:
+            # 超过有效推理甜蜜区：智能避开轻量模型中间失忆盲区！
+            if (
+                lineage_slice_info
+                and not is_global_audit
+                and int(lineage_slice_info.get("estimated_tokens") or 0) <= eff_budget
+            ):
+                strategy = "lineage_sliced"
+                reason = (
+                    f"全文 ~{adjusted_tokens:,} tok 超出 {model_tier} 有效推理甜蜜区 ({eff_budget:,} tok)，"
+                    f"但问题聚焦表 `{matched_tables[0]}`：已沿血缘 DAG 手术刀切片提取 "
+                    f"{len(lineage_slice_info['blocks'])} 条核心语句 (~{lineage_slice_info['estimated_tokens']:,} tok) 单轮高准度直达。"
+                )
+            elif eff_run_mode == "goal" or (is_global_audit and has_sql):
+                strategy = "goal_driven_staged"
+                reason = (
+                    f"全文 ~{adjusted_tokens:,} tok 超出 {model_tier} 有效推理甜蜜区 ({eff_budget:,} tok) "
+                    f"且需要{'🎯 Goal 深度闭环' if eff_run_mode == 'goal' else '全局审计/全量梳理'}："
+                    f"已按静态语句与章节边界划分为甜蜜区多阶段 (~{chunk_budget:,} tok/段) 逐段推进并做覆盖率与隐患硬验收。"
+                )
+            else:
+                strategy = "agentic_explore"
+                reason = (
+                    f"全文 ~{adjusted_tokens:,} tok 超出 {model_tier} 有效推理甜蜜区 ({eff_budget:,} tok)，"
+                    "已下发零 Token 静态血缘图纸与隐患雷达，由助手按需调用血缘/语句切片工具精准查阅。"
+                )
+
+        stages = cls._build_balanced_stages(
+            turn_attachments,
+            chunk_budget=chunk_budget,
+            use_compact_view=use_compact,
+            strategy=strategy,
+            lineage_blocks=(lineage_slice_info or {}).get("blocks") if strategy == "lineage_sliced" else None,
+        )
+
+        return {
+            "strategy": strategy,
+            "strategy_label": _STRATEGY_LABELS.get(strategy, strategy),
+            "reason": reason,
+            "run_mode": eff_run_mode,
+            "model_tier": model_tier,
+            "context_window": context_window,
+            "effective_reasoning_budget": eff_budget,
+            "recommended_chunk_tokens": chunk_budget,
+            "token_ratio": token_ratio,
+            "ttft_ms": float(model_caps.get("ttft_ms") or 0.0),
+            "capability_source": str(model_caps.get("source") or "heuristic"),
+            "total_attachment_tokens": total_att_tokens,
+            "adjusted_tokens": adjusted_tokens,
+            "use_compact_view": use_compact,
+            "matched_target_tables": matched_tables[:6],
+            "lineage_summary": lineage_summary[:10],
+            "static_findings_count": len(all_findings),
+            "high_medium_findings_count": len(hm_findings),
+            "total_statements": total_stmts,
+            "stages": stages,
+            "lineage_slice": lineage_slice_info if strategy == "lineage_sliced" else None,
+        }
+
+
+def detect_tool_loop_and_build_steering(
+    recent_calls: List[Tuple[str, Dict[str, Any]]],
+    *,
+    attachments: Optional[List[Dict[str, Any]]] = None,
+    inspected_stmt_ids: Optional[set[str]] = None,
+) -> str:
+    """防原地打转纠偏护栏：检测连续 2 步同类高重叠工具调用并生成定向纠偏提示."""
+    if len(recent_calls) < 2:
+        return ""
+    prev_tool, prev_args = recent_calls[-2]
+    cur_tool, cur_args = recent_calls[-1]
+    if prev_tool != cur_tool:
+        return ""
+
+    overlapped = False
+    if prev_args == cur_args:
+        overlapped = True
+    elif cur_tool == "read_attachment_lines":
+        if str(prev_args.get("attachment_id") or "") == str(cur_args.get("attachment_id") or ""):
+            try:
+                p_s = int(prev_args.get("start_line") or 1)
+                p_e = int(prev_args.get("end_line") or p_s + 200)
+                c_s = int(cur_args.get("start_line") or 1)
+                c_e = int(cur_args.get("end_line") or c_s + 200)
+                inter = max(0, min(p_e, c_e) - max(p_s, c_s) + 1)
+                span = max(1, min(p_e - p_s + 1, c_e - c_s + 1))
+                if inter / span >= 0.6:
+                    overlapped = True
+            except Exception:
+                pass
+    elif cur_tool == "search_attachment":
+        if (
+            str(prev_args.get("attachment_id") or "") == str(cur_args.get("attachment_id") or "")
+            and str(prev_args.get("keyword") or "").strip().lower() == str(cur_args.get("keyword") or "").strip().lower()
+        ):
+            overlapped = True
+    elif cur_tool == "read_attachment_statement":
+        if str(prev_args.get("stmt_id") or "").upper() == str(cur_args.get("stmt_id") or "").upper():
+            overlapped = True
+    elif cur_tool == "trace_attachment_lineage":
+        if str(prev_args.get("table_name") or "").lower() == str(cur_args.get("table_name") or "").lower():
+            overlapped = True
+
+    if not overlapped:
+        return ""
+
+    # 给出具体尚未核查的高危项或语句编号，引导弱模型跳出重复循环
+    hints: List[str] = []
+    seen_sids = inspected_stmt_ids or set()
+    for att in attachments or []:
+        an = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
+        if not an:
+            continue
+        unchecked_findings = [
+            f
+            for f in (an.get("static_findings") or [])
+            if f.get("severity") in ("HIGH", "MEDIUM") and f.get("stmt_id") not in seen_sids
+        ][:3]
+        if unchecked_findings:
+            f_txt = "；".join(
+                f"{f['finding_id']}[{f['severity']}] {f.get('stmt_id') or ''} L{f['line']}:{f['title']}"
+                for f in unchecked_findings
+            )
+            hints.append(f"建议优先核查未检静态隐患：{f_txt}")
+        unchecked_stmts = [
+            s
+            for s in (an.get("statements") or [])
+            if s.get("stmt_id") and s["stmt_id"] not in seen_sids and s.get("verb") not in ("CREATE_PROC", "SELECT")
+        ][:4]
+        if unchecked_stmts:
+            s_txt = ", ".join(f"{s['stmt_id']}({s['verb']} L{s['start_line']})" for s in unchecked_stmts)
+            hints.append(f"可改用 `read_attachment_statement` 查看未读语句：{s_txt}")
+
+    hint_tail = (" " + "；".join(hints)) if hints else " 若已掌握足够证据，请立即停止重复查同一位置并直接输出最终 Markdown 分析报告。"
+    return f"\n\n【系统防打转纠偏提示】检测到连续 2 步以高度重叠参数调用 `{cur_tool}`，请勿原地重复读取！{hint_tail}"
+
+
 class AiAssistantService(AssistantStorageMixin):
     """Data.O.G v3.0 多轮渐进式数据库智能助手核心服务."""
 
@@ -309,11 +900,14 @@ class AiAssistantService(AssistantStorageMixin):
         filename: str,
         raw_bytes: bytes,
         session_id: str = "",
+        dialect: str = "",
     ) -> Dict[str, Any]:
         clean_sid = (session_id or "").strip()
-        if clean_sid and self.get_session_detail(clean_sid) is None:
+        sess = self.get_session_detail(clean_sid) if clean_sid else None
+        if clean_sid and sess is None:
             raise ValueError("目标对话会话不存在，无法绑定附件")
-        parsed = process_attachment_payload(filename, raw_bytes)
+        eff_dialect = (dialect or (sess.get("dialect") if sess else "") or "").strip()
+        parsed = process_attachment_payload(filename, raw_bytes, dialect=eff_dialect)
         return self.save_attachment(parsed, session_id=clean_sid)
 
     def create_pasted_attachment(
@@ -323,14 +917,19 @@ class AiAssistantService(AssistantStorageMixin):
         filename: str = "",
         file_hint: str = "",
         session_id: str = "",
+        dialect: str = "",
     ) -> Dict[str, Any]:
         clean_sid = (session_id or "").strip()
-        if clean_sid and self.get_session_detail(clean_sid) is None:
+        sess = self.get_session_detail(clean_sid) if clean_sid else None
+        if clean_sid and sess is None:
             raise ValueError("目标对话会话不存在，无法绑定粘贴文本")
+        eff_dialect = (dialect or (sess.get("dialect") if sess else "") or "").strip()
         inferred_name, _ = infer_pasted_filename_and_ext(
             content, filename=filename, file_hint=file_hint
         )
-        parsed = process_attachment_payload(inferred_name, (content or "").encode("utf-8"))
+        parsed = process_attachment_payload(
+            inferred_name, (content or "").encode("utf-8"), dialect=eff_dialect
+        )
         return self.save_attachment(parsed, session_id=clean_sid)
 
     def _resolve_scope(
@@ -365,6 +964,7 @@ class AiAssistantService(AssistantStorageMixin):
         default_schema: str,
         focus_tables: List[str],
         session_attachments: Optional[List[Dict[str, Any]]] = None,
+        compact_mode: bool = False,
     ) -> str:
         sections: List[str] = []
         dialect_label = DIALECT_LABEL_MAP.get(dialect, dialect)
@@ -456,8 +1056,11 @@ class AiAssistantService(AssistantStorageMixin):
                 )
 
         if session_attachments:
-            manifests = [format_attachment_manifest(att) for att in session_attachments[:5]]
-            sections.append("当前对话已挂载的本地附件总览（超长内容已按语义分块）:\n\n" + "\n\n".join(manifests))
+            manifests = [
+                format_attachment_manifest(att, compact_mode=compact_mode)
+                for att in session_attachments[:5]
+            ]
+            sections.append("当前对话已挂载的本地附件总览（含静态血缘图谱与语义分块）:\n\n" + "\n\n".join(manifests))
 
         return "\n\n".join(sections)
 
@@ -471,8 +1074,56 @@ class AiAssistantService(AssistantStorageMixin):
         sample_limit: int,
         context_block: str,
         has_attachments: bool = False,
+        model_tier: str = "standard",
+        has_sql_attachments: bool = False,
+        has_csv_attachments: bool = False,
     ) -> str:
+        is_lightweight = str(model_tier or "standard").lower() == "lightweight"
         guidance = _TASK_MODE_GUIDANCE.get(task_mode, _TASK_MODE_GUIDANCE["general"])
+
+        # 轻量模型离线长文本/SQL 精简模式：动态裁剪无关查库工具，压缩指令密度以防注意力涣散与幻觉调用
+        if is_lightweight and work_mode == "dialect" and has_attachments:
+            pruned_tools: List[str] = []
+            if has_sql_attachments or not has_csv_attachments:
+                pruned_tools.extend(
+                    [
+                        '- `trace_attachment_lineage`: {"attachment_id":"att_xxx","table_name":"目标表名","depth":3,"compact":true} — 沿血缘 DAG 手术刀切片提取目标表上下游核心 SQL 语句',
+                        '- `read_attachment_statement`: {"attachment_id":"att_xxx","stmt_id":"S004","compact":true} — 按静态清单编号完整读取单条 SQL（带真实行号，绝不腰斩）',
+                        '- `get_attachment_static_report`: {"attachment_id":"att_xxx","severity":"HIGH"} — 查看完整静态隐患明细与涉表读写矩阵',
+                    ]
+                )
+            pruned_tools.extend(
+                [
+                    '- `read_attachment_lines`: {"attachment_id":"att_xxx","start_line":1,"end_line":200} — 按 1-based 行号精读附件原文片段',
+                    '- `search_attachment`: {"attachment_id":"att_xxx","keyword":"关键字或正则","regex":false} — 在附件中检索关键词并返回行号与上下文',
+                    '- `search_knowledge`: {"query":"报错码或语法","dialect":"' + dialect + '","top_k":4} — 检索离线方言知识库',
+                ]
+            )
+            if has_csv_attachments:
+                pruned_tools.append(
+                    '- `query_csv_attachment`: {"attachment_id":"att_xxx","sql":"SELECT ... FROM csv_data ...","limit":50} — 只读 SQL 聚合查询 CSV 附件'
+                )
+            if task_mode == "ddl":
+                pruned_tools.append(
+                    '- `propose_write_sql`: {"title":"变更标题","rationale":"说明","sql":"..."} — 生成待确认 DDL/写语句卡片'
+                )
+            tools_block = "\n".join(pruned_tools)
+            return (
+                f"你是 Data.O.G 数据库专家助手（目标方言 `{dialect}` · 离线纯方言模式）。\n"
+                "请严格遵循以下步骤分析附件代码：\n"
+                "1. 先看下方【静态血缘图谱与隐患雷达】，优先用 `trace_attachment_lineage` / `read_attachment_statement` 精读关键语句，禁止编造未看到的行号或字段名。\n"
+                f"2. 最多调用 {max_steps} 次工具；不要重复读取相同行区间或同一语句。\n"
+                "3. 若发现 HIGH/MEDIUM 静态隐患，务必逐项说明是「确认隐患及修复方案」还是「误报及原因」。\n\n"
+                f"【精简工具集（仅暴露与当前任务直接相关的工具）】\n{tools_block}\n\n"
+                f"【当前上下文与架构图纸】\n{context_block}\n\n"
+                "【输出格式】\n"
+                "- 调用工具时，仅输出单个代码块：\n"
+                "```dataog_action\n"
+                '{"action":"tool","tool":"工具名","args":{...},"purpose":"本步意图(24字内)"}\n'
+                "```\n"
+                "- 最终回答时，直接输出清晰 Markdown（带 `Lxxx` 精确行号、问题分级与改写 SQL），勿用 JSON 包裹正文。\n"
+            )
+
         online_rules = (
             "1. 当前为【在线连库模式】，你只能通过 `run_readonly_sql` 与 `explain_sql` 在物理只读沙箱中探查；"
             "任何 DDL（CREATE/ALTER/DROP/TRUNCATE/COMMENT）或 DML 写操作（INSERT/UPDATE/DELETE/MERGE）**严禁直接执行**，"
@@ -482,6 +1133,9 @@ class AiAssistantService(AssistantStorageMixin):
             "聚焦方言语法规则、知识库检索与标准 SQL 编写；若需产出 DDL/写语句，使用 `propose_write` 卡片规范呈现以便用户审阅或后续连库执行。\n"
         )
         attachment_tools_desc = (
+            "- `trace_attachment_lineage`: {\"attachment_id\":\"att_xxx\",\"table_name\":\"表名\",\"depth\":3,\"include_downstream\":true,\"compact\":false} — 沿 SQL 血缘 DAG 提取目标表上下游核心语句切片\n"
+            "- `read_attachment_statement`: {\"attachment_id\":\"att_xxx\",\"stmt_id\":\"S004\",\"compact\":false} — 按静态语句编号完整读取单条 SQL（含前置注释与真实行号）\n"
+            "- `get_attachment_static_report`: {\"attachment_id\":\"att_xxx\",\"severity\":\"\",\"include_statements\":true} — 按严重级别拉取完整静态隐患明细与血缘矩阵\n"
             "- `read_attachment_lines`: {\"attachment_id\":\"att_xxx\",\"start_line\":1,\"end_line\":250} — 按 1-based 行号区间精读长文件或存储过程原文片段（带行号，单次最多 400 行）\n"
             "- `search_attachment`: {\"attachment_id\":\"att_xxx\",\"keyword\":\"关键字或正则\",\"regex\":false,\"context_lines\":2,\"limit\":12} — 在附件原文中检索关键字或正则并返回命中行号与上下文片段\n"
             "- `inspect_attachment_chunk`: {\"attachment_id\":\"att_xxx\",\"chunk_index\":0,\"window\":0} — 按语义分片序号阅读附件片段\n"
@@ -962,16 +1616,22 @@ class AiAssistantService(AssistantStorageMixin):
         eff_strategy: str,
         total_att_tokens: int,
         model_ctx_window: int,
+        plan: Optional[Dict[str, Any]] = None,
     ) -> str:
+        use_compact = bool((plan or {}).get("use_compact_view"))
+        eff_budget = int((plan or {}).get("effective_reasoning_budget") or model_ctx_window)
+
         if eff_strategy == "full_context":
             blocks = []
             for a in turn_attachments:
                 raw_txt = str(a.get("raw_text") or "")
-                numbered = (
-                    raw_txt
-                    if a.get("file_kind") == "csv"
-                    else format_with_line_numbers(raw_txt, start_line=1)
-                )
+                if a.get("file_kind") == "csv":
+                    numbered = raw_txt
+                elif use_compact and a.get("file_kind") == "sql" and total_att_tokens > int(eff_budget * 0.78):
+                    comp = compact_sql_for_llm(raw_txt, start_line=1)
+                    numbered = comp["text"]
+                else:
+                    numbered = format_with_line_numbers(raw_txt, start_line=1)
                 blocks.append(
                     f"--- 附件 `{a['filename']}` [id={a['attachment_id']}, {a['summary']}] ---\n"
                     f"```\n{numbered}\n```"
@@ -981,6 +1641,28 @@ class AiAssistantService(AssistantStorageMixin):
                 "【用户本轮附带文件全文】\n"
                 "（已完整装载进当前上下文窗口，文本/SQL 行首已附带 `行号| ` 前缀以便精准定位）\n"
                 + "\n\n".join(blocks)
+            )
+
+        if eff_strategy == "lineage_sliced":
+            lslice = (plan or {}).get("lineage_slice") or {}
+            blocks = lslice.get("blocks") or []
+            path_lines = lslice.get("lineage_paths") or []
+            path_sec = ("\n".join(f"- {p}" for p in path_lines[:20])) if path_lines else ""
+            code_parts: List[str] = []
+            for blk in blocks:
+                code_parts.append(
+                    f"--- {blk['stmt_id']} [{blk['verb']}] L{blk['start_line']}-L{blk['end_line']}"
+                    + (f" -> {blk['target_table']}" if blk.get("target_table") else "")
+                    + f" ---\n```sql\n{blk['content']}\n```"
+                )
+            return (
+                f"{clean_prompt}\n\n"
+                f"【血缘手术刀精准切片】已沿数据血缘 DAG 提取与目标表 `{lslice.get('query_table', '')}` 直接关联的 "
+                f"{len(blocks)} 条核心 SQL 语句（共 ~{lslice.get('estimated_tokens', 0)} tokens，严格保留原始行号；"
+                "如需查看其他无关段可继续调用 `read_attachment_statement` / `read_attachment_lines`）：\n"
+                + (f"\n血缘链路:\n{path_sec}\n" if path_sec else "")
+                + "\n\n"
+                + "\n\n".join(code_parts)
             )
 
         if eff_strategy == "agentic_explore":
@@ -998,18 +1680,172 @@ class AiAssistantService(AssistantStorageMixin):
                     head = format_with_line_numbers("\n".join(lines[:60]), start_line=1)
                     tail_start = max(61, len(lines) - 29)
                     tail = format_with_line_numbers("\n".join(lines[tail_start - 1 :]), start_line=tail_start)
-                    snippet = f"{head}\n... (中间 {tail_start - 61} 行已省略，请用 read_attachment_lines / search_attachment 按需阅读) ...\n{tail}"
+                    snippet = f"{head}\n... (中间 {tail_start - 61} 行已省略，请用 trace_attachment_lineage / read_attachment_statement / read_attachment_lines / search_attachment 按需阅读) ...\n{tail}"
                 preview_blocks.append(f"--- `{a['filename']}` 头尾预览 (共 {len(lines)} 行) ---\n```\n{snippet}\n```")
             preview_sec = ("\n\n" + "\n\n".join(preview_blocks)) if preview_blocks else ""
             return (
                 f"{clean_prompt}\n\n"
-                f"【长上下文智能探索指引】用户本轮附带大体积文件（{att_hints}，共 ~{total_att_tokens} tokens，当前模型上下文窗口 ~{model_ctx_window} tokens）。"
-                "请先参考全局上下文中的结构大纲与逻辑锚点行号：CSV 请直接利用画像并调用 `query_csv_attachment`（表名固定 `csv_data`）做精确 SQL 查询；"
-                "存储过程/长 SQL/文本请调用 `search_attachment` 检索关键词并调用 `read_attachment_lines` 按起止行号精读核心段落。"
+                f"【长上下文智能探索指引】用户本轮附带大体积文件（{att_hints}，共 ~{total_att_tokens} tokens，当前模型上下文窗口 ~{model_ctx_window} tokens，有效推理甜蜜区 ~{eff_budget} tokens）。"
+                "请先参考全局上下文中的静态血缘 DAG、语句索引与隐患雷达：CSV 请利用画像并调用 `query_csv_attachment`（表名固定 `csv_data`）；"
+                "存储过程/长 SQL 请优先调用 `trace_attachment_lineage` 按表切片、`read_attachment_statement` 按语句号精读，或用 `search_attachment` / `read_attachment_lines` 定位。"
                 f"{preview_sec}"
             )
 
         return clean_prompt
+
+    def _run_goal_staged_sync_analysis(
+        self,
+        *,
+        plan: Dict[str, Any],
+        turn_attachments: List[Dict[str, Any]],
+        clean_prompt: str,
+        dialect: str,
+        provider_id: str,
+        model: str,
+        thinking_mode: str,
+        cb: ProgressCallback,
+        event_cb: Optional[Callable[[Dict[str, Any]], None]],
+        cancel_check: Optional[Callable[[], bool]],
+        t_start: float,
+        trace_steps: List[Dict[str, Any]],
+    ) -> Tuple[str, str, str]:
+        """在常规同步/流式通道触发 `goal_driven_staged` 时，按甜蜜区阶段清单逐段拆解并汇总结构化账本."""
+        stages = list(plan.get("stages") or [])
+        if not stages:
+            return "", "", ""
+        att_by_id = {str(a.get("attachment_id") or ""): a for a in turn_attachments}
+        rolling_ledger: List[str] = []
+        stage_digests: List[str] = []
+        used_prov = ""
+        used_mdl = ""
+        use_compact = bool(plan.get("use_compact_view"))
+
+        sys_prompt = (
+            f"你是 Data.O.G 数据库研发审计专家（目标方言 `{dialect}`）。"
+            "当前正在执行超长 SQL 的【甜蜜区分段分析】，请严格围绕本阶段代码与静态隐患清单提取事实，严禁编造行号或表名。"
+            '请输出紧凑 JSON：{"summary":"80字内总结","findings":["[Fxxx] 或 Lxxx 具体结论与修复"],"lineage_notes":["涉表转换要点"]}。'
+        )
+
+        total_s = len(stages)
+        for idx, st in enumerate(stages, start=1):
+            if cancel_check and cancel_check():
+                raise RuntimeError("用户已取消分段深度分析任务")
+            if (time.perf_counter() - t_start) > LOOP_WALLCLOCK_BUDGET_SEC - 20.0 and idx > 1:
+                break
+
+            aid = str(st.get("attachment_id") or "")
+            att = att_by_id.get(aid) or (turn_attachments[0] if turn_attachments else None)
+            if att is None:
+                continue
+            all_lines = str(att.get("raw_text") or "").splitlines()
+            s_ln = max(1, int(st.get("start_line") or 1))
+            e_ln = min(len(all_lines), max(s_ln, int(st.get("end_line") or len(all_lines))))
+            seg_raw = "\n".join(all_lines[s_ln - 1 : e_ln])
+            if use_compact and att.get("file_kind") == "sql":
+                seg_code = compact_sql_for_llm(seg_raw, start_line=s_ln)["text"]
+            else:
+                seg_code = format_with_line_numbers(seg_raw, start_line=s_ln)
+
+            pct = min(72, 12 + int((idx / max(1, total_s)) * 58))
+            cb(pct, "甜蜜区分段分析", f"{st['title']}", idx - 1, total_s)
+            if event_cb:
+                event_cb(
+                    {
+                        "type": "stage_start",
+                        "stage_id": st["stage_id"],
+                        "index": idx,
+                        "total": total_s,
+                        "title": st["title"],
+                        "range_label": f"L{s_ln}-L{e_ln}",
+                        "kind": st.get("kind", "analysis"),
+                    }
+                )
+
+            an = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
+            stage_fids = set(st.get("finding_ids") or [])
+            stage_findings = [
+                f for f in (an.get("static_findings") or []) if f.get("finding_id") in stage_fids
+            ]
+            f_block = (
+                "【本阶段必查静态隐患（请逐项判定真伪与修复）】\n"
+                + "\n".join(
+                    f"- [{f['finding_id']}][{f['severity']}][{f['code']}] L{f['line']}: {f['title']} ({f['detail']})"
+                    for f in stage_findings
+                )
+                + "\n\n"
+                if stage_findings
+                else ""
+            )
+            ledger_block = (
+                "【前序阶段只读账本摘要】\n" + "\n".join(rolling_ledger[-8:])[-1600:] + "\n\n"
+                if rolling_ledger
+                else ""
+            )
+            user_content = (
+                f"用户目标：{clean_prompt}\n"
+                f"{ledger_block}{f_block}"
+                f"【当前阶段 {idx}/{total_s} | {st['title']} | 语句={','.join((st.get('stmt_ids') or [])[:12])}】\n"
+                f"```sql\n{seg_code}\n```"
+            )
+
+            t0 = time.perf_counter()
+            llm_res = self.ctx.llm_hub.chat_completion(
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
+                provider_id=provider_id,
+                model=model,
+                temperature=0.1,
+                timeout_sec=90.0,
+                thinking_mode=thinking_mode,
+                on_retry=event_cb,
+                cancel_check=cancel_check,
+            )
+            used_prov = str(llm_res.get("provider_name") or used_prov)
+            used_mdl = str(llm_res.get("model") or used_mdl)
+            ms = round((time.perf_counter() - t0) * 1000.0, 1)
+            raw_r = str(llm_res.get("content") or "").strip()
+            parsed, _ = self._parse_agent_payload(raw_r)
+            if isinstance(parsed, dict):
+                s_sum = str(parsed.get("summary") or "").strip()
+                f_list = [str(x).strip() for x in (parsed.get("findings") or []) if str(x).strip()][:8]
+                l_list = [str(x).strip() for x in (parsed.get("lineage_notes") or []) if str(x).strip()][:5]
+                compact_out = "；".join(p for p in [s_sum, *f_list, *l_list] if p)[:520] or raw_r[:360]
+            else:
+                s_sum = raw_r[:160]
+                compact_out = raw_r[:520]
+
+            step_no = len(trace_steps) + 1
+            step_rec = {
+                "step": step_no,
+                "tool": "goal_stage_analyze",
+                "purpose": st["title"],
+                "args": {"stage_id": st["stage_id"], "start_line": s_ln, "end_line": e_ln},
+                "ok": True,
+                "elapsed_ms": ms,
+                "summary": (s_sum or compact_out)[:180],
+            }
+            trace_steps.append(step_rec)
+            if event_cb:
+                event_cb(
+                    {
+                        "type": "stage_done",
+                        "stage_id": st["stage_id"],
+                        "index": idx,
+                        "total": total_s,
+                        "title": st["title"],
+                        "ok": True,
+                        "elapsed_ms": ms,
+                        "summary": step_rec["summary"],
+                    }
+                )
+            rolling_ledger.append(f"- [{st['stage_id']} L{s_ln}-L{e_ln}] {step_rec['summary']}")
+            stage_digests.append(f"- **{st['title']}**: {compact_out}")
+
+        digest = (
+            f"【甜蜜区分段深度审计账本（共完成 {len(stage_digests)}/{total_s} 个阶段）】\n"
+            + "\n".join(stage_digests)
+            + "\n\n请基于以上全部阶段账本与静态血缘图纸，输出全景结构化最终分析报告（含数据血缘图、所有 HIGH/MEDIUM 隐患逐项判定与精确行号修复 SQL）。"
+        )
+        return digest, used_prov, used_mdl
 
     def _invoke_llm_step(
         self,
@@ -1068,7 +1904,11 @@ class AiAssistantService(AssistantStorageMixin):
             cancel_check=cancel_check,
         ):
             ev_type = ev.get("type")
-            if ev_type == "reasoning":
+            if ev_type == "retry_wait":
+                event_cb({"type": "retry_wait", "step": step_idx, **{k: v for k, v in ev.items() if k != "type"}})
+            elif ev_type == "status":
+                event_cb({"type": "status", "stage": ev.get("stage", "推理中"), "detail": ev.get("detail", "")})
+            elif ev_type == "reasoning":
                 delta = str(ev.get("delta") or "")
                 if delta:
                     if not think_started:
@@ -1131,6 +1971,7 @@ class AiAssistantService(AssistantStorageMixin):
         large_payload_strategy: str = "auto",
         batch_start_chunk: int = 0,
         batch_max_chunks: int = DEFAULT_BATCH_MAX_CHUNKS,
+        run_mode: str = "standard",
         progress_cb: Optional[ProgressCallback] = None,
         event_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -1278,7 +2119,12 @@ class AiAssistantService(AssistantStorageMixin):
         safe_max_steps = max(1, min(MAX_STEPS_CAP, int(max_steps or 6)))
         safe_sample_limit = max(10, min(200, int(sample_limit or 100)))
 
-        _emit_status(6, "准备上下文", f"正在组装 {eff_dialect} 语法基线、元数据与附件清单...", 0, safe_max_steps)
+        model_tier = str(model_caps.get("model_tier") or "standard")
+        eff_reasoning_budget = int(model_caps.get("effective_reasoning_budget") or model_attach_budget)
+        has_sql_atts = any(a.get("file_kind") == "sql" for a in bound_session_atts)
+        has_csv_atts = any(a.get("file_kind") == "csv" for a in bound_session_atts)
+
+        _emit_status(6, "准备上下文", f"正在组装 {eff_dialect} 语法基线、静态血缘图谱与附件清单...", 0, safe_max_steps)
         context_block = self._build_context_block(
             work_mode=eff_mode,
             profile=prof,
@@ -1286,6 +2132,7 @@ class AiAssistantService(AssistantStorageMixin):
             default_schema=eff_schema,
             focus_tables=eff_focus,
             session_attachments=bound_session_atts,
+            compact_mode=(model_tier == "lightweight"),
         )
         system_prompt = self._build_system_prompt(
             work_mode=eff_mode,
@@ -1295,39 +2142,23 @@ class AiAssistantService(AssistantStorageMixin):
             sample_limit=safe_sample_limit,
             context_block=context_block,
             has_attachments=bool(bound_session_atts),
+            model_tier=model_tier,
+            has_sql_attachments=has_sql_atts,
+            has_csv_attachments=has_csv_atts,
         )
 
-        # 3. 模型感知的现代长上下文附件策略（full_context | agentic_explore | stepped_batch | none）
-        total_att_tokens = sum(int(a.get("estimated_tokens") or 0) for a in turn_attachments)
-        req_strategy = (large_payload_strategy or "auto").strip().lower()
-        if req_strategy == "inline":
-            req_strategy = "full_context"
-        elif req_strategy == "on_demand":
-            req_strategy = "agentic_explore"
-
-        all_csv = bool(turn_attachments) and all(a.get("file_kind") == "csv" for a in turn_attachments)
-        has_oversized_csv = any(
-            a.get("file_kind") == "csv" and int(a.get("estimated_tokens") or 0) > CSV_INLINE_TOKEN_BUDGET
-            for a in turn_attachments
+        # 3. ExecutionPlanner 每次分析前综合模型探查档案 × SQL 静态解剖 × 意图制定最优执行计划
+        exec_plan = ExecutionPlanner.plan(
+            model_caps=model_caps,
+            turn_attachments=turn_attachments,
+            clean_prompt=clean_prompt,
+            req_strategy=large_payload_strategy,
+            run_mode=run_mode,
+            dialect=eff_dialect,
+            batch_start_chunk=batch_start_chunk,
         )
-        if not turn_attachments:
-            eff_strategy = "none"
-        elif req_strategy == "full_context":
-            eff_strategy = "agentic_explore" if (all_csv and total_att_tokens > CSV_INLINE_TOKEN_BUDGET) else "full_context"
-        elif req_strategy == "agentic_explore":
-            eff_strategy = "agentic_explore"
-        elif req_strategy == "stepped_batch" and (
-            total_att_tokens > INLINE_TOKEN_BUDGET
-            or any(int(a.get("chunk_count") or 0) > 1 for a in turn_attachments)
-            or batch_start_chunk > 0
-        ):
-            eff_strategy = "stepped_batch"
-        elif has_oversized_csv:
-            eff_strategy = "agentic_explore"
-        elif total_att_tokens <= model_attach_budget:
-            eff_strategy = "full_context"
-        else:
-            eff_strategy = "agentic_explore"
+        eff_strategy = str(exec_plan["strategy"])
+        total_att_tokens = int(exec_plan["total_attachment_tokens"])
 
         attachments_meta = [self._build_attachment_metadata(a) for a in turn_attachments]
         next_turn = int(sess.get("turn_count") or 0) + 1
@@ -1341,6 +2172,7 @@ class AiAssistantService(AssistantStorageMixin):
             attachments=attachments_meta,
         )
 
+        plan_public = {k: v for k, v in exec_plan.items() if k != "lineage_slice"}
         if event_cb:
             event_cb(
                 {
@@ -1349,10 +2181,14 @@ class AiAssistantService(AssistantStorageMixin):
                     "user_message": user_msg,
                     "strategy": eff_strategy,
                     "context_window": model_ctx_window,
+                    "effective_reasoning_budget": eff_reasoning_budget,
                     "attachment_budget": model_attach_budget,
+                    "model_tier": model_tier,
                     "thinking_mode": eff_thinking_mode,
                 }
             )
+            if eff_strategy != "none" or run_mode == "goal":
+                event_cb({"type": "plan_ready", "plan": plan_public})
 
         toolbox = AssistantToolbox(
             ctx=self.ctx,
@@ -1389,6 +2225,24 @@ class AiAssistantService(AssistantStorageMixin):
             used_provider_name = mp_prov or used_provider_name
             used_model = mp_mdl or used_model
             llm_user_prompt = f"{clean_prompt}\n\n{batch_digest}" if batch_digest else clean_prompt
+        elif eff_strategy == "goal_driven_staged":
+            staged_digest, st_prov, st_mdl = self._run_goal_staged_sync_analysis(
+                plan=exec_plan,
+                turn_attachments=turn_attachments,
+                clean_prompt=clean_prompt,
+                dialect=eff_dialect,
+                provider_id=eff_provider_id,
+                model=eff_model,
+                thinking_mode=eff_thinking_mode,
+                cb=cb,
+                event_cb=event_cb,
+                cancel_check=cancel_check,
+                t_start=t_start,
+                trace_steps=trace_steps,
+            )
+            used_provider_name = st_prov or used_provider_name
+            used_model = st_mdl or used_model
+            llm_user_prompt = f"{clean_prompt}\n\n{staged_digest}" if staged_digest else clean_prompt
         else:
             llm_user_prompt = self._build_attachment_prompt_text(
                 turn_attachments=turn_attachments,
@@ -1396,6 +2250,7 @@ class AiAssistantService(AssistantStorageMixin):
                 eff_strategy=eff_strategy,
                 total_att_tokens=total_att_tokens,
                 model_ctx_window=model_ctx_window,
+                plan=exec_plan,
             )
 
         sys_tokens = estimate_tokens(system_prompt)
@@ -1448,6 +2303,8 @@ class AiAssistantService(AssistantStorageMixin):
         streamed_final_md = ""
         was_cancelled = False
         step_idx = 0
+        recent_tool_calls: List[Tuple[str, Dict[str, Any]]] = []
+        inspected_stmt_ids: set[str] = set()
 
         # 4. 多轮循序渐进工具推理循环
         while step_idx < safe_max_steps:
@@ -1626,6 +2483,18 @@ class AiAssistantService(AssistantStorageMixin):
                 if event_cb:
                     event_cb({"type": "tool_end", **step_rec})
 
+                recent_tool_calls.append((tool_name, dict(tool_args)))
+                if tool_name == "read_attachment_statement" and tool_args.get("stmt_id"):
+                    inspected_stmt_ids.add(str(tool_args["stmt_id"]).upper())
+                elif tool_name == "trace_attachment_lineage" and isinstance(tool_out.get("stmt_ids"), list):
+                    for sid_hit in tool_out["stmt_ids"]:
+                        inspected_stmt_ids.add(str(sid_hit).upper())
+                steering_hint = detect_tool_loop_and_build_steering(
+                    recent_tool_calls,
+                    attachments=bound_session_atts,
+                    inspected_stmt_ids=inspected_stmt_ids,
+                )
+
                 llm_messages.append({"role": "assistant", "content": raw_reply})
                 llm_messages.append(
                     {
@@ -1633,6 +2502,7 @@ class AiAssistantService(AssistantStorageMixin):
                         "content": (
                             f"【工具 `{tool_name}` 返回结果】\n"
                             + json.dumps(tool_out, ensure_ascii=False)[:24000]
+                            + steering_hint
                         ),
                     }
                 )
@@ -1859,6 +2729,7 @@ class AiAssistantService(AssistantStorageMixin):
             "session": updated_session,
             "user_message": user_msg,
             "assistant_message": assistant_msg,
+            "plan": plan_public,
             "cancelled": was_cancelled,
         }
         if event_cb:
