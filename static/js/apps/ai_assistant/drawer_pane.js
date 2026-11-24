@@ -166,7 +166,10 @@ export class AssistantInspectorDrawer {
           onClick: async () => {
             try {
               const res = await platformApi.refreshMetadataTree(this.connectionId);
-              if (res.tree) store.updateCatalogTree(this.connectionId, res.tree);
+              if (res && (res.tree || res.schemas || res.tables)) {
+                store.updateCatalogTree(this.connectionId, res.tree || res);
+              }
+              Toast.success(res.message || "库表目录已刷新");
               this.render();
             } catch (err) {
               Toast.error(err.message);

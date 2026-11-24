@@ -764,11 +764,26 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             self.assertIn("nonexistent_tbl_xyz", exec_fail["execution_message"]["content"])
 
     def test_frontend_ai_assistant_and_knowledge_modules_via_node(self) -> None:
-        """Node.js 运行时验证 v3.0 前端应用 `Data.O.G` (ai_assistant) 与 `KnowledgeSettingsView` 渲染及销毁零报错."""
+        """全静态防呆扫描 + Node.js 运行时真实交互端到端验证 v3.0.2 AI 助手、提案卡片、抽屉及参考知识库."""
+        static_root = resolve_static_dir()
+        js_root = os.path.join(static_root, "js")
+        for dirpath, _dirnames, filenames in os.walk(js_root):
+            for fname in filenames:
+                if not fname.endswith(".js"):
+                    continue
+                fpath = os.path.join(dirpath, fname)
+                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                    src = fh.read()
+                self.assertNotIn(
+                    ".activityBar.run(",
+                    src,
+                    f"{os.path.relpath(fpath, static_root)} 禁止调用不存在的 activityBar.run()，必须使用 TaskActivityBar.track()",
+                )
+
         if getattr(sys, "frozen", False) or not shutil.which("node"):
             return
 
-        project_root = os.path.dirname(resolve_static_dir())
+        project_root = os.path.dirname(static_root)
         node_script = r"""
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -776,6 +791,7 @@ import { pathToFileURL } from "node:url";
 class MockNode {
   constructor(tag) {
     this.tagName = String(tag || "div").toUpperCase();
+    this.id = "";
     this.children = [];
     this.attributes = new Map();
     this.listeners = new Map();
@@ -784,11 +800,14 @@ class MockNode {
     this.className = "";
     this.value = "";
     this.textContent = "";
+    this.title = "";
     this.hidden = false;
     this.disabled = false;
     this.checked = false;
     this.selected = false;
     this.parentNode = null;
+    this.scrollTop = 0;
+    this.scrollHeight = 120;
     const self = this;
     this.classList = {
       add(...cs) { self.className = [...new Set([...(self.className||"").split(/\s+/).filter(Boolean), ...cs])].join(" "); },
@@ -797,23 +816,105 @@ class MockNode {
       contains(c) { return (self.className||"").split(/\s+/).includes(c); },
     };
   }
+  append(...ns) { for (const n of ns) if (n) this.appendChild(n); }
   appendChild(c) { if (c) { c.parentNode = this; this.children.push(c); } return c; }
   replaceChildren(...ns) { this.children = ns.filter(Boolean); this.children.forEach(c => c.parentNode = this); }
-  setAttribute(k, v) { this.attributes.set(k, String(v)); }
-  getAttribute(k) { return this.attributes.get(k) ?? null; }
+  setAttribute(k, v) {
+    const s = String(v);
+    this.attributes.set(k, s);
+    if (k === "id") this.id = s;
+    if (k === "title") this.title = s;
+  }
+  getAttribute(k) {
+    if (k === "id" && this.id) return this.id;
+    if (k === "title" && this.title) return this.title;
+    return this.attributes.get(k) ?? null;
+  }
   addEventListener(e, fn) { (this.listeners.get(e) || this.listeners.set(e, []).get(e)).push(fn); }
-  removeEventListener() {}
-  querySelector() { return null; }
-  querySelectorAll() { return []; }
+  removeEventListener(e, fn) {
+    const arr = this.listeners.get(e);
+    if (arr) this.listeners.set(e, arr.filter((f) => f !== fn));
+  }
+  contains(target) {
+    if (!target) return false;
+    if (target === this) return true;
+    return this.children.some((c) => typeof c.contains === "function" && c.contains(target));
+  }
+  click() {
+    if (this.disabled) return;
+    const fns = this.listeners.get("click") || [];
+    for (const fn of fns) fn({ target: this, stopPropagation() {}, preventDefault() {} });
+  }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  querySelectorAll(sel) {
+    const out = [];
+    const match = (n) => {
+      if (!n || !sel) return false;
+      if (sel.startsWith("#")) return n.id === sel.slice(1);
+      if (sel.startsWith(".")) return (n.className || "").split(/\s+/).includes(sel.slice(1));
+      return String(n.tagName || "").toLowerCase() === sel.toLowerCase();
+    };
+    const walk = (n) => {
+      for (const c of (n.children || [])) {
+        if (match(c)) out.push(c);
+        walk(c);
+      }
+    };
+    walk(this);
+    return out;
+  }
   closest() { return null; }
   focus() {}
-  remove() {}
+  remove() {
+    if (this.parentNode && Array.isArray(this.parentNode.children)) {
+      this.parentNode.children = this.parentNode.children.filter((x) => x !== this);
+      this.parentNode = null;
+    }
+  }
 }
+
+function getNodeText(node) {
+  if (!node) return "";
+  let s = node.textContent || "";
+  for (const c of (node.children || [])) s += getNodeText(c);
+  return s;
+}
+
+function findNodes(root, pred) {
+  const res = [];
+  const walk = (n) => {
+    if (!n) return;
+    if (pred(n)) res.push(n);
+    for (const c of (n.children || [])) walk(c);
+  };
+  walk(root);
+  return res;
+}
+
+function triggerInput(node, value) {
+  node.value = value;
+  for (const fn of (node.listeners.get("input") || [])) fn({ target: node });
+}
+
+async function flushAsync(rounds = 8) {
+  for (let i = 0; i < rounds; i += 1) {
+    await new Promise((r) => setTimeout(r, 8));
+  }
+}
+
+const toastRoot = new MockNode("div");
+toastRoot.id = "toast-root";
 
 globalThis.Node = MockNode;
 globalThis.HTMLDialogElement = class HTMLDialogElement {};
 globalThis.localStorage = { getItem: () => null, setItem() {} };
-globalThis.window = { addEventListener() {}, removeEventListener() {}, dispatchEvent() {}, innerWidth: 1440, innerHeight: 900 };
+globalThis.window = {
+  addEventListener() {},
+  removeEventListener() {},
+  dispatchEvent() {},
+  innerWidth: 1440,
+  innerHeight: 900,
+};
 globalThis.document = {
   head: new MockNode("head"),
   body: new MockNode("body"),
@@ -821,22 +922,193 @@ globalThis.document = {
   createElementNS: (_ns, tag) => new MockNode(tag),
   createTextNode: (t) => Object.assign(new MockNode("#text"), { textContent: String(t) }),
   createDocumentFragment: () => new MockNode("#frag"),
-  getElementById: () => null,
+  getElementById: (id) => (id === "toast-root" ? toastRoot : null),
   querySelector: () => null,
   querySelectorAll: () => [],
   addEventListener() {},
   removeEventListener() {},
 };
-globalThis.fetch = async () => ({
-  ok: true,
-  status: 200,
-  headers: new Map([["content-type", "application/json"]]),
-  json: async () => ({ ok: true, dialects: [{ code: "DWS", label: "GaussDB(DWS)" }], sessions: [], llm_models: [], documents: [], summary: {} }),
-  text: async () => "{}",
-});
+
+const fetchCalls = [];
+const mockState = { sessions: [] };
+
+const stdProposal = {
+  proposal_id: "prop_std",
+  connection_id: "conn_dws_1",
+  dialect: "DWS",
+  schema_name: "dwd",
+  title: "创建订单汇总表",
+  rationale: "按客户分布存储",
+  risk_level: "STANDARD_WRITE",
+  status: "pending",
+  original_sql: "CREATE TABLE dwd.agg_orders (cust_id BIGINT, amt NUMERIC(18,2));",
+  statements: [{ index: 1 }],
+  warnings: [],
+};
+
+const hiProposal = {
+  proposal_id: "prop_hi",
+  connection_id: "conn_dws_1",
+  dialect: "DWS",
+  schema_name: "dwd",
+  title: "清理测试订单",
+  rationale: "清理脏数据",
+  risk_level: "HIGH_RISK",
+  status: "pending",
+  original_sql: "DELETE FROM dwd.orders WHERE status = 'BAD';",
+  statements: [{ index: 1 }],
+  warnings: ["高危删除"],
+  estimated_rows: 2,
+};
+
+globalThis.fetch = async (rawUrl, opts = {}) => {
+  const url = String(rawUrl || "");
+  const method = String(opts.method || "GET").toUpperCase();
+  const headers = opts.headers || {};
+  let bodyObj = null;
+  if (typeof opts.body === "string") {
+    try { bodyObj = JSON.parse(opts.body); } catch (_e) { bodyObj = opts.body; }
+  }
+  fetchCalls.push({ url, method, headers, body: bodyObj });
+
+  let payload = { ok: true };
+  if (url.includes("/api/modules/ai_assistant/dialects")) {
+    payload = {
+      ok: true,
+      dialects: [
+        { code: "DWS", label: "华为云 GaussDB(DWS)" },
+        { code: "PGSQL", label: "PostgreSQL" },
+      ],
+      llm_models: [
+        { provider_id: "deepseek", provider_name: "DeepSeek", model: "deepseek-chat", ready: false, has_api_key: false, is_default: true },
+        { provider_id: "custom", provider_name: "内网Qwen", model: "qwen-coder", ready: true, has_api_key: true, is_default: false },
+      ],
+      knowledge_summary: {},
+    };
+  } else if (url.endsWith("/api/modules/ai_assistant/sessions") || url.includes("/api/modules/ai_assistant/sessions?")) {
+    payload = { ok: true, sessions: mockState.sessions };
+  } else if (url.startsWith("/api/modules/ai_assistant/chat")) {
+    const asstMsg = {
+      id: "msg_asst_1",
+      role: "assistant",
+      response_type: "proposal",
+      content: "# 分析结论\n\n已查询表结构与知识库：\n\n```sql\nSELECT COUNT(*) FROM dwd.orders;\n```",
+      steps: [{ step: 1, tool: "search_knowledge", purpose: "检索 DWS 建表规范", ok: true, elapsed_ms: 11.2, summary: "命中 1 条知识" }],
+      citations: [{ chunk_id: "doc1::c0000", doc_id: "doc1", doc_title: "DWS 9.1 规范", dialect: "DWS", heading_path: "分布键规则", snippet: "DISTRIBUTE BY HASH" }],
+      result_table: { columns: [{ name: "cnt" }], rows: [[42]], row_count: 1, truncated: false, elapsed_ms: 4.5 },
+      proposal: { ...stdProposal },
+      next_steps: [{ label: "查看分布倾斜", prompt: "查看 dwd.orders 分布倾斜情况" }],
+      provider_name: "内网Qwen",
+      model: "qwen-coder",
+      created_at: "2026-11-24 11:00:00",
+      total_elapsed_ms: 28.0,
+    };
+    const sess = {
+      session_id: "sess_1",
+      title: "统计 dwd.orders 总额",
+      work_mode: "connection",
+      connection_id: "conn_dws_1",
+      dialect: "DWS",
+      schema_name: "dwd",
+      focus_tables: [],
+      task_mode: "auto",
+      turn_count: 1,
+      messages: [
+        { id: "msg_u_1", role: "user", content: bodyObj?.prompt || "" },
+        asstMsg,
+      ],
+    };
+    mockState.sessions = [sess];
+    payload = { ok: true, session: sess, user_message: sess.messages[0], assistant_message: asstMsg };
+  } else if (url.includes("/api/modules/ai_assistant/proposals/prop_std/confirm")) {
+    payload = {
+      ok: true,
+      execution_ok: true,
+      catalog_refreshed: true,
+      proposal: {
+        ...stdProposal,
+        status: "executed",
+        execution_result: { statements: [{ index: 1, primary_verb: "CREATE", ok: true, affected_rows: 0, elapsed_ms: 3.1 }] },
+      },
+      session: mockState.sessions[0],
+    };
+  } else if (url.includes("/api/modules/ai_assistant/proposals/prop_hi/confirm")) {
+    payload = {
+      ok: true,
+      execution_ok: true,
+      catalog_refreshed: false,
+      proposal: {
+        ...hiProposal,
+        status: "executed",
+        execution_result: { statements: [{ index: 1, primary_verb: "DELETE", ok: true, affected_rows: 2, elapsed_ms: 2.5 }] },
+      },
+      session: mockState.sessions[0],
+    };
+  } else if (url.includes("/proposals/") && url.endsWith("/reject")) {
+    payload = { ok: true, proposal: { ...hiProposal, status: "rejected" }, session: mockState.sessions[0], message: "已取消执行该语句" };
+  } else if (url.includes("/api/platform/knowledge/chunks/")) {
+    payload = {
+      ok: true,
+      document: { doc_id: "doc1", title: "DWS 9.1 规范", dialect: "DWS" },
+      sections: [{ chunk_id: "doc1::c0000", heading_path: "分布键规则", content: "优先选择高基数列作为 DISTRIBUTE BY HASH。" }],
+    };
+  } else if (url === "/api/platform/knowledge/search") {
+    payload = {
+      ok: true,
+      retrieval_mode: "fts5",
+      hits: [{ chunk_id: "doc1::c0000", doc_title: "DWS 9.1 规范", dialect: "DWS", is_builtin: false, heading_path: "分布键规则", snippet: "DISTRIBUTE BY HASH", score: 0.96 }],
+    };
+  } else if (url === "/api/platform/metadata/conn_dws_1/refresh") {
+    payload = {
+      ok: true,
+      schemas: ["dwd", "dm"],
+      tables: [
+        { schema_name: "dwd", table_name: "orders", table_comment: "订单" },
+        { schema_name: "dm", table_name: "agg_orders", table_comment: "订单汇总" },
+      ],
+      message: "成功刷新元数据缓存（共 2 个模式、2 个对象）",
+    };
+  } else if (url.startsWith("/api/platform/metadata/conn_dws_1/tree")) {
+    payload = {
+      ok: true,
+      schemas: ["dwd", "dm"],
+      tables: [{ schema_name: "dwd", table_name: "orders" }, { schema_name: "dm", table_name: "agg_orders" }],
+    };
+  } else if (url === "/api/platform/knowledge/summary") {
+    payload = {
+      ok: true,
+      summary: { fts5_available: true, user_docs: 1, builtin_docs: 11, total_chunks: 12, total_bytes: 2048 },
+      embedding_config: { enabled: true, provider_id: "", base_url: "http://127.0.0.1:11434/v1", model: "bge-m3", has_api_key: false },
+    };
+  } else if (url.startsWith("/api/platform/knowledge/documents")) {
+    payload = { ok: true, documents: [], summary: { fts5_available: true } };
+  } else if (url === "/api/platform/knowledge/embedding-config" && method === "PUT") {
+    payload = { ok: true, embedding_config: { enabled: true, base_url: "http://127.0.0.1:11434/v1", model: "bge-m3", has_api_key: false }, message: "已保存" };
+  } else if (url.startsWith("/api/platform/knowledge/embeddings/reindex")) {
+    payload = { ok: true, embedded_chunks: 12, message: "向量索引重建完成" };
+  } else if (url.startsWith("/api/platform/tasks/")) {
+    payload = { ok: true, status: "running", stage: "执行中", percent: 50, logs: [] };
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    headers: new Map([["content-type", "application/json"]]),
+    json: async () => payload,
+    text: async () => JSON.stringify(payload),
+  };
+};
 
 const root = process.argv[1];
 const imp = (rel) => import(pathToFileURL(path.join(root, rel)).href);
+
+const { store } = await imp("static/js/core/state.js");
+store.state.connections = [
+  { connection_id: "conn_dws_1", name: "DWS生产集群", db_type: "DWS", default_schema: "dwd" },
+];
+store.state.catalogTrees = {
+  conn_dws_1: { schemas: ["dwd"], tables: [{ schema_name: "dwd", table_name: "orders" }] },
+};
 
 const { getDesktopApp, loadAppInstance } = await imp("static/js/core/app_registry.js");
 await imp("static/js/apps/index.js");
@@ -846,37 +1118,161 @@ if (!manifest || manifest.title !== "Data.O.G") {
   throw new Error("ai_assistant not registered with expected title Data.O.G");
 }
 
+// 场景 1：真实挂载 AiAssistantView、验证自动选中已就绪模型 + sendUserMessage 全链路闭环
 const view = await loadAppInstance("ai_assistant");
 const host = new MockNode("div");
-await view.mount(host, { dialect: "DM8" });
+await view.mount(host);
 const hdr = view.getHeaderParts();
 if (!hdr?.center || !hdr?.right) throw new Error("AiAssistantView header parts missing");
+
+const parsedSel = view._parseSelectedModel();
+if (parsedSel.providerId !== "custom" || parsedSel.model !== "qwen-coder") {
+  throw new Error(`Expected ready model custom::qwen-coder, got ${JSON.stringify(parsedSel)}`);
+}
+
+await view.sendUserMessage("统计 dwd.orders 总额");
+const errToasts1 = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
+if (errToasts1.length > 0) {
+  throw new Error(`Unexpected toast-error after sendUserMessage: ${errToasts1.map(getNodeText).join("; ")}`);
+}
+
+const chatCall = fetchCalls.find((c) => c.url.startsWith("/api/modules/ai_assistant/chat"));
+if (!chatCall) throw new Error("sendUserMessage did not call /api/modules/ai_assistant/chat");
+if (!String(chatCall.headers["X-Task-Id"] || "").startsWith("asst_")) {
+  throw new Error(`Missing asst_ X-Task-Id header on chat request: ${JSON.stringify(chatCall.headers)}`);
+}
+if (chatCall.body?.provider_id !== "custom" || chatCall.body?.model !== "qwen-coder") {
+  throw new Error(`Unexpected model payload in chat request: ${JSON.stringify(chatCall.body)}`);
+}
+if (!fetchCalls.some((c) => c.url.includes("/api/modules/ai_assistant/sessions"))) {
+  throw new Error("Sessions list not refreshed after chat turn");
+}
+
+const renderedText = getNodeText(view.root);
+if (!renderedText.includes("创建订单汇总表") || !renderedText.includes("DWS 9.1 规范") || !renderedText.includes("查看分布倾斜")) {
+  throw new Error("Assistant response sections (proposal / citations / next_steps) not rendered");
+}
+if (!view.root.querySelectorAll(".ai-asst-result-box").length) {
+  throw new Error("Result DataGrid not rendered for result_table");
+}
+
+// 场景 2：提案卡片真实点击（常规写确认 + 高危 CONFIRM 拦截与放行 + 取消提案）
+const confirmBtn1 = findNodes(view.root, (n) => n.tagName === "BUTTON" && getNodeText(n).includes("确认执行"))[0];
+if (!confirmBtn1) throw new Error("Standard proposal 确认执行 button missing");
+confirmBtn1.click();
+await flushAsync();
+
+const stdConfirmCall = fetchCalls.find((c) => c.url.includes("/proposals/prop_std/confirm"));
+if (!stdConfirmCall) throw new Error("Standard proposal confirm request not triggered on click");
+if (!fetchCalls.some((c) => c.url.includes("/api/platform/metadata/conn_dws_1/tree"))) {
+  throw new Error("Metadata catalog tree refresh not triggered after catalog_refreshed DDL");
+}
+
+const { renderProposalCard } = await imp("static/js/apps/ai_assistant/proposal_card.js");
+let rejectedCalled = false;
+let hiConfirmed = false;
+const hiCard = renderProposalCard(hiProposal, {
+  activeConnectionId: "conn_dws_1",
+  onProposalUpdated: (res) => {
+    if (res?.proposal?.status === "executed") hiConfirmed = true;
+    if (res?.proposal?.status === "rejected") rejectedCalled = true;
+  },
+});
+const hiExecBtn = findNodes(hiCard, (n) => n.tagName === "BUTTON" && getNodeText(n).includes("确认执行"))[0];
+const hiRejectBtn = findNodes(hiCard, (n) => n.tagName === "BUTTON" && getNodeText(n) === "取消不执行")[0];
+const hiInput = findNodes(hiCard, (n) => n.tagName === "INPUT")[0];
+if (!hiExecBtn || !hiRejectBtn || !hiInput) throw new Error("High-risk proposal controls missing");
+
+const beforeHiCount = fetchCalls.filter((c) => c.url.includes("/proposals/prop_hi/confirm")).length;
+hiExecBtn.click();
+await flushAsync(3);
+const afterBlockedCount = fetchCalls.filter((c) => c.url.includes("/proposals/prop_hi/confirm")).length;
+if (afterBlockedCount !== beforeHiCount) {
+  throw new Error("High-risk proposal should be blocked cleanly before entering CONFIRM");
+}
+toastRoot.replaceChildren();
+
+triggerInput(hiInput, "CONFIRM");
+hiExecBtn.click();
+await flushAsync();
+const hiConfirmCall = fetchCalls.find((c) => c.url.includes("/proposals/prop_hi/confirm"));
+if (!hiConfirmCall || hiConfirmCall.body?.confirm_token !== "CONFIRM" || !hiConfirmed) {
+  throw new Error("High-risk proposal did not submit CONFIRM token properly");
+}
+const rejCard = renderProposalCard(
+  { ...hiProposal, proposal_id: "prop_rej" },
+  {
+    activeConnectionId: "conn_dws_1",
+    onProposalUpdated: (res) => {
+      if (res?.proposal?.status === "rejected") rejectedCalled = true;
+    },
+  }
+);
+const rejBtn = findNodes(rejCard, (n) => n.tagName === "BUTTON" && getNodeText(n) === "取消不执行")[0];
+if (!rejBtn) throw new Error("Proposal reject button missing on fresh card");
+rejBtn.click();
+await flushAsync();
+if (!rejectedCalled) {
+  throw new Error("Proposal reject action did not trigger callback");
+}
+
+// 场景 3：右侧抽屉（知识引用定位 + 知识搜索 + 库表目录顶层 schemas/tables 刷新）
+await view.drawer.openCitation("doc1::c0000");
+if (!fetchCalls.some((c) => c.url.includes("/api/platform/knowledge/chunks/doc1%3A%3Ac0000?window=1"))) {
+  throw new Error("openCitation did not request knowledge chunk section");
+}
+if (!getNodeText(view.drawer.root).includes("优先选择高基数列")) {
+  throw new Error("openCitation did not render fetched section content");
+}
+
+view.drawer.kbQuery = "DISTRIBUTE";
+await view.drawer.searchKb();
+if (!fetchCalls.some((c) => c.url === "/api/platform/knowledge/search")) {
+  throw new Error("drawer.searchKb did not request /api/platform/knowledge/search");
+}
+
+view.drawer.activeTab = "tables";
+view.drawer.render();
+const refreshBtn = findNodes(view.drawer.root, (n) => n.tagName === "BUTTON" && n.title === "刷新库表目录")[0];
+if (!refreshBtn) throw new Error("Drawer 刷新库表目录 button missing");
+refreshBtn.click();
+await flushAsync();
+const updatedTree = store.state.catalogTrees.conn_dws_1;
+if (!updatedTree || updatedTree.table_count !== 2 || updatedTree.schema_count !== 2) {
+  throw new Error(`Drawer metadata refresh failed to handle flat schemas/tables response: ${JSON.stringify(updatedTree)}`);
+}
+
+// 场景 4：KnowledgeSettingsView 真实刷新、检索测试与重建向量索引（TaskActivityBar.track）
+const { KnowledgeSettingsView } = await imp("static/js/views/knowledge_view.js");
+const kbView = new KnowledgeSettingsView();
+await kbView.refreshFromServer();
+kbView.testQuery = "DISTRIBUTE";
+await kbView._runSearchTest();
+kbView.embeddingExpanded = true;
+kbView.render();
+
+toastRoot.replaceChildren();
+const reindexBtn = findNodes(kbView.root, (n) => n.tagName === "BUTTON" && getNodeText(n) === "保存并重建向量索引")[0];
+if (!reindexBtn) throw new Error("KnowledgeSettingsView 保存并重建向量索引 button missing");
+reindexBtn.click();
+await flushAsync();
+
+const reindexCall = fetchCalls.find((c) => c.url.startsWith("/api/platform/knowledge/embeddings/reindex"));
+if (!reindexCall || !String(reindexCall.headers["X-Task-Id"] || "").startsWith("kb_emb_")) {
+  throw new Error(`Knowledge reindexEmbeddings failed or missing kb_emb_ X-Task-Id: ${JSON.stringify(reindexCall)}`);
+}
+const finalErrToasts = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
+if (finalErrToasts.length > 0) {
+  throw new Error(`Unexpected error toasts in v3 frontend E2E: ${finalErrToasts.map(getNodeText).join("; ")}`);
+}
 
 const { renderSafeMarkdown } = await imp("static/js/apps/ai_assistant/markdown_dom.js");
 const mdNode = renderSafeMarkdown("# 标题\n\n> 引用\n\n```sql\nSELECT 1;\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |");
 if (!mdNode.children.length) throw new Error("renderSafeMarkdown produced empty DOM");
 
-const { renderProposalCard } = await imp("static/js/apps/ai_assistant/proposal_card.js");
-const propNode = renderProposalCard({
-  proposal_id: "prop_1",
-  title: "高危清理",
-  dialect: "DWS",
-  risk_level: "HIGH_RISK",
-  status: "pending",
-  original_sql: "DELETE FROM dwd.t WHERE id = 1;",
-  statements: [{ index: 1 }],
-  warnings: ["高危删除"],
-  estimated_rows: 1,
-});
-if (!propNode || !propNode.children.length) throw new Error("renderProposalCard failed");
-
-const { KnowledgeSettingsView } = await imp("static/js/views/knowledge_view.js");
-const kbView = new KnowledgeSettingsView();
-kbView.render();
-if (!kbView.root.children.length) throw new Error("KnowledgeSettingsView render failed");
 kbView.destroy();
 view.destroy();
-console.log("V3_AI_ASSISTANT_FRONTEND_OK");
+console.log("V3_AI_ASSISTANT_FRONTEND_E2E_OK");
 """
         proc = subprocess.run(
             ["node", "--input-type=module", "-e", node_script, project_root],
@@ -884,14 +1280,14 @@ console.log("V3_AI_ASSISTANT_FRONTEND_OK");
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=20,
+            timeout=25,
         )
         self.assertEqual(
             proc.returncode,
             0,
-            f"Node 前端 v3.0 AI 助手验证失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+            f"Node 前端 v3.0.2 AI 助手交互测试失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
         )
-        self.assertIn("V3_AI_ASSISTANT_FRONTEND_OK", proc.stdout)
+        self.assertIn("V3_AI_ASSISTANT_FRONTEND_E2E_OK", proc.stdout)
 
 
 if __name__ == "__main__":

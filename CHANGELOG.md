@@ -8,6 +8,24 @@
 
 ---
 
+## [3.0.2] - 2026-11-24
+
+> **AI 助手与知识库运行时修复与真实交互测试补强**：根治点击发送消息或重建向量索引时抛出 `this.activityBar.run is not a function` 的前端方法调用错误，并全面排查修复默认就绪模型选择、发送态用户气泡占位及抽屉目录刷新兼容问题，将前端测试升级为真实交互闭环验证。
+
+### Fixed
+- **修复智能数据助手 (`Data.O.G`) 与参考知识库视图调用 `TaskActivityBar` 方法名错误 (`static/js/apps/ai_assistant/view.js`, `static/js/views/knowledge_view.js`)**：
+  - 将 `AiAssistantView.sendUserMessage()` 与 `KnowledgeSettingsView` 的向量索引重建按钮误用的 `this.activityBar.run(...)` 统一修正为正确的 `this.activityBar.track(title, asyncFn, opts)`；补充 `isAbortError` 取消提示，消除执行对话命令即报 `this.activityBar.run is not a function` 的阻断故障。
+- **修复模型自动选择、等待态交互反馈与抽屉目录刷新 (`static/js/apps/ai_assistant/view.js`, `static/js/apps/ai_assistant/drawer_pane.js`)**：
+  - `_ensureSelectedModel()` 优先自动选中已就绪模型（`ready || has_api_key`），避免默认落到未配置密钥的内置服务商；
+  - 发送中通过 `_pendingUserPrompt` 在对话流即时渲染用户问题气泡与进度状态提示；修复纯方言模式提案确认后目录刷新目标 `connection_id` 读取；
+  - 修复右侧抽屉「刷新库表目录」按后端 `/metadata/{cid}/refresh` 顶层 `schemas`/`tables` 结构正确同步 `store.updateCatalogTree` 并弹出成功提示。
+
+### Changed
+- **前端真实交互端到端测试升级与全库静态防呆守卫 (`tests/test_ai_assistant_and_kb.py`)**：
+  - 在 `test_frontend_ai_assistant_and_knowledge_modules_via_node` 中新增遍历 `static/js/**/*.js` 禁止出现 `.activityBar.run(` 的全库静态扫描，并借助增强后的 Node.js DOM 运行时真实执行 `AiAssistantView.sendUserMessage()`、提案卡片常规/高危 `CONFIRM` 门禁点击与拒绝、右侧抽屉知识引用/检索/库表刷新以及 `KnowledgeSettingsView` 检索与重建向量索引全流程闭环（断言零 `toast-error` 与请求头/参数契约）。
+
+---
+
 ## [3.0.1] - 2026-11-24
 
 > **热更新防缓存与桌面一键重载增强**：彻底解决客户端版本频繁覆盖升级或本地重启后，浏览器缓存锁死旧版 ES Modules（如看不到「参考知识库」或 3.0 新特性）的问题，同时在仓库 `knowledge_packs/` 补充华为 DWS 9.1 / 星环 Inceptor 9.x / 官方 PostgreSQL 19 离线初始化知识包与 GitHub 直连下载索引。
