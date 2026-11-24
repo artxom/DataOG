@@ -763,8 +763,380 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             self.assertEqual(exec_fail["execution_message"]["response_type"], "execution")
             self.assertIn("nonexistent_tbl_xyz", exec_fail["execution_message"]["content"])
 
+    def test_chat_attachments_csv_query_and_stepped_map_reduce(self) -> None:
+        """端到端验证聊天附件校验、GBK CSV 画像与只读 SQL 沙箱、超长 SQL Map-Reduce 分步拆解及级联隔离."""
+        from modules.ai_assistant.attachments import (
+            CHUNK_HARD_MAX_TOKENS,
+            MAX_CSV_BYTES,
+            MAX_TEXT_BYTES,
+            estimate_tokens,
+            query_csv_in_memory,
+        )
+        from core.platform.readonly_guard import ReadOnlyViolationError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(private_root=os.path.join(tmp, "vault"))
+            ctx: PlatformContext = app.state.platform_ctx
+            _activate_ctx(ctx)
+            ctx.llm_hub.save_provider(
+                {
+                    "provider_id": "local_mock",
+                    "name": "Local Mock LLM",
+                    "provider_type": "OPENAI_COMPATIBLE",
+                    "enabled": True,
+                    "base_url": "http://127.0.0.1:11434/v1",
+                    "default_model": "mock-coder",
+                    "models": ["mock-coder"],
+                    "is_default": True,
+                }
+            )
+            client = TestClient(app)
+
+            # 0. /dialects 下发 attachment_limits
+            dl_res = client.get("/api/modules/ai_assistant/dialects").json()
+            self.assertTrue(dl_res["ok"])
+            self.assertEqual(dl_res["attachment_limits"]["max_csv_bytes"], MAX_CSV_BYTES)
+            self.assertEqual(dl_res["attachment_limits"]["max_text_bytes"], MAX_TEXT_BYTES)
+
+            # 1. 安全拦截：不允许后缀 / 空字节二进制伪装 / CSV>2MB / TXT>5MB
+            bad_ext = client.post(
+                "/api/modules/ai_assistant/attachments/upload",
+                files={"file": ("malware.exe", b"MZ...", "application/octet-stream")},
+            )
+            self.assertEqual(bad_ext.status_code, 400)
+
+            bad_bin = client.post(
+                "/api/modules/ai_assistant/attachments/upload",
+                files={"file": ("fake.txt", b"hello\x00\x01binary", "text/plain")},
+            )
+            self.assertEqual(bad_bin.status_code, 400)
+            self.assertIn("空字节", bad_bin.json()["error"])
+
+            big_csv = client.post(
+                "/api/modules/ai_assistant/attachments/upload",
+                files={"file": ("huge.csv", b"a,b\n" + b"1,2\n" * (MAX_CSV_BYTES // 3), "text/csv")},
+            )
+            self.assertEqual(big_csv.status_code, 400)
+
+            big_txt = client.post(
+                "/api/modules/ai_assistant/attachments/upload",
+                files={"file": ("huge.txt", b"x" * (MAX_TEXT_BYTES + 100), "text/plain")},
+            )
+            self.assertEqual(big_txt.status_code, 400)
+
+            # 2. GBK 编码 CSV 解析、前导零保留 TEXT、类型推断与 :memory: 只读 SQLite 查询 + 写阻断
+            gbk_csv_text = "网点号,部门,交易笔数,金额\n001024,零售部,10,120.5\n001024,零售部,5,79.5\n002048,对公部,3,500.0\n"
+            gbk_bytes = gbk_csv_text.encode("gbk")
+            up_gbk = client.post(
+                "/api/modules/ai_assistant/attachments/upload",
+                files={"file": ("txns_gbk.csv", gbk_bytes, "text/csv")},
+            )
+            self.assertEqual(up_gbk.status_code, 200)
+            gbk_att = up_gbk.json()["attachment"]
+            self.assertEqual(gbk_att["file_kind"], "csv")
+            self.assertEqual(gbk_att["row_count"], 3)
+            cols_by_name = {c["name"]: c for c in gbk_att["csv_profile"]["columns"]}
+            self.assertEqual(cols_by_name["网点号"]["inferred_type"], "TEXT")
+            self.assertEqual(cols_by_name["交易笔数"]["inferred_type"], "INTEGER")
+            self.assertEqual(cols_by_name["金额"]["inferred_type"], "REAL")
+
+            mem_res = query_csv_in_memory(
+                gbk_csv_text,
+                ".csv",
+                'SELECT 网点号, 部门, SUM(交易笔数) AS total_cnt, ROUND(SUM(金额), 2) AS total_amt FROM csv_data GROUP BY 网点号, 部门 ORDER BY total_amt DESC',
+            )
+            self.assertTrue(mem_res["ok"])
+            self.assertEqual(mem_res["rows"][0], ["002048", "对公部", 3, 500.0])
+            self.assertEqual(mem_res["rows"][1], ["001024", "零售部", 15, 200.0])
+
+            for evil_sql in ("DROP TABLE csv_data", "ATTACH DATABASE '/tmp/x.db' AS x"):
+                with self.assertRaises(ReadOnlyViolationError):
+                    query_csv_in_memory(gbk_csv_text, ".csv", evil_sql)
+
+            # 3. 粘贴长文本：单行无换行超长字符强制硬切，每片严格 <= CHUNK_HARD_MAX_TOKENS
+            giant_single_line = "SELECT col_a FROM dwd.t WHERE note = '" + ("中文业务说明" * 2600) + "';"
+            paste_giant = client.post(
+                "/api/modules/ai_assistant/attachments/text",
+                json={"content": giant_single_line},
+            )
+            self.assertEqual(paste_giant.status_code, 200)
+            giant_att = paste_giant.json()["attachment"]
+            self.assertEqual(giant_att["file_kind"], "sql")
+            self.assertTrue(giant_att["filename"].endswith(".sql"))
+            self.assertTrue(giant_att["oversized"])
+            self.assertGreater(giant_att["chunk_count"], 3)
+            for ch in giant_att["chunks"]:
+                self.assertLessEqual(ch["estimated_tokens"], CHUNK_HARD_MAX_TOKENS)
+            # 验证删除草稿附件
+            del_giant = client.delete(f"/api/modules/ai_assistant/attachments/{giant_att['attachment_id']}")
+            self.assertEqual(del_giant.status_code, 200)
+
+            # 4. 超长 SQL 脚本：Map-Reduce 分步拆解 + 滚动摘要 + 接续下一批芯片
+            sql_stmts = [
+                f"CREATE TABLE dwd.tbl_{i:02d} (\n    id BIGINT NOT NULL,\n    cust_no VARCHAR(32) COMMENT '客户编号_{i}',\n    amt NUMERIC(18,2) DEFAULT 0,\n    remark TEXT\n)\nDISTRIBUTE BY HASH(id);\n"
+                + f"-- 补充长注释说明第 {i:02d} 张金融业务宽表的落标校验口径与合规审计规则，" * 14
+                for i in range(1, 35)
+            ]
+            big_sql_bytes = "\n".join(sql_stmts).encode("utf-8")
+            up_sql = client.post(
+                "/api/modules/ai_assistant/attachments/upload",
+                files={"file": ("batch_ddl.sql", big_sql_bytes, "text/plain")},
+            ).json()
+            big_sql_att = up_sql["attachment"]
+            self.assertTrue(big_sql_att["oversized"])
+            self.assertEqual(big_sql_att["recommended_strategy"], "stepped_batch")
+            self.assertGreaterEqual(big_sql_att["chunk_count"], 5)
+
+            seen_prompts: list[str] = []
+
+            def _mock_chat_completion(**kwargs):
+                msgs = kwargs.get("messages") or []
+                user_msg = msgs[-1]["content"] if msgs else ""
+                seen_prompts.append(user_msg)
+                sys_msg = msgs[0]["content"] if msgs else ""
+                if "Map 阶段" in sys_msg:
+                    return {
+                        "provider_name": "Local Mock LLM",
+                        "model": "mock-coder",
+                        "content": json.dumps(
+                            {
+                                "summary": "本片包含合规 HASH 分布建表语句",
+                                "findings": ["发现 BIGINT 主键与 NUMERIC 金额字段"],
+                                "sql_or_action": "已登记建表",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                # On-demand CSV 工具多轮触发
+                if "csv_large.csv" in user_msg and "【工具 `" not in user_msg:
+                    return {
+                        "provider_name": "Local Mock LLM",
+                        "model": "mock-coder",
+                        "content": json.dumps(
+                            {
+                                "action": "tool",
+                                "tool": "query_csv_attachment",
+                                "args": {
+                                    "sql": "SELECT dept, SUM(amt) AS sum_amt FROM csv_data GROUP BY dept ORDER BY sum_amt DESC"
+                                },
+                                "purpose": "在内存只读 SQLite 中按部门聚合 CSV 金额",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                if "【工具 `query_csv_attachment` 返回结果】" in user_msg:
+                    return {
+                        "provider_name": "Local Mock LLM",
+                        "model": "mock-coder",
+                        "content": json.dumps(
+                            {
+                                "action": "tool",
+                                "tool": "search_attachment",
+                                "args": {"keyword": "DEPT_A"},
+                                "purpose": "在 CSV 原文中检索 DEPT_A 行号定位",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                if "【工具 `search_attachment` 返回结果】" in user_msg:
+                    return {
+                        "provider_name": "Local Mock LLM",
+                        "model": "mock-coder",
+                        "content": json.dumps(
+                            {
+                                "action": "tool",
+                                "tool": "inspect_attachment_chunk",
+                                "args": {"chunk_index": 0},
+                                "purpose": "抽查首个 CSV 分片原文确认明细",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                return {
+                    "provider_name": "Local Mock LLM",
+                    "model": "mock-coder",
+                    "content": json.dumps(
+                        {
+                            "action": "answer",
+                            "summary": "已完成全部超长脚本/CSV 拆解与统计归纳",
+                            "content": "汇总结果已生成，所有表结构与聚合口径核查完毕。",
+                            "citations": [],
+                            "next_steps": [{"label": "生成索引检查建议", "prompt": "检查索引分布"}],
+                        },
+                        ensure_ascii=False,
+                    ),
+                }
+
+            with unittest.mock.patch.object(ctx.llm_hub, "chat_completion", side_effect=_mock_chat_completion):
+                # 仅拆解前 2 片 -> 必定返回「继续拆解第 3~... 片」接续芯片
+                r_batch1 = client.post(
+                    "/api/modules/ai_assistant/chat",
+                    json={
+                        "prompt": "审查全部 DDL 规范",
+                        "dialect": "DWS",
+                        "attachment_ids": [big_sql_att["attachment_id"]],
+                        "large_payload_strategy": "stepped_batch",
+                        "batch_start_chunk": 0,
+                        "batch_max_chunks": 2,
+                    },
+                ).json()
+                self.assertTrue(r_batch1["ok"])
+                sid_sql = r_batch1["session"]["session_id"]
+                asst1 = r_batch1["assistant_message"]
+                map_steps = [s for s in asst1["steps"] if s["tool"] == "analyze_attachment_chunk"]
+                self.assertEqual(len(map_steps), 2)
+                self.assertGreaterEqual(len(asst1["next_steps"]), 1)
+                cont_chip = asst1["next_steps"][0]
+                self.assertEqual(cont_chip["batch_start_chunk"], 2)
+                self.assertIn(big_sql_att["attachment_id"], cont_chip["attachment_ids"])
+
+                # 校验没有任何 Map 请求超过窗口防爆限制（滚动摘要 + 单片 <= 4200 tok）
+                for sent_p in seen_prompts:
+                    self.assertLessEqual(estimate_tokens(sent_p), 4500)
+
+                # 接续下一批拆解
+                r_batch2 = client.post(
+                    "/api/modules/ai_assistant/chat",
+                    json={
+                        "session_id": sid_sql,
+                        "prompt": cont_chip["prompt"],
+                        "dialect": "DWS",
+                        "attachment_ids": cont_chip["attachment_ids"],
+                        "large_payload_strategy": "stepped_batch",
+                        "batch_start_chunk": 2,
+                        "batch_max_chunks": 12,
+                    },
+                ).json()
+                self.assertTrue(r_batch2["ok"])
+                map_steps2 = [s for s in r_batch2["assistant_message"]["steps"] if s["tool"] == "analyze_attachment_chunk"]
+                self.assertEqual(len(map_steps2), big_sql_att["chunk_count"] - 2)
+
+                # 5. 超大 CSV：默认 on_demand 策略 -> query_csv_attachment + search_attachment + inspect_attachment_chunk
+                csv_rows = ["id,dept,amt,remark"] + [
+                    f"{i},{'DEPT_A' if i % 2 == 0 else 'DEPT_B'},{100.0 if i % 2 == 0 else 50.0},大体积财务流水明细对比备注_{i:04d}_" + ("X" * 40)
+                    for i in range(1, 260)
+                ]
+                big_csv_bytes = "\n".join(csv_rows).encode("utf-8")
+                up_big_csv = client.post(
+                    "/api/modules/ai_assistant/attachments/upload",
+                    files={"file": ("csv_large.csv", big_csv_bytes, "text/csv")},
+                ).json()
+                big_csv_att = up_big_csv["attachment"]
+                self.assertTrue(big_csv_att["oversized"])
+                self.assertEqual(big_csv_att["recommended_strategy"], "on_demand")
+
+                r_csv = client.post(
+                    "/api/modules/ai_assistant/chat",
+                    json={
+                        "prompt": "",
+                        "dialect": "DWS",
+                        "attachment_ids": [big_csv_att["attachment_id"]],
+                    },
+                ).json()
+                self.assertTrue(r_csv["ok"])
+                sid_csv = r_csv["session"]["session_id"]
+                csv_asst = r_csv["assistant_message"]
+                csv_tool_names = [s["tool"] for s in csv_asst["steps"]]
+                self.assertEqual(
+                    csv_tool_names,
+                    ["query_csv_attachment", "search_attachment", "inspect_attachment_chunk"],
+                )
+                self.assertEqual(csv_asst["result_table"]["row_count"], 2)
+                self.assertEqual(csv_asst["result_table"]["rows"][0][0], "DEPT_A")
+
+                # 5b. 小体积 SQL inline 直通单次调用 + 历史消息不重复内嵌全文正文
+                up_small = client.post(
+                    "/api/modules/ai_assistant/attachments/upload",
+                    files={
+                        "file": (
+                            "small.sql",
+                            b"SELECT id, amt FROM dwd.orders WHERE status = 'PAID';\n",
+                            "text/plain",
+                        )
+                    },
+                ).json()
+                small_att = up_small["attachment"]
+                self.assertFalse(small_att["oversized"])
+                self.assertEqual(small_att["recommended_strategy"], "inline")
+
+                r_inline = client.post(
+                    "/api/modules/ai_assistant/chat",
+                    json={
+                        "prompt": "检查这条小查询",
+                        "dialect": "DWS",
+                        "attachment_ids": [small_att["attachment_id"]],
+                    },
+                ).json()
+                self.assertTrue(r_inline["ok"])
+                self.assertIn("【用户本轮附带文件全文】", seen_prompts[-1])
+                self.assertIn("SELECT id, amt FROM dwd.orders WHERE status = 'PAID';", seen_prompts[-1])
+
+                detail_inline = client.get(
+                    f"/api/modules/ai_assistant/sessions/{r_inline['session']['session_id']}"
+                ).json()
+                user_msgs = [m for m in detail_inline["session"]["messages"] if m["role"] == "user"]
+                self.assertEqual(len(user_msgs), 1)
+                self.assertEqual(user_msgs[0]["content"], "检查这条小查询")
+                self.assertNotIn("【用户本轮附带文件全文】", user_msgs[0]["content"])
+                self.assertEqual(user_msgs[0]["attachments"][0]["attachment_id"], small_att["attachment_id"])
+
+                # 5c. AssistantToolbox.tool_query_csv_attachment 写入语句只读沙箱拦截
+                from modules.ai_assistant.tools import AssistantToolbox
+                from modules.ai_assistant.service import AiAssistantService
+
+                tb = AssistantToolbox(
+                    ctx=ctx,
+                    work_mode="dialect",
+                    profile=None,
+                    dialect="DWS",
+                    default_schema="public",
+                    attachments=[big_csv_att],
+                    storage=AiAssistantService(ctx),
+                )
+                blk = tb.tool_query_csv_attachment(
+                    {
+                        "attachment_id": big_csv_att["attachment_id"],
+                        "sql": "DELETE FROM csv_data",
+                    }
+                )
+                self.assertFalse(blk["ok"])
+                self.assertTrue(blk.get("blocked_by_sandbox"))
+
+            # 6. 工作区导出隔离（严禁包含 ai_assistant_attachments / chunks）与级联删除清理
+            ws_bytes, _ = ctx.workspace_hub.export_workspace_bytes()
+            ws_file = os.path.join(tmp, "att_ws_check.dataog.db")
+            with open(ws_file, "wb") as fh:
+                fh.write(ws_bytes)
+            with contextlib.closing(sqlite3.connect(ws_file)) as wconn:
+                tbls = {
+                    r[0]
+                    for r in wconn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    ).fetchall()
+                }
+            self.assertFalse(any("ai_assistant_" in t for t in tbls))
+
+            del_sess = client.delete(f"/api/modules/ai_assistant/sessions/{sid_sql}")
+            self.assertEqual(del_sess.status_code, 200)
+            with ctx.store.module_db(scope="private") as pconn:
+                rem_att = pconn.execute(
+                    "SELECT COUNT(*) FROM ai_assistant_attachments WHERE attachment_id = ?",
+                    (big_sql_att["attachment_id"],),
+                ).fetchone()[0]
+                rem_chk = pconn.execute(
+                    "SELECT COUNT(*) FROM ai_assistant_attachment_chunks WHERE attachment_id = ?",
+                    (big_sql_att["attachment_id"],),
+                ).fetchone()[0]
+                rem_csv_keep = pconn.execute(
+                    "SELECT COUNT(*) FROM ai_assistant_attachments WHERE session_id = ?",
+                    (sid_csv,),
+                ).fetchone()[0]
+            self.assertEqual(rem_att, 0)
+            self.assertEqual(rem_chk, 0)
+            self.assertEqual(rem_csv_keep, 1)
+
     def test_frontend_ai_assistant_and_knowledge_modules_via_node(self) -> None:
-        """全静态防呆扫描 + Node.js 运行时真实交互端到端验证 v3.0.2 AI 助手、提案卡片、抽屉及参考知识库."""
+        """全静态防呆扫描 + Node.js 运行时真实交互端到端验证 v3.1.0 AI 助手（含粘贴/上传/防爆窗拆解）、提案卡片、抽屉及参考知识库."""
         static_root = resolve_static_dir()
         js_root = os.path.join(static_root, "js")
         for dirpath, _dirnames, filenames in os.walk(js_root):
@@ -983,13 +1355,104 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
         { provider_id: "deepseek", provider_name: "DeepSeek", model: "deepseek-chat", ready: false, has_api_key: false, is_default: true },
         { provider_id: "custom", provider_name: "内网Qwen", model: "qwen-coder", ready: true, has_api_key: true, is_default: false },
       ],
+      attachment_limits: {
+        max_csv_bytes: 2 * 1024 * 1024,
+        max_text_bytes: 5 * 1024 * 1024,
+        inline_token_budget: 3500,
+        max_attachments_per_turn: 5,
+        csv_extensions: [".csv", ".tsv"],
+        allowed_extensions: [".txt", ".sql", ".ddl", ".md", ".log", ".json", ".csv", ".tsv"],
+      },
       knowledge_summary: {},
+    };
+  } else if (url === "/api/modules/ai_assistant/attachments/upload") {
+    payload = {
+      ok: true,
+      attachment: {
+        attachment_id: "att_file_1",
+        filename: "tiny.sql",
+        file_ext: ".sql",
+        file_kind: "sql",
+        size_bytes: 120,
+        line_count: 3,
+        row_count: 0,
+        estimated_tokens: 45,
+        chunk_count: 1,
+        oversized: false,
+        recommended_strategy: "inline",
+        summary: "SQL 脚本：3 行 | 估算 ~45 tokens | 切分为 1 个语义块",
+        csv_profile: {},
+        chunks: [{ chunk_index: 0, title: "语句 #1", range_label: "L1-L3", estimated_tokens: 45, content: "SELECT 1;" }],
+      },
+    };
+  } else if (url === "/api/modules/ai_assistant/attachments/text") {
+    payload = {
+      ok: true,
+      attachment: {
+        attachment_id: "att_paste_1",
+        filename: "pasted_sql_120000.sql",
+        file_ext: ".sql",
+        file_kind: "sql",
+        size_bytes: 18000,
+        line_count: 220,
+        row_count: 0,
+        estimated_tokens: 9200,
+        chunk_count: 10,
+        oversized: true,
+        recommended_strategy: "stepped_batch",
+        summary: "SQL 脚本：220 行 | 估算 ~9200 tokens | 切分为 10 个语义块",
+        csv_profile: {},
+        chunks: [{ chunk_index: 0, title: "语句 #1~#3", range_label: "L1-L40", estimated_tokens: 2100, content: "CREATE TABLE t1 (id INT);" }],
+      },
+    };
+  } else if (url.startsWith("/api/modules/ai_assistant/attachments/") && method === "DELETE") {
+    payload = { ok: true, message: "附件已移除" };
+  } else if (url.startsWith("/api/modules/ai_assistant/attachments/")) {
+    payload = {
+      ok: true,
+      attachment: {
+        attachment_id: "att_paste_1",
+        filename: "pasted_sql_120000.sql",
+        file_ext: ".sql",
+        file_kind: "sql",
+        size_bytes: 18000,
+        line_count: 220,
+        row_count: 0,
+        estimated_tokens: 9200,
+        chunk_count: 10,
+        oversized: true,
+        recommended_strategy: "stepped_batch",
+        summary: "SQL 脚本：220 行 | 估算 ~9200 tokens | 切分为 10 个语义块",
+        csv_profile: {},
+        chunks: [{ chunk_index: 0, title: "语句 #1~#3", range_label: "L1-L40", estimated_tokens: 2100, content: "CREATE TABLE t1 (id INT);" }],
+      },
     };
   } else if (url.endsWith("/api/modules/ai_assistant/sessions") || url.includes("/api/modules/ai_assistant/sessions?")) {
     payload = { ok: true, sessions: mockState.sessions };
   } else if (url.startsWith("/api/modules/ai_assistant/chat")) {
+    const reqAtts = Array.isArray(bodyObj?.attachment_ids) ? bodyObj.attachment_ids : [];
+    const reqBatchStart = Number(bodyObj?.batch_start_chunk || 0);
+    const nextStepsList = reqAtts.length && reqBatchStart === 0
+      ? [
+          {
+            label: "继续拆解第 9~10 片 (共 10 片)",
+            prompt: "请继续拆解第 9~10 片",
+            batch_start_chunk: 8,
+            batch_max_chunks: 8,
+            attachment_ids: reqAtts,
+            large_payload_strategy: "stepped_batch",
+          },
+        ]
+      : [{ label: "查看分布倾斜", prompt: "查看 dwd.orders 分布倾斜情况" }];
+    const attMeta = reqAtts.map((aid) => ({
+      attachment_id: aid,
+      filename: aid === "att_file_1" ? "tiny.sql" : "pasted_sql_120000.sql",
+      file_kind: "sql",
+      estimated_tokens: aid === "att_file_1" ? 45 : 9200,
+      chunk_count: aid === "att_file_1" ? 1 : 10,
+    }));
     const asstMsg = {
-      id: "msg_asst_1",
+      id: `msg_asst_${fetchCalls.length}`,
       role: "assistant",
       response_type: "proposal",
       content: "# 分析结论\n\n已查询表结构与知识库：\n\n```sql\nSELECT COUNT(*) FROM dwd.orders;\n```",
@@ -997,7 +1460,7 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
       citations: [{ chunk_id: "doc1::c0000", doc_id: "doc1", doc_title: "DWS 9.1 规范", dialect: "DWS", heading_path: "分布键规则", snippet: "DISTRIBUTE BY HASH" }],
       result_table: { columns: [{ name: "cnt" }], rows: [[42]], row_count: 1, truncated: false, elapsed_ms: 4.5 },
       proposal: { ...stdProposal },
-      next_steps: [{ label: "查看分布倾斜", prompt: "查看 dwd.orders 分布倾斜情况" }],
+      next_steps: nextStepsList,
       provider_name: "内网Qwen",
       model: "qwen-coder",
       created_at: "2026-11-24 11:00:00",
@@ -1014,7 +1477,7 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
       task_mode: "auto",
       turn_count: 1,
       messages: [
-        { id: "msg_u_1", role: "user", content: bodyObj?.prompt || "" },
+        { id: "msg_u_1", role: "user", content: bodyObj?.prompt || "结合附件分析", attachments: attMeta },
         asstMsg,
       ],
     };
@@ -1269,6 +1732,79 @@ if (finalErrToasts.length > 0) {
 const { renderSafeMarkdown } = await imp("static/js/apps/ai_assistant/markdown_dom.js");
 const mdNode = renderSafeMarkdown("# 标题\n\n> 引用\n\n```sql\nSELECT 1;\n```\n\n| A | B |\n| --- | --- |\n| 1 | 2 |");
 if (!mdNode.children.length) throw new Error("renderSafeMarkdown produced empty DOM");
+
+// 场景 5：粘贴文件 + 超长纯文本自动转分片 + 拒绝超大 CSV + 策略切换 + 接续下一批拆解
+toastRoot.replaceChildren();
+const fakeSqlFile = new File(["SELECT 1;\n"], "tiny.sql", { type: "text/plain" });
+await view.handlePasteEvent({
+  preventDefault() {},
+  clipboardData: { files: [fakeSqlFile], getData: () => "" },
+});
+if (view.pendingAttachments.length !== 1 || view.pendingAttachments[0].attachment_id !== "att_file_1") {
+  throw new Error(`Paste file upload failed: ${JSON.stringify(view.pendingAttachments)}`);
+}
+
+const composerTa = view.root.querySelector(".ai-asst-composer-input");
+if (!composerTa || !(composerTa.listeners.get("paste") || []).length) {
+  throw new Error("Composer textarea paste handler missing");
+}
+let pastePrevented = false;
+const giantPasteSql = "SELECT col_x FROM dwd.orders WHERE id > 0;\n".repeat(160);
+for (const fn of composerTa.listeners.get("paste")) {
+  await fn({
+    preventDefault() { pastePrevented = true; },
+    clipboardData: {
+      files: [],
+      getData: (t) => (t === "text/plain" ? giantPasteSql : ""),
+    },
+  });
+}
+if (!pastePrevented) throw new Error("Oversized text paste did not trigger preventDefault()");
+if (view.pendingAttachments.length !== 2 || !view.root.querySelector(".ai-asst-strategy-bar")) {
+  throw new Error("Oversized pasted text did not render strategy protection bar");
+}
+
+const beforeUploadCount = fetchCalls.filter((c) => c.url === "/api/modules/ai_assistant/attachments/upload").length;
+await view.handleUploadFiles([{ name: "too_big.csv", size: 2.5 * 1024 * 1024 }]);
+const afterUploadCount = fetchCalls.filter((c) => c.url === "/api/modules/ai_assistant/attachments/upload").length;
+if (afterUploadCount !== beforeUploadCount) {
+  throw new Error("Oversized 2.5MB CSV should be rejected client-side without hitting upload API");
+}
+const sizeErrToasts = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
+if (!sizeErrToasts.length || !getNodeText(sizeErrToasts[0]).includes("超出")) {
+  throw new Error("Oversized CSV rejection did not show clear error toast");
+}
+toastRoot.replaceChildren();
+
+view.largePayloadStrategy = "stepped_batch";
+await view.sendUserMessage("");
+const attChatCalls = fetchCalls.filter(
+  (c) => c.url.startsWith("/api/modules/ai_assistant/chat") && Array.isArray(c.body?.attachment_ids) && c.body.attachment_ids.length === 2
+);
+if (!attChatCalls.length || attChatCalls[0].body.large_payload_strategy !== "stepped_batch") {
+  throw new Error("Attachment chat payload did not transmit attachment_ids and large_payload_strategy");
+}
+if (view.pendingAttachments.length !== 0) {
+  throw new Error("pendingAttachments were not cleared after sending turn");
+}
+if (!view.root.querySelectorAll(".ai-asst-msg-attach-pill").length) {
+  throw new Error("User message bubble did not render sent attachment pills");
+}
+
+const contChipBtn = findNodes(view.root, (n) => n.tagName === "BUTTON" && getNodeText(n).includes("继续拆解第 9~10 片"))[0];
+if (!contChipBtn) throw new Error("Stepped-batch continuation chip missing from next_steps");
+contChipBtn.click();
+await flushAsync();
+const contChatCall = fetchCalls.find(
+  (c) => c.url.startsWith("/api/modules/ai_assistant/chat") && Number(c.body?.batch_start_chunk) === 8
+);
+if (!contChatCall) {
+  throw new Error("Clicking continuation chip did not trigger batch_start_chunk=8 chat call");
+}
+const postAttachErrs = toastRoot.children.filter((c) => c.classList.contains("toast-error"));
+if (postAttachErrs.length > 0) {
+  throw new Error(`Unexpected toast-error in Scene 5: ${postAttachErrs.map(getNodeText).join("; ")}`);
+}
 
 kbView.destroy();
 view.destroy();

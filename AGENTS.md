@@ -48,19 +48,19 @@
    - **分支清理**：合并与打标推送完成后及时删除已使命终结的临时工作分支，确认远端 `main` 与新标签就位。
 
 ## 5. 当前代码基线快照
-- **当前主干最新正式版本**：**`v3.0.2`**（在 `v3.0.1` 基础上修复 `AiAssistantView` 与 `KnowledgeSettingsView` 的 `TaskActivityBar.track` 调用错误、默认就绪模型选择、发送态占位与抽屉目录刷新，并升级 Node.js 真实交互端到端验证与 `.activityBar.run(` 全库静态防线）。
+- **当前主干最新正式版本**：**`v3.1.0`**（在 `v3.0.2` 基础上为 AI 助手新增纯文本/SQL 剪贴板粘贴与拖拽、`.csv`/`.tsv` (<=2MB) 及文本/SQL (<=5MB) 上传、语义切片、CSV `:memory:` 只读 SQLite `csv_data` 沙箱、按需检索工具及 `stepped_batch` Map-Reduce 防爆窗分步拆解闭环）。
 - **核心入口、脚本与工具**：
-  - `app.py`（FastAPI `3.0.2` 微内核、`APP_VERSION`、前端 `.html/.js/.css` 防缓存头、`check_static_ui_version_sync`、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）、`knowledge_packs/`（DWS 9.1 / Inceptor 9.x / PGSQL 19 离线知识包 `.json.gz` 与源码 `.md`，不打入安装包，含 `build_packs.py` 与 GitHub 自助下载索引）。
+  - `app.py`（FastAPI `3.1.0` 微内核、`APP_VERSION`、前端 `.html/.js/.css` 防缓存头、`check_static_ui_version_sync`、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）、`knowledge_packs/`（DWS 9.1 / Inceptor 9.x / PGSQL 19 离线知识包 `.json.gz` 与源码 `.md`，不打入安装包，含 `build_packs.py` 与 GitHub 自助下载索引）。
   - `tools/admin_console/` & `DataOG_Console.command`、`tools/keygen_src/` & `tools/build_keygen.py`、`demo_sandbox/`（启明商业银行信创三引擎演示沙箱）：全部严格排除于客户安装包之外。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
-  - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.0.2"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（6 领域子路由含 `knowledge.py`）、`schemas.py`、`models.py`。
+  - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.1.0"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（6 领域子路由含 `knowledge.py`）、`schemas.py`、`models.py`。
   - `knowledge_hub.py` & `builtin_dialect_kb.py`（零新增依赖支持 `.md`/`.txt`/`.sql`/`.html`/`.json`/`.csv`/`.docx`/`.xlsx`，FTS5+BM25 中英/错误码切词、方言硬过滤、11 篇内置方言速查卡、`.json.gz` 知识包、可选 `/embeddings` RRF 与离线回退，Layer 2 私有隔离）、`sql_risk_guard.py`（词法多语句切分 + `READONLY`/`STANDARD_WRITE`/`HIGH_RISK` 定级 + 安全影响行数探针）。
   - `storage_paths.py`、`storage/`、`workspace_hub.py`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）、`license_hub.py` & `_license_native_src/`、`asset_store.py`、`standard_catalog.py`、`offline_report/`、`import_progress.py`、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`llm_hub.py`（含 `create_embeddings`）、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`、`core/dws_engine.py`。
 - **五大独立插件模块 (`modules/`, 导出 `MODULE_SPEC`, 严格零互引)**：
-  - `modules/standard_migrator/`、`modules/cross_comparator/`、`modules/ddl_translator/`、`modules/data_explorer/`（`scope="private"`）、`modules/ai_assistant/`（`scope="private"`，在线连库/纯方言双模式、7 安全只读工具与渐进多轮探索、DDL/写提案分级确认执行闭环）。
+  - `modules/standard_migrator/`、`modules/cross_comparator/`、`modules/ddl_translator/`、`modules/data_explorer/`（`scope="private"`）、`modules/ai_assistant/`（`scope="private"`，在线连库/纯方言双模式、10 安全只读工具含 `attachments.py` CSV 内存只读 SQLite 沙箱与 `stepped_batch` Map-Reduce 防爆窗拆解、DDL/写提案分级确认执行闭环）。
 - **前端 ES Modules 工作台 (`static/`)**：
-  - `index.html`、`css/tokens.css` & `workbench.css`、`js/main.js`（零静态 View 依赖）、`js/core/`、`js/apps/`（`index.js` + `ai_assistant/` 独立懒加载应用）、`js/api/`、`js/ui/`、`js/views/`（含 `knowledge_view.js`、`workspace_merge_wizard.js`、`standard_migrator/modals.js`、`cross_comparator/*.js`）。
-- **自动化测试套件 (`tests/`，共 87 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (21)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (6)、`test_ai_assistant_and_kb.py` (5)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
+  - `index.html`、`css/tokens.css` & `workbench.css`、`js/main.js`（零静态 View 依赖）、`js/core/`、`js/apps/`（`index.js` + `ai_assistant/` 独立懒加载应用，支持粘贴/拖拽/上传文本与 CSV 及 `<dialog>` 分片预览）、`js/api/`、`js/ui/`、`js/views/`（含 `knowledge_view.js`、`workspace_merge_wizard.js`、`standard_migrator/modals.js`、`cross_comparator/*.js`）。
+- **自动化测试套件 (`tests/`，共 88 项全绿)**：`test_core.py` (16)、`test_platform.py` (18)、`test_modules_and_api.py` (21)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (6)、`test_ai_assistant_and_kb.py` (6)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
 
 ## 6. AI 只读探查四道硬隔离铁律
 涉及 AI 自动查询必须复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束：

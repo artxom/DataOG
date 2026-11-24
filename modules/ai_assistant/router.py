@@ -7,14 +7,16 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from core.platform.context import PlatformContext, get_platform_context
 from core.platform.http_utils import file_download_response, json_error, run_tracked_task
+from modules.ai_assistant.attachments import MAX_TEXT_BYTES, get_attachment_limits
 from modules.ai_assistant.schemas import (
     AssistantChatPayload,
     AssistantExportResultPayload,
+    AssistantPastedAttachmentPayload,
     AssistantSessionCreatePayload,
     AssistantSessionUpdatePayload,
     ProposalConfirmPayload,
@@ -32,7 +34,67 @@ def api_list_assistant_dialects(ctx: PlatformContext = Depends(get_platform_cont
         "dialects": ctx.knowledge_hub.list_supported_dialects(),
         "llm_models": ctx.llm_hub.list_available_models(),
         "knowledge_summary": ctx.knowledge_hub.get_summary(),
+        "attachment_limits": get_attachment_limits(),
     }
+
+
+@router.post("/attachments/upload")
+async def api_upload_assistant_attachment(
+    file: UploadFile = File(...),
+    session_id: str = Form(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    raw_bytes = await file.read(MAX_TEXT_BYTES + 1024)
+    try:
+        att = AiAssistantService(ctx).upload_attachment_bytes(
+            filename=file.filename or "attachment.txt",
+            raw_bytes=raw_bytes,
+            session_id=session_id,
+        )
+        return {"ok": True, "attachment": att}
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+
+@router.post("/attachments/text")
+def api_create_pasted_attachment(
+    payload: AssistantPastedAttachmentPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        att = AiAssistantService(ctx).create_pasted_attachment(
+            content=payload.content,
+            filename=payload.filename,
+            file_hint=payload.file_hint,
+            session_id=payload.session_id,
+        )
+        return {"ok": True, "attachment": att}
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+
+@router.get("/attachments/{attachment_id}")
+def api_get_assistant_attachment(
+    attachment_id: str,
+    include_chunks: bool = Query(default=True),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    att = AiAssistantService(ctx).get_attachment(
+        attachment_id, include_raw=False, include_chunks=include_chunks
+    )
+    if att is None:
+        return json_error("未找到指定的附件或附件已过期清理", 404)
+    return {"ok": True, "attachment": att}
+
+
+@router.delete("/attachments/{attachment_id}")
+def api_delete_assistant_attachment(
+    attachment_id: str,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    if not AiAssistantService(ctx).delete_attachment(attachment_id):
+        return json_error("未找到要移除的附件", 404)
+    return {"ok": True, "message": "附件已移除"}
 
 
 @router.get("/sessions")
@@ -159,6 +221,10 @@ async def api_assistant_chat(
             "max_steps": payload.max_steps,
             "sample_limit": payload.sample_limit,
             "clarification_reply": payload.clarification_reply,
+            "attachment_ids": payload.attachment_ids,
+            "large_payload_strategy": payload.large_payload_strategy,
+            "batch_start_chunk": payload.batch_start_chunk,
+            "batch_max_chunks": payload.batch_max_chunks,
         },
         inject_progress_cb=True,
         inject_cancel_check=True,

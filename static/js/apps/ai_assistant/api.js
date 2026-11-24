@@ -3,7 +3,7 @@
  * 严格遵守 3.0 隔离规范：仅从 core/http.js 导入基础请求原语。
  */
 
-import { downloadApiFile, requestJson, withRequestOpts } from "../../core/http.js";
+import { downloadApiFile, requestJson, uploadFormData, withRequestOpts } from "../../core/http.js";
 
 const BASE = "/api/modules/ai_assistant";
 
@@ -37,6 +37,27 @@ export const assistantApi = {
 
   sendChatTurn: (payload, opts = {}) =>
     requestJson(`${BASE}/chat`, withRequestOpts({ method: "POST", body: payload }, opts)),
+
+  uploadAttachment: (file, sessionId = "") => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (sessionId) fd.append("session_id", sessionId);
+    return uploadFormData(`${BASE}/attachments/upload`, fd);
+  },
+
+  createPastedAttachment: (payload) =>
+    requestJson(`${BASE}/attachments/text`, { method: "POST", body: payload }),
+
+  getAttachment: (attachmentId, includeChunks = true) =>
+    requestJson(
+      `${BASE}/attachments/${encodeURIComponent(attachmentId)}?include_chunks=${includeChunks ? "true" : "false"}`,
+      { cache: "no-store" }
+    ),
+
+  deleteAttachment: (attachmentId) =>
+    requestJson(`${BASE}/attachments/${encodeURIComponent(attachmentId)}`, {
+      method: "DELETE",
+    }),
 
   approveProposal: (proposalId, payload) =>
     requestJson(`${BASE}/proposals/${encodeURIComponent(proposalId)}/confirm`, {
