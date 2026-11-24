@@ -1609,6 +1609,20 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                 self.assertTrue(r_lin["ok"])
                 self.assertIn("tmp_stage_txn", [t.lower() for t in r_lin["related_tables"]])
 
+                # 验证 direction="upstream" 在中间表上严格不拉入下游表
+                r_mid_up = tb.tool_trace_attachment_lineage(
+                    {"attachment_id": att["attachment_id"], "table_name": "tmp_stage_txn", "direction": "upstream"}
+                )
+                self.assertTrue(r_mid_up["ok"])
+                mid_up_tbls = [t.lower() for t in r_mid_up["related_tables"]]
+                self.assertIn("ods.raw_txn", mid_up_tbls)
+                self.assertNotIn("dm.rpt_monthly_settle", mid_up_tbls)
+
+                # 验证 search_attachment 兼容 pattern 别名
+                r_srch = tb.tool_search_attachment({"attachment_id": att["attachment_id"], "pattern": "rpt_monthly_settle"})
+                self.assertTrue(r_srch["ok"])
+                self.assertGreater(r_srch["hit_count"], 0)
+
                 r_stmt = tb.tool_read_attachment_statement(
                     {"attachment_id": att["attachment_id"], "stmt_id": unb["stmt_id"], "compact": True}
                 )
@@ -1623,6 +1637,36 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                 self.assertIn("UNBOUNDED_DML", {f["code"] for f in r_rep["static_findings"]})
             finally:
                 ctx.close()
+
+        # 5. 对抗语法边界验证：Oracle 无显式 DECLARE 变量、内嵌 WITH CTE、子查询逗号连接、字符串内 /* 与 -- 不阻断 DIALECT_COMPAT
+        adv_sql = "\n".join(
+            [
+                "CREATE OR REPLACE PROCEDURE sp_ora_edge(p_dt VARCHAR2) IS",
+                "  v_cnt NUMBER := 0;",
+                "  v_msg VARCHAR2(200);",
+                "BEGIN",
+                "  CREATE TEMP TABLE tmp_cte_ok AS",
+                "  WITH cte_daily AS (SELECT id, amt FROM ods.raw_txns)",
+                "  SELECT id, SUM(amt) AS s_amt FROM cte_daily GROUP BY id;",
+                "  INSERT INTO dwd.dst_edge",
+                "  SELECT a.id, b.col2 FROM ods.t1 a, (SELECT col1, col2 FROM ods.t2) b WHERE a.id = b.col1;",
+                "  SELECT '/* not a comment' FROM ods.a;",
+                "  SELECT '-- not a comment' FROM ods.b WHERE ROWNUM <= 10 AND NVL(x, 0) > 0;",
+                "END;",
+            ]
+        )
+        an_adv = analyze_sql_static(adv_sql, dialect="DWS")
+        var_names = [v["name"] for v in an_adv["control_flow"]["variables"]]
+        self.assertIn("v_cnt", var_names)
+        self.assertIn("v_msg", var_names)
+        cte_stmt = next(s for s in an_adv["statements"] if s["target_table"] == "tmp_cte_ok")
+        self.assertIn("cte_daily", cte_stmt["ctes"])
+        self.assertEqual(cte_stmt["source_tables"], ["ods.raw_txns"])
+        sub_stmt = next(s for s in an_adv["statements"] if s["target_table"] == "dwd.dst_edge")
+        self.assertEqual(sub_stmt["source_tables"], ["ods.t1", "ods.t2"])
+        adv_titles = [f["title"] for f in an_adv["static_findings"]]
+        self.assertTrue(any("ORACLE_ROWNUM" in t for t in adv_titles), adv_titles)
+        self.assertTrue(any("ORACLE_NVL" in t for t in adv_titles), adv_titles)
 
     def test_execution_planner_lightweight_pruning_and_anti_loop_guardrail(self) -> None:
         """验证 ExecutionPlanner 在 lightweight 模型下的血缘切片/分段决策、工具裁剪与防原地打转护栏."""
@@ -1691,6 +1735,23 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
             dialect="DWS",
         )
         self.assertEqual(plan_full["strategy"], "full_context")
+
+        # 1d. 多附件场景 ([readme.txt, sp_risk_calc.sql]) 下 lineage_sliced 精准绑定 SQL 附件而非附件 0
+        txt_att = process_attachment_payload("readme.txt", b"analysis note\n" * 4, dialect="DWS")
+        txt_att["attachment_id"] = "att_note_0"
+        att["attachment_id"] = "att_sql_1"
+        plan_multi_lin = ExecutionPlanner.plan(
+            model_caps=caps_flash,
+            turn_attachments=[txt_att, att],
+            clean_prompt="请排查 dm.rpt_risk_final 上游血缘问题",
+            req_strategy="auto",
+            run_mode="standard",
+            dialect="DWS",
+        )
+        self.assertEqual(plan_multi_lin["strategy"], "lineage_sliced")
+        self.assertEqual(plan_multi_lin["stages"][0]["attachment_id"], "att_sql_1")
+        self.assertEqual(plan_multi_lin["stages"][0]["filename"], "sp_risk_calc.sql")
+        self.assertGreaterEqual(len(plan_multi_lin["stages"][0]["finding_ids"]), 1)
 
         # 2. 防原地打转规则单测（重复完全一致调用 & 行号高度重叠调用）
         steer_dup = detect_tool_loop_and_build_steering(
@@ -2129,6 +2190,170 @@ class TestAiAssistantAndKnowledgeBaseV3(unittest.TestCase):
                     c_res = client.post(f"/api/modules/ai_assistant/runs/{run_id_c}/cancel")
                     self.assertEqual(c_res.status_code, 200)
                     self.assertEqual(c_res.json()["run"]["status"], "cancelled")
+
+                    # --- 场景 B2：模拟进程重启遗留孤儿 running 任务 -> active-run/events 自动对账为 paused_recoverable -> /resume 成功 ---
+                    from modules.ai_assistant.service import AiAssistantService as _SvcCls
+
+                    svc_tmp = _SvcCls(ctx)
+                    s_orp = svc_tmp.create_session(title="孤儿重启恢复测试", dialect="DWS")
+                    orp_run = svc_tmp.create_run(
+                        session_id=s_orp["session_id"],
+                        run_mode="goal",
+                        provider_id="ds_flash",
+                        model="deepseek-v4-flash",
+                        request_payload={
+                            "session_id": s_orp["session_id"],
+                            "prompt": "重启恢复验证",
+                            "dialect": "DWS",
+                            "provider_id": "ds_flash",
+                            "model": "deepseek-v4-flash",
+                            "attachment_ids": [],
+                            "run_mode": "goal",
+                            "max_goal_steps": 6,
+                        },
+                    )
+                    orp_rid = orp_run["run_id"]
+                    svc_tmp.update_run(orp_rid, status="running", current_stage="阶段 1/2")
+                    act_orp = client.get(f"/api/modules/ai_assistant/sessions/{s_orp['session_id']}/active-run").json()
+                    self.assertEqual(act_orp["run"]["status"], "paused_recoverable")
+                    evs_orp = _parse_id_sse(client.get(f"/api/modules/ai_assistant/runs/{orp_rid}/events").text)
+                    self.assertIn("run_paused", [nm for _, nm, _ in evs_orp])
+                    orp_last_id = evs_orp[-1][0]
+                    res_orp = client.post(f"/api/modules/ai_assistant/runs/{orp_rid}/resume", json={"extra_steps": 5})
+                    self.assertEqual(res_orp.status_code, 200)
+                    evs_orp2 = _parse_id_sse(
+                        client.get(
+                            f"/api/modules/ai_assistant/runs/{orp_rid}/events",
+                            headers={"Last-Event-ID": str(orp_last_id)},
+                        ).text
+                    )
+                    self.assertIn("done", [nm for _, nm, _ in evs_orp2])
+
+                    # --- 场景 B3：多 SQL 附件防 F001 碰撞 + 终稿剥离 dataog_meta 不泄露到 content_delta ---
+                    up_m1 = client.post(
+                        "/api/modules/ai_assistant/attachments/upload",
+                        files={"file": ("proc_a.sql", b"DELETE FROM dm.t_a;\nINSERT INTO dm.t_a SELECT id FROM ods.a;", "text/plain")},
+                    ).json()["attachment"]
+                    up_m2 = client.post(
+                        "/api/modules/ai_assistant/attachments/upload",
+                        files={"file": ("proc_b.sql", b"DELETE FROM dm.t_b;\nINSERT INTO dm.t_b SELECT id FROM ods.b;", "text/plain")},
+                    ).json()["attachment"]
+
+                    seen_multi_prompts: List[str] = []
+
+                    def _mock_multi_meta_stream(**kwargs):
+                        msgs = kwargs.get("messages") or []
+                        sys_txt = msgs[0]["content"] if msgs else ""
+                        usr_txt = msgs[-1]["content"] if msgs else ""
+                        seen_multi_prompts.append(usr_txt)
+                        if "全景 Markdown 分析报告" in sys_txt:
+                            raw_final = '### 多附件全景报告\n\n已核验 A1-F001 与 A2-F001。\n```dataog_meta\n{"next_steps":[{"label":"查看修复DDL","prompt":"生成修复DDL"}]}\n```'
+                            yield {"type": "content", "delta": raw_final}
+                            yield {"type": "done", "provider_name": "DeepSeekFlash", "model": "deepseek-v4-flash", "reasoning": "", "content": raw_final, "cancelled": False}
+                            return
+                        verdicts = {}
+                        for tag in ("A1-F001", "A2-F001"):
+                            if tag in usr_txt:
+                                verdicts[tag] = {"status": "confirmed", "reason": "无 WHERE 删除", "fix": "补充过滤条件"}
+                        yield {
+                            "type": "done",
+                            "provider_name": "DeepSeekFlash",
+                            "model": "deepseek-v4-flash",
+                            "reasoning": "",
+                            "content": json.dumps({"summary": "已核查", "finding_verdicts": verdicts}, ensure_ascii=False),
+                            "cancelled": False,
+                        }
+
+                    with unittest.mock.patch.object(
+                        ctx.llm_hub, "chat_completion_stream", side_effect=_mock_multi_meta_stream
+                    ):
+                        r_m = client.post(
+                            "/api/modules/ai_assistant/runs",
+                            json={
+                                "prompt": "全量审计两份 SQL 附件",
+                                "dialect": "DWS",
+                                "provider_id": "ds_flash",
+                                "model": "deepseek-v4-flash",
+                                "attachment_ids": [up_m1["attachment_id"], up_m2["attachment_id"]],
+                                "run_mode": "goal",
+                            },
+                        ).json()
+                        m_rid = r_m["run"]["run_id"]
+                        m_frames = _parse_id_sse(client.get(f"/api/modules/ai_assistant/runs/{m_rid}/events").text)
+                    self.assertTrue(any("A1-F001" in p for p in seen_multi_prompts))
+                    self.assertTrue(any("A2-F001" in p for p in seen_multi_prompts))
+                    for _, nm, payload_ev in m_frames:
+                        if nm == "content_delta":
+                            self.assertNotIn("dataog_meta", payload_ev.get("delta", ""))
+                    done_m = [p for _, nm, p in m_frames if nm == "done"][-1]
+                    self.assertEqual(done_m["assistant_message"]["next_steps"][0]["label"], "查看修复DDL")
+
+                    # --- 场景 B4：无附件 Goal 模式 + 在线连库（SQLite）支持环境上下文注入与工具探索闭环 ---
+                    db_path = os.path.join(tmp, "goal_online.sqlite")
+                    with contextlib.closing(sqlite3.connect(db_path)) as sconn:
+                        sconn.execute("CREATE TABLE cust_orders (order_id INT PRIMARY KEY, amt REAL)")
+                        sconn.execute("INSERT INTO cust_orders VALUES (1, 99.5)")
+                        sconn.commit()
+                    conn_prof = ctx.connection_hub.save_profile(
+                        {
+                            "name": "GoalSQLite",
+                            "driver_track": "NATIVE",
+                            "db_type": "SQLITE",
+                            "sqlite_path": db_path,
+                            "default_schema": "main",
+                        }
+                    )
+                    ctx.metadata_hub.refresh_catalog(conn_prof.connection_id)
+
+                    online_goal_calls = {"n": 0}
+                    online_prompts: List[str] = []
+
+                    def _mock_online_goal_stream(**kwargs):
+                        online_goal_calls["n"] += 1
+                        msgs = kwargs.get("messages") or []
+                        sys_txt = msgs[0]["content"] if msgs else ""
+                        usr_txt = msgs[-1]["content"] if msgs else ""
+                        online_prompts.append(usr_txt)
+                        if "全景 Markdown 分析报告" in sys_txt:
+                            md = "### 在线 Goal 排查报告\n\n已核实 `main.cust_orders` 表结构。"
+                            yield {"type": "content", "delta": md}
+                            yield {"type": "done", "provider_name": "DeepSeekFlash", "model": "deepseek-v4-flash", "reasoning": "", "content": md, "cancelled": False}
+                            return
+                        if online_goal_calls["n"] == 1:
+                            act = '```dataog_action\n{"action":"tool","tool":"inspect_table","args":{"table_ref":"main.cust_orders"},"purpose":"核查订单表结构"}\n```'
+                            yield {"type": "done", "provider_name": "DeepSeekFlash", "model": "deepseek-v4-flash", "reasoning": "", "content": act, "cancelled": False}
+                            return
+                        yield {
+                            "type": "done",
+                            "provider_name": "DeepSeekFlash",
+                            "model": "deepseek-v4-flash",
+                            "reasoning": "",
+                            "content": json.dumps({"summary": "已通过 inspect_table 核实 cust_orders 字段 order_id/amt"}, ensure_ascii=False),
+                            "cancelled": False,
+                        }
+
+                    with unittest.mock.patch.object(
+                        ctx.llm_hub, "chat_completion_stream", side_effect=_mock_online_goal_stream
+                    ):
+                        r_on = client.post(
+                            "/api/modules/ai_assistant/runs",
+                            json={
+                                "prompt": "核实 cust_orders 表结构",
+                                "work_mode": "connection",
+                                "connection_id": conn_prof.connection_id,
+                                "focus_tables": ["main.cust_orders"],
+                                "provider_id": "ds_flash",
+                                "model": "deepseek-v4-flash",
+                                "run_mode": "goal",
+                            },
+                        ).json()
+                        on_frames = _parse_id_sse(
+                            client.get(f"/api/modules/ai_assistant/runs/{r_on['run']['run_id']}/events").text
+                        )
+                    self.assertIn("tool_start", [nm for _, nm, _ in on_frames])
+                    self.assertIn("tool_end", [nm for _, nm, _ in on_frames])
+                    self.assertIn("done", [nm for _, nm, _ in on_frames])
+                    self.assertTrue(any("cust_orders" in p for p in online_prompts))
 
                 # --- 场景 C：.dataog.db 工作区导出零私有泄露 + 删除会话级联清理 runs & run_events ---
                 ws_bytes, _ = ctx.workspace_hub.export_workspace_bytes()
@@ -2893,7 +3118,53 @@ globalThis.fetch = async (rawUrl, opts = {}) => {
           ],
         },
         checkpoint: { completed_stage_ids: ["stage_1"] },
+        last_event_id: 12,
       },
+    };
+  } else if (url === "/api/modules/ai_assistant/runs/run_rec_9/resume" && method === "POST") {
+    payload = {
+      ok: true,
+      run: {
+        run_id: "run_rec_9",
+        session_id: "sess_paused_recover",
+        status: "running",
+        progress_pct: 65,
+        last_event_id: 13,
+      },
+    };
+  } else if (url.startsWith("/api/modules/ai_assistant/runs/run_rec_9/events")) {
+    const encoder = new TextEncoder();
+    const recStream = new ReadableStream({
+      start(controller) {
+        const pushRec = (id, evObj) => {
+          controller.enqueue(encoder.encode(`id: ${id}\nevent: ${evObj.type}\ndata: ${JSON.stringify(evObj)}\n\n`));
+        };
+        pushRec(13, { type: "status", stage: "从断点恢复执行", detail: "继续第 2 阶段", resumed: true });
+        pushRec(14, {
+          type: "done",
+          ok: true,
+          run: { run_id: "run_rec_9", status: "completed", progress_pct: 100 },
+          assistant_message: { id: "m_rec_a1", role: "assistant", content: "历史断点恢复完成", steps: [] },
+          session: {
+            session_id: "sess_paused_recover",
+            title: "恢复历史断点会话",
+            work_mode: "dialect",
+            dialect: "DWS",
+            turn_count: 1,
+            messages: [
+              { id: "m_rec_1", role: "user", content: "继续分析旧断点", attachments: [] },
+              { id: "m_rec_a1", role: "assistant", content: "历史断点恢复完成", steps: [] },
+            ],
+          },
+        });
+        controller.close();
+      },
+    });
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([["content-type", "text/event-stream"]]),
+      body: recStream,
     };
   } else if (url.endsWith("/active-run")) {
     payload = { ok: true, run: null };
@@ -3278,7 +3549,7 @@ store.state.llmProviders = [
 ];
 view.render();
 
-// 7a. 点击模型能力探查胶囊触发 /api/platform/llm/probe-model 并刷新胶囊读数
+// 7a. 点击模型能力探查胶囊触发 /api/platform/llm/probe-model 并刷新胶囊读数，且切换模型立即更新胶囊
 const probeCapsuleBtn = view.root.querySelector(".ai-asst-probe-capsule");
 if (!probeCapsuleBtn) throw new Error("Model probe capsule button missing in AiAssistantView toolbar");
 probeCapsuleBtn.click();
@@ -3291,16 +3562,42 @@ const refreshedCapsule = view.root.querySelector(".ai-asst-probe-capsule");
 if (!refreshedCapsule || !getNodeText(refreshedCapsule).includes("实测") || !getNodeText(refreshedCapsule).includes("TTFT")) {
   throw new Error(`Probe capsule did not refresh with live probe telemetry: ${getNodeText(refreshedCapsule)}`);
 }
+// 切换模型（无附件时）必须立即重绘探查胶囊
+const hdrParts = view.getHeaderParts();
+const modelSel = findNodes(hdrParts.right, (n) => n.tagName === "SELECT" && n.getAttribute("aria-label") === "选择 AI 模型")[0];
+const otherM = (store.state.llmModels || []).find(
+  (m) => (m.ready || m.has_api_key) && `${m.provider_id}::${m.model}` !== view.selectedModelKey
+);
+if (!modelSel || !otherM) {
+  throw new Error("Expected modelSelect and >=2 ready models to verify probe capsule refresh on model change");
+}
+const prevKey = view.selectedModelKey;
+const prevCapTxt = getNodeText(view.root.querySelector(".ai-asst-probe-capsule"));
+modelSel.value = `${otherM.provider_id}::${otherM.model}`;
+for (const fn of (modelSel.listeners.get("change") || [])) fn({ target: modelSel });
+const afterCapTxt = getNodeText(view.root.querySelector(".ai-asst-probe-capsule"));
+if (afterCapTxt === prevCapTxt || !afterCapTxt.includes("32K")) {
+  throw new Error(`Switching modelSelect without attachments did not refresh probe capsule: before=${prevCapTxt}, after=${afterCapTxt}`);
+}
+modelSel.value = prevKey;
+for (const fn of (modelSel.listeners.get("change") || [])) fn({ target: modelSel });
 
-// 7b. SettingsView AI 模型页「探查能力与窗口」按钮与能力档案读数卡
+// 7b. SettingsView AI 模型页「探查能力与窗口」按钮：保留未保存草稿 + 刷新能力档案读数卡
 const { SettingsView } = await imp("static/js/views/settings_view.js");
 const settingsView = new SettingsView();
 const settingsHost = new MockNode("div");
 settingsView.mount(settingsHost, { section: "llm" });
+if (settingsView.llmDraft) {
+  settingsView.llmDraft.api_key = "sk-unsaved-draft-key";
+  settingsView.llmDraft.model_tier = "standard";
+}
 const settingsProbeBtn = settingsView.root.querySelector(".ai-llm-probe-btn");
 if (!settingsProbeBtn) throw new Error("SettingsView 探查能力与窗口 button missing");
 settingsProbeBtn.click();
 await flushAsync(4);
+if (settingsView.llmDraft?.api_key !== "sk-unsaved-draft-key" || settingsView.llmDraft?.model_tier !== "standard") {
+  throw new Error(`SettingsView probe wiped unsaved draft edits: ${JSON.stringify(settingsView.llmDraft)}`);
+}
 const probeReadout = settingsView.root.querySelector(".ai-llm-probe-readout");
 if (!probeReadout || !getNodeText(probeReadout).includes("甜蜜区 18K") || !getNodeText(probeReadout).includes("live_probe")) {
   throw new Error(`SettingsView probe readout missing expected values: ${getNodeText(probeReadout)}`);
@@ -3352,14 +3649,23 @@ if (!getNodeText(view.root).includes("断点续跑全景报告")) {
   throw new Error("Resumed Goal run did not render final completed Markdown report");
 }
 
-// 7d. 切换至含断点任务的会话时自动调用 /active-run 恢复断点卡片
+// 7d. 切换至含断点任务的会话时自动调用 /active-run 恢复断点卡片，且点击续跑携带 activeRun.last_event_id=12 而非 0
 await view.selectSession("sess_paused_recover");
 await flushAsync(4);
 if (!fetchCalls.some((c) => c.url === "/api/modules/ai_assistant/sessions/sess_paused_recover/active-run")) {
   throw new Error("selectSession did not fetch /active-run for recovery");
 }
-if (!view.root.querySelector(".ai-asst-recoverable-card") || !view.root.querySelector(".ai-asst-resume-btn")) {
+const recResumeBtn = view.root.querySelector(".ai-asst-resume-btn");
+if (!view.root.querySelector(".ai-asst-recoverable-card") || !recResumeBtn) {
   throw new Error("selectSession did not render recoverable checkpoint card for paused run");
+}
+recResumeBtn.click();
+await flushAsync(6);
+const recEvCall = fetchCalls.find(
+  (c) => c.url.includes("/api/modules/ai_assistant/runs/run_rec_9/events?after_event_id=12") && String(c.headers["Last-Event-ID"] || "") === "12"
+);
+if (!recEvCall) {
+  throw new Error("Resuming recovered session run did not carry after_event_id=12 and Last-Event-ID=12");
 }
 
 const scene7Errs = toastRoot.children.filter((c) => c.classList.contains("toast-error"));

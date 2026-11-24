@@ -426,9 +426,7 @@ export class AiAssistantView {
         disabled: models.length === 0 || this.loading,
         onChange: (e) => {
           this.selectedModelKey = e.target.value;
-          if (this.pendingAttachments.length) {
-            this.render();
-          }
+          this.render();
         },
       },
       models.length
@@ -1294,8 +1292,12 @@ export class AiAssistantView {
 
     const seedRun = this.activeRun && this.activeRun.run_id === runId ? this.activeRun : null;
     const seedPlan = seedRun?.plan && typeof seedRun.plan === "object" ? seedRun.plan : null;
+    const seedDoneSet = new Set(seedRun?.checkpoint?.completed_stage_ids || []);
     const seedStages = Array.isArray(seedPlan?.stages)
-      ? seedPlan.stages.map((s) => ({ ...s }))
+      ? seedPlan.stages.map((s) => ({
+          ...s,
+          status: seedDoneSet.has(s.stage_id) ? "done" : s.status || "pending",
+        }))
       : [];
 
     this._lastRunEventId = Math.max(Number(afterEventId || 0), 0);
@@ -1451,12 +1453,17 @@ export class AiAssistantView {
   async resumeActiveRun(runId = "") {
     const targetId = runId || this.activeRun?.run_id || "";
     if (!targetId || this.loading) return;
+    // 在 /resume 前锁定已有事件光标，避免切换会话或刷新后从 0 重放旧的 run_paused/error 帧
+    const resumeCursor = Math.max(
+      Number(this._lastRunEventId || 0),
+      Number(this.activeRun?.last_event_id || 0)
+    );
     try {
       const res = await assistantApi.resumeRun(targetId, { extra_steps: 15 });
       if (res?.run) {
         this.activeRun = res.run;
       }
-      await this._attachToRunStream(targetId, { afterEventId: this._lastRunEventId });
+      await this._attachToRunStream(targetId, { afterEventId: resumeCursor });
     } catch (err) {
       Toast.error(err.message || "从断点恢复执行失败");
     }

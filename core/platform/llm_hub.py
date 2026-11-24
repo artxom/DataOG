@@ -196,6 +196,7 @@ _UNSUPPORTED_THINKING_PATTERNS: Tuple[str, ...] = (
     "reasoning_effort",
     "enable_thinking",
     "thinking",
+    "stream_options",
 )
 
 _SMALL_LOCAL_TAG_RE = re.compile(r"(?:^|[:\-_])(?:0\.5b|1\.5b|3b|4b|7b|8b|9b|14b|32b)(?:$|[:\-_])")
@@ -221,37 +222,62 @@ _PROBE_CALIBRATION_SQL = (
     "WHERE a.biz_date = '20261124' GROUP BY a.cust_id; -- 标定Token换算比率，请仅回复OK"
 )
 
-_CTX_LIMIT_NUM_PATTERNS: Tuple[re.Pattern[str], ...] = (
+_NUM_TOKEN_RE = r"(\d{1,3}(?:,\d{3})+|\d{4,8})"
+
+_CTX_LIMIT_STRICT_PATTERNS: Tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"(?i)(?:maximum\s+context\s+length(?:\s+is|\s+exceeded)?|max_model_len|context_length|context\s+window|input\s+token\s+limit|token\s+limit|maximum\s+of|limit(?:\s+is)?)\D{0,18}(\d{4,8})\b"
+        rf"(?i)(?:maximum\s+context\s+length(?:\s+is|\s+exceeded|\s+of)?|"
+        rf"maximum(?:\s+number\s+of)?\s+tokens?\s*(?:allowed|is|limit|of)?|"
+        rf"max_model_len|context_length|context\s+window|input\s+token\s+limit|"
+        rf"token\s+limit|maximum\s+of|limit(?:\s+is|\s+of)?|allowed)\D{{0,18}}{_NUM_TOKEN_RE}\b"
     ),
-    re.compile(r"(?i)\((\d{4,8})\s*tokens?\)"),
-    re.compile(r"(?i)\b(\d{4,8})\s*tokens?\s*(?:maximum|limit|max|allowed)"),
-    re.compile(r"(?i)\((\d{1,4})\s*k(?:\s*tokens?)?\)"),
-    re.compile(r"(?i)(?:context|limit|window|max)\D{0,12}(\d{1,4})\s*k\b"),
+    re.compile(rf"(?i)\b{_NUM_TOKEN_RE}\s*tokens?\s*(?:maximum|limit|max|allowed)"),
 )
+
+_CTX_LIMIT_K_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?i)\((\d{1,4})\s*k(?:\s*tokens?)?\)"),
+    re.compile(r"(?i)(?:context|limit|window|max|allowed)\D{0,12}(\d{1,4})\s*k\b"),
+)
+
+_CTX_LIMIT_PAREN_FALLBACK_RE = re.compile(rf"(?i)\({_NUM_TOKEN_RE}\s*tokens?\)")
+
+
+def _parse_int_commas(raw: str) -> Optional[int]:
+    try:
+        return int(str(raw or "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_context_limit_from_error(detail: str) -> Optional[int]:
-    """从上游 400/413 上下文超限报错文本中提取真实最大上下文窗口数值（Tokens）."""
+    """从上游 400/413 上下文超限报错文本中提取真实最大上下文窗口数值（兼容千分位逗号与多数字误判防护）."""
     text = str(detail or "").strip()
     if not text:
         return None
-    for idx, pat in enumerate(_CTX_LIMIT_NUM_PATTERNS):
+    for pat in _CTX_LIMIT_STRICT_PATTERNS:
         m = pat.search(text)
         if not m:
             continue
-        try:
-            raw_num = int(m.group(1))
-        except (TypeError, ValueError):
-            continue
-        # 后两条正则匹配 `32k` / `64k` 单位
-        if idx >= 3:
-            val = raw_num * 1024
-        else:
-            val = raw_num
-        if 4096 <= val <= 10_000_000:
+        val = _parse_int_commas(m.group(1))
+        if val is not None and 4096 <= val <= 10_000_000:
             return val
+    for pat in _CTX_LIMIT_K_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
+        val = _parse_int_commas(m.group(1))
+        if val is not None:
+            scaled = val * 1024
+            if 4096 <= scaled <= 10_000_000:
+                return scaled
+    # 兜底匹配 `(32768 tokens)`：若报错同时出现请求数与上限数，取较小值作为窗口上限（因超限必有 input > limit）
+    paren_vals: List[int] = []
+    for m in _CTX_LIMIT_PAREN_FALLBACK_RE.finditer(text):
+        val = _parse_int_commas(m.group(1))
+        if val is not None and 4096 <= val <= 10_000_000:
+            paren_vals.append(val)
+    if paren_vals:
+        return min(paren_vals)
     return None
 
 
@@ -865,8 +891,8 @@ def infer_model_capabilities(
             source = str(probe["source"])
         if probe.get("probed_at"):
             probed_at = str(probe["probed_at"])
-        if str(probe.get("model_tier") or "").strip().lower() in ("flagship", "standard", "lightweight"):
-            probe_tier_override = str(probe["model_tier"]).strip().lower()
+        if str(probe.get("detected_model_tier") or "").strip().lower() in ("flagship", "standard", "lightweight"):
+            probe_tier_override = str(probe["detected_model_tier"]).strip().lower()
 
     # 服务商显式配置的自定义上下文窗口覆盖（>= 4096；若存在更小的实测 error_calibrated 物理上限则保护不越界）
     if isinstance(extra, dict) and extra.get("context_window"):
@@ -1261,7 +1287,7 @@ class LLMHub:
         safe_url = validate_llm_base_url(endpoint)
         headers: Dict[str, str] = {
             "Accept": accept,
-            "User-Agent": "Data.O.G/3.3",
+            "User-Agent": "Data.O.G/3.4",
         }
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -1435,6 +1461,7 @@ class LLMHub:
         stream: bool,
         thinking_mode: str = "auto",
         reasoning_effort: str = "",
+        include_usage: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], bool]:
         caps = infer_model_capabilities(model, profile.provider_type, profile.base_url, profile.extra)
         body: Dict[str, Any] = {
@@ -1446,12 +1473,15 @@ class LLMHub:
         if max_tokens is not None:
             tok_key = "max_completion_tokens" if caps["use_max_completion_tokens"] else "max_tokens"
             body[tok_key] = max_tokens
+        injected = False
         if stream:
             body["stream"] = True
+            if include_usage:
+                body["stream_options"] = {"include_usage": True}
+                injected = True
 
         tmode = (thinking_mode or "auto").strip().lower()
         style = caps["thinking_param_style"]
-        injected = False
         if tmode in ("enabled", "disabled"):
             if style == "deepseek":
                 body["thinking"] = {"type": "enabled" if tmode == "enabled" else "disabled"}
@@ -1472,7 +1502,7 @@ class LLMHub:
     @staticmethod
     def _strip_optional_thinking_params(body: Dict[str, Any]) -> Dict[str, Any]:
         cleaned = dict(body)
-        for k in ("thinking", "reasoning_effort", "enable_thinking"):
+        for k in ("thinking", "reasoning_effort", "enable_thinking", "stream_options"):
             cleaned.pop(k, None)
         return cleaned
 
@@ -1606,7 +1636,7 @@ class LLMHub:
             if m_b:
                 try:
                     if float(m_b.group(1)) <= 14.5:
-                        meta["model_tier"] = "lightweight"
+                        meta["detected_model_tier"] = "lightweight"
                 except ValueError:
                     pass
         return meta
@@ -1941,6 +1971,7 @@ class LLMHub:
         retry_delays: Optional[Tuple[float, ...]] = None,
         auto_continue_on_length: bool = True,
         max_continuations: int = 3,
+        include_usage: bool = False,
     ) -> Iterator[Dict[str, Any]]:
         """零依赖流式调用 OpenAI 兼容 `/chat/completions`，支持弹性静默超时、瞬态指数退避重试与 length 自动续写."""
         resolved = self.resolve_provider_and_model(
@@ -1948,6 +1979,44 @@ class LLMHub:
         )
         assert resolved is not None
         profile, eff_model = resolved
+        yield from self._stream_chat_with_profile(
+            profile,
+            messages=messages,
+            model=eff_model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
+            cancel_check=cancel_check,
+            retry_on_transient=retry_on_transient,
+            max_retries=max_retries,
+            retry_delays=retry_delays,
+            auto_continue_on_length=auto_continue_on_length,
+            max_continuations=max_continuations,
+            include_usage=include_usage,
+        )
+
+    def _stream_chat_with_profile(
+        self,
+        profile: LLMProviderProfile,
+        *,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: float = 0.1,
+        max_tokens: Optional[int] = None,
+        timeout_sec: float = 120.0,
+        thinking_mode: str = "auto",
+        reasoning_effort: str = "",
+        cancel_check: Optional[Callable[[], bool]] = None,
+        retry_on_transient: bool = True,
+        max_retries: int = 3,
+        retry_delays: Optional[Tuple[float, ...]] = None,
+        auto_continue_on_length: bool = True,
+        max_continuations: int = 3,
+        include_usage: bool = False,
+    ) -> Iterator[Dict[str, Any]]:
+        eff_model = model
         is_local = any(h in (profile.base_url or "") for h in ("127.0.0.1", "localhost"))
         if not profile.api_key and not is_local:
             raise ValueError(f"请先填写 [{profile.name}] 的 API Key")
@@ -2139,6 +2208,7 @@ class LLMHub:
                 stream=True,
                 thinking_mode=seg_tmode,
                 reasoning_effort=reasoning_effort,
+                include_usage=include_usage,
             )
             try:
                 resp_obj, _ = _open_stream(body, eff_timeout)
@@ -2412,8 +2482,14 @@ class LLMHub:
             assert resolved is not None
             prof, eff_model = resolved
 
-        # 检查 24h TTL 缓存命中
-        cached_probe = _lookup_model_probe(prof.extra, eff_model)
+        # 检查 24h TTL 缓存命中（若草稿修改了 base_url 则跳过旧端点缓存）
+        saved_for_cache = self.store.get_llm_provider(prof.provider_id) if payload_override else None
+        base_url_changed = bool(
+            payload_override
+            and saved_for_cache is not None
+            and saved_for_cache.base_url != prof.base_url
+        )
+        cached_probe = None if base_url_changed else _lookup_model_probe(prof.extra, eff_model)
         if not force_refresh and _is_probe_fresh(cached_probe):
             caps = infer_model_capabilities(eff_model, prof.provider_type, prof.base_url, prof.extra)
             return {
@@ -2551,22 +2627,53 @@ class LLMHub:
             probe_record["source"] = "heuristic"
         probe_record["probed_at"] = datetime.datetime.now().isoformat(timespec="seconds")
 
-        saved_probe = self._persist_model_probe(
-            prof.provider_id,
-            eff_model,
-            probe_record,
-            preserve_stronger_source=not live_ok and not bool(calibrated_limit),
+        saved_existing = self.store.get_llm_provider(prof.provider_id)
+        can_persist_probe = (
+            saved_existing is not None
+            and (not payload_override or saved_existing.base_url == prof.base_url)
         )
+        saved_probe: Optional[Dict[str, Any]] = None
+        if can_persist_probe:
+            saved_probe = self._persist_model_probe(
+                prof.provider_id,
+                eff_model,
+                probe_record,
+                preserve_stronger_source=not live_ok and not bool(calibrated_limit),
+            )
 
-        # 重新加载计算最终能力档案
-        refreshed_prof = self.store.get_llm_provider(prof.provider_id) or prof
-        eff_extra = dict(refreshed_prof.extra or {})
-        if saved_probe is None:
-            probes_tmp = dict(eff_extra.get("model_probes") or {})
-            probes_tmp[eff_model] = probe_record
-            eff_extra["model_probes"] = probes_tmp
-        caps = infer_model_capabilities(eff_model, refreshed_prof.provider_type, refreshed_prof.base_url, eff_extra)
-        final_probe = saved_probe or {**probe_record, **caps}
+        # 重新加载计算最终能力档案；若存在未落盘草稿（如 context_window / model_tier / base_url），保留草稿覆盖
+        if payload_override:
+            eff_extra = dict((saved_existing.extra if saved_existing else {}) or {})
+            if saved_probe is not None:
+                probes_tmp = dict(eff_extra.get("model_probes") or {})
+                probes_tmp[eff_model] = saved_probe
+                eff_extra["model_probes"] = probes_tmp
+            else:
+                probes_tmp = dict(eff_extra.get("model_probes") or {})
+                probes_tmp[eff_model] = probe_record
+                eff_extra["model_probes"] = probes_tmp
+            if "context_window" in payload_override:
+                if "context_window" in prof.extra:
+                    eff_extra["context_window"] = prof.extra["context_window"]
+                else:
+                    eff_extra.pop("context_window", None)
+            if "model_tier" in payload_override:
+                if "model_tier" in prof.extra:
+                    eff_extra["model_tier"] = prof.extra["model_tier"]
+                else:
+                    eff_extra.pop("model_tier", None)
+            caps = infer_model_capabilities(eff_model, prof.provider_type, prof.base_url, eff_extra)
+        else:
+            refreshed_prof = self.store.get_llm_provider(prof.provider_id) or prof
+            eff_extra = dict(refreshed_prof.extra or {})
+            if saved_probe is None:
+                probes_tmp = dict(eff_extra.get("model_probes") or {})
+                probes_tmp[eff_model] = probe_record
+                eff_extra["model_probes"] = probes_tmp
+            caps = infer_model_capabilities(
+                eff_model, refreshed_prof.provider_type, refreshed_prof.base_url, eff_extra
+            )
+        final_probe = {**(saved_probe or probe_record), **caps}
 
         return {
             "ok": True,
@@ -2595,24 +2702,8 @@ class LLMHub:
         max_tokens: int,
         timeout_sec: float,
     ) -> Iterator[Dict[str, Any]]:
-        """供 probe_model_capabilities 使用的轻量流式调用（支持未落盘草稿配置，禁用重试与续写）."""
-        saved = self.store.get_llm_provider(profile.provider_id)
-        if saved is not None and saved.base_url == profile.base_url and saved.api_key == profile.api_key:
-            yield from self.chat_completion_stream(
-                messages=messages,
-                provider_id=profile.provider_id,
-                model=model,
-                temperature=0.0,
-                max_tokens=max_tokens,
-                timeout_sec=timeout_sec,
-                retry_on_transient=False,
-                max_retries=0,
-                auto_continue_on_length=False,
-            )
-            return
-
-        # 未落盘配置直连单次探针
-        res = self._execute_chat_with_profile(
+        """供 probe_model_capabilities 使用的轻量流式调用（支持未落盘草稿配置，开启 include_usage，禁用重试与续写）."""
+        yield from self._stream_chat_with_profile(
             profile,
             messages=messages,
             model=model,
@@ -2622,16 +2713,8 @@ class LLMHub:
             retry_on_transient=False,
             max_retries=0,
             auto_continue_on_length=False,
+            include_usage=True,
         )
-        if res.get("reasoning"):
-            yield {"type": "reasoning", "delta": res["reasoning"]}
-        if res.get("content"):
-            yield {"type": "content", "delta": res["content"]}
-        yield {
-            "type": "done",
-            "usage": res.get("usage") or {},
-            "stream_supported": False,
-        }
 
     def test_provider(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         prof = self.build_profile_from_payload(payload, provider_id=payload.get("provider_id"))

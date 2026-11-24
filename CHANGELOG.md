@@ -8,6 +8,32 @@
 
 ---
 
+## [3.4.1] - 2026-11-24
+
+> **AI 助手静态血缘解剖、四级模型探查自校准、持久化 🎯 `/goal` 断点续跑与前端续流深度加固**：针对 `v3.4.0` 上线后的边界代码审计与全链路压力测试，彻底修复确定性 SQL 静态解析、动态模型探查与粘滞档位、孤儿后台任务对账与多附件/无附件 Goal 闭环以及前端探查胶囊与断点恢复的 13 处深层缺陷，确保弱模型分析超长存储过程与断点续流在极端边界场景下稳定可靠。
+
+### Fixed
+- **确定性 SQL 静态解剖器与手术刀工具加固 (`modules/ai_assistant/{sql_static_analyzer.py,tools.py}`)**:
+  - 修复 `_tokenize_sql_tolerant` 未跟踪 `open_dollar_tag` 导致过程体结束 `$tag$` 与后续 `$...$` 串联误吞语句；
+  - 升级 `_extract_ctes` 支持 `CREATE TEMP TABLE ... AS WITH ...` 与 `INSERT INTO ... WITH ...` 嵌入式 CTE，杜绝 CTE 别名污染血缘上游表清单；
+  - 重构 `_extract_source_tables` 逗号连接扫描引入括号层级深度跟踪，彻底修复 `FROM t1, (SELECT c1, c2 FROM t2) sub` 将子查询列名 `c2` 误报为源表并确保漏网后缀源表被正确捕获；
+  - 适配 Oracle / DM8 / GaussDB 无显式 `DECLARE` 的 `CREATE PROCEDURE ... IS/AS <vars>; BEGIN ...` 变量声明提取；改用词法 Token 还原每行非字符串代码修复字符串内 `'/*'`/`'--'` 导致的 `DIALECT_COMPAT` 漏检，并防护 `compact_sql_for_llm` 忽略注释行中的 `CASE`/`END` 关键字；
+  - 完善 `trace_attachment_lineage` 的 `direction="upstream" | "downstream" | "both"` 精确方向支持，并使 `search_attachment` 兼容 `keyword` / `pattern` / `query` 参数别名。
+- **四级模型探查、自校准与流式探针修复 (`core/platform/{llm_hub.py,routes/appearance_and_llm.py}`)**:
+  - 修复 `parse_context_limit_from_error` 无法识别千分位逗号上限（如 `131,072` / `32,768`）及多数字报错优先误取输入长度而非窗口上限的问题；
+  - 拆分 `model_probes` 中 Ollama 权威 `detected_model_tier` 与派生 `model_tier`，修复将供应商档位改回 `auto` 或经 L3 400 下调窗口后档位粘滞锁死的问题；
+  - 修复未保存草稿执行 `/api/platform/llm/probe-model` 时缺失 `model_tier` 覆盖、草稿端点覆写已存缓存及未走真实流式探测的问题，并补齐 `stream_options={"include_usage": True}` 遇到 HTTP 400 自动剥离降级与 `http.client.IncompleteRead` 流中途续接验证。
+- **战前规划、持久化 🎯 `/goal` 孤儿对账与多场景闭环加固 (`modules/ai_assistant/{service.py,goal_runner.py,router.py}`, `core/platform/context.py`)**:
+  - 修复 `ExecutionPlanner` 在提及多表时按字母序而非 `final_target > temp_staging > source_only` 优先切片，以及多附件场景下 `lineage_sliced` 硬编码读取 `attachments[0]` 的缺陷；补齐非流式步与 `stepped_batch` 的取消/重试回调透传；
+  - 修复服务重启后遗留 `running`/`probing`/`planning`/`verifying` 孤儿任务无法自动转入 `paused_recoverable` 续跑的问题，新增 `_RunRuntimeHub.try_register_run()` 防止并发 `/resume` 重复拉起双线程，并接入 `PlatformContext.close()` 优雅取消后台线程；
+  - `GET /runs/{run_id}/events` 升级分页读取（1000/页）突破 2,000 事件截断上限，并在续跑非终态事件出现后重置 `last_event_was_terminal`；`_invoke_stage_stream` 通过 `_StreamActionDemuxer` 剥离 ` ```dataog_meta ` 原始块并实施 `content_delta` 轻量合批减压 SQLite 写入；
+  - 修复多附件 Goal 中 `F001`/`S001` ID 碰撞（自动按 `A1-F001`/`A2-F001` 隔离并精准定位所属附件）、Gate 3 临时表 `written_by` 血缘连续性核验遗漏与 `open_questions` 未透传综合报告，并打通无附件/CSV/在线连库 Goal 阶段内的只读工具探索（支持最多 4 步 `dataog_action` 并将引用与结果表写入最终消息）。
+- **前端续流游标、探查胶囊与配置草稿保护 (`static/js/core/http.js`, `static/js/apps/ai_assistant/view.js`, `static/js/views/settings_view.js`)**:
+  - 修复 `streamSseGet` 在重放历史 `run_paused` 后续紧接续跑事件时残留旧终态，修复 `view.js` 切换模型无附件时探查胶囊不重绘、`_attachToRunStream` 未回显 `checkpoint.completed_stage_ids` 及切换会话恢复断点续跑携带 `after_event_id=0` 而非 `activeRun.last_event_id` 的缺陷；
+  - 修复 `SettingsView` 点击「探查能力与窗口」时重置未保存草稿输入的问题（改为仅增量合并 `model_probes`）；全量扩充 `test_platform.py` 与 `test_ai_assistant_and_kb.py`（含 Node.js E2E 回归断言，全套 110 项测试与 `-W error::ResourceWarning` 零告警全绿）。
+
+---
+
 ## [3.4.0] - 2026-11-24
 
 > **AI 助手超长 SQL 弱模型增幅、四级动态模型能力探查、超时韧性重试与持久化 🎯 `/goal`「不达目的不结束」闭环引擎**：全面面向轻量/极速模型（如 `deepseek-v4-flash`、本地 7B/14B）分析数千行超长存储过程与上游慢速/偶发超时供应商场景，实现确定性 SQL 静态血缘/隐患预解剖与保行号语义压缩、四级动态模型能力实测与有效推理甜蜜区预算收敛、瞬态超时/5xx 指数退避重试+减载降级+`length` 自动续写、`ExecutionPlanner` 战前最优拆解规划，以及后台持久化 Checkpoint + `Last-Event-ID` 零丢帧断点续流 + 硬验收补救闭环。

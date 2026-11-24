@@ -1,4 +1,4 @@
-# Data.O.G v3.4.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.4.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -61,9 +61,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（Ed25519 独立域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.4.0，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.4.1，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.4.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.4.1 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -152,7 +152,8 @@ DataOG/
 | **`v3.2.4`** | `feat/v3.2.4-partial-compliance-alt-standard` → `main` | **数据标准对标「部分落标 (`PARTIAL_COMPLIANT`)」状态区分与满足标准展示**：字段名符合但类型不满足当前选择标准、却满足同标准下其他物理格式档时精确区分为「部分落标」并高亮展示命中的具体标准名称及类型，全面透传单库绑标核验页、左侧目录树徽标、单库离线 HTML/Excel 报告与跨环境比对视图（97 项测试全绿） |
 | **`v3.3.0`** | `feat/v3.3.0-signed-incremental-updates` → `main` | **Ed25519 签名同系列累积增量升级体系与 GitHub Release 双产物自动化发版**：拆分 `app.py` 冻结外壳与 `core/app_kernel.py`、`update_bootstrap.py` 纯标准库 `sys.meta_path` `zipimport` 挂载器；每个正式版同步发布完整客户端 (`DataOG-Windows-x64-vX.Y.Z.zip`) 与 ~0.9 MB 同二级版本累积增量包 (`DataOG-Update-vX.Y.Z.zip`，适用 `vX.Y.0+`)，支持 `updates/` 目录覆盖解压与「系统配置 → 版本与升级」双渠道导入、独立域 Ed25519 + SHA-256 验签、崩溃/篡改自愈回退与一键版本回滚（103 项测试全绿） |
 | **`v3.3.1`** | `feat/ai-long-context-thinking-stream` → `main` | **AI 助手现代模型感知长上下文策略重构、Thinking 深度思考适配与 SSE 实时流式输出**：`LLMHub` 推断现代模型上下文窗口与思考能力并支持自定义 `context_window`；提升分片阈值至 `12K/16K` 避免数千行存储过程碎片化，新增零 Token 结构化大纲与紧凑行号标记，按模型预算在「全量直通」「大纲 + 按行/正则探索 (`read_attachment_lines`)」与「`stepped_batch` 兜底拆解」间自适应切换并支持超限透明降级；全面打通推理模型字段与 `<think>`/`<thought>` 流式解析，新增 `/chat/stream` SSE、前端折叠思考卡、自然 Markdown 边生成边渲染及「停止生成」中断（105 项测试全绿） |
-| **`v3.4.0`**（当前正式版） | `feat/ai-long-sql-weak-model-goal` → `main` | **AI 助手超长 SQL 弱模型增幅、四级动态模型能力探查、超时韧性重试与持久化 🎯 `/goal` 闭环引擎**：新增确定性 SQL 静态血缘 DAG/控制流/隐患雷达预解剖与保行号语义压缩 (`sql_static_analyzer.py`) 及 3 个手术刀工具；落地 L1/L2/L3 四级模型能力实测与 `POST /api/platform/llm/probe-model`、`lightweight` 有效推理甜蜜区预算收敛、瞬态超时/5xx 指数退避重试+减载降级+`length` 自动续写；新增战前 `ExecutionPlanner` 最优拆解规划、弱模型工具裁剪与防原地打转护栏；新增 Layer 2 私有表 `ai_assistant_runs`/`ai_assistant_run_events`、后台持久化 `GoalRunner` 状态机（覆盖率与 HIGH/MEDIUM 隐患硬验收 + 自动补救 + `Last-Event-ID` 无损断点续流 + 一键 `/resume`）及前端探查胶囊、Goal 切换与实时 Checklist UI（110 项测试全绿） |
+| **`v3.4.0`** | `feat/ai-long-sql-weak-model-goal` → `main` | **AI 助手超长 SQL 弱模型增幅、四级动态模型能力探查、超时韧性重试与持久化 🎯 `/goal` 闭环引擎**：新增确定性 SQL 静态血缘 DAG/控制流/隐患雷达预解剖与保行号语义压缩 (`sql_static_analyzer.py`) 及 3 个手术刀工具；落地 L1/L2/L3 四级模型能力实测与 `POST /api/platform/llm/probe-model`、`lightweight` 有效推理甜蜜区预算收敛、瞬态超时/5xx 指数退避重试+减载降级+`length` 自动续写；新增战前 `ExecutionPlanner` 最优拆解规划、弱模型工具裁剪与防原地打转护栏；新增 Layer 2 私有表 `ai_assistant_runs`/`ai_assistant_run_events`、后台持久化 `GoalRunner` 状态机（覆盖率与 HIGH/MEDIUM 隐患硬验收 + 自动补救 + `Last-Event-ID` 无损断点续流 + 一键 `/resume`）及前端探查胶囊、Goal 切换与实时 Checklist UI（110 项测试全绿） |
+| **`v3.4.1`**（当前正式版） | `fix/ai-goal-and-static-analyzer-hardening` → `main` | **AI 助手静态血缘解析、模型探查校准、孤儿 Goal 断点恢复与前端续流深度加固**：修复 `$$` 闭合标签、嵌入式 CTE、子查询逗号连接列名泄露、Oracle 无 `DECLARE` 变量及字符串内注释符号导致的静态解析与 `DIALECT_COMPAT` 边界缺陷；修复千分位 400 超限解析、`model_tier` 粘滞与草稿流式探查；补齐重启孤儿 Goal 任务自动对账转 `paused_recoverable`、并发 `/resume` 原子防重、SSE 分页无截断续流、多附件 `A1/A2` 隔离、无附件/在线库 Goal 工具探索、`dataog_meta` 剥离与前端切换模型胶囊/断点游标/配置草稿保护（110 项测试全绿） |
 
 ---
 

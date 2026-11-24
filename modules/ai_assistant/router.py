@@ -223,8 +223,10 @@ def api_get_session_active_run(
     session_id: str,
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    svc = AiAssistantService(ctx)
-    active_run = svc.get_active_run_for_session(session_id)
+    runner = GoalRunner(ctx)
+    active_run = runner.svc.get_active_run_for_session(session_id)
+    if active_run is not None:
+        active_run = runner.reconcile_orphaned_run(active_run)
     return {
         "ok": True,
         "run": active_run,
@@ -251,12 +253,13 @@ def api_get_assistant_run(
     limit: int = Query(default=200, ge=1, le=2000),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    svc = AiAssistantService(ctx)
-    run = svc.get_run(run_id)
+    runner = GoalRunner(ctx)
+    run = runner.svc.get_run(run_id)
     if run is None:
         return json_error("未找到指定的后台分析任务", 404)
+    run = runner.reconcile_orphaned_run(run) or run
     events = (
-        svc.list_run_events(run_id, after_event_id=after_event_id, limit=limit)
+        runner.svc.list_run_events(run_id, after_event_id=after_event_id, limit=limit)
         if include_events
         else []
     )
@@ -274,9 +277,13 @@ async def api_stream_assistant_run_events(
     after_event_id: int = Query(default=0, ge=0),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
-    svc = AiAssistantService(ctx)
-    if svc.get_run(run_id) is None:
+    runner = GoalRunner(ctx)
+    svc = runner.svc
+    init_run = svc.get_run(run_id)
+    if init_run is None:
         return json_error("未找到指定的后台分析任务", 404)
+    # 若该任务因进程重启孤悬为 running/probing/planning，先对账为 paused_recoverable 防止 SSE 永久挂起
+    runner.reconcile_orphaned_run(init_run)
 
     hdr_last_id = 0
     raw_hdr = (request.headers.get("last-event-id") or "").strip()
@@ -307,15 +314,29 @@ async def api_stream_assistant_run_events(
                 frames.append(
                     f"id: {ev_id}\nevent: {ev_type}\ndata: {json.dumps(ev_payload, ensure_ascii=False)}\n\n"
                 )
-                last_event_was_terminal = ev_type in ("done", "run_paused", "run_cancelled", "error")
+                if ev_type in ("done", "run_paused", "run_cancelled", "error"):
+                    last_event_was_terminal = True
+                elif ev_type == "stage_start" or (ev_type == "status" and ev_payload.get("resumed")):
+                    last_event_was_terminal = False
             return frames
 
+        def _drain_db_frames():
+            """分页拉取数据库内所有未推事件，确保超过 2000 帧的超长任务也能零截断补齐."""
+            frames_all = []
+            while True:
+                batch = svc.list_run_events(run_id, after_event_id=last_sent_id, limit=1000)
+                if not batch:
+                    break
+                frames_all.extend(_format_db_events(batch))
+                if len(batch) < 1000:
+                    break
+            return frames_all
+
         try:
-            missed = svc.list_run_events(run_id, after_event_id=cursor_id, limit=2000)
-            for frame_str in _format_db_events(missed):
+            for frame_str in _drain_db_frames():
                 yield frame_str
 
-            cur_run = svc.get_run(run_id)
+            cur_run = runner.reconcile_orphaned_run(svc.get_run(run_id))
             if cur_run is None:
                 return
             cur_status = str(cur_run.get("status") or "")
@@ -323,8 +344,7 @@ async def api_stream_assistant_run_events(
                 last_event_was_terminal or not hub.is_running(run_id)
             ):
                 # 二次追平窗口内刚落盘的尾部事件（如 worker 在首次查库与 unregister_run 之间写入的 done）
-                tail_missed = svc.list_run_events(run_id, after_event_id=last_sent_id, limit=2000)
-                for frame_str in _format_db_events(tail_missed):
+                for frame_str in _drain_db_frames():
                     yield frame_str
                 return
 
@@ -332,20 +352,18 @@ async def api_stream_assistant_run_events(
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=15.0)
                 except asyncio.TimeoutError:
-                    latest = svc.get_run(run_id)
+                    latest = runner.reconcile_orphaned_run(svc.get_run(run_id))
                     if latest is None or (
                         str(latest.get("status") or "") in TERMINAL_RUN_STATUSES
                         and not hub.is_running(run_id)
                     ):
-                        tail_missed = svc.list_run_events(run_id, after_event_id=last_sent_id, limit=2000)
-                        for frame_str in _format_db_events(tail_missed):
+                        for frame_str in _drain_db_frames():
                             yield frame_str
                         break
                     yield ": keep-alive\n\n"
                     continue
                 if item is None:
-                    tail_missed = svc.list_run_events(run_id, after_event_id=last_sent_id, limit=2000)
-                    for frame_str in _format_db_events(tail_missed):
+                    for frame_str in _drain_db_frames():
                         yield frame_str
                     break
                 ev_id = int(item.get("event_id") or 0)

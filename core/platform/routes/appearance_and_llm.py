@@ -208,7 +208,9 @@ def api_probe_llm_model(
 ):
     try:
         raw = payload.model_dump(exclude_unset=True)
-        has_draft_override = any(k in raw for k in ("base_url", "api_key", "provider_type", "context_window"))
+        has_draft_override = any(
+            k in raw for k in ("base_url", "api_key", "provider_type", "context_window", "model_tier")
+        )
         target_model = str(payload.model or payload.default_model or "").strip()
         res = ctx.llm_hub.probe_model_capabilities(
             provider_id=str(payload.provider_id or "").strip(),
