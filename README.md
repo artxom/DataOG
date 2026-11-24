@@ -1,4 +1,4 @@
-# Data.O.G v3.2.4 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.3.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -32,6 +32,7 @@
    - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——无密码连接拓扑随工作区协同共享，个人账号与密码严格落盘于本机私有凭据库并支持按 `(db_type, host, port, dbname)` / `jdbc_url` 端点指纹跨工作区自动匹配；免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
    - **参考知识库 (`KnowledgeHub`)**：零新增依赖离线知识库管理中心，内置 11 篇主流数据库方言速查卡并支持上传 `.md` / `.txt` / `.sql` / `.html` / `.json` / `.csv` / `.docx` / `.xlsx` 参考资料，借助 SQLite FTS5 + BM25 实现中英文与报错码毫秒级离线检索，支持按方言导出/导入轻量 `.json.gz` 知识包与团队分享，并可选接入 OpenAI 兼容 `/embeddings` 接口做混合排序（离线自动退回纯 FTS5）。
    - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
+   - **版本与升级 (`UpdateHub`)**：提供基于 RFC 8032 Ed25519 数字签名与全量 SHA-256 校验的 **同二级版本累积增量升级**（约 `0.9 MB` 的 `DataOG-Update-vX.Y.Z.zip` 适用 `vX.Y.0+` 全部同系列客户端）。支持 **系统目录 `updates/` 覆盖解压** 与 **应用内上传 `.zip`/`.dgp`** 双渠道升级，并内置启动自愈自动回退、一键回退上一补丁与恢复内置基础版本。
    - **性能诊断 (`DiagnosticsHub`)**：零写盘全内存链路追踪、端到端环回与磁盘/SQLite/DNS/鉴权/DB/AI 全栈基准压测 (`Benchmark`)、自动瓶颈研判（识别企业代理未豁免环回、EDR/慢盘 `fsync`、锁竞争、事件循环阻塞等）以及一键导出全量脱敏 `.json` 诊断日志包（顶部「执行日志」弹窗亦可快捷一键导出）。
 2. **数据探查 (`explorer`)**
    - 顶栏分段切换 **`SQL 查询` | `AI 探查`**，左侧统一维持 **DataGrip 风格四级已连接数据库目录树**（`连接` → `Schema` → `表/视图` → `字段`）。
@@ -58,13 +59,16 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 3.2.4 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 零阻塞快速通道 + 线程池回退、Server-Timing 遥测、--smoke-test 极速冒烟与自动发现插件装配）
+├── update_bootstrap.py           # 纯标准库增量更新引导器（Ed25519 独立域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.3.0，引导增量加载并重导出内核公开入口）
 ├── core/
+│   ├── app_kernel.py             # FastAPI 3.3.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
 │   │   ├── diagnostics_hub.py    # 全内存零写盘链路追踪、全栈环境 Benchmark、自动瓶颈研判与严格脱敏诊断日志导出中枢
-│   │   ├── routes/               # 平台领域子路由包（auth_and_system / data_sources / appearance_and_llm / knowledge / standards / workspaces / diagnostics）
+│   │   ├── update_hub.py         # Layer 2 增量补丁版本管理、兼容检查、双渠道安装与回退中枢（零物理路径泄露）
+│   │   ├── routes/               # 平台领域子路由包（auth_and_system / data_sources / appearance_and_llm / knowledge / standards / workspaces / diagnostics / updates）
 │   │   ├── storage/              # 双库分离 WAL 引擎包（schema / base / legacy_migration / platform_repos / governance_repos，支持 3.0 插件表自动随工作区流转）
 │   │   ├── storage_paths.py      # 三层分离混淆私有路径解析器（OS 用户隐藏目录、时钟锚点混淆编码与 DATAOG_HOME 隔离）
 │   │   ├── workspace_hub.py      # 团队共享工作区生命周期管理、零密钥 .dataog.db 导出与三步引导式增量合并引擎
@@ -95,12 +99,13 @@ DataOG/
 │   └── ai_assistant/             # /api/modules/ai_assistant      Data.O.G 3.0 旗舰多轮渐进式数据库智能助手（含写确认门禁）
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
 │   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css（已清理 392 行废弃死样式）
-│   └── js/                       # main.js（零业务视图静态依赖）、core/（http / perf_monitor / platform_api / app_registry / dom / state / type_compat）、apps/（3.0 独立懒加载应用含 ai_assistant/）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图含 knowledge_view.js 与 diagnostics_view.js）
+│   └── js/                       # main.js（零业务视图静态依赖）、core/（http / perf_monitor / platform_api / app_registry / dom / state / type_compat）、apps/（3.0 独立懒加载应用含 ai_assistant/）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图含 knowledge_view.js、updates_view.js 与 diagnostics_view.js）
 ├── docs/                         # 3.0 模块化开发指南 (MODULE_SDK_3_0.md)
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 97 项全量自动化测试（部分落标跨标准核验与离线报告展示、全链路性能诊断、全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与防爆窗分步拆解 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
+├── tests/                        # 103 项全量自动化测试（Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断、全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与防爆窗分步拆解 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
+├── build_update_pack.py          # 同二级版本累积增量包 (DataOG-Update-vX.Y.Z.zip) Ed25519 签名构建脚本
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 纯净打包脚本（支持 --skip-tests、内置 static/dataog.ico 图标并严格剔除 tests/）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -143,7 +148,8 @@ DataOG/
 | **`v3.2.1`** | `fix/v3.2.1-windows-ci-diagnostics-tests` → `main` | **Windows 打包单测 SQLite 句柄泄露与时序竞态修复**：使用 `contextlib.closing` 彻底关闭诊断测试临时 SQLite 句柄避免 Windows `[WinError 32]` 清理失败、消除跨线程锁争用定时器竞态，并加固 `GetDriveTypeW` ctypes 签名、临时压测库 WAL 回收与 `socketserver` 冻结态导入（92 项测试全绿） |
 | **`v3.2.2`** | `chore/v3.2.2-fast-ci-smoke-test` → `main` | **CI 纯打包瘦身与 2 秒冻结态 `--smoke-test` 启动冒烟闭环**：移除 GitHub Actions 与 CI 打包阶段重复 4 次的冗余全量单元测试（回归「发布前本地一次测试」定位），为 `app.py` 新增 2 秒极速 `--smoke-test` 冒烟校验（覆盖冻结依赖 / 原生护盾 / 静态资源与版本同步 / 5 插件挂载 / 4 路内存 ASGI 探活），`build_exe.py` 支持 `--skip-tests` 并彻底将 `tests/` 目录从客户版安装包移除（93 项测试全绿） |
 | **`v3.2.3`** | `perf/v3.2.3-intranet-sqlite-gate1-binding-stats` → `main` | **内网性能核爆级治理（消灭 SQLite O(N×M) 平方锁死 / 开关库 EDR 风暴 / Gate 1 事件循环阻塞 / N+1 核验比对）**：重构 `get_connection_binding_stats()` 为线性索引查询 + 锁外内存聚合压降至 10ms 级；`PlatformStateStore` 持久复用 SQLite 长连接 + `temp_store = MEMORY` + 16MB 缓存告别每次 214ms 开关句柄开销；Gate 1 新增 10 秒纯内存热缓存快速通道并卸载至线程池；落标核验与跨环境报告全面批处理消除冗余写盘与逐表查询（95 项测试全绿） |
-| **`v3.2.4`**（当前正式版） | `feat/v3.2.4-partial-compliance-alt-standard` → `main` | **数据标准对标「部分落标 (`PARTIAL_COMPLIANT`)」状态区分与满足标准展示**：字段名符合但类型不满足当前选择标准、却满足同标准下其他物理格式档时精确区分为「部分落标」并高亮展示命中的具体标准名称及类型，全面透传单库绑标核验页、左侧目录树徽标、单库离线 HTML/Excel 报告与跨环境比对视图（97 项测试全绿） |
+| **`v3.2.4`** | `feat/v3.2.4-partial-compliance-alt-standard` → `main` | **数据标准对标「部分落标 (`PARTIAL_COMPLIANT`)」状态区分与满足标准展示**：字段名符合但类型不满足当前选择标准、却满足同标准下其他物理格式档时精确区分为「部分落标」并高亮展示命中的具体标准名称及类型，全面透传单库绑标核验页、左侧目录树徽标、单库离线 HTML/Excel 报告与跨环境比对视图（97 项测试全绿） |
+| **`v3.3.0`**（当前正式版） | `feat/v3.3.0-signed-incremental-updates` → `main` | **Ed25519 签名同系列累积增量升级体系与 GitHub Release 双产物自动化发版**：拆分 `app.py` 冻结外壳与 `core/app_kernel.py`、`update_bootstrap.py` 纯标准库 `sys.meta_path` `zipimport` 挂载器；每个正式版同步发布完整客户端 (`DataOG-Windows-x64-vX.Y.Z.zip`) 与 ~0.9 MB 同二级版本累积增量包 (`DataOG-Update-vX.Y.Z.zip`，适用 `vX.Y.0+`)，支持 `updates/` 目录覆盖解压与「系统配置 → 版本与升级」双渠道导入、独立域 Ed25519 + SHA-256 验签、崩溃/篡改自愈回退与一键版本回滚（103 项测试全绿） |
 
 ---
 
@@ -154,7 +160,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（97 项，发布前本地执行）
+# 运行全量自动化单元测试（103 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）
@@ -178,12 +184,18 @@ DATAOG_HOME="./demo_sandbox/.demo_home" python3 app.py
 ./demo_sandbox/sandbox.sh reset
 ```
 
-### 3. 在 Windows 下打包为独立免安装程序 (`DataOG.exe`)
+### 3. 在 Windows 下打包为独立免安装程序 (`DataOG.exe`) 与签名增量包
 ```bash
-# 安装打包器后直接执行打包脚本（或双击 build_windows.bat，产出于 dist/DataOG/DataOG.exe；若本地已跑完单测可附加 --skip-tests 跳过重复单测）
+# 安装打包器后直接执行完整客户端打包脚本（产出于 dist/DataOG/DataOG.exe；若本地已跑完单测可附加 --skip-tests）
 python -m pip install "pyinstaller>=6.10.0"
 python build_exe.py --skip-tests
+
+# 构建轻量签名同系列累积增量更新包 DataOG-Update-vX.Y.Z.zip（约 0.9 MB，自动自检 Ed25519 签名与白名单）
+python build_update_pack.py --output-dir dist
 ```
+> **客户升级双渠道**（同二级版本 `v3.3.0+` 均适用后续 `3.3.x` 增量包；跨二级版本请下载完整客户端）：
+> - **方式一（外部解压覆盖）**：将 `DataOG-Update-vX.Y.Z.zip` 解压覆盖到 `DataOG` 客户端目录（掉落 `updates/*.dgp`），下次双击启动 `DataOG.exe` 自动验签生效；
+> - **方式二（应用内上传）**：在 **「系统配置 → 版本与升级」** 上传同一 `.zip`/`.dgp`，重启 `DataOG.exe` 即刻切换，支持随时一键回退或恢复内置基础版本。
 
 ---
 

@@ -30,6 +30,29 @@ export const tasksApi = {
 export const platformApi = {
   bootstrap: () => requestJson("/api/platform/bootstrap", { cache: "no-store" }),
 
+  // 版本与增量升级 (UpdateHub)
+  getUpdateStatus: () => requestJson("/api/platform/updates/status", { cache: "no-store" }),
+  inspectUpdatePackage: (file) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFormData("/api/platform/updates/inspect", fd);
+  },
+  uploadUpdatePackage: (file) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFormData("/api/platform/updates/upload", fd);
+  },
+  scanUpdatePackages: () =>
+    requestJson("/api/platform/updates/scan", { method: "POST" }),
+  rollbackUpdate: () =>
+    requestJson("/api/platform/updates/rollback", { method: "POST" }),
+  resetUpdateToBase: () =>
+    requestJson("/api/platform/updates/reset-base", { method: "POST" }),
+  deleteCachedUpdate: (version) =>
+    requestJson(`/api/platform/updates/releases/${encodeURIComponent(version)}`, {
+      method: "DELETE",
+    }),
+
   // 外观壁纸与软件/模块图标本地持久化 (AssetStore)
   getAppearance: () => requestJson("/api/platform/appearance"),
   updateAppearance: (payload) =>
@@ -350,4 +373,14 @@ export const diagnosticsApi = {
       method: "PUT",
       body: payload,
     }),
+};
+
+export const updatesApi = {
+  status: () => platformApi.getUpdateStatus(),
+  inspect: (file) => platformApi.inspectUpdatePackage(file),
+  upload: (file) => platformApi.uploadUpdatePackage(file),
+  scan: () => platformApi.scanUpdatePackages(),
+  rollback: () => platformApi.rollbackUpdate(),
+  resetBase: () => platformApi.resetUpdateToBase(),
+  deleteRelease: (version) => platformApi.deleteCachedUpdate(version),
 };

@@ -21,6 +21,7 @@ from core.platform.query_engine import QueryEngine
 from core.platform.standard_catalog import StandardCatalog
 from core.platform.storage import PlatformStateStore
 from core.platform.storage_paths import resolve_private_storage_layout
+from core.platform.update_hub import UpdateHub
 from core.platform.workspace_hub import WorkspaceManager
 
 
@@ -37,6 +38,8 @@ class PlatformContext:
         private_root: Optional[str] = None,
         workspace_db_path: Optional[str] = None,
         legacy_data_dir: Optional[str] = None,
+        install_dir: Optional[str] = None,
+        base_version: Optional[str] = None,
     ) -> None:
         if db_path is None:
             layout = resolve_private_storage_layout(
@@ -48,6 +51,7 @@ class PlatformContext:
             eff_assets_dir = assets_dir or layout.assets_dir
             eff_workspaces_dir = layout.workspaces_dir
             eff_tmp_dir = layout.tmp_dir
+            eff_updates_dir = layout.updates_dir
             eff_clock_anchor = layout.clock_anchor_path
             eff_ws_db = (
                 os.path.abspath(workspace_db_path)
@@ -85,6 +89,7 @@ class PlatformContext:
             eff_assets_dir = assets_dir or os.path.join(self.data_dir, "assets")
             eff_workspaces_dir = os.path.join(self.data_dir, "workspaces")
             eff_tmp_dir = os.path.join(self.data_dir, "tmp")
+            eff_updates_dir = os.path.join(self.data_dir, "rt_upd")
             eff_clock_anchor = os.path.join(self.data_dir, ".chk", "m_anchor.bin")
             os.makedirs(eff_drivers_dir, exist_ok=True)
             os.makedirs(eff_assets_dir, exist_ok=True)
@@ -121,7 +126,14 @@ class PlatformContext:
         self.task_progress = self.import_progress
         self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
-        self.app_version = "3.2.4"
+        self.app_version = "3.3.0"
+        self.update_hub = UpdateHub(
+            updates_dir=eff_updates_dir,
+            running_version=self.app_version,
+            base_version=base_version,
+            install_dir=install_dir,
+            verifier_pubkey=verifier_pubkey,
+        )
         self.diagnostics_hub = DiagnosticsHub(self)
 
     def register_module_manifest(
@@ -184,7 +196,8 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "3.2.4",
+            "version": "3.3.0",
+            "update_summary": self.update_hub.get_bootstrap_summary(),
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": license_info,
             "active_workspace": active_ws,

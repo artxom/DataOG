@@ -15,7 +15,7 @@ env:
 
 jobs:
   build-windows-exe:
-    name: 打包 DataOG Windows 独立可执行程序 (.exe)
+    name: 打包 DataOG Windows 独立客户端与同系列增量更新包
     runs-on: windows-latest
     steps:
       - name: Checkout 代码
@@ -41,30 +41,83 @@ jobs:
           $env:DATAOG_HOME = Join-Path $env:RUNNER_TEMP "dataog_ci_home"
           dist\DataOG\DataOG.exe --smoke-test
 
-      - name: 压缩可执行程序目录
+      - name: 压缩完整客户端与构建签名同系列增量包
         shell: pwsh
+        env:
+          DATAOG_UPDATE_SIGNING_KEY: ${{ secrets.DATAOG_UPDATE_SIGNING_KEY }}
         run: |
           if (Test-Path "dist/DataOG/data") {
             Remove-Item -Path "dist/DataOG/data" -Recurse -Force -ErrorAction SilentlyContinue
           }
           $shortSha = (git rev-parse --short HEAD).Trim()
           $version = if ("${{ github.ref_name }}" -like "v*") { "${{ github.ref_name }}" } else { "dev-$shortSha" }
-          $zipName = "DataOG-Windows-x64-$version.zip"
-          Compress-Archive -Path "dist/DataOG/*" -DestinationPath $zipName -Force
-          echo "ZIP_PATH=$zipName" >> $env:GITHUB_ENV
+          $fullZipName = "DataOG-Windows-x64-$version.zip"
+          Compress-Archive -Path "dist/DataOG/*" -DestinationPath $fullZipName -Force
+          echo "ZIP_PATH=$fullZipName" >> $env:GITHUB_ENV
 
-      - name: 上传构建产物至 GitHub Artifacts
+          if ([string]::IsNullOrWhiteSpace($env:DATAOG_UPDATE_SIGNING_KEY)) {
+            Write-Error "::error::缺少仓库 Secret DATAOG_UPDATE_SIGNING_KEY。请在 GitHub 仓库 Settings -> Secrets and variables -> Actions 中新增 Secret DATAOG_UPDATE_SIGNING_KEY（值为本地 .keygen_secrets/master_ed25519.key 的 64 位十六进制 Ed25519 私钥种子），然后重新运行工作流。"
+            exit 1
+          }
+
+          $codeVer = (python -c "import build_update_pack as b; print(b._detect_source_version('.'))").Trim()
+          if ("${{ github.ref_name }}" -like "v*" -and "${{ github.ref_name }}" -ne "v$codeVer") {
+            Write-Error "::error::Git 标签 ${{ github.ref_name }} 与代码版本号 v$codeVer 不一致！"
+            exit 1
+          }
+
+          python build_update_pack.py --version $codeVer --output-dir .
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $builtUpdateZip = "DataOG-Update-v$codeVer.zip"
+          $updateZipName = "DataOG-Update-$version.zip"
+          if ($builtUpdateZip -ne $updateZipName) {
+            Move-Item -Path $builtUpdateZip -Destination $updateZipName -Force
+          }
+          echo "UPDATE_ZIP_PATH=$updateZipName" >> $env:GITHUB_ENV
+
+      - name: 2 秒冻结态增量补丁激活冒烟自检
+        shell: pwsh
+        run: |
+          $patchTestDir = Join-Path $env:RUNNER_TEMP "dataog_patch_test"
+          if (Test-Path $patchTestDir) {
+            Remove-Item -Path $patchTestDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          New-Item -ItemType Directory -Path $patchTestDir -Force | Out-Null
+          Copy-Item -Path "dist\DataOG\*" -Destination $patchTestDir -Recurse -Force
+          Expand-Archive -Path $env:UPDATE_ZIP_PATH -DestinationPath $patchTestDir -Force
+          $env:DATAOG_HOME = Join-Path $env:RUNNER_TEMP "dataog_ci_patch_home"
+          if (Test-Path $env:DATAOG_HOME) {
+            Remove-Item -Path $env:DATAOG_HOME -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          $smokeLines = & (Join-Path $patchTestDir "DataOG.exe") --smoke-test
+          $smokeExit = $LASTEXITCODE
+          $joined = ($smokeLines | Out-String)
+          Write-Host $joined
+          if ($smokeExit -ne 0) {
+            throw "增量包冻结态冒烟测试失败 (exit=$smokeExit)"
+          }
+          if ($joined -notmatch "patch_active=True") {
+            throw "增量包冻结态冒烟测试未能激活增量补丁: $joined"
+          }
+
+      - name: 上传双构建产物至 GitHub Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: DataOG-Windows-x64
-          path: ${{ env.ZIP_PATH }}
+          name: DataOG-Windows-x64-and-Updates
+          path: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.UPDATE_ZIP_PATH }}
           retention-days: 30
 
-      - name: 自动发布至 GitHub Releases (仅限 v* 版本标签)
+      - name: 自动发布双产物至 GitHub Releases (仅限 v* 版本标签)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           draft: false
           overwrite_files: true
-          files: ${{ env.ZIP_PATH }}
+          files: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.UPDATE_ZIP_PATH }}
           generate_release_notes: true

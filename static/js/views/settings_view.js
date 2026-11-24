@@ -23,6 +23,7 @@ import { Toast } from "../ui/toast.js";
 import { ConnectionsView, renderDriversSection } from "./connections_view.js";
 import { DiagnosticsView } from "./diagnostics_view.js";
 import { KnowledgeSettingsView } from "./knowledge_view.js";
+import { UpdatesView } from "./updates_view.js";
 import { WorkspaceView } from "./workspace_view.js";
 
 const WALLPAPER_PRESETS = [
@@ -39,6 +40,7 @@ const SECTIONS = [
   { id: "drivers", label: "JDBC 驱动" },
   { id: "knowledge", label: "参考知识库" },
   { id: "llm", label: "AI 模型" },
+  { id: "updates", label: "版本与升级" },
   { id: "diagnostics", label: "性能诊断" },
 ];
 
@@ -48,6 +50,7 @@ export class SettingsView {
     this.connectionsPane = new ConnectionsView({ onChange: () => this.render() });
     this.workspacePane = new WorkspaceView({ onChange: () => this.render() });
     this.knowledgePane = new KnowledgeSettingsView({ onChange: () => this.render() });
+    this.updatesPane = new UpdatesView({ onChange: () => this.render() });
     this.diagnosticsPane = new DiagnosticsView({ onChange: () => this.render() });
     this.selectedProviderId = "deepseek";
     this.llmDraft = null;
@@ -67,6 +70,7 @@ export class SettingsView {
 
   destroy() {
     this.knowledgePane?.destroy();
+    this.updatesPane?.destroy();
     this.diagnosticsPane?.destroy();
     this._unsub?.();
   }
@@ -95,6 +99,8 @@ export class SettingsView {
       this.workspacePane.refreshFromServer();
     } else if (this.activeSection === "knowledge") {
       this.knowledgePane.refreshFromServer();
+    } else if (this.activeSection === "updates") {
+      this.updatesPane.refreshFromServer();
     } else if (this.activeSection === "diagnostics") {
       this.diagnosticsPane.refreshFromServer();
     }
@@ -689,6 +695,8 @@ export class SettingsView {
                 this.workspacePane.refreshFromServer();
               } else if (s.id === "knowledge") {
                 this.knowledgePane.refreshFromServer();
+              } else if (s.id === "updates") {
+                this.updatesPane.refreshFromServer();
               } else if (s.id === "diagnostics") {
                 this.diagnosticsPane.refreshFromServer();
               }
@@ -701,6 +709,10 @@ export class SettingsView {
             ? badge(store.state.connections.length, "neutral")
             : s.id === "workspaces" && store.state.workspaces.length > 1
             ? badge(store.state.workspaces.length, "neutral")
+            : s.id === "updates" && (this.updatesPane?.status?.restart_required || store.state.bootstrap?.update_summary?.restart_required)
+            ? badge("待重启", "warn")
+            : s.id === "updates" && this.updatesPane?.status?.install_dir_pending_count > 0
+            ? badge(this.updatesPane.status.install_dir_pending_count, "info")
             : null
         )
       )
@@ -720,6 +732,9 @@ export class SettingsView {
     } else if (this.activeSection === "knowledge") {
       this.knowledgePane.render();
       paneBody = this.knowledgePane.root;
+    } else if (this.activeSection === "updates") {
+      this.updatesPane.render();
+      paneBody = this.updatesPane.root;
     } else if (this.activeSection === "diagnostics") {
       this.diagnosticsPane.render();
       paneBody = this.diagnosticsPane.root;
