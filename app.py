@@ -140,6 +140,7 @@ try:
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
+    from starlette.concurrency import run_in_threadpool
 
     from core.platform.context import PlatformContext
     from core.platform.license_hub import AUTH_PUBLIC_EXEMPT_PREFIXES
@@ -227,7 +228,7 @@ def setup_console_logging() -> logging.Logger:
 
 logger = setup_console_logging()
 
-APP_VERSION = "3.2.2"
+APP_VERSION = "3.2.3"
 _NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
 _UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
 
@@ -414,7 +415,13 @@ def create_app(
                 req_path.startswith(pref) for pref in AUTH_PUBLIC_EXEMPT_PREFIXES
             ):
                 t_auth0 = time.perf_counter()
-                ok_auth, auth_info = ctx.license_hub.check_and_stamp_request(request)
+                fast_auth = ctx.license_hub.try_fast_stamp_request(request)
+                if fast_auth is not None:
+                    ok_auth, auth_info = fast_auth
+                else:
+                    ok_auth, auth_info = await run_in_threadpool(
+                        ctx.license_hub.check_and_stamp_request, request
+                    )
                 auth_gate1_ms = (time.perf_counter() - t_auth0) * 1000.0
                 if not ok_auth:
                     error_text = str(auth_info.get("status") or "LICENSE_REQUIRED")
@@ -694,6 +701,7 @@ def run_smoke_test(require_native_shield: Optional[bool] = None) -> Dict[str, An
 
     # 3. 隔离临时保险箱实例化 FastAPI 微内核并验证插件/知识库/原生护盾
     smoke_tmp = tempfile.mkdtemp(prefix="dataog_smoke_")
+    ctx = None
     try:
         vault_root = os.path.join(smoke_tmp, "vault")
         app_inst = create_app(private_root=vault_root)
@@ -768,6 +776,8 @@ def run_smoke_test(require_native_shield: Optional[bool] = None) -> Dict[str, An
 
         asyncio.run(_run_probes())
     finally:
+        if ctx is not None:
+            ctx.close()
         for attempt in range(4):
             shutil.rmtree(smoke_tmp, ignore_errors=True)
             if not os.path.exists(smoke_tmp):
@@ -875,7 +885,13 @@ def main() -> None:
         ws="none",
     )
     server = uvicorn.Server(config)
-    server.run()
+    try:
+        server.run()
+    finally:
+        try:
+            app_instance.state.platform_ctx.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

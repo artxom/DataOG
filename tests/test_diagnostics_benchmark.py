@@ -620,6 +620,228 @@ console.log("DIAGNOSTICS_FRONTEND_E2E_OK");
                 self.assertNotIn(priv_root, resp.text)
                 self.assertNotIn(sqlite_file, resp.text)
                 self.assertNotIn(os.path.basename(sqlite_file), resp.text)
+                ctx.close()
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_persistent_sqlite_reuse_and_gate1_fast_path_non_blocking(self) -> None:
+        """验证持久复用 SQLite 连接、热切换 checkpoint、Gate 1 纯内存快速通道及锁定即时失效."""
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_root = os.path.join(tmp, "persist_vault")
+            app = create_app(private_root=priv_root)
+            ctx: PlatformContext = app.state.platform_ctx
+            client = TestClient(app)
+            try:
+                act_code = str(ctx.store.get_meta("license_activation_code", "") or "")
+                self.assertTrue(act_code)
+
+                # 首请求预热 Gate 1 内存缓存
+                boot = client.get("/api/platform/bootstrap")
+                self.assertEqual(boot.status_code, 200)
+
+                # 后续连续请求走纯内存 Gate 1 快速通道且持久复用私有/工作区 SQLite 连接
+                conn_resp = client.get("/api/platform/connections")
+                self.assertEqual(conn_resp.status_code, 200)
+                ping_resp = client.get("/api/platform/diagnostics/ping")
+                self.assertEqual(ping_resp.status_code, 200)
+
+                conn_tid = conn_resp.headers.get("x-dataog-trace-id") or ""
+                self.assertTrue(conn_tid)
+                tr_json = client.get(f"/api/platform/diagnostics/traces/{conn_tid}").json()
+                span_names = {
+                    f"{s.get('category')}.{s.get('name')}"
+                    for s in ((tr_json.get("trace") or {}).get("spans") or [])
+                }
+                self.assertIn("license.gate1_fast_hit", span_names)
+                self.assertNotIn("license.device_probe", span_names)
+
+                ov = client.get("/api/platform/diagnostics/overview").json()
+                sq_stats = ov["sqlite_stats"]
+                self.assertGreater(sq_stats["private_reuses"], 0)
+                self.assertGreater(sq_stats["workspace_reuses"], 0)
+                self.assertLessEqual(sq_stats["private_opens"], 2)
+                self.assertLessEqual(sq_stats["workspace_opens"], 2)
+
+                # 热切换新工作区并确认 WAL checkpoint + 持久连接重建正常
+                ctx.workspace_hub.create_workspace(name="PerfWS2", switch_immediately=True)
+                ws_list_resp = client.get("/api/platform/workspaces")
+                self.assertEqual(ws_list_resp.status_code, 200)
+                ctx.store.checkpoint_workspace()
+
+                # 锁定工作台必须立即失效 Gate 1 热缓存并返回 401，重新激活恢复 200
+                self.assertEqual(client.post("/api/platform/auth/lock").status_code, 200)
+                self.assertEqual(client.get("/api/platform/connections").status_code, 401)
+                self.assertEqual(
+                    client.post(
+                        "/api/platform/auth/activate",
+                        json={"activation_code": act_code},
+                    ).status_code,
+                    200,
+                )
+                self.assertEqual(client.get("/api/platform/connections").status_code, 200)
+            finally:
+                ctx.close()
+
+    def test_binding_stats_large_scale_speed_batch_prune_and_readonly_view(self) -> None:
+        """验证大规模元数据时 get_connection_binding_stats 线性性能、批量僵尸清理及只读态零冗余写盘."""
+        from modules.standard_migrator.service import StandardMigratorService
+
+        with tempfile.TemporaryDirectory() as tmp:
+            priv_root = os.path.join(tmp, "scale_vault")
+            live_db = os.path.join(tmp, "live_src.db")
+            with contextlib.closing(sqlite3.connect(live_db)) as sconn:
+                sconn.execute("CREATE TABLE t_live (col_a TEXT, col_b INTEGER)")
+                sconn.commit()
+
+            app = create_app(private_root=priv_root)
+            ctx: PlatformContext = app.state.platform_ctx
+            try:
+                prof = ctx.connection_hub.save_profile(
+                    {
+                        "name": "ScaleSQLite",
+                        "db_type": "SQLITE",
+                        "sqlite_path": live_db,
+                    }
+                )
+                cid = prof.connection_id
+
+                # 写入 250 张表 × 30 列 = 7,500 条 meta_columns
+                meta_rows = [
+                    (
+                        cid,
+                        "dwd",
+                        f"tbl_{t:04d}",
+                        c + 1,
+                        f"col_{c:02d}",
+                        "VARCHAR(64)",
+                        "VARCHAR(64)",
+                        0,
+                        None,
+                        "",
+                        0,
+                        "[]",
+                        "",
+                        "2026-11-24 14:00:00",
+                    )
+                    for t in range(250)
+                    for c in range(30)
+                ]
+                with ctx.store.module_db() as conn:
+                    conn.executemany(
+                        """
+                        INSERT INTO meta_columns (
+                            connection_id, schema_name, table_name, ordinal_position,
+                            column_name, data_type, normalized_type, is_not_null,
+                            column_default, column_comment, is_primary_key,
+                            index_names_json, lineage_source, refreshed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        meta_rows,
+                    )
+
+                # 写入 150 表 × 30 列 = 4,500 条绑定 + 5 条僵尸绑定 + 1 张未缓存表绑定
+                bindings = [
+                    {
+                        "schema_name": "dwd",
+                        "table_name": f"tbl_{t:04d}",
+                        "column_name": f"col_{c:02d}",
+                        "std_code": f"STD{c:04d}",
+                        "compliance_status": "COMPLIANT",
+                    }
+                    for t in range(150)
+                    for c in range(30)
+                ]
+                for z in range(3):
+                    bindings.append(
+                        {
+                            "schema_name": "dwd",
+                            "table_name": "tbl_0000",
+                            "column_name": f"zombie_col_{z}",
+                            "std_code": "STD0001",
+                            "compliance_status": "NON_COMPLIANT",
+                        }
+                    )
+                for z in range(2):
+                    bindings.append(
+                        {
+                            "schema_name": "dwd",
+                            "table_name": "tbl_0001",
+                            "column_name": f"zombie_col_{z}",
+                            "std_code": "STD0001",
+                            "compliance_status": "NON_COMPLIANT",
+                        }
+                    )
+                for u in range(2):
+                    bindings.append(
+                        {
+                            "schema_name": "dwd",
+                            "table_name": "tbl_uncached",
+                            "column_name": f"u_col_{u}",
+                            "std_code": "STD0001",
+                            "compliance_status": "COMMENT_ONLY",
+                        }
+                    )
+                ctx.standard_catalog.bulk_save_field_bindings(cid, bindings, mode="merge")
+
+                t0 = time.perf_counter()
+                stats = ctx.standard_catalog.get_connection_binding_stats(cid)
+                elapsed_ms = (time.perf_counter() - t0) * 1000.0
+                self.assertLess(elapsed_ms, 1000.0, f"大规模绑标统计耗时过长: {elapsed_ms:.1f}ms")
+                self.assertEqual(stats["dwd.tbl_0000"]["bound_count"], 30)
+                self.assertEqual(stats["dwd.tbl_0000"]["compliant_count"], 30)
+                self.assertEqual(stats["dwd.tbl_0000"]["total_cols"], 30)
+                self.assertEqual(stats["dwd.tbl_0001"]["bound_count"], 30)
+                self.assertEqual(stats["dwd.tbl_uncached"]["bound_count"], 2)
+                self.assertEqual(stats["dwd.tbl_uncached"]["comment_only_count"], 2)
+                self.assertEqual(stats["dwd.tbl_uncached"]["total_cols"], 0)
+
+                # 单连接批量清理 2 张表的 5 条僵尸绑定
+                live_cols = [f"col_{c:02d}" for c in range(30)]
+                removed = ctx.standard_catalog.prune_stale_tables_bindings_batch(
+                    cid,
+                    [("dwd", "tbl_0000", live_cols), ("dwd", "tbl_0001", live_cols)],
+                )
+                self.assertEqual(removed, 5)
+                self.assertEqual(
+                    ctx.standard_catalog.prune_stale_tables_bindings_batch(
+                        cid, [("dwd", "tbl_0000", live_cols)]
+                    ),
+                    0,
+                )
+
+                # 验证只读打开表核验：状态未变时跳过冗余 UPDATE 写事务
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_LIVE_A",
+                        "cn_name": "测试列A",
+                        "en_abbr": "col_a",
+                        "type_dws": "TEXT",
+                        "type_mysql": "TEXT",
+                    }
+                )
+                ctx.standard_catalog.upsert_field_bindings(
+                    cid,
+                    [
+                        {
+                            "schema_name": "main",
+                            "table_name": "t_live",
+                            "column_name": "col_a",
+                            "std_code": "STD_LIVE_A",
+                        }
+                    ],
+                )
+                mig = StandardMigratorService(ctx)
+                first_res = mig.get_table_compliance(cid, "main", "t_live", force_refresh=True)
+                self.assertEqual(first_res["columns"][0]["compliance_status"], "COMMENT_ONLY")
+
+                with mock.patch.object(
+                    ctx.standard_catalog,
+                    "update_binding_compliance_batch",
+                    wraps=ctx.standard_catalog.update_binding_compliance_batch,
+                ) as mock_upd:
+                    second_res = mig.get_table_compliance(cid, "main", "t_live", force_refresh=False)
+                self.assertEqual(second_res["columns"][0]["compliance_status"], "COMMENT_ONLY")
+                mock_upd.assert_not_called()
+            finally:
+                ctx.close()

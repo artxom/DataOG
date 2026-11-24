@@ -966,6 +966,9 @@ class LicenseHub:
         self._verify_cache: Optional[
             Tuple[Tuple[Any, ...], Tuple[str, int, int, int, str], float]
         ] = None
+        self._gate1_cache: Optional[
+            Tuple[float, datetime.date, int, str, Dict[str, Any]]
+        ] = None
         self._last_watermark_write_ts: float = 0.0
         self._max_watermark_mem: float = 0.0
 
@@ -985,6 +988,7 @@ class LicenseHub:
             self._verifier_pubkey = bytes(pubkey)
             self._using_custom_pubkey = True
             self._verify_cache = None
+            self._gate1_cache = None
 
     def _now_ts(self) -> float:
         return float(self._clock_fn())
@@ -1016,7 +1020,7 @@ class LicenseHub:
                 if (
                     not force_refresh
                     and self._cached_device is not None
-                    and (now_mono - self._cached_device_ts) < 20.0
+                    and (now_mono - self._cached_device_ts) < 120.0
                 ):
                     annotate_current_span(cache_hit=True)
                     return dict(self._cached_device)
@@ -1101,7 +1105,7 @@ class LicenseHub:
                 self._clock_fn is time.time
                 and not force_persist
                 and self._last_watermark_write_ts > 0.0
-                and 0.0 <= (now_ts - self._last_watermark_write_ts) < 60.0
+                and 0.0 <= (now_ts - self._last_watermark_write_ts) < 300.0
             ):
                 return
             with trace_span("license", "advance_clock_watermark", {"force_persist": bool(force_persist), "persisted": True}):
@@ -1398,6 +1402,7 @@ class LicenseHub:
         with self._lock:
             self._failed_attempts.clear()
             self._verify_cache = None
+            self._gate1_cache = None
             self.store.save_meta("license_activation_code", cleaned_code)
             self.store.save_meta("license_locked", "0")
             self._advance_clock_watermark(
@@ -1417,6 +1422,7 @@ class LicenseHub:
     def lock(self) -> Dict[str, Any]:
         with self._lock:
             self._verify_cache = None
+            self._gate1_cache = None
             self.store.save_meta("license_locked", "1")
             self._session_epoch = secrets.token_hex(8)
         self.store.add_log("INFO", "安全授权", "用户主动锁定工作台并退回登录页")
@@ -1448,11 +1454,7 @@ class LicenseHub:
         ).hexdigest()[:24]
         return hmac.compare_digest(sig, expected)
 
-    def check_and_stamp_request(self, request: Request) -> Tuple[bool, Dict[str, Any]]:
-        """Gate 1: 中间件调用。校验授权并在 request.state 上加盖请求级动态 HMAC 能力令牌."""
-        auth = self.get_auth_status()
-        if not auth["authorized"]:
-            return False, auth
+    def _stamp_request(self, request: Request) -> None:
         nonce = secrets.token_hex(12)
         path = request.url.path
         stamp_mono = time.monotonic()
@@ -1462,6 +1464,63 @@ class LicenseHub:
             hashlib.sha256,
         ).hexdigest()
         request.state.license_cap = (nonce, path, stamp_mono, mac)
+
+    def try_fast_stamp_request(
+        self, request: Request
+    ) -> Optional[Tuple[bool, Dict[str, Any]]]:
+        """纯内存零 SQLite/C探针 I/O 的 Gate 1 快速能力签发通道（10 秒热缓存）."""
+        if self._clock_fn is not time.time or self._custom_device_probe_fn is not None:
+            return None
+        with trace_span("license", "gate1_fast_hit"):
+            with self._lock:
+                cached = self._gate1_cache
+                if cached is None:
+                    return None
+                cached_mono, cached_today, expiry_day, cached_epoch, auth_snap = cached
+                if cached_epoch != self._session_epoch:
+                    self._gate1_cache = None
+                    return None
+                if (time.monotonic() - cached_mono) >= 10.0:
+                    self._gate1_cache = None
+                    return None
+                now_ts = time.time()
+                if (
+                    self._max_watermark_mem > 0.0
+                    and (now_ts + CLOCK_ROLLBACK_TOLERANCE_SEC) < self._max_watermark_mem
+                ):
+                    self._gate1_cache = None
+                    return None
+                today = datetime.date.fromtimestamp(now_ts)
+                if today != cached_today or date_to_epoch_day(today) > expiry_day:
+                    self._gate1_cache = None
+                    return None
+                self._max_watermark_mem = max(self._max_watermark_mem, now_ts)
+                self._stamp_request(request)
+                return True, dict(auth_snap)
+
+    def check_and_stamp_request(self, request: Request) -> Tuple[bool, Dict[str, Any]]:
+        """Gate 1: 中间件调用。校验授权并在 request.state 上加盖请求级动态 HMAC 能力令牌."""
+        auth = self.get_auth_status()
+        if not auth["authorized"]:
+            with self._lock:
+                self._gate1_cache = None
+            return False, auth
+        if self._clock_fn is time.time and self._custom_device_probe_fn is None:
+            exp_iso = str(auth.get("expires_date") or "").strip()
+            if exp_iso:
+                try:
+                    exp_day = date_to_epoch_day(datetime.date.fromisoformat(exp_iso))
+                    with self._lock:
+                        self._gate1_cache = (
+                            time.monotonic(),
+                            datetime.date.fromtimestamp(time.time()),
+                            exp_day,
+                            self._session_epoch,
+                            dict(auth),
+                        )
+                except ValueError:
+                    pass
+        self._stamp_request(request)
         return True, auth
 
     def verify_request_capability(self, request: Request) -> Tuple[bool, Dict[str, Any]]:

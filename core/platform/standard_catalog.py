@@ -13,7 +13,7 @@ import datetime
 import io
 import json
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -21,6 +21,7 @@ from openpyxl.utils import get_column_letter
 
 from core.excel_formula import EXCEL_ERROR_TOKENS, ResolvedWorkbook, clean_excel_cell_str
 from core.excel_handler import validate_xlsx_bytes
+from core.platform.diagnostics_hub import trace_span
 from core.platform.dialects import clean_identifier_input, is_cross_type_compatible
 from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.storage import PlatformStateStore
@@ -1880,14 +1881,77 @@ class StandardCatalog:
                 for r in rows
                 if ((clean_identifier_input(str(r["column_name"] or "")) or "").lower() not in valid_lower)
             ]
-            if not stale_ids:
-                return 0
-            ph = ",".join("?" for _ in stale_ids)
-            conn.execute(
-                f"DELETE FROM field_standard_bindings WHERE id IN ({ph})",
-                tuple(stale_ids),
-            )
+            if stale_ids:
+                ph = ",".join("?" for _ in stale_ids)
+                conn.execute(
+                    f"DELETE FROM field_standard_bindings WHERE id IN ({ph})",
+                    tuple(stale_ids),
+                )
             return len(stale_ids)
+
+    def prune_stale_tables_bindings_batch(
+        self,
+        connection_id: str,
+        targets: Sequence[Tuple[str, str, Iterable[str]]],
+    ) -> int:
+        """单连接单事务批量清理多张表已改名/已删除的僵尸绑标，消除逐表打开 SQLite 风暴."""
+        if not connection_id or not targets:
+            return 0
+        valid_by_table: Dict[Tuple[str, str], Set[str]] = {}
+        for raw_sch, raw_tbl, valid_cols in targets:
+            eff_s = clean_identifier_input(raw_sch or "") or "public"
+            eff_t = clean_identifier_input(raw_tbl or "")
+            if not eff_t:
+                continue
+            vset = {
+                (clean_identifier_input(str(c or "")) or "").lower()
+                for c in (valid_cols or [])
+            }
+            vset.discard("")
+            if not vset:
+                continue
+            tk = (eff_s.lower(), eff_t.lower())
+            if tk in valid_by_table:
+                valid_by_table[tk].update(vset)
+            else:
+                valid_by_table[tk] = vset
+
+        if not valid_by_table:
+            return 0
+
+        with trace_span("standard", "prune_stale_batch", {"table_count": len(valid_by_table)}):
+            with self.store.module_db() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, schema_name, table_name, column_name
+                    FROM field_standard_bindings
+                    WHERE connection_id = ?
+                    """,
+                    (connection_id,),
+                ).fetchall()
+                stale_ids: List[int] = []
+                for r in rows:
+                    s_low = (clean_identifier_input(str(r["schema_name"] or "")) or "public").lower()
+                    t_low = clean_identifier_input(str(r["table_name"] or "")).lower()
+                    valid_cols_set = valid_by_table.get((s_low, t_low))
+                    if valid_cols_set is None:
+                        continue
+                    c_low = (clean_identifier_input(str(r["column_name"] or "")) or "").lower()
+                    if c_low not in valid_cols_set:
+                        stale_ids.append(int(r["id"]))
+
+                if not stale_ids:
+                    return 0
+
+                chunk_size = 500
+                for i in range(0, len(stale_ids), chunk_size):
+                    chunk = stale_ids[i : i + chunk_size]
+                    ph = ",".join("?" for _ in chunk)
+                    conn.execute(
+                        f"DELETE FROM field_standard_bindings WHERE id IN ({ph})",
+                        tuple(chunk),
+                    )
+                return len(stale_ids)
 
     def upsert_field_bindings(
         self,
@@ -1954,69 +2018,67 @@ class StandardCatalog:
             )
 
     def get_connection_binding_stats(self, connection_id: str) -> Dict[str, Dict[str, int]]:
-        """返回指定数据源下按 lowercase `schema.table` 聚合的有效绑标/落标计数（自动剔除不存在于 meta_columns 的僵尸绑标）."""
+        """返回指定数据源下按 lowercase `schema.table` 聚合的有效绑标/落标计数（O(N+M) 线性索引读取 + 内存聚合）."""
         if not connection_id:
             return {}
-        with self.store.module_db() as conn:
-            rows = conn.execute(
-                """
-                WITH cached_tables AS (
-                    SELECT DISTINCT
-                        LOWER(TRIM(schema_name)) AS s_key,
-                        LOWER(TRIM(table_name)) AS t_key
+        with trace_span("standard", "binding_stats", {"connection_id": connection_id}):
+            with self.store.module_db() as conn:
+                fb_rows = conn.execute(
+                    """
+                    SELECT schema_name, table_name, column_name, compliance_status
+                    FROM field_standard_bindings
+                    WHERE connection_id = ? AND std_code != ''
+                    """,
+                    (connection_id,),
+                ).fetchall()
+                if not fb_rows:
+                    return {}
+                mc_rows = conn.execute(
+                    """
+                    SELECT schema_name, table_name, column_name
                     FROM meta_columns
                     WHERE connection_id = ?
-                ),
-                live_cols AS (
-                    SELECT DISTINCT
-                        LOWER(TRIM(schema_name)) AS s_key,
-                        LOWER(TRIM(table_name)) AS t_key,
-                        LOWER(TRIM(column_name)) AS c_key
-                    FROM meta_columns
-                    WHERE connection_id = ?
-                ),
-                table_totals AS (
-                    SELECT
-                        LOWER(TRIM(schema_name)) || '.' || LOWER(TRIM(table_name)) AS tbl_key,
-                        COUNT(DISTINCT LOWER(TRIM(column_name))) AS total_cols
-                    FROM meta_columns
-                    WHERE connection_id = ?
-                    GROUP BY LOWER(TRIM(schema_name)), LOWER(TRIM(table_name))
-                )
-                SELECT
-                    LOWER(TRIM(fb.schema_name)) || '.' || LOWER(TRIM(fb.table_name)) AS tbl_key,
-                    COUNT(*) AS bound_count,
-                    SUM(CASE WHEN fb.compliance_status = 'COMPLIANT' THEN 1 ELSE 0 END) AS compliant_count,
-                    SUM(CASE WHEN fb.compliance_status = 'COMMENT_ONLY' THEN 1 ELSE 0 END) AS comment_only_count,
-                    SUM(CASE WHEN fb.compliance_status IN ('NON_COMPLIANT', 'STD_MISSING') THEN 1 ELSE 0 END) AS non_compliant_count,
-                    COALESCE(tt.total_cols, 0) AS total_cols
-                FROM field_standard_bindings fb
-                LEFT JOIN cached_tables ct
-                    ON ct.s_key = LOWER(TRIM(fb.schema_name))
-                   AND ct.t_key = LOWER(TRIM(fb.table_name))
-                LEFT JOIN live_cols lc
-                    ON lc.s_key = LOWER(TRIM(fb.schema_name))
-                   AND lc.t_key = LOWER(TRIM(fb.table_name))
-                   AND lc.c_key = LOWER(TRIM(fb.column_name))
-                LEFT JOIN table_totals tt
-                    ON tt.tbl_key = LOWER(TRIM(fb.schema_name)) || '.' || LOWER(TRIM(fb.table_name))
-                WHERE fb.connection_id = ?
-                  AND fb.std_code != ''
-                  AND (ct.t_key IS NULL OR lc.c_key IS NOT NULL)
-                GROUP BY LOWER(TRIM(fb.schema_name)), LOWER(TRIM(fb.table_name))
-                """,
-                (connection_id, connection_id, connection_id, connection_id),
-            ).fetchall()
-        return {
-            r["tbl_key"]: {
-                "bound_count": int(r["bound_count"] or 0),
-                "compliant_count": int(r["compliant_count"] or 0),
-                "comment_only_count": int(r["comment_only_count"] or 0),
-                "non_compliant_count": int(r["non_compliant_count"] or 0),
-                "total_cols": int(r["total_cols"] or 0),
-            }
-            for r in rows
-        }
+                    """,
+                    (connection_id,),
+                ).fetchall()
+
+            live_cols_by_table: Dict[Tuple[str, str], Set[str]] = {}
+            for mr in mc_rows:
+                s_k = str(mr["schema_name"] or "").strip().lower()
+                t_k = str(mr["table_name"] or "").strip().lower()
+                c_k = str(mr["column_name"] or "").strip().lower()
+                if t_k and c_k:
+                    live_cols_by_table.setdefault((s_k, t_k), set()).add(c_k)
+
+            stats: Dict[str, Dict[str, int]] = {}
+            for fr in fb_rows:
+                s_k = str(fr["schema_name"] or "").strip().lower()
+                t_k = str(fr["table_name"] or "").strip().lower()
+                c_k = str(fr["column_name"] or "").strip().lower()
+                tk = (s_k, t_k)
+                live_cols = live_cols_by_table.get(tk)
+                if live_cols is not None and c_k not in live_cols:
+                    continue
+                tbl_key = f"{s_k}.{t_k}"
+                entry = stats.get(tbl_key)
+                if entry is None:
+                    entry = {
+                        "bound_count": 0,
+                        "compliant_count": 0,
+                        "comment_only_count": 0,
+                        "non_compliant_count": 0,
+                        "total_cols": len(live_cols) if live_cols is not None else 0,
+                    }
+                    stats[tbl_key] = entry
+                entry["bound_count"] += 1
+                st = str(fr["compliance_status"] or "")
+                if st == "COMPLIANT":
+                    entry["compliant_count"] += 1
+                elif st == "COMMENT_ONLY":
+                    entry["comment_only_count"] += 1
+                elif st in ("NON_COMPLIANT", "STD_MISSING"):
+                    entry["non_compliant_count"] += 1
+            return stats
 
     def list_bound_tables_for_connection(self, connection_id: str) -> List[Tuple[str, str]]:
         if not connection_id:

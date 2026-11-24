@@ -652,7 +652,10 @@ class WorkspaceManager:
                 if not src_rec:
                     raise LookupError("未找到要复制的来源工作区")
                 src_path = self._get_workspace_file_path_for_record(src_rec)
-                _checkpoint_sqlite_quietly(src_path)
+                if os.path.abspath(src_path) == os.path.abspath(self.store.workspace_db_path):
+                    self.store.checkpoint_workspace()
+                else:
+                    _checkpoint_sqlite_quietly(src_path)
                 with contextlib.closing(_open_readonly_sqlite(src_path)) as sconn:
                     _extract_sanitized_workspace_to_file(
                         sconn,
@@ -772,7 +775,7 @@ class WorkspaceManager:
                 if not self.store.is_split_storage and workspace_id != DEFAULT_WORKSPACE_ID:
                     def_path = self._resolve_safe_workspace_path(DEFAULT_WORKSPACE_FILE)
                     if not os.path.isfile(def_path):
-                        _checkpoint_sqlite_quietly(self.store.workspace_db_path)
+                        self.store.checkpoint_workspace()
                         with contextlib.closing(_open_readonly_sqlite(self.store.workspace_db_path)) as sconn:
                             _extract_sanitized_workspace_to_file(
                                 sconn,
@@ -829,7 +832,10 @@ class WorkspaceManager:
                 raise LookupError("未找到要导出的工作区")
             src_path = self._get_workspace_file_path_for_record(rec)
 
-            _checkpoint_sqlite_quietly(src_path)
+            if os.path.abspath(src_path) == os.path.abspath(self.store.workspace_db_path):
+                self.store.checkpoint_workspace()
+            else:
+                _checkpoint_sqlite_quietly(src_path)
 
             fd, tmp_export_path = tempfile.mkstemp(prefix="exp_", suffix=".bin", dir=self.tmp_dir)
             os.close(fd)
