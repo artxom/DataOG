@@ -357,16 +357,22 @@ class ExecutionPlanner:
         low_p = (prompt or "").lower()
         if not low_p:
             return []
-        matched: List[str] = []
+        role_rank = {"final_target": 0, "temp_staging": 1, "source_only": 2}
+        scored: List[Tuple[int, int, str]] = []
         seen: set[str] = set()
+        order = 0
         for att in attachments:
             analysis = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
             dag_nodes = (analysis.get("lineage_dag") or {}).get("nodes") or []
-            candidates: List[str] = [str(n.get("table") or "") for n in dag_nodes if n.get("table")]
+            candidates: List[Tuple[str, int]] = [
+                (str(n.get("table") or ""), role_rank.get(str(n.get("role") or ""), 2))
+                for n in dag_nodes
+                if n.get("table")
+            ]
             if not candidates:
                 outline = att.get("outline") if isinstance(att.get("outline"), dict) else {}
-                candidates = [str(t) for t in (outline.get("referenced_tables") or []) if t]
-            for tbl in candidates:
+                candidates = [(str(t), 2) for t in (outline.get("referenced_tables") or []) if t]
+            for tbl, rnk in candidates:
                 t_full = tbl.strip().lower()
                 t_bare = t_full.split(".")[-1]
                 if len(t_bare) < 3:
@@ -377,8 +383,10 @@ class ExecutionPlanner:
                 ):
                     if t_full not in seen:
                         seen.add(t_full)
-                        matched.append(tbl)
-        return matched
+                        scored.append((rnk, order, tbl))
+                        order += 1
+        scored.sort(key=lambda x: (x[0], x[1]))
+        return [tbl for _, _, tbl in scored]
 
     @staticmethod
     def _build_balanced_stages(
@@ -388,6 +396,7 @@ class ExecutionPlanner:
         use_compact_view: bool,
         strategy: str,
         lineage_blocks: Optional[List[Dict[str, Any]]] = None,
+        lineage_attachment_id: str = "",
     ) -> List[Dict[str, Any]]:
         stages: List[Dict[str, Any]] = []
         safe_chunk_budget = max(2500, int(chunk_budget or 6000))
@@ -419,8 +428,11 @@ class ExecutionPlanner:
             s_ln = min(int(b.get("start_line") or 1) for b in lineage_blocks)
             e_ln = max(int(b.get("end_line") or s_ln) for b in lineage_blocks)
             tot_tok = sum(int(b.get("estimated_tokens") or 0) for b in lineage_blocks)
-            att0 = attachments[0]
-            an0 = att0.get("analysis") if isinstance(att0.get("analysis"), dict) else {}
+            att_match = next(
+                (a for a in attachments if lineage_attachment_id and a.get("attachment_id") == lineage_attachment_id),
+                None,
+            ) or next((a for a in attachments if a.get("file_kind") == "sql"), attachments[0])
+            an0 = att_match.get("analysis") if isinstance(att_match.get("analysis"), dict) else {}
             lin_fids = [
                 f["finding_id"]
                 for f in (an0.get("static_findings") or [])
@@ -431,8 +443,8 @@ class ExecutionPlanner:
                     "stage_id": "stage_1",
                     "index": 1,
                     "title": f"阶段 1/1 · 血缘精准切片分析 (L{s_ln}-L{e_ln} · {len(s_ids)} 条语句)",
-                    "attachment_id": att0.get("attachment_id", ""),
-                    "filename": att0.get("filename", ""),
+                    "attachment_id": att_match.get("attachment_id", ""),
+                    "filename": att_match.get("filename", ""),
                     "start_line": s_ln,
                     "end_line": e_ln,
                     "stmt_ids": s_ids,
@@ -783,6 +795,9 @@ class ExecutionPlanner:
             use_compact_view=use_compact,
             strategy=strategy,
             lineage_blocks=(lineage_slice_info or {}).get("blocks") if strategy == "lineage_sliced" else None,
+            lineage_attachment_id=str((lineage_slice_info or {}).get("attachment_id") or "")
+            if strategy == "lineage_sliced"
+            else "",
         )
 
         return {
@@ -841,10 +856,9 @@ def detect_tool_loop_and_build_steering(
             except Exception:
                 pass
     elif cur_tool == "search_attachment":
-        if (
-            str(prev_args.get("attachment_id") or "") == str(cur_args.get("attachment_id") or "")
-            and str(prev_args.get("keyword") or "").strip().lower() == str(cur_args.get("keyword") or "").strip().lower()
-        ):
+        prev_kw = str(prev_args.get("keyword") or prev_args.get("pattern") or prev_args.get("query") or "").strip().lower()
+        cur_kw = str(cur_args.get("keyword") or cur_args.get("pattern") or cur_args.get("query") or "").strip().lower()
+        if str(prev_args.get("attachment_id") or "") == str(cur_args.get("attachment_id") or "") and prev_kw and prev_kw == cur_kw:
             overlapped = True
     elif cur_tool == "read_attachment_statement":
         if str(prev_args.get("stmt_id") or "").upper() == str(cur_args.get("stmt_id") or "").upper():
@@ -1530,6 +1544,8 @@ class AiAssistantService(AssistantStorageMixin):
                 temperature=0.1,
                 timeout_sec=60.0,
                 thinking_mode=thinking_mode,
+                on_retry=event_cb,
+                cancel_check=cancel_check,
             )
             used_provider_name = str(llm_res.get("provider_name") or used_provider_name)
             used_model = str(llm_res.get("model") or used_model)
@@ -1869,6 +1885,7 @@ class AiAssistantService(AssistantStorageMixin):
                 temperature=0.1,
                 timeout_sec=timeout_sec,
                 thinking_mode=thinking_mode,
+                cancel_check=cancel_check,
             )
             elapsed = round((time.perf_counter() - t0) * 1000.0, 1)
             raw_reply = str(llm_res.get("content") or "")

@@ -710,8 +710,12 @@ export class SettingsView {
               this.lastProbeResult = res;
               if (res.providers && res.available_models) {
                 store.updateLlmState(res.providers, res.available_models);
-                if (d.provider_id) {
-                  this._syncLlmDraftFromStore(d.provider_id);
+                // 仅同步最新探查缓存，严禁覆盖用户在表单中尚未保存的 api_key / base_url / model_tier 草稿
+                if (d.provider_id && this.llmDraft && this.llmDraft.provider_id === d.provider_id) {
+                  const matchedProv = res.providers.find((p) => p.provider_id === d.provider_id);
+                  if (matchedProv?.extra?.model_probes && typeof matchedProv.extra.model_probes === "object") {
+                    this.llmDraft.model_probes = { ...matchedProv.extra.model_probes };
+                  }
                 }
               }
               Toast.success(res.message || "模型能力探查完成");

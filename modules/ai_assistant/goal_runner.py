@@ -33,6 +33,7 @@ from modules.ai_assistant.attachments import (
 from modules.ai_assistant.service import (
     AiAssistantService,
     ExecutionPlanner,
+    _StreamActionDemuxer,
     infer_task_mode,
 )
 from modules.ai_assistant.sql_static_analyzer import (
@@ -40,6 +41,7 @@ from modules.ai_assistant.sql_static_analyzer import (
     extract_statement_source,
     format_static_analysis_brief,
 )
+from modules.ai_assistant.tools import AssistantToolbox
 
 TERMINAL_RUN_STATUSES = frozenset({"completed", "paused_recoverable", "cancelled", "failed"})
 ACTIVE_RUN_STATUSES = frozenset({"queued", "probing", "planning", "running", "verifying"})
@@ -71,6 +73,16 @@ class _RunRuntimeHub:
             self._active_runs.add(run_id)
             return ev
 
+    def try_register_run(self, run_id: str) -> Optional[threading.Event]:
+        """原子性检查并注册运行中任务，防止并发 /resume 重复拉起同一 run_id 的两个工作线程."""
+        with self._lock:
+            if run_id in self._active_runs:
+                return None
+            ev = threading.Event()
+            self._cancel_events[run_id] = ev
+            self._active_runs.add(run_id)
+            return ev
+
     def unregister_run(self, run_id: str) -> None:
         with self._lock:
             self._active_runs.discard(run_id)
@@ -87,6 +99,16 @@ class _RunRuntimeHub:
                 ev.set()
                 return True
             return False
+
+    def cancel_all(self) -> None:
+        """优雅关闭时取消所有后台运行中的 Goal 线程并通知流订阅者退出."""
+        with self._lock:
+            events = list(self._cancel_events.values())
+            run_ids = list(self._subscribers.keys())
+        for ev in events:
+            ev.set()
+        for rid in run_ids:
+            self.notify_stream_close(rid)
 
     def subscribe(
         self,
@@ -195,7 +217,7 @@ def _extract_addressed_findings_from_reply(
                             )
                     else:
                         txt_it = str(it or "")
-                        for m in re.finditer(r"\bF\d{3}\b", txt_it.upper()):
+                        for m in re.finditer(r"\b(?:A\d+-)?F\d{3}\b", txt_it.upper()):
                             fid = m.group(0)
                             addressed.add(fid)
                             verdicts.setdefault(fid, {"status": default_status, "reason": txt_it[:240], "fix": ""})
@@ -210,7 +232,7 @@ def _extract_addressed_findings_from_reply(
         fid = str(f.get("finding_id") or "").upper()
         if not fid or fid in addressed:
             continue
-        if re.search(rf"\b{re.escape(fid)}\b", up_corpus):
+        if re.search(rf"(?<![A-Z0-9_]){re.escape(fid)}(?![A-Z0-9_])", up_corpus):
             addressed.add(fid)
             verdicts.setdefault(fid, {"status": "reviewed", "reason": f"已在阶段结论中核验 {fid}", "fix": ""})
             continue
@@ -411,30 +433,34 @@ class GoalRunner:
             thinking_mode=eff_thinking_mode,
         )
         run_id = run_rec["run_id"]
-
-        # 持久化初始 session_init 事件
-        ev_init = self.svc.append_run_event(
-            run_id,
-            "session_init",
-            {
-                "type": "session_init",
-                "run_id": run_id,
-                "run_mode": run_mode,
-                "session": {k: v for k, v in sess.items() if k != "messages"},
-                "user_message": user_msg,
-                "thinking_mode": eff_thinking_mode,
-            },
-        )
-        self.hub.publish(run_id, ev_init)
-
+        # 立即在内存运行态注册，防止并发查询在线程启动前将其误判为孤儿任务
         cancel_ev = self.hub.register_run(run_id)
-        thr = threading.Thread(
-            target=self._run_worker,
-            args=(run_id, cancel_ev, False),
-            name=f"ai_goal_{run_id[:10]}",
-            daemon=True,
-        )
-        thr.start()
+        try:
+            # 持久化初始 session_init 事件
+            ev_init = self.svc.append_run_event(
+                run_id,
+                "session_init",
+                {
+                    "type": "session_init",
+                    "run_id": run_id,
+                    "run_mode": run_mode,
+                    "session": {k: v for k, v in sess.items() if k != "messages"},
+                    "user_message": user_msg,
+                    "thinking_mode": eff_thinking_mode,
+                },
+            )
+            self.hub.publish(run_id, ev_init)
+
+            thr = threading.Thread(
+                target=self._run_worker,
+                args=(run_id, cancel_ev, False),
+                name=f"ai_goal_{run_id[:10]}",
+                daemon=True,
+            )
+            thr.start()
+        except Exception:
+            self.hub.unregister_run(run_id)
+            raise
 
         refreshed_run = self.svc.get_run(run_id) or run_rec
         return {
@@ -444,14 +470,50 @@ class GoalRunner:
             "user_message": user_msg,
         }
 
+    def reconcile_orphaned_run(self, run_rec: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """对账孤儿活跃任务：若数据库仍为 running/probing/planning/verifying 但内存无活跃线程（如进程重启），优雅转为 paused_recoverable."""
+        if not isinstance(run_rec, dict) or not run_rec.get("run_id"):
+            return run_rec
+        rid = str(run_rec["run_id"])
+        status = str(run_rec.get("status") or "")
+        if status in ACTIVE_RUN_STATUSES and not self.hub.is_running(rid):
+            reason = (
+                "后台任务因服务重启或进程中断而暂停，已完成阶段与 Checkpoint 账本均已安全保留，"
+                "点击「从断点继续执行」即可无缝接力。"
+            )
+            updated = self.svc.update_run(
+                rid,
+                status="paused_recoverable",
+                current_stage="进程重启中断（可断点继续）",
+                error_message=reason,
+            )
+            self._emit(
+                rid,
+                "run_paused",
+                {
+                    "type": "run_paused",
+                    "run_id": rid,
+                    "status": "paused_recoverable",
+                    "progress_pct": int((updated or run_rec).get("progress_pct") or 0),
+                    "reason": reason,
+                    "plan": (updated or run_rec).get("plan") or {},
+                    "checkpoint": (updated or run_rec).get("checkpoint") or {},
+                    "run": updated or run_rec,
+                    "orphaned_recovered": True,
+                },
+            )
+            return self.svc.get_run(rid) or updated or run_rec
+        return run_rec
+
     def resume_run(self, run_id: str, *, extra_steps: int = 15) -> Dict[str, Any]:
-        """从 SQLite Checkpoint 断点继续推进 `paused_recoverable` / `failed` / `cancelled` 任务，绝不从头重跑."""
+        """从 SQLite Checkpoint 断点继续推进 `paused_recoverable` / `failed` / `cancelled` / 孤儿中断任务，绝不从头重跑."""
         run_rec = self.svc.get_run(run_id)
         if run_rec is None:
             raise KeyError("未找到指定的后台任务")
         if self.hub.is_running(run_id):
             return {"ok": True, "run": run_rec, "message": "任务正在后台执行中"}
 
+        run_rec = self.reconcile_orphaned_run(run_rec) or run_rec
         status = str(run_rec.get("status") or "")
         if status == "completed":
             raise ValueError("该任务已完成，无需继续执行")
@@ -464,36 +526,42 @@ class GoalRunner:
         cur_cap = int(req.get("max_goal_steps") or DEFAULT_MAX_GOAL_STEPS)
         req["max_goal_steps"] = min(60, max(cur_cap, steps_done + max(1, int(extra_steps or 15))))
 
-        updated = self.svc.update_run(
-            run_id,
-            status="running",
-            request_payload=req,
-            current_stage="从断点恢复执行",
-            error_message="",
-            finished_at="",
-        )
-        ev_res = self.svc.append_run_event(
-            run_id,
-            "status",
-            {
-                "type": "status",
-                "run_id": run_id,
-                "stage": "从断点恢复执行",
-                "detail": f"已加载 Checkpoint（已完成 {len(ckpt.get('completed_stage_ids') or [])} 个阶段），正在接续剩余目标...",
-                "percent": int((updated or run_rec).get("progress_pct") or 0),
-                "resumed": True,
-            },
-        )
-        self.hub.publish(run_id, ev_res)
+        cancel_ev = self.hub.try_register_run(run_id)
+        if cancel_ev is None:
+            return {"ok": True, "run": self.svc.get_run(run_id) or run_rec, "message": "任务正在后台执行中"}
+        try:
+            updated = self.svc.update_run(
+                run_id,
+                status="running",
+                request_payload=req,
+                current_stage="从断点恢复执行",
+                error_message="",
+                finished_at="",
+            )
+            ev_res = self.svc.append_run_event(
+                run_id,
+                "status",
+                {
+                    "type": "status",
+                    "run_id": run_id,
+                    "stage": "从断点恢复执行",
+                    "detail": f"已加载 Checkpoint（已完成 {len(ckpt.get('completed_stage_ids') or [])} 个阶段），正在接续剩余目标...",
+                    "percent": int((updated or run_rec).get("progress_pct") or 0),
+                    "resumed": True,
+                },
+            )
+            self.hub.publish(run_id, ev_res)
 
-        cancel_ev = self.hub.register_run(run_id)
-        thr = threading.Thread(
-            target=self._run_worker,
-            args=(run_id, cancel_ev, True),
-            name=f"ai_goal_resume_{run_id[:10]}",
-            daemon=True,
-        )
-        thr.start()
+            thr = threading.Thread(
+                target=self._run_worker,
+                args=(run_id, cancel_ev, True),
+                name=f"ai_goal_resume_{run_id[:10]}",
+                daemon=True,
+            )
+            thr.start()
+        except Exception:
+            self.hub.unregister_run(run_id)
+            raise
         return {"ok": True, "run": self.svc.get_run(run_id) or updated}
 
     def cancel_run(self, run_id: str) -> Dict[str, Any]:
@@ -745,35 +813,111 @@ class GoalRunner:
                     },
                 )
 
-            # 收集附件静态分析上下文索引
+            # 收集附件静态分析上下文索引（多附件场景自动加 A1-/A2- 前缀消除 F001/S001 碰撞）
             att_by_id: Dict[str, Dict[str, Any]] = {
                 str(a.get("attachment_id") or ""): a for a in turn_attachments
             }
+            multi_att = len(turn_attachments) > 1
+            att_prefix_by_id: Dict[str, str] = {
+                str(a.get("attachment_id") or ""): (f"A{idx}" if multi_att else "")
+                for idx, a in enumerate(turn_attachments, start=1)
+            }
+
+            def _scope_id(aid_val: str, raw_id: str) -> str:
+                r = str(raw_id or "").strip().upper()
+                if not r:
+                    return ""
+                pref = att_prefix_by_id.get(str(aid_val or ""), "")
+                if pref and not r.startswith(f"{pref}-"):
+                    return f"{pref}-{r}"
+                return r
+
             all_static_findings: List[Dict[str, Any]] = []
             finding_by_id: Dict[str, Dict[str, Any]] = {}
+            stmt_att_by_scoped_id: Dict[str, Tuple[str, str]] = {}
             all_stmt_ids_expected: List[str] = []
             lineage_brief_blocks: List[str] = []
 
             for att in turn_attachments:
+                aid_cur = str(att.get("attachment_id") or "")
+                pref_cur = att_prefix_by_id.get(aid_cur, "")
                 an = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
                 if an:
+                    for st_item in an.get("statements") or []:
+                        raw_sid = str(st_item.get("stmt_id") or "").upper()
+                        if raw_sid:
+                            sc_sid = _scope_id(aid_cur, raw_sid)
+                            stmt_att_by_scoped_id[sc_sid] = (aid_cur, raw_sid)
                     for f in an.get("static_findings") or []:
                         f_copy = dict(f)
-                        f_copy["attachment_id"] = att["attachment_id"]
+                        raw_fid = str(f.get("finding_id") or "").upper()
+                        raw_fsid = str(f.get("stmt_id") or "").upper()
+                        scoped_fid = _scope_id(aid_cur, raw_fid)
+                        scoped_fsid = _scope_id(aid_cur, raw_fsid) if raw_fsid else ""
+                        f_copy["raw_finding_id"] = raw_fid
+                        f_copy["finding_id"] = scoped_fid
+                        f_copy["raw_stmt_id"] = raw_fsid
+                        f_copy["stmt_id"] = scoped_fsid
+                        f_copy["attachment_id"] = aid_cur
                         f_copy["filename"] = att["filename"]
                         all_static_findings.append(f_copy)
-                        finding_by_id[str(f["finding_id"]).upper()] = f_copy
+                        finding_by_id[scoped_fid] = f_copy
                     brief = format_static_analysis_brief(
                         an, max_lineage_lines=10, max_findings=16, max_statements=16
                     )
                     if brief:
-                        lineage_brief_blocks.append(f"### 附件 `{att['filename']}` 静态图纸\n{brief}")
+                        tag_p = f" [{pref_cur}]" if pref_cur else ""
+                        lineage_brief_blocks.append(f"### 附件 `{att['filename']}`{tag_p} 静态图纸\n{brief}")
+
+            # 同步为多附件计划阶段内的 stmt_ids / finding_ids 施加一致前缀（幂等）
+            if multi_att:
+                for st in plan.get("stages") or []:
+                    st_aid = str(st.get("attachment_id") or "")
+                    if st_aid and att_prefix_by_id.get(st_aid):
+                        st["stmt_ids"] = [_scope_id(st_aid, x) for x in (st.get("stmt_ids") or []) if x]
+                        st["finding_ids"] = [_scope_id(st_aid, x) for x in (st.get("finding_ids") or []) if x]
+
+            # 为无附件 / CSV / 在线连库场景准备紧凑环境上下文（数据库表结构 + 焦点表 + 知识库基线）
+            eff_work_mode, conn_prof, eff_dialect, eff_schema = self.svc._resolve_scope(
+                work_mode=str(req.get("work_mode") or "auto"),
+                connection_id=str(req.get("connection_id") or ""),
+                dialect=dialect,
+                schema_name=str(req.get("schema_name") or ""),
+            )
+            has_sql_atts = any(a.get("file_kind") == "sql" for a in turn_attachments)
+            has_csv_atts = any(a.get("file_kind") == "csv" for a in turn_attachments)
+            env_context_block = ""
+            if (not has_sql_atts) or eff_work_mode == "connection" or has_csv_atts:
+                env_context_block = self.svc._build_context_block(
+                    work_mode=eff_work_mode,
+                    profile=conn_prof,
+                    dialect=eff_dialect,
+                    default_schema=eff_schema,
+                    focus_tables=list(req.get("focus_tables") or []),
+                    session_attachments=turn_attachments if has_csv_atts else None,
+                    compact_mode=True,
+                )
+            goal_toolbox = (
+                AssistantToolbox(
+                    ctx=self.ctx,
+                    work_mode=eff_work_mode,
+                    profile=conn_prof,
+                    dialect=eff_dialect,
+                    default_schema=eff_schema,
+                    sample_limit=max(10, min(200, int(req.get("sample_limit") or 100))),
+                    attachments=turn_attachments,
+                    storage=self.svc,
+                )
+                if (not has_sql_atts or has_csv_atts)
+                else None
+            )
 
             # 期望覆盖的语句集合（血缘切片策略以计划内语句为准，全量/分段策略覆盖计划全部语句）
             for st in plan.get("stages") or []:
                 for s_id in st.get("stmt_ids") or []:
-                    if s_id not in all_stmt_ids_expected:
-                        all_stmt_ids_expected.append(s_id)
+                    s_up = str(s_id).upper()
+                    if s_up and s_up not in all_stmt_ids_expected:
+                        all_stmt_ids_expected.append(s_up)
 
             # 期望核验的 HIGH/MEDIUM 静态隐患集合
             if plan.get("strategy") == "lineage_sliced":
@@ -782,7 +926,7 @@ class GoalRunner:
                     f
                     for f in all_static_findings
                     if f.get("severity") in ("HIGH", "MEDIUM")
-                    and (not f.get("stmt_id") or f["stmt_id"] in exp_sids_set)
+                    and (not f.get("stmt_id") or str(f["stmt_id"]).upper() in exp_sids_set)
                 ]
             else:
                 required_hm_findings = [
@@ -869,15 +1013,18 @@ class GoalRunner:
                         },
                     )
 
-                    # 构造本阶段高信噪比上下文（静态图纸 + 只读账本 + 精准源码片段）
+                    # 构造本阶段高信噪比上下文（静态图纸 + 只读账本 + 环境元数据 + 精准源码片段）
                     stage_msgs = self._build_stage_messages(
                         stage=st,
                         clean_prompt=clean_prompt,
-                        dialect=dialect,
+                        dialect=eff_dialect,
                         att_by_id=att_by_id,
                         finding_by_id=finding_by_id,
+                        stmt_att_by_scoped_id=stmt_att_by_scoped_id,
                         checkpoint=checkpoint,
                         lineage_brief="\n\n".join(lineage_brief_blocks)[:3000],
+                        env_context=env_context_block[:4000] if env_context_block else "",
+                        allow_tools=bool(goal_toolbox is not None and not st.get("stmt_ids")),
                         force_compact=bool(st.get("use_compact_view")),
                     )
 
@@ -889,25 +1036,81 @@ class GoalRunner:
 
                     for ctx_retry in range(2):
                         try:
-                            (
-                                stage_reply,
-                                stage_reasoning,
-                                stage_think_ms,
-                                s_prov,
-                                s_mdl,
-                                stage_cancelled,
-                            ) = self._invoke_stage_stream(
-                                run_id=run_id,
-                                messages=stage_msgs,
-                                provider_id=provider_id,
-                                model=model,
-                                thinking_mode=thinking_mode,
-                                step_no=steps_executed + 1,
-                                cancel_ev=cancel_ev,
-                                checkpoint=checkpoint,
-                            )
-                            used_provider_name = s_prov or used_provider_name
-                            used_model = s_mdl or used_model
+                            # 无 SQL 附件或 CSV 探索阶段支持受控只读/知识库/CSV 工具循环（最多 4 步）
+                            max_tool_hops = 4 if (goal_toolbox is not None and not st.get("stmt_ids")) else 1
+                            cur_stage_msgs = list(stage_msgs)
+                            for hop in range(max_tool_hops):
+                                (
+                                    hop_reply,
+                                    hop_reasoning,
+                                    hop_think_ms,
+                                    s_prov,
+                                    s_mdl,
+                                    stage_cancelled,
+                                ) = self._invoke_stage_stream(
+                                    run_id=run_id,
+                                    messages=cur_stage_msgs,
+                                    provider_id=provider_id,
+                                    model=model,
+                                    thinking_mode=thinking_mode,
+                                    step_no=steps_executed + 1,
+                                    cancel_ev=cancel_ev,
+                                    checkpoint=checkpoint,
+                                )
+                                used_provider_name = s_prov or used_provider_name
+                                used_model = s_mdl or used_model
+                                stage_reply = hop_reply
+                                if hop_reasoning.strip():
+                                    stage_reasoning = (
+                                        (stage_reasoning + "\n\n" + hop_reasoning.strip()).strip()
+                                        if stage_reasoning
+                                        else hop_reasoning.strip()
+                                    )
+                                stage_think_ms += float(hop_think_ms or 0.0)
+                                if stage_cancelled or cancel_ev.is_set():
+                                    break
+                                if goal_toolbox is None or hop + 1 >= max_tool_hops:
+                                    break
+                                r_mode, r_obj, _, _ = AiAssistantService._parse_agent_response(hop_reply)
+                                if r_mode == "json_action" and isinstance(r_obj, dict) and str(r_obj.get("action") or "").lower() == "tool":
+                                    t_name = str(r_obj.get("tool") or "").strip()
+                                    t_args = r_obj.get("args") if isinstance(r_obj.get("args"), dict) else {}
+                                    t_purpose = str(r_obj.get("purpose") or t_name).strip()[:80]
+                                    tool_step_no = len(checkpoint["steps_trace"]) + 1
+                                    self._emit(
+                                        run_id,
+                                        "tool_start",
+                                        {
+                                            "type": "tool_start",
+                                            "step": tool_step_no,
+                                            "tool": t_name,
+                                            "purpose": t_purpose,
+                                            "args": t_args,
+                                        },
+                                    )
+                                    t_tool0 = time.perf_counter()
+                                    t_out = goal_toolbox.dispatch(t_name, t_args)
+                                    t_tool_ms = round((time.perf_counter() - t_tool0) * 1000.0, 1)
+                                    t_step_rec = {
+                                        "step": tool_step_no,
+                                        "tool": t_name,
+                                        "purpose": t_purpose,
+                                        "args": t_args,
+                                        "ok": bool(t_out.get("ok")),
+                                        "elapsed_ms": t_tool_ms,
+                                        "summary": str(t_out.get("note") or t_out.get("error") or "完成")[:180],
+                                    }
+                                    checkpoint["steps_trace"].append(t_step_rec)
+                                    self._emit(run_id, "tool_end", {"type": "tool_end", **t_step_rec})
+                                    cur_stage_msgs.append({"role": "assistant", "content": hop_reply})
+                                    cur_stage_msgs.append(
+                                        {
+                                            "role": "user",
+                                            "content": f"【工具 `{t_name}` 返回结果】\n{json.dumps(t_out, ensure_ascii=False)[:16000]}",
+                                        }
+                                    )
+                                    continue
+                                break
                             break
                         except ContextLengthExceededError as ctx_exc:
                             if ctx_retry == 0:
@@ -925,11 +1128,14 @@ class GoalRunner:
                                 stage_msgs = self._build_stage_messages(
                                     stage=st,
                                     clean_prompt=clean_prompt,
-                                    dialect=dialect,
+                                    dialect=eff_dialect,
                                     att_by_id=att_by_id,
                                     finding_by_id=finding_by_id,
+                                    stmt_att_by_scoped_id=stmt_att_by_scoped_id,
                                     checkpoint=checkpoint,
                                     lineage_brief="\n\n".join(lineage_brief_blocks)[:1600],
+                                    env_context=env_context_block[:2000] if env_context_block else "",
+                                    allow_tools=bool(goal_toolbox is not None and not st.get("stmt_ids")),
                                     force_compact=True,
                                     max_code_tokens=max(2500, int(model_caps.get("recommended_chunk_tokens", 5500) * 0.6)),
                                 )
@@ -1122,16 +1328,22 @@ class GoalRunner:
                     f for f in required_hm_findings if str(f.get("finding_id") or "").upper() not in addr_fids_set
                 ]
 
-                # 门禁 3：检查 temp_staging 上游写语句是否断链
+                # 门禁 3：检查 temp_staging 上游写语句血缘连续性（凡已被分析语句消费的临时表，其前置写语句必须覆盖）
                 broken_lineage_sids: List[str] = []
+                exp_stmts_set = set(all_stmt_ids_expected)
                 for att in turn_attachments:
+                    aid_cur = str(att.get("attachment_id") or "")
                     an = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
                     for nd in (an.get("lineage_dag") or {}).get("nodes") or []:
-                        if nd.get("role") == "temp_staging":
-                            for wsid in nd.get("written_by") or []:
-                                if wsid in all_stmt_ids_expected and wsid.upper() not in covered_stmts_set:
-                                    if wsid not in broken_lineage_sids:
-                                        broken_lineage_sids.append(wsid)
+                        if nd.get("role") != "temp_staging":
+                            continue
+                        read_scoped = [_scope_id(aid_cur, rsid) for rsid in (nd.get("read_by") or []) if rsid]
+                        temp_consumed = any(rs in covered_stmts_set or rs in exp_stmts_set for rs in read_scoped)
+                        for wsid in nd.get("written_by") or []:
+                            sc_wsid = _scope_id(aid_cur, wsid)
+                            if (temp_consumed or sc_wsid in exp_stmts_set) and sc_wsid not in covered_stmts_set:
+                                if sc_wsid not in broken_lineage_sids:
+                                    broken_lineage_sids.append(sc_wsid)
 
                 remedial_rounds = int(checkpoint.get("remedial_rounds") or 0)
                 gate_passed = (
@@ -1310,6 +1522,18 @@ class GoalRunner:
 
             total_ms = round((time.perf_counter() - t_start) * 1000.0, 1)
             combined_reasoning = "\n\n---\n\n".join(checkpoint.get("reasoning_segments") or [])
+            citations_list = (
+                self.svc._resolve_citations((meta_obj or {}).get("citations"), goal_toolbox)
+                if goal_toolbox is not None
+                else []
+            )
+            result_table = (
+                dict(goal_toolbox.latest_result_table or {})
+                if goal_toolbox is not None and goal_toolbox.latest_result_table
+                else {}
+            )
+            if result_table and isinstance(result_table.get("rows"), list):
+                result_table["rows"] = result_table["rows"][:200]
 
             assistant_msg = self.svc._insert_message(
                 session_id=sid,
@@ -1321,10 +1545,10 @@ class GoalRunner:
                 reasoning=combined_reasoning,
                 reasoning_ms=float(checkpoint.get("reasoning_ms") or 0.0),
                 steps=list(checkpoint.get("steps_trace") or []),
-                citations=[],
+                citations=citations_list,
                 clarification={},
                 next_steps=next_steps_list,
-                result_table={},
+                result_table=result_table,
                 proposal_id="",
                 provider_name=used_provider_name or provider_id,
                 model=used_model or model,
@@ -1440,6 +1664,33 @@ class GoalRunner:
         full_content = ""
         full_reasoning = ""
         was_cancelled = False
+        demuxer = _StreamActionDemuxer() if emit_content_deltas else None
+
+        # 轻量流式聚合缓冲：降低超长报告逐 token 写 SQLite 的事务抖动，保持事件顺序与低延迟
+        r_pending: List[str] = []
+        r_last_flush = time.perf_counter()
+        c_pending: List[str] = []
+        c_last_flush = time.perf_counter()
+
+        def _flush_reasoning() -> None:
+            nonlocal r_last_flush
+            if r_pending:
+                chunk_r = "".join(r_pending)
+                r_pending.clear()
+                r_last_flush = time.perf_counter()
+                self._emit(
+                    run_id,
+                    "thinking_delta",
+                    {"type": "thinking_delta", "step": step_no, "delta": chunk_r},
+                )
+
+        def _flush_content() -> None:
+            nonlocal c_last_flush
+            if c_pending:
+                chunk_c = "".join(c_pending)
+                c_pending.clear()
+                c_last_flush = time.perf_counter()
+                self._emit(run_id, "content_delta", {"type": "content_delta", "delta": chunk_c})
 
         for ev in self.ctx.llm_hub.chat_completion_stream(
             messages=messages,
@@ -1456,6 +1707,8 @@ class GoalRunner:
         ):
             ev_type = ev.get("type")
             if ev_type == "retry_wait":
+                _flush_reasoning()
+                _flush_content()
                 checkpoint["retry_count"] = int(checkpoint.get("retry_count") or 0) + 1
                 self._emit(
                     run_id,
@@ -1472,6 +1725,8 @@ class GoalRunner:
                     },
                 )
             elif ev_type == "status":
+                _flush_reasoning()
+                _flush_content()
                 self._emit(
                     run_id,
                     "status",
@@ -1488,13 +1743,13 @@ class GoalRunner:
                         think_started = True
                         t_think0 = time.perf_counter()
                         self._emit(run_id, "thinking_start", {"type": "thinking_start", "step": step_no})
-                    self._emit(
-                        run_id,
-                        "thinking_delta",
-                        {"type": "thinking_delta", "step": step_no, "delta": delta},
-                    )
+                    r_pending.append(delta)
+                    now_t = time.perf_counter()
+                    if sum(len(x) for x in r_pending) >= 120 or (now_t - r_last_flush) >= 0.06:
+                        _flush_reasoning()
             elif ev_type == "content":
                 if think_started and not think_ended:
+                    _flush_reasoning()
                     think_ended = True
                     think_ms = round((time.perf_counter() - t_think0) * 1000.0, 1)
                     self._emit(
@@ -1503,9 +1758,15 @@ class GoalRunner:
                         {"type": "thinking_end", "step": step_no, "elapsed_ms": think_ms},
                     )
                 delta = str(ev.get("delta") or "")
-                if delta and emit_content_deltas:
-                    self._emit(run_id, "content_delta", {"type": "content_delta", "delta": delta})
+                if delta and emit_content_deltas and demuxer is not None:
+                    md_delta = demuxer.feed(delta)
+                    if md_delta:
+                        c_pending.append(md_delta)
+                        now_t = time.perf_counter()
+                        if sum(len(x) for x in c_pending) >= 120 or (now_t - c_last_flush) >= 0.06:
+                            _flush_content()
             elif ev_type == "done":
+                _flush_reasoning()
                 if think_started and not think_ended:
                     think_ended = True
                     think_ms = round((time.perf_counter() - t_think0) * 1000.0, 1)
@@ -1514,12 +1775,19 @@ class GoalRunner:
                         "thinking_end",
                         {"type": "thinking_end", "step": step_no, "elapsed_ms": think_ms},
                     )
+                if emit_content_deltas and demuxer is not None:
+                    tail_md, _ = demuxer.finish()
+                    if tail_md:
+                        c_pending.append(tail_md)
+                    _flush_content()
                 used_prov = str(ev.get("provider_name") or "")
                 used_mdl = str(ev.get("model") or "")
                 full_content = str(ev.get("content") or "")
                 full_reasoning = str(ev.get("reasoning") or "")
                 was_cancelled = bool(ev.get("cancelled"))
 
+        _flush_reasoning()
+        _flush_content()
         return full_content, full_reasoning, think_ms, used_prov, used_mdl, was_cancelled
 
     @staticmethod
@@ -1587,12 +1855,21 @@ class GoalRunner:
         dialect: str,
         att_by_id: Dict[str, Dict[str, Any]],
         finding_by_id: Dict[str, Dict[str, Any]],
+        stmt_att_by_scoped_id: Optional[Dict[str, Tuple[str, str]]] = None,
         checkpoint: Dict[str, Any],
         lineage_brief: str,
+        env_context: str = "",
+        allow_tools: bool = False,
         force_compact: bool = False,
         max_code_tokens: int = 0,
     ) -> List[Dict[str, str]]:
         is_remedial = stage.get("kind") == "remedial"
+        tool_hint = (
+            "\n4. 如需实时探查在线库表结构、检索离线知识库或聚合查询 CSV 附件，可先输出单个 ```dataog_action "
+            '{"action":"tool","tool":"inspect_table|search_catalog|run_readonly_sql|explain_sql|search_knowledge|query_csv_attachment","args":{...},"purpose":"..."} ``` 收集证据后再输出本阶段 JSON 总结。'
+            if allow_tools
+            else ""
+        )
         sys_prompt = (
             f"你是 Data.O.G 首席数据库研发与代码审计专家（目标方言 `{dialect}`）。\n"
             f"当前处于 🎯 Goal 深度模式的【{'定向补救核验阶段' if is_remedial else '甜蜜区分段分析阶段'}】。\n"
@@ -1601,6 +1878,7 @@ class GoalRunner:
             "2. 所有结论必须绑定精确真实行号 `Lxxx` 与实际表名/语句号 `Sxxx`，严禁编造。\n"
             "3. 请优先输出单个结构化 JSON 对象：\n"
             '{"summary":"本阶段核心结论(100字内)","covered_stmts":["S001"],"finding_verdicts":{"F001":{"status":"confirmed","reason":"具体原因","fix":"修复方案"}},"confirmed_issues":["Lxxx 问题描述"],"false_positives":["Lxxx 误报说明"],"lineage_notes":["关键临时表/目标表加工逻辑"],"open_questions":[]}'
+            f"{tool_hint}"
         )
 
         # 压缩前序只读账本
@@ -1621,8 +1899,9 @@ class GoalRunner:
         for fid in stage_fids:
             f = finding_by_id.get(fid)
             if f:
+                fname_tag = f" ({f.get('filename')})" if f.get("filename") and len(att_by_id) > 1 else ""
                 f_lines.append(
-                    f"- [{f['finding_id']}][{f['severity']}][{f['code']}] "
+                    f"- [{f['finding_id']}][{f['severity']}][{f['code']}]{fname_tag} "
                     f"{f.get('stmt_id') or ''} L{f['line']}: {f['title']} — {f['detail']}"
                 )
         findings_block = (
@@ -1633,46 +1912,64 @@ class GoalRunner:
             else ""
         )
 
-        # 提取本阶段精确源码
+        # 提取本阶段精确源码（多附件补救阶段自动按各语句/隐患所属 attachment_id 定位正确文件）
         code_block = ""
+        code_fence_lang = "sql"
         aid = str(stage.get("attachment_id") or "")
         att = att_by_id.get(aid) or (next(iter(att_by_id.values())) if att_by_id else None)
-        if att is not None and att.get("raw_text"):
-            raw_text = str(att["raw_text"])
-            all_lines = raw_text.splitlines()
-            an = att.get("analysis") if isinstance(att.get("analysis"), dict) else {}
-            sids = list(stage.get("stmt_ids") or [])
+        stmt_map = stmt_att_by_scoped_id or {}
 
+        if att is not None and att.get("raw_text"):
+            if att.get("file_kind") == "csv":
+                code_fence_lang = "csv"
+            elif att.get("file_kind") != "sql":
+                code_fence_lang = "text"
+
+            sids = list(stage.get("stmt_ids") or [])
             if (is_remedial or stage.get("kind") == "lineage_slice") and (sids or stage_fids):
-                # 补救/血缘切片阶段：精准抽取相关语句与隐患周边行
                 pieces: List[str] = []
-                extracted_ranges: Set[Tuple[int, int]] = set()
+                extracted_ranges: Set[Tuple[str, int, int]] = set()
                 for sid_item in sids[:20]:
-                    ext = extract_statement_source(an, raw_text, sid_item, compact=force_compact)
+                    sc_key = str(sid_item).upper()
+                    mapped_aid, raw_sid = stmt_map.get(sc_key, (aid, sc_key.split("-", 1)[-1] if "-" in sc_key else sc_key))
+                    src_att = att_by_id.get(mapped_aid) or att
+                    if not src_att or not src_att.get("raw_text"):
+                        continue
+                    src_an = src_att.get("analysis") if isinstance(src_att.get("analysis"), dict) else {}
+                    ext = extract_statement_source(src_an, str(src_att["raw_text"]), raw_sid, compact=force_compact)
                     if ext:
-                        rk = (ext["start_line"], ext["end_line"])
+                        rk = (str(src_att.get("attachment_id") or ""), ext["start_line"], ext["end_line"])
                         if rk not in extracted_ranges:
                             extracted_ranges.add(rk)
-                            pieces.append(f"-- 语句 {sid_item} (L{rk[0]}-L{rk[1]})\n{ext['content']}")
+                            f_lbl = f" [{src_att.get('filename')}]" if len(att_by_id) > 1 else ""
+                            pieces.append(f"-- 语句 {sid_item}{f_lbl} (L{rk[1]}-L{rk[2]})\n{ext['content']}")
                 for fid in stage_fids:
                     f = finding_by_id.get(fid)
                     if not f:
                         continue
+                    f_aid = str(f.get("attachment_id") or aid)
+                    f_att = att_by_id.get(f_aid) or att
+                    if not f_att or not f_att.get("raw_text"):
+                        continue
+                    f_lines_all = str(f_att["raw_text"]).splitlines()
                     fln = int(f.get("line") or 1)
-                    if any(a <= fln <= b for a, b in extracted_ranges):
+                    if any(fa == f_aid and a <= fln <= b for fa, a, b in extracted_ranges):
                         continue
                     w_s = max(1, fln - 12)
-                    w_e = min(len(all_lines), fln + 15)
-                    extracted_ranges.add((w_s, w_e))
-                    seg = "\n".join(all_lines[w_s - 1 : w_e])
+                    w_e = min(len(f_lines_all), fln + 15)
+                    extracted_ranges.add((f_aid, w_s, w_e))
+                    seg = "\n".join(f_lines_all[w_s - 1 : w_e])
                     numbered = (
                         compact_sql_for_llm(seg, start_line=w_s)["text"]
-                        if force_compact
+                        if force_compact and f_att.get("file_kind") == "sql"
                         else format_with_line_numbers(seg, start_line=w_s)
                     )
-                    pieces.append(f"-- 隐患 {fid} 上下文 (L{w_s}-L{w_e})\n{numbered}")
+                    f_lbl = f" [{f_att.get('filename')}]" if len(att_by_id) > 1 else ""
+                    pieces.append(f"-- 隐患 {fid}{f_lbl} 上下文 (L{w_s}-L{w_e})\n{numbered}")
                 code_block = "\n\n".join(pieces)
             else:
+                raw_text = str(att["raw_text"])
+                all_lines = raw_text.splitlines()
                 s_ln = max(1, int(stage.get("start_line") or 1))
                 e_ln = min(len(all_lines), max(s_ln, int(stage.get("end_line") or len(all_lines))))
                 seg_raw = "\n".join(all_lines[s_ln - 1 : e_ln])
@@ -1684,12 +1981,18 @@ class GoalRunner:
             if max_code_tokens > 0 and len(code_block) > max_code_tokens * 3:
                 code_block = code_block[: max_code_tokens * 3] + "\n-- ... [已按减载预算截断尾段] ..."
 
+        env_sec = f"【当前数据库与知识库环境上下文】\n{env_context}\n\n" if env_context else ""
         brief_sec = f"【全局静态血缘图纸参考】\n{lineage_brief}\n\n" if lineage_brief else ""
-        code_sec = f"【本阶段待审源码（严格保留真实行号）】\n```sql\n{code_block}\n```" if code_block else ""
+        code_sec = (
+            f"【本阶段待审{'数据样本' if code_fence_lang == 'csv' else '源码'}（严格保留真实行号）】\n"
+            f"```{code_fence_lang}\n{code_block}\n```"
+            if code_block
+            else ""
+        )
 
         user_msg = (
             f"用户总体目标：{clean_prompt}\n\n"
-            f"{brief_sec}{ledger_block}{findings_block}"
+            f"{env_sec}{brief_sec}{ledger_block}{findings_block}"
             f"当前阶段：{stage.get('title') or stage.get('stage_id')}\n"
             f"{code_sec}"
         )
@@ -1719,6 +2022,7 @@ class GoalRunner:
         issue_lines = [f"- {x}" for x in (ledger.get("confirmed_issues") or [])[:30]]
         fp_lines = [f"- {x}" for x in (ledger.get("false_positives") or [])[:15]]
         lin_lines = [f"- {x}" for x in (ledger.get("lineage_notes") or [])[:20]]
+        open_q_lines = [f"- {x}" for x in (ledger.get("open_questions") or [])[:10]]
 
         verdict_lines: List[str] = []
         for f in required_hm_findings:
@@ -1752,6 +2056,7 @@ class GoalRunner:
             + ("## 确认问题明细\n" + "\n".join(issue_lines) + "\n\n" if issue_lines else "")
             + ("## 排除误报说明\n" + "\n".join(fp_lines) + "\n\n" if fp_lines else "")
             + ("## 血缘与业务要点\n" + "\n".join(lin_lines) + "\n\n" if lin_lines else "")
+            + ("## 待进一步核实事项\n" + "\n".join(open_q_lines) + "\n\n" if open_q_lines else "")
         )
         return [
             {"role": "system", "content": sys_prompt},

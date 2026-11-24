@@ -3045,9 +3045,17 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
         self.assertEqual(caps_flag["model_tier"], "flagship")
         self.assertGreaterEqual(caps_flag["effective_reasoning_budget"], 200000)
 
-        # 2. L3 400 报错正则提取验证
+        # 2. L3 400 报错正则提取验证（含千分位逗号与多数字误判防护）
         self.assertEqual(
             parse_context_limit_from_error("This model's maximum context length is 32768 tokens. However, your messages resulted in 41000 tokens."),
+            32768,
+        )
+        self.assertEqual(
+            parse_context_limit_from_error("This model's maximum context length is 131,072 tokens."),
+            131072,
+        )
+        self.assertEqual(
+            parse_context_limit_from_error("Input token count (50000 tokens) exceeds the maximum number of tokens allowed (32768 tokens)"),
             32768,
         )
         self.assertEqual(
@@ -3225,6 +3233,54 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
                 ][0]
                 self.assertEqual(avail["context_window"], 24576)
                 self.assertEqual(avail["source"], "error_calibrated")
+
+                # 验证 model_tier 重置为 auto 不被 probe 缓存粘死，且草稿覆盖 context_window/model_tier 生效于 /probe-model
+                ctx.llm_hub.save_provider({"provider_id": "ollama_local", "model_tier": "flagship"})
+                ctx.llm_hub._persist_model_probe("ollama_local", "deepseek-v4-flash", {"context_window": 64000, "source": "live_probe"})
+                ctx.llm_hub.save_provider({"provider_id": "ollama_local", "model_tier": "auto"})
+                p_reset = ctx.store.get_llm_provider("ollama_local")
+                caps_reset = infer_model_capabilities(
+                    "deepseek-v4-flash", p_reset.provider_type, p_reset.base_url, p_reset.extra
+                )
+                self.assertEqual(caps_reset["model_tier"], "lightweight")
+
+                seen_probe_bodies: List[Dict[str, Any]] = []
+
+                def _fake_draft_probe_open(self_opener, req, data=None, timeout=30):
+                    url = req.full_url if hasattr(req, "full_url") else str(req)
+                    if url.endswith("/chat/completions"):
+                        b = json.loads((req.data or b"{}").decode("utf-8"))
+                        seen_probe_bodies.append(b)
+                        # 首次故意模拟网关不支持 stream_options 返回 400，验证自动降级重试成功
+                        if len(seen_probe_bodies) == 1 and "stream_options" in b:
+                            raise urllib.error.HTTPError(
+                                url, 400, "Bad Request", {}, io.BytesIO(b'{"error":{"message":"unknown parameter: stream_options"}}')
+                            )
+                        sse_lines = [
+                            'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":140,"completion_tokens":3}}\n\n',
+                            "data: [DONE]\n\n",
+                        ]
+                        return _FakeResp("".join(sse_lines).encode("utf-8"), content_type="text/event-stream")
+                    return _fake_open(self_opener, req, data=data, timeout=timeout)
+
+                with patch("urllib.request.OpenerDirector.open", _fake_draft_probe_open):
+                    draft_res = client.post(
+                        "/api/platform/llm/probe-model",
+                        json={
+                            "provider_id": "ollama_local",
+                            "model": "deepseek-v4-flash",
+                            "force_refresh": True,
+                            "context_window": 32768,
+                            "model_tier": "standard",
+                        },
+                    ).json()
+                self.assertTrue(draft_res["ok"])
+                self.assertTrue(draft_res["probe_ok"])
+                self.assertEqual(draft_res["capabilities"]["context_window"], 32768)
+                self.assertEqual(draft_res["capabilities"]["model_tier"], "standard")
+                self.assertTrue(draft_res["capabilities"]["stream_supported"])
+                self.assertEqual(seen_probe_bodies[0].get("stream_options"), {"include_usage": True})
+                self.assertNotIn("stream_options", seen_probe_bodies[1])
             finally:
                 ctx.close()
 
@@ -3389,6 +3445,67 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
                     )
                 self.assertEqual(len(sync_retries), 1)
                 self.assertEqual(sync_res["content"], "前文：阶段 1 审计完成；阶段 2 全部通过。")
+
+                # 3. 流式半途发生 http.client.IncompleteRead 时保留已流正文并平滑续写去重拼接
+                import http.client
+
+                mid_idx = {"n": 0}
+
+                class _MidDropResp:
+                    def __init__(self, lines: List[bytes], drop_after: Optional[int] = None) -> None:
+                        self._lines = lines
+                        self._drop_after = drop_after
+                        self._pos = 0
+                        self.headers = {"Content-Type": "text/event-stream"}
+
+                    def readline(self) -> bytes:
+                        if self._drop_after is not None and self._pos >= self._drop_after:
+                            raise http.client.IncompleteRead(b"truncated")
+                        if self._pos >= len(self._lines):
+                            return b""
+                        ln = self._lines[self._pos]
+                        self._pos += 1
+                        return ln
+
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *args):
+                        return False
+
+                def _mid_drop_open(self_opener, req, data=None, timeout=60):
+                    mid_idx["n"] += 1
+                    if mid_idx["n"] == 1:
+                        return _MidDropResp(
+                            [
+                                b'data: {"choices":[{"delta":{"content":"Part1: found UNBOUNDED_DML at L42."}}]}\n',
+                                b"\n",
+                            ],
+                            drop_after=2,
+                        )
+                    return _MidDropResp(
+                        [
+                            b'data: {"choices":[{"delta":{"content":"at L42. Part2: add WHERE biz_date."},"finish_reason":"stop"}]}\n',
+                            b"\n",
+                            b"data: [DONE]\n",
+                        ]
+                    )
+
+                with patch.object(llm_mod, "RETRY_BACKOFF_SCHEDULE", (0.01, 0.01, 0.01)), patch(
+                    "urllib.request.OpenerDirector.open", _mid_drop_open
+                ):
+                    mid_evs = list(
+                        ctx.llm_hub.chat_completion_stream(
+                            messages=[{"role": "user", "content": "audit"}],
+                            provider_id="flaky_ds",
+                            model="deepseek-v4-flash",
+                        )
+                    )
+                self.assertEqual(len([e for e in mid_evs if e.get("type") == "retry_wait"]), 1)
+                self.assertEqual(
+                    [e for e in mid_evs if e.get("type") == "done"][-1]["content"],
+                    "Part1: found UNBOUNDED_DML at L42. Part2: add WHERE biz_date.",
+                )
             finally:
                 ctx.close()
 

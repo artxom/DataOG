@@ -372,6 +372,13 @@ async function _consumeSseStream(resp, { onEvent = null, initialLastEventId = 0 
         terminalPayload = parsed;
       } else if (effEvent === "run_paused" || effEvent === "run_cancelled") {
         terminalPayload = parsed;
+      } else if (
+        effEvent === "stage_start" ||
+        (effEvent === "status" && parsed && parsed.resumed)
+      ) {
+        // 断点续跑后的新事件覆盖历史暂停/错误终态，防止旧帧误判本次续流已终止
+        terminalPayload = null;
+        streamError = null;
       }
       if (effEvent === "error") {
         streamError = new Error(

@@ -126,7 +126,7 @@ class PlatformContext:
         self.task_progress = self.import_progress
         self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
-        self.app_version = "3.4.0"
+        self.app_version = "3.4.1"
         self.update_hub = UpdateHub(
             updates_dir=eff_updates_dir,
             running_version=self.app_version,
@@ -196,7 +196,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "3.4.0",
+            "version": "3.4.1",
             "update_summary": self.update_hub.get_bootstrap_summary(),
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": license_info,
@@ -217,7 +217,13 @@ class PlatformContext:
         }
 
     def close(self) -> None:
-        """优雅释放连接池与底层 SQLite 持久连接句柄."""
+        """优雅释放后台任务、连接池与底层 SQLite 持久连接句柄."""
+        try:
+            run_hub = getattr(self, "_ai_assistant_run_hub", None)
+            if run_hub is not None and hasattr(run_hub, "cancel_all"):
+                run_hub.cancel_all()
+        except Exception:
+            pass
         try:
             self.connection_hub.close_warm_connections()
         except Exception:

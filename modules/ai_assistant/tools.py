@@ -543,7 +543,7 @@ class AssistantToolbox:
         att = self._resolve_attachment(str(params.get("attachment_id") or ""))
         if att is None:
             return {"ok": False, "error": "未找到指定的附件，请核对 `attachment_id`"}
-        kw = str(params.get("keyword") or "").strip()
+        kw = str(params.get("keyword") or params.get("pattern") or params.get("query") or "").strip()
         if not kw:
             return {"ok": False, "error": "缺少检索关键词 `keyword`"}
         regex = bool(params.get("regex", False))
@@ -718,7 +718,19 @@ class AssistantToolbox:
             depth = max(1, min(6, int(params.get("depth") or 3)))
         except Exception:
             depth = 3
-        include_downstream = bool(params.get("include_downstream", True))
+        direction = str(params.get("direction") or "").strip().lower()
+        if direction == "upstream":
+            include_upstream = True
+            include_downstream = False
+        elif direction == "downstream":
+            include_upstream = False
+            include_downstream = True
+        elif direction == "both":
+            include_upstream = True
+            include_downstream = True
+        else:
+            include_upstream = bool(params.get("include_upstream", True))
+            include_downstream = bool(params.get("include_downstream", True))
         compact = bool(params.get("compact", False))
         try:
             max_tokens = max(2000, min(24000, int(params.get("max_tokens") or 14000)))
@@ -730,6 +742,7 @@ class AssistantToolbox:
             full_att.get("raw_text") or "",
             table_name,
             depth=depth,
+            include_upstream=include_upstream,
             include_downstream=include_downstream,
             compact=compact,
             max_tokens=max_tokens,

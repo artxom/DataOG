@@ -205,6 +205,7 @@ def _tokenize_sql_tolerant(sql: str, line_offsets: List[int]) -> Tuple[List[_Sql
     """容错 SQL/PL-SQL 词法扫描，解包过程体 `$$...$$` 并记录章节注释锚点."""
     tokens: List[_SqlToken] = []
     section_comments: List[Tuple[int, str]] = []
+    open_dollar_tag: Optional[str] = None
     n = len(sql)
     i = 0
 
@@ -240,11 +241,20 @@ def _tokenize_sql_tolerant(sql: str, line_offsets: List[int]) -> Tuple[List[_Sql
             if m:
                 tag = m.group(0)
                 ln = _offset_to_line(line_offsets, i)
+                # 若命中当前已打开过程体定界符，直接作为闭合定界符处理，避免误吞后续语句/字面量
+                if open_dollar_tag is not None and tag == open_dollar_tag:
+                    open_dollar_tag = None
+                    tokens.append(_SqlToken("DOLLAR_DELIM", tag.upper(), tag, i, i + len(tag), ln))
+                    i += len(tag)
+                    continue
                 close_pos = sql.find(tag, i + len(tag))
                 if close_pos != -1:
                     inner = sql[i + len(tag) : close_pos]
-                    if inner.count("\n") >= 2 or _BODY_SQL_HINT_RE.search(inner[:2000]):
+                    if open_dollar_tag is None and (
+                        inner.count("\n") >= 2 or _BODY_SQL_HINT_RE.search(inner[:2000])
+                    ):
                         # 过程体/函数体定界符：保留定界符 token 并继续深入扫描内部 SQL 语句
+                        open_dollar_tag = tag
                         tokens.append(_SqlToken("DOLLAR_DELIM", tag.upper(), tag, i, i + len(tag), ln))
                         i += len(tag)
                         continue
@@ -389,22 +399,49 @@ def _read_qualified_name(tokens: List[_SqlToken], idx: int) -> Tuple[str, int]:
 
 
 def _extract_ctes(tokens: List[_SqlToken]) -> List[str]:
-    """提取语句顶层 `WITH [RECURSIVE] cte1 AS (...), cte2 AS (...)` 中定义的 CTE 名称."""
+    """提取语句顶层或内嵌 `WITH [RECURSIVE] cte1 AS (...), cte2 AS (...)` 中定义的全部 CTE 名称.
+
+    同时覆盖：
+    - `WITH cte AS (...) SELECT/INSERT/UPDATE/DELETE ...`
+    - `CREATE [TEMP] TABLE tmp AS WITH cte AS (...) SELECT ...`
+    - `INSERT INTO dst WITH cte AS (...) SELECT ...`
+    """
     ctes: List[str] = []
+    seen_low: Set[str] = set()
     n = len(tokens)
-    if not n or tokens[0].kind != "WORD" or tokens[0].upper != "WITH":
-        return ctes
-    idx = 1
-    if idx < n and tokens[idx].kind == "WORD" and tokens[idx].upper == "RECURSIVE":
-        idx += 1
-    depth = 0
-    while idx < n:
-        if depth == 0:
-            if tokens[idx].kind in ("WORD", "QIDENT"):
-                cand = _clean_ident_part(tokens[idx])
-                j = idx + 1
-                # 可选列清单 cte(a, b) AS (...)
+    pos = 0
+    while pos < n:
+        if tokens[pos].kind != "WORD" or tokens[pos].upper != "WITH":
+            pos += 1
+            continue
+        idx = pos + 1
+        if idx < n and tokens[idx].kind == "WORD" and tokens[idx].upper == "RECURSIVE":
+            idx += 1
+        while idx < n:
+            if tokens[idx].kind not in ("WORD", "QIDENT"):
+                break
+            cand = _clean_ident_part(tokens[idx])
+            j = idx + 1
+            # 可选列清单 cte(a, b) AS (...)
+            if j < n and tokens[j].kind == "LP":
+                sub_d = 1
+                j += 1
+                while j < n and sub_d > 0:
+                    if tokens[j].kind == "LP":
+                        sub_d += 1
+                    elif tokens[j].kind == "RP":
+                        sub_d -= 1
+                    j += 1
+            if j < n and tokens[j].kind == "WORD" and tokens[j].upper == "AS":
+                j += 1
+                if j < n and tokens[j].kind == "WORD" and tokens[j].upper in ("NOT", "MATERIALIZED"):
+                    j += 1
+                    if j < n and tokens[j].kind == "WORD" and tokens[j].upper == "MATERIALIZED":
+                        j += 1
                 if j < n and tokens[j].kind == "LP":
+                    if cand and cand.upper() not in _TABLE_STOPWORDS and cand.lower() not in seen_low:
+                        seen_low.add(cand.lower())
+                        ctes.append(cand)
                     sub_d = 1
                     j += 1
                     while j < n and sub_d > 0:
@@ -413,29 +450,13 @@ def _extract_ctes(tokens: List[_SqlToken]) -> List[str]:
                         elif tokens[j].kind == "RP":
                             sub_d -= 1
                         j += 1
-                if j < n and tokens[j].kind == "WORD" and tokens[j].upper == "AS":
-                    j += 1
-                    if j < n and tokens[j].kind == "WORD" and tokens[j].upper in ("NOT", "MATERIALIZED"):
-                        j += 1
-                        if j < n and tokens[j].kind == "WORD" and tokens[j].upper == "MATERIALIZED":
-                            j += 1
-                    if j < n and tokens[j].kind == "LP":
-                        if cand and cand.upper() not in _TABLE_STOPWORDS:
-                            ctes.append(cand)
-                        sub_d = 1
-                        j += 1
-                        while j < n and sub_d > 0:
-                            if tokens[j].kind == "LP":
-                                sub_d += 1
-                            elif tokens[j].kind == "RP":
-                                sub_d -= 1
-                            j += 1
-                        if j < n and tokens[j].kind == "COMMA":
-                            idx = j + 1
-                            continue
-                        break
+                    if j < n and tokens[j].kind == "COMMA":
+                        idx = j + 1
+                        continue
+                    pos = j - 1
+                    break
             break
-        idx += 1
+        pos += 1
     return ctes
 
 
@@ -455,6 +476,47 @@ def _extract_source_tables(tokens: List[_SqlToken], cte_names: Set[str]) -> List
         if low not in seen:
             seen.add(low)
             sources.append(name)
+
+    def _scan_ansi_comma_tables(start_k: int) -> None:
+        """在 FROM 同一括号层级内扫描 ANSI 逗号连接表 (`FROM t1 a, (SELECT ...) b, t2 c`)，绝不误入子查询列清单."""
+        k = start_k
+        sub_d = 0
+        while k < n:
+            tk = tokens[k]
+            if tk.kind == "LP":
+                sub_d += 1
+                k += 1
+                continue
+            if tk.kind == "RP":
+                if sub_d == 0:
+                    break
+                sub_d -= 1
+                k += 1
+                continue
+            if sub_d > 0:
+                k += 1
+                continue
+            if tk.kind == "SEMI":
+                break
+            if tk.kind == "WORD" and tk.upper in (
+                "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "INTERSECT",
+                "EXCEPT", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS",
+                "ON", "SET", "INTO", "RETURNING", "FOR", "WINDOW", "QUALIFY", "WHEN",
+            ):
+                break
+            if tk.kind == "COMMA":
+                c_idx = k + 1
+                if c_idx < n and tokens[c_idx].kind == "WORD" and tokens[c_idx].upper == "ONLY":
+                    c_idx += 1
+                if c_idx < n and tokens[c_idx].kind == "LP":
+                    k = c_idx
+                    continue
+                c_tbl, c_next = _read_qualified_name(tokens, c_idx)
+                if c_tbl and not (c_next < n and tokens[c_next].kind == "LP"):
+                    _add_table(c_tbl)
+                    k = c_next
+                    continue
+            k += 1
 
     while i < n:
         tok = tokens[i]
@@ -478,32 +540,17 @@ def _extract_source_tables(tokens: List[_SqlToken], cte_names: Set[str]) -> List
             if j < n and tokens[j].kind == "WORD" and tokens[j].upper == "ONLY":
                 j += 1
             if j < n and tokens[j].kind == "LP":
+                # 支持 `FROM (SELECT ... FROM t1) sub, ods.t2`：在括号配对之后继续扫描同层逗号连接表
+                if tok.upper == "FROM":
+                    _scan_ansi_comma_tables(j)
                 i += 1
                 continue
             tbl, next_j = _read_qualified_name(tokens, j)
             # 跳过表函数调用如 `FROM unnest(...)` / `FROM table(...)`
             if tbl and not (next_j < n and tokens[next_j].kind == "LP"):
                 _add_table(tbl)
-                # 处理 ANSI 逗号连接 `FROM t1 a, t2 b WHERE ...`
                 if tok.upper == "FROM":
-                    k = next_j
-                    while k < n:
-                        tk = tokens[k]
-                        if tk.kind == "WORD" and tk.upper in (
-                            "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION", "INTERSECT",
-                            "EXCEPT", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS",
-                            "ON", "SET", "INTO", "RETURNING", "FOR", "WINDOW", "QUALIFY",
-                        ):
-                            break
-                        if tk.kind in ("RP", "SEMI"):
-                            break
-                        if tk.kind == "COMMA":
-                            c_tbl, c_next = _read_qualified_name(tokens, k + 1)
-                            if c_tbl and not (c_next < n and tokens[c_next].kind == "LP"):
-                                _add_table(c_tbl)
-                                k = c_next
-                                continue
-                        k += 1
+                    _scan_ansi_comma_tables(next_j)
                 i = next_j
                 continue
         i += 1
@@ -586,21 +633,31 @@ def _split_top_level_clauses(
         if not chunk:
             return
         n = len(chunk)
-        # 1. CREATE [OR REPLACE] PROCEDURE/FUNCTION/PACKAGE/TRIGGER 头与后续 DECLARE/BEGIN 拆开
+        # 1. CREATE [OR REPLACE] PROCEDURE/FUNCTION/PACKAGE/TRIGGER 头与后续 DECLARE/BEGIN/Oracle无DECLARE变量区拆开
         if chunk[0].kind == "WORD" and chunk[0].upper == "CREATE":
             for k in range(1, min(n, 8)):
                 if chunk[k].kind == "WORD" and chunk[k].upper in ("PROCEDURE", "FUNCTION", "PACKAGE", "TRIGGER"):
-                    # 找到紧随签名之后的 AS/IS 后若跟 DECLARE 或 BEGIN
                     d = 0
                     for m in range(k + 1, n):
                         if chunk[m].kind == "LP":
                             d += 1
                         elif chunk[m].kind == "RP":
                             d = max(0, d - 1)
-                        elif d == 0 and chunk[m].kind == "WORD" and chunk[m].upper in ("DECLARE", "BEGIN"):
-                            expanded.append(chunk[:m])
-                            _split_chunk_recursive(chunk[m:])
-                            return
+                        elif d == 0 and chunk[m].kind == "WORD":
+                            up_m = chunk[m].upper
+                            if up_m in ("DECLARE", "BEGIN"):
+                                expanded.append(chunk[:m])
+                                _split_chunk_recursive(chunk[m:])
+                                return
+                            if up_m in ("AS", "IS") and m + 1 < n:
+                                nxt = chunk[m + 1]
+                                if not (
+                                    nxt.kind == "WORD"
+                                    and nxt.upper in ("LANGUAGE", "EXTERNAL", "DECLARE", "BEGIN")
+                                ):
+                                    expanded.append(chunk[: m + 1])
+                                    _split_chunk_recursive(chunk[m + 1 :])
+                                    return
                     expanded.append(chunk)
                     return
 
@@ -1044,6 +1101,9 @@ def analyze_sql_static(text: str, *, dialect: str = "") -> Dict[str, Any]:
 
         if verb == "CREATE_PROC":
             has_proc_block = True
+            # Oracle / DM8 / GaussDB PL-SQL `CREATE PROCEDURE p(...) IS/AS v_x TYPE; BEGIN ...` 无需显式 DECLARE
+            if clause and clause[-1].kind == "WORD" and clause[-1].upper in ("AS", "IS"):
+                in_declare = True
             # 提取过程参数签名 (...)
             lp_i = next((k for k, t in enumerate(clause) if t.kind == "LP"), -1)
             if lp_i != -1:
@@ -1246,32 +1306,17 @@ def analyze_sql_static(text: str, *, dialect: str = "") -> Dict[str, Any]:
                 table=tgt,
             )
 
-    # 6. DIALECT_COMPAT [MEDIUM]（在非 Oracle 原生方言下扫描遗留语法，剥离注释与字符串后精确定位行号）
+    # 6. DIALECT_COMPAT [MEDIUM]（基于已剥离注释与字符串的词法 token 重建行内代码，杜绝字符串内 /* / -- 误伤）
     if eff_dialect not in _ORACLE_NATIVE_DIALECTS:
-        lines_raw = text.splitlines()
+        code_tokens_by_line: Dict[int, List[str]] = {}
+        for tok in tokens:
+            if tok.kind == "STRING":
+                continue
+            code_tokens_by_line.setdefault(tok.line, []).append(tok.raw)
+
         compat_hits_by_rule: Dict[str, List[int]] = {}
-        in_block_cmt = False
-        for ln_no, raw_ln in enumerate(lines_raw, start=1):
-            work = raw_ln
-            if in_block_cmt:
-                end_c = work.find("*/")
-                if end_c == -1:
-                    continue
-                work = work[end_c + 2 :]
-                in_block_cmt = False
-            while "/*" in work:
-                s_c = work.find("/*")
-                e_c = work.find("*/", s_c + 2)
-                if e_c == -1:
-                    work = work[:s_c]
-                    in_block_cmt = True
-                    break
-                work = work[:s_c] + " " + work[e_c + 2 :]
-            # 去掉行注释与单引号字面量
-            dash_pos = work.find("--")
-            if dash_pos != -1:
-                work = work[:dash_pos]
-            work = re.sub(r"'(?:''|[^'])*'", "''", work)
+        for ln_no in sorted(code_tokens_by_line.keys()):
+            work = " ".join(code_tokens_by_line[ln_no])
             if not work.strip():
                 continue
             for rule_name, pat, _msg in _ORACLE_LEGACY_CHECKS:
@@ -1552,8 +1597,14 @@ def compact_sql_for_llm(
                 i = j
                 continue
 
-        # 检测多行大型静态 CASE WHEN ... THEN ... END 枚举映射（> max_case_branches 分支）
-        if re.search(r"(?i)\bCASE\b", stripped) and not re.search(r"(?i)\bEND\b", stripped):
+        # 检测多行大型静态 CASE WHEN ... THEN ... END 枚举映射（> max_case_branches 分支，跳过纯注释行）
+        code_head = re.sub(r"'(?:''|[^'])*'", "''", stripped).split("--", 1)[0]
+        if (
+            not stripped.startswith("--")
+            and not stripped.startswith("/*")
+            and re.search(r"(?i)\bCASE\b", code_head)
+            and not re.search(r"(?i)\bEND\b", code_head)
+        ):
             when_indices: List[int] = []
             end_idx = -1
             nested_case = 0
@@ -1562,16 +1613,19 @@ def compact_sql_for_llm(
                 if j in skip_line_indices:
                     continue
                 sj = raw_lines[j].strip()
-                if re.search(r"(?i)\bCASE\b", sj) and not re.search(r"(?i)\bEND\b", sj):
+                if sj.startswith("--") or sj.startswith("/*"):
+                    continue
+                sj_code = re.sub(r"'(?:''|[^'])*'", "''", sj).split("--", 1)[0]
+                if re.search(r"(?i)\bCASE\b", sj_code) and not re.search(r"(?i)\bEND\b", sj_code):
                     nested_case += 1
                     continue
-                if re.search(r"(?i)\bEND\b", sj):
+                if re.search(r"(?i)\bEND\b", sj_code):
                     if nested_case > 0:
                         nested_case -= 1
                         continue
                     end_idx = j
                     break
-                if nested_case == 0 and re.match(r"(?i)^WHEN\b.*\bTHEN\b", sj):
+                if nested_case == 0 and re.match(r"(?i)^WHEN\b.*\bTHEN\b", sj_code):
                     when_indices.append(j)
             if end_idx != -1 and len(when_indices) > max_case_branches:
                 # 保留 CASE 头、首 3 条 WHEN、折叠占位说明、末 3 条 WHEN 以及 ELSE/END
@@ -1685,6 +1739,7 @@ def extract_lineage_subgraph(
     table_name: str,
     *,
     depth: int = 3,
+    include_upstream: bool = True,
     include_downstream: bool = True,
     compact: bool = False,
     max_tokens: int = 16000,
@@ -1742,25 +1797,26 @@ def extract_lineage_subgraph(
     seen_edge_keys: Set[Tuple[str, str, str]] = set()
 
     # 反向 BFS 溯源上游
-    q_up: deque[Tuple[str, int]] = deque((t, 0) for t in seed_tables)
-    visited_up: Set[str] = set(seed_tables)
-    while q_up:
-        cur_t, dist = q_up.popleft()
-        if dist >= max_depth:
-            continue
-        for e in upstream_map.get(cur_t, []):
-            sk = str(e.get("source") or "").lower()
-            sid = str(e.get("stmt_id") or "")
-            ek = (sk, cur_t, sid)
-            if ek not in seen_edge_keys:
-                seen_edge_keys.add(ek)
-                related_edges.append(e)
-            if sid:
-                related_stmt_ids.add(sid)
-            if sk and sk not in visited_up:
-                visited_up.add(sk)
-                related_tables.add(sk)
-                q_up.append((sk, dist + 1))
+    if include_upstream:
+        q_up: deque[Tuple[str, int]] = deque((t, 0) for t in seed_tables)
+        visited_up: Set[str] = set(seed_tables)
+        while q_up:
+            cur_t, dist = q_up.popleft()
+            if dist >= max_depth:
+                continue
+            for e in upstream_map.get(cur_t, []):
+                sk = str(e.get("source") or "").lower()
+                sid = str(e.get("stmt_id") or "")
+                ek = (sk, cur_t, sid)
+                if ek not in seen_edge_keys:
+                    seen_edge_keys.add(ek)
+                    related_edges.append(e)
+                if sid:
+                    related_stmt_ids.add(sid)
+                if sk and sk not in visited_up:
+                    visited_up.add(sk)
+                    related_tables.add(sk)
+                    q_up.append((sk, dist + 1))
 
     # 可选下游 BFS
     if include_downstream:
@@ -1789,7 +1845,10 @@ def extract_lineage_subgraph(
         sid = str(s.get("stmt_id") or "")
         tgt = str(s.get("target_table") or "").lower()
         srcs = [str(x).lower() for x in (s.get("source_tables") or [])]
-        if tgt in related_tables or any(x in seed_tables for x in srcs):
+        if tgt in related_tables:
+            if include_upstream or tgt in seed_tables:
+                related_stmt_ids.add(sid)
+        elif include_downstream and any(x in seed_tables for x in srcs):
             related_stmt_ids.add(sid)
         # 始终保留过程头签名以便理解参数
         if s.get("verb") == "CREATE_PROC":
