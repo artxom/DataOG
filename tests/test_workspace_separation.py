@@ -588,6 +588,7 @@ class TestWorkspaceThreeTierSeparation(unittest.TestCase):
                     """
                 )
                 mconn.commit()
+            mate_ctx.close()
             with open(mate_db, "rb") as fh:
                 mate_bytes = fh.read()
 

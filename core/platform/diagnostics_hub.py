@@ -342,13 +342,27 @@ class DiagnosticsHub:
             "private_opens": 0,
             "private_open_total_ms": 0.0,
             "private_open_max_ms": 0.0,
+            "private_reuses": 0,
             "workspace_opens": 0,
             "workspace_open_total_ms": 0.0,
             "workspace_open_max_ms": 0.0,
+            "workspace_reuses": 0,
         }
 
         store = getattr(ctx, "store", None)
         if store is not None:
+            init_stats = getattr(store, "_init_open_stats", None)
+            if isinstance(init_stats, dict):
+                p_init = init_stats.get("private") or {}
+                w_init = init_stats.get("workspace") or {}
+                self._sqlite_stats["private_opens"] = int(p_init.get("count") or 0)
+                self._sqlite_stats["private_open_total_ms"] = float(p_init.get("total_ms") or 0.0)
+                self._sqlite_stats["private_open_max_ms"] = float(p_init.get("max_ms") or 0.0)
+                self._sqlite_stats["private_reuses"] = int(p_init.get("reuses") or 0)
+                self._sqlite_stats["workspace_opens"] = int(w_init.get("count") or 0)
+                self._sqlite_stats["workspace_open_total_ms"] = float(w_init.get("total_ms") or 0.0)
+                self._sqlite_stats["workspace_open_max_ms"] = float(w_init.get("max_ms") or 0.0)
+                self._sqlite_stats["workspace_reuses"] = int(w_init.get("reuses") or 0)
             store._diag_hub = self
 
     def record_sqlite_stat(
@@ -380,12 +394,18 @@ class DiagnosticsHub:
                 st["private_open_total_ms"] += o
                 if o > st["private_open_max_ms"]:
                     st["private_open_max_ms"] = o
+            elif kind == "private_reuse":
+                st["private_reuses"] += 1
             elif kind == "workspace_open" and open_ms is not None:
                 o = max(0.0, float(open_ms))
                 st["workspace_opens"] += 1
                 st["workspace_open_total_ms"] += o
                 if o > st["workspace_open_max_ms"]:
                     st["workspace_open_max_ms"] = o
+            elif kind == "workspace_reuse":
+                if st["workspace_opens"] == 0 and st["private_opens"] > 0:
+                    st["workspace_opens"] = 1
+                st["workspace_reuses"] += 1
 
     def get_sqlite_stats(self) -> Dict[str, Any]:
         with self._lock:
@@ -402,9 +422,11 @@ class DiagnosticsHub:
             "private_opens": int(st["private_opens"]),
             "private_open_avg_ms": _round_ms(st["private_open_total_ms"] / priv_opens) if st["private_opens"] else 0.0,
             "private_open_max_ms": _round_ms(st["private_open_max_ms"]),
+            "private_reuses": int(st["private_reuses"]),
             "workspace_opens": int(st["workspace_opens"]),
             "workspace_open_avg_ms": _round_ms(st["workspace_open_total_ms"] / ws_opens) if st["workspace_opens"] else 0.0,
             "workspace_open_max_ms": _round_ms(st["workspace_open_max_ms"]),
+            "workspace_reuses": int(st["workspace_reuses"]),
         }
 
     # =========================================================================
@@ -1339,10 +1361,12 @@ class DiagnosticsHub:
         drive_type = str(storage_info.get("storage_drive_type") or "UNKNOWN")
         is_unc = bool(storage_info.get("is_unc_path"))
         fsync_avg = float(((benchmark or {}).get("disk_io") or {}).get("fsync_4k_avg_ms") or 0.0)
-        sq_priv_open = max(
-            float(((benchmark or {}).get("sqlite_io") or {}).get("private_open_close_avg_ms") or 0.0),
-            float(sqlite_stats.get("private_open_max_ms") or 0.0),
+        bench_sq_open = float(
+            ((benchmark or {}).get("sqlite_io") or {}).get("private_open_close_avg_ms") or 0.0
         )
+        priv_opens = int(sqlite_stats.get("private_opens") or 0)
+        priv_max = float(sqlite_stats.get("private_open_max_ms") or 0.0)
+        sq_priv_open = max(bench_sq_open, priv_max if priv_opens > 2 else 0.0)
         if is_unc or drive_type == "REMOTE" or fsync_avg > 20.0 or sq_priv_open > 15.0:
             findings.append(
                 {

@@ -1464,6 +1464,113 @@ class _CrossIoAndReportMixin:
             "unbound_tgt_cols": 0,
         }
 
+        # 批量预加载全部涉及表对的已保存列配对、两侧第 2 步绑标与标准字典，消除报告逐表 SQLite 连接/查询风暴
+        saved_cols_by_key: Dict[str, List[Dict[str, Any]]] = {}
+        src_binds_by_tbl: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        tgt_binds_by_tbl: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        prefetched_std_dict_map: Dict[str, Dict[str, Any]] = {}
+
+        if probe_saved_tables:
+            wanted_keys = [
+                str(tb.get("std_table_key") or "").strip().lower()
+                for tb in probe_saved_tables
+                if str(tb.get("std_table_key") or "").strip()
+            ]
+            if wanted_keys:
+                with self.ctx.store.module_db() as conn:
+                    for i in range(0, len(wanted_keys), 400):
+                        chunk = wanted_keys[i : i + 400]
+                        ph = ",".join("?" for _ in chunk)
+                        c_rows = conn.execute(
+                            f"""
+                            SELECT * FROM cross_column_bindings
+                            WHERE LOWER(std_table_key) IN ({ph})
+                            ORDER BY row_index ASC, id ASC
+                            """,
+                            chunk,
+                        ).fetchall()
+                        for r in c_rows:
+                            rd = dict(r)
+                            tk = str(rd.get("std_table_key") or "").strip().lower()
+                            saved_cols_by_key.setdefault(tk, []).append(rd)
+
+            src_bind_targets: List[Tuple[str, str]] = []
+            tgt_bind_targets: List[Tuple[str, str]] = []
+            for tb in probe_saved_tables:
+                ss = clean_identifier_input(str(tb.get("source_schema") or src_def_sch)) or src_def_sch
+                st = clean_identifier_input(str(tb.get("source_table") or tb.get("std_table_name") or ""))
+                if st:
+                    src_bind_targets.append((ss, st))
+                    if src_metas_map:
+                        sm = src_metas_map.get((ss.lower(), st.lower()))
+                        if sm and sm.table_name:
+                            src_bind_targets.append((sm.schema_name or ss, sm.table_name))
+                ts = clean_identifier_input(str(tb.get("target_schema") or tgt_def_sch)) or tgt_def_sch
+                tt = clean_identifier_input(str(tb.get("target_table") or tb.get("std_table_name") or ""))
+                if tt:
+                    tgt_bind_targets.append((ts, tt))
+                    if tgt_metas_map:
+                        tm = tgt_metas_map.get((ts.lower(), tt.lower()))
+                        if tm and tm.table_name:
+                            tgt_bind_targets.append((tm.schema_name or ts, tm.table_name))
+
+            if src_cid and src_bind_targets:
+                src_binds_by_tbl = self.ctx.standard_catalog.get_tables_field_bindings_batch(
+                    src_cid, src_bind_targets
+                )
+            if tgt_cid and tgt_bind_targets:
+                if same_cid and tgt_bind_targets == src_bind_targets:
+                    tgt_binds_by_tbl = src_binds_by_tbl
+                else:
+                    tgt_binds_by_tbl = self.ctx.standard_catalog.get_tables_field_bindings_batch(
+                        tgt_cid, tgt_bind_targets
+                    )
+
+            all_pref_codes: List[str] = []
+            for cols_list in saved_cols_by_key.values():
+                for sc in cols_list:
+                    c1 = clean_excel_cell_str(sc.get("source_std_code"), treat_placeholder_empty=True)
+                    c2 = clean_excel_cell_str(sc.get("target_std_code"), treat_placeholder_empty=True)
+                    if c1:
+                        all_pref_codes.append(c1)
+                    if c2:
+                        all_pref_codes.append(c2)
+            for bmap in src_binds_by_tbl.values():
+                for br in bmap.values():
+                    sc_val = (br.get("std_code") or "").strip()
+                    if sc_val:
+                        all_pref_codes.append(sc_val)
+            for bmap in tgt_binds_by_tbl.values():
+                for br in bmap.values():
+                    tc_val = (br.get("std_code") or "").strip()
+                    if tc_val:
+                        all_pref_codes.append(tc_val)
+            if all_pref_codes:
+                prefetched_std_dict_map = self.ctx.standard_catalog.get_items_by_codes(
+                    all_pref_codes
+                )
+
+        def _pick_prefetched_binds(
+            binds_map: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]],
+            metas_map: Optional[Dict[Tuple[str, str], TableMeta]],
+            cfg_schema: str,
+            cfg_table: str,
+        ) -> Dict[str, Dict[str, Any]]:
+            cs = clean_identifier_input(cfg_schema or "").lower() or "public"
+            ct = clean_identifier_input(cfg_table or "").lower()
+            if not ct:
+                return {}
+            m_obj = metas_map.get((cs, ct)) if metas_map else None
+            if m_obj and m_obj.exists:
+                ak = (
+                    (clean_identifier_input(m_obj.schema_name or "") or cs).lower(),
+                    (clean_identifier_input(m_obj.table_name or "") or ct).lower(),
+                )
+                hit = binds_map.get(ak)
+                if hit is not None:
+                    return hit
+            return binds_map.get((cs, ct)) or {}
+
         for idx, t in enumerate(probe_saved_tables, start=1):
             if idx == 1 or idx % p_step == 0 or idx == tot_pairs:
                 pct = 48.0 + 38.0 * (idx / max(1, tot_pairs))
@@ -1474,6 +1581,11 @@ class _CrossIoAndReportMixin:
                     idx,
                     tot_pairs,
                 )
+            t_key_low = str(t.get("std_table_key") or "").strip().lower()
+            s_sch_pair = clean_identifier_input(str(t.get("source_schema") or src_def_sch)) or src_def_sch
+            s_tbl_pair = clean_identifier_input(str(t.get("source_table") or t.get("std_table_name") or ""))
+            t_sch_pair = clean_identifier_input(str(t.get("target_schema") or tgt_def_sch)) or tgt_def_sch
+            t_tbl_pair = clean_identifier_input(str(t.get("target_table") or t.get("std_table_name") or ""))
             comp = self.compare_single_table(
                 t["std_table_key"],
                 force_refresh=False,
@@ -1490,6 +1602,15 @@ class _CrossIoAndReportMixin:
                 prefetched_tgt_skipped=tgt_skipped,
                 prefetched_src_warning=src_probe_warn,
                 prefetched_tgt_warning=tgt_probe_warn,
+                prefetched_table_binding=t,
+                prefetched_saved_cols=saved_cols_by_key.get(t_key_low, []),
+                prefetched_src_field_binds=_pick_prefetched_binds(
+                    src_binds_by_tbl, src_metas_map, s_sch_pair, s_tbl_pair
+                ),
+                prefetched_tgt_field_binds=_pick_prefetched_binds(
+                    tgt_binds_by_tbl, tgt_metas_map, t_sch_pair, t_tbl_pair
+                ),
+                prefetched_std_dict_map=prefetched_std_dict_map,
             )
             hydrated = self._hydrate_five_col_pair(comp)
             if only_bound_tables and len(hydrated["center_rows"]) == 0:

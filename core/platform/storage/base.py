@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+import weakref
 
 from core.platform.diagnostics_hub import record_instant_metric
 
@@ -24,6 +25,25 @@ from core.platform.storage.schema import (
 )
 
 _SAFE_SQL_IDENT_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
+
+
+def _close_live_conns_dict(conns: Dict[str, Optional[sqlite3.Connection]]) -> None:
+    """进程退出或对象销毁前安全关闭持久 SQLite 连接，消除 ResourceWarning 与文件句柄泄露."""
+    seen: Set[int] = set()
+    for key in list(conns.keys()):
+        conn = conns.get(key)
+        conns[key] = None
+        if conn is not None and id(conn) not in seen:
+            seen.add(id(conn))
+            try:
+                if getattr(conn, "in_transaction", False):
+                    conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 class _TimedRLock:
@@ -106,6 +126,16 @@ class _BaseStateStore(_SchemaColumnMixin):
 
         self._diag_hub: Any = None
         self._lock = _TimedRLock(owner=self)
+        self._live_conns: Dict[str, Optional[sqlite3.Connection]] = {
+            "private": None,
+            "workspace": None,
+        }
+        self._conn_depth: Dict[str, int] = {"private": 0, "workspace": 0}
+        self._init_open_stats: Dict[str, Dict[str, float]] = {
+            "private": {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "reuses": 0},
+            "workspace": {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "reuses": 0},
+        }
+        self._finalizer = weakref.finalize(self, _close_live_conns_dict, self._live_conns)
         self._registered_schemas: Dict[str, List[Tuple[str, str, List[Tuple[str, str]]]]] = {
             "private": [],
             "workspace": [],
@@ -126,62 +156,128 @@ class _BaseStateStore(_SchemaColumnMixin):
         conn = sqlite3.connect(path, timeout=15.0, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout = 10000;")
+        try:
+            conn.execute("PRAGMA temp_store = MEMORY;")
+            conn.execute("PRAGMA cache_size = -16000;")
+        except Exception:
+            pass
         return conn
+
+    def _drop_persistent_conn(
+        self, eff_kind: str, *, checkpoint: bool = False, checkpoint_mode: str = "PASSIVE"
+    ) -> None:
+        with self._lock:
+            conn = self._live_conns.get(eff_kind)
+            self._live_conns[eff_kind] = None
+            self._conn_depth[eff_kind] = 0
+            if conn is None:
+                return
+            mode = (
+                checkpoint_mode.upper()
+                if str(checkpoint_mode or "").upper() in ("PASSIVE", "FULL", "RESTART", "TRUNCATE")
+                else "PASSIVE"
+            )
+            try:
+                if getattr(conn, "in_transaction", False):
+                    conn.rollback()
+                if checkpoint:
+                    conn.execute(f"PRAGMA wal_checkpoint({mode});")
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _acquire_persistent_conn(
+        self, kind: str, eff_kind: str
+    ) -> Tuple[sqlite3.Connection, float, bool]:
+        existing = self._live_conns.get(eff_kind)
+        hub = getattr(self, "_diag_hub", None)
+        if existing is not None:
+            if hub is not None:
+                hub.record_sqlite_stat(f"{kind}_reuse")
+            else:
+                st = self._init_open_stats[kind]
+                if kind == "workspace" and st["count"] == 0 and eff_kind != kind:
+                    st["count"] = 1
+                st["reuses"] += 1
+            return existing, 0.0, True
+
+        target_path = (
+            self.private_db_path if eff_kind == "private" else self.workspace_db_path
+        )
+        t0 = time.perf_counter()
+        conn = self._connect_sqlite(target_path)
+        open_ms = (time.perf_counter() - t0) * 1000.0
+        self._live_conns[eff_kind] = conn
+        if hub is not None:
+            hub.record_sqlite_stat(f"{kind}_open", open_ms=open_ms)
+        else:
+            st = self._init_open_stats[kind]
+            st["count"] += 1
+            st["total_ms"] += open_ms
+            if open_ms > st["max_ms"]:
+                st["max_ms"] = open_ms
+        if open_ms >= 2.0:
+            record_instant_metric(f"sqlite_{kind}", "open", open_ms, min_span_ms=2.0)
+        return conn, open_ms, False
+
+    @contextlib.contextmanager
+    def _managed_conn(self, kind: str, *, autocommit: bool = False):
+        """复用持久 SQLite 连接并在外层临界区退出时收敛未决事务，彻底消除高频开关句柄与 EDR 扫描开销."""
+        t0 = time.perf_counter()
+        with self._lock:
+            eff_kind = (
+                "private"
+                if (kind == "private" or not self.is_split_storage)
+                else "workspace"
+            )
+            conn, open_ms, reused = self._acquire_persistent_conn(kind, eff_kind)
+            self._conn_depth[eff_kind] = int(self._conn_depth.get(eff_kind, 0)) + 1
+            is_outer = self._conn_depth[eff_kind] == 1
+            try:
+                yield conn
+                if is_outer and getattr(conn, "in_transaction", False):
+                    if autocommit:
+                        conn.commit()
+                    else:
+                        conn.rollback()
+            except Exception as exc:
+                if is_outer and getattr(conn, "in_transaction", False):
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                if isinstance(exc, (sqlite3.DatabaseError, sqlite3.ProgrammingError)):
+                    self._drop_persistent_conn(eff_kind, checkpoint=False)
+                raise
+            finally:
+                cur_depth = int(self._conn_depth.get(eff_kind, 0))
+                self._conn_depth[eff_kind] = max(0, cur_depth - 1)
+                total_ms = (time.perf_counter() - t0) * 1000.0
+                record_instant_metric(
+                    f"sqlite_{kind}",
+                    "session",
+                    total_ms,
+                    {"open_ms": round(open_ms, 2), "reused": reused},
+                    min_span_ms=5.0,
+                )
 
     @contextlib.contextmanager
     def _get_private_conn(self):
-        t0 = time.perf_counter()
-        conn = self._connect_sqlite(self.private_db_path)
-        open_ms = (time.perf_counter() - t0) * 1000.0
-        hub = getattr(self, "_diag_hub", None)
-        if hub is not None:
-            hub.record_sqlite_stat("private_open", open_ms=open_ms)
-        if open_ms >= 2.0:
-            record_instant_metric("sqlite_private", "open", open_ms, min_span_ms=2.0)
-        try:
+        with self._managed_conn("private", autocommit=False) as conn:
             yield conn
-        finally:
-            t_close = time.perf_counter()
-            conn.close()
-            close_ms = (time.perf_counter() - t_close) * 1000.0
-            total_ms = (time.perf_counter() - t0) * 1000.0
-            record_instant_metric(
-                "sqlite_private",
-                "session",
-                total_ms,
-                {"open_ms": round(open_ms, 2), "close_ms": round(close_ms, 2)},
-                min_span_ms=5.0,
-            )
 
     @contextlib.contextmanager
     def _get_workspace_conn(self):
-        t0 = time.perf_counter()
-        conn = self._connect_sqlite(self.workspace_db_path)
-        open_ms = (time.perf_counter() - t0) * 1000.0
-        hub = getattr(self, "_diag_hub", None)
-        if hub is not None:
-            hub.record_sqlite_stat("workspace_open", open_ms=open_ms)
-        if open_ms >= 2.0:
-            record_instant_metric("sqlite_workspace", "open", open_ms, min_span_ms=2.0)
-        try:
+        with self._managed_conn("workspace", autocommit=False) as conn:
             yield conn
-        finally:
-            t_close = time.perf_counter()
-            conn.close()
-            close_ms = (time.perf_counter() - t_close) * 1000.0
-            total_ms = (time.perf_counter() - t0) * 1000.0
-            record_instant_metric(
-                "sqlite_workspace",
-                "session",
-                total_ms,
-                {"open_ms": round(open_ms, 2), "close_ms": round(close_ms, 2)},
-                min_span_ms=5.0,
-            )
 
     @contextlib.contextmanager
     def _get_conn(self):
         """默认指向当前活动工作区数据库（在单库兼容模式下与私有库为同一文件）."""
-        with self._get_workspace_conn() as conn:
+        with self._managed_conn("workspace", autocommit=False) as conn:
             yield conn
 
     @contextlib.contextmanager
@@ -224,10 +320,33 @@ class _BaseStateStore(_SchemaColumnMixin):
                 self._ensure_columns_for_table(conn, tbl_name, exp_cols)
             conn.commit()
 
+    def checkpoint_workspace(self) -> None:
+        """在不重开连接的前提下对当前工作区 WAL 执行 PASSIVE checkpoint."""
+        with self._lock:
+            eff_kind = "workspace" if self.is_split_storage else "private"
+            conn = self._live_conns.get(eff_kind)
+            if conn is None:
+                return
+            try:
+                if not getattr(conn, "in_transaction", False):
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        """优雅关闭私有库与工作区库持久连接（执行 TRUNCATE 刷盘并释放句柄）."""
+        with self._lock:
+            self._drop_persistent_conn("workspace", checkpoint=True, checkpoint_mode="TRUNCATE")
+            self._drop_persistent_conn("private", checkpoint=True, checkpoint_mode="TRUNCATE")
+
     def switch_workspace_db(self, new_workspace_db_path: str) -> None:
         """原子热切换当前活动的 Layer 3 团队共享工作区 SQLite 文件（不改动私有保险箱）."""
         target = os.path.abspath(new_workspace_db_path)
         with self._lock:
+            if self.is_split_storage:
+                self._drop_persistent_conn("workspace", checkpoint=True)
+            else:
+                self.checkpoint_workspace()
             self.workspace_db_path = target
             self.is_split_storage = self.private_db_path != self.workspace_db_path
             self._init_workspace_db()
@@ -270,14 +389,8 @@ class _BaseStateStore(_SchemaColumnMixin):
     def module_db(self, scope: str = "workspace"):
         """供业务插件模块执行参数化 SQLite 读写事务的线程安全上下文."""
         norm_scope = "private" if str(scope or "").strip().lower() == "private" else "workspace"
-        cm = self._get_private_conn() if norm_scope == "private" else self._get_workspace_conn()
-        with self._lock, cm as conn:
-            try:
-                yield conn
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+        with self._managed_conn(norm_scope, autocommit=True) as conn:
+            yield conn
 
 
     def register_private_tables(self, table_names: Iterable[str]) -> None:

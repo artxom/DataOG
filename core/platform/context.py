@@ -121,7 +121,7 @@ class PlatformContext:
         self.task_progress = self.import_progress
         self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
-        self.app_version = "3.2.2"
+        self.app_version = "3.2.3"
         self.diagnostics_hub = DiagnosticsHub(self)
 
     def register_module_manifest(
@@ -184,7 +184,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "3.2.2",
+            "version": "3.2.3",
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": license_info,
             "active_workspace": active_ws,
@@ -202,6 +202,17 @@ class PlatformContext:
             "modules": list(self._registered_modules),
             "logs": logs,
         }
+
+    def close(self) -> None:
+        """优雅释放连接池与底层 SQLite 持久连接句柄."""
+        try:
+            self.connection_hub.close_warm_connections()
+        except Exception:
+            pass
+        try:
+            self.store.close()
+        except Exception:
+            pass
 
 
 def get_platform_context(request: Request) -> PlatformContext:

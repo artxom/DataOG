@@ -994,8 +994,8 @@ export class CrossComparatorView {
     this._prefetchedSignature = sig;
     setTimeout(() => {
       if (this._destroyed) return;
-      crossApi.prefetchPairs({ max_pairs: 60 }).catch(() => {});
-    }, 80);
+      crossApi.prefetchPairs({ max_pairs: 20 }).catch(() => {});
+    }, 1200);
   }
 
   async loadOverview(tableKey = "", forceRefresh = false, extra = {}) {

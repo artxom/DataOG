@@ -188,6 +188,7 @@ class _StandardBindingsMixin:
         bindings_map: Dict[str, Dict[str, Any]],
         std_dict_map: Dict[str, Dict[str, Any]],
         format_profile: str = "AUTO",
+        skip_unchanged: bool = True,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         actual_schema = t_meta.schema_name or eff_schema
         actual_table = t_meta.table_name or eff_table
@@ -229,17 +230,20 @@ class _StandardBindingsMixin:
             st = ev["status"]
             if std_code:
                 counts["bound_cols"] += 1
-                upd_schema = (bind_rec.get("schema_name") if bind_rec else "") or actual_schema
-                upd_table = (bind_rec.get("table_name") if bind_rec else "") or actual_table
-                compliance_updates.append(
-                    {
-                        "schema_name": upd_schema,
-                        "table_name": upd_table,
-                        "column_name": col_clean,
-                        "compliance_status": st,
-                        "compliance_detail": ev["detail"],
-                    }
-                )
+                prev_st = str(bind_rec.get("compliance_status") or "") if bind_rec else ""
+                prev_dt = str(bind_rec.get("compliance_detail") or "") if bind_rec else ""
+                if (not skip_unchanged) or (prev_st != st) or (prev_dt != ev["detail"]):
+                    upd_schema = (bind_rec.get("schema_name") if bind_rec else "") or actual_schema
+                    upd_table = (bind_rec.get("table_name") if bind_rec else "") or actual_table
+                    compliance_updates.append(
+                        {
+                            "schema_name": upd_schema,
+                            "table_name": upd_table,
+                            "column_name": col_clean,
+                            "compliance_status": st,
+                            "compliance_detail": ev["detail"],
+                        }
+                    )
             if st == "COMPLIANT":
                 counts["compliant_cols"] += 1
             elif st == "COMMENT_ONLY":
@@ -365,16 +369,6 @@ class _StandardBindingsMixin:
         actual_table = t_meta.table_name or eff_table
         col_total = len(t_meta.columns)
 
-        if t_meta.exists and t_meta.columns:
-            live_col_names = [c.column_name for c in t_meta.columns if c.column_name]
-            self.ctx.standard_catalog.prune_stale_table_bindings(
-                prof.connection_id, actual_schema, actual_table, live_col_names
-            )
-            if eff_schema.lower() != actual_schema.lower():
-                self.ctx.standard_catalog.prune_stale_table_bindings(
-                    prof.connection_id, eff_schema, actual_table, live_col_names
-                )
-
         report(
             74.0,
             "匹配数据标准",
@@ -401,6 +395,24 @@ class _StandardBindingsMixin:
                 )
             )
         bindings_map.update(actual_binds)
+
+        if t_meta.exists and t_meta.columns and bindings_map:
+            live_col_names = [c.column_name for c in t_meta.columns if c.column_name]
+            live_col_lower = {
+                (clean_identifier_input(cn) or cn).lower() for cn in live_col_names
+            }
+            stale_keys = [k for k in bindings_map.keys() if k not in live_col_lower]
+            if stale_keys:
+                self.ctx.standard_catalog.prune_stale_table_bindings(
+                    prof.connection_id, actual_schema, actual_table, live_col_names
+                )
+                if eff_schema.lower() != actual_schema.lower():
+                    self.ctx.standard_catalog.prune_stale_table_bindings(
+                        prof.connection_id, eff_schema, actual_table, live_col_names
+                    )
+                for sk in stale_keys:
+                    bindings_map.pop(sk, None)
+
         std_codes = [
             b.get("std_code", "")
             for b in bindings_map.values()
@@ -423,6 +435,7 @@ class _StandardBindingsMixin:
             bindings_map=bindings_map,
             std_dict_map=std_dict_map,
             format_profile=eff_format,
+            skip_unchanged=True,
         )
         if compliance_updates:
             self.ctx.standard_catalog.update_binding_compliance_batch(
@@ -848,6 +861,7 @@ class _StandardBindingsMixin:
                 bindings_map=b_map,
                 std_dict_map=std_dict_map,
                 format_profile=eff_format,
+                skip_unchanged=not should_realign,
             )
             if c_updates:
                 if should_realign:
@@ -877,9 +891,9 @@ class _StandardBindingsMixin:
                 replace_mode=realign_replace_mode,
             )
 
-        for p_sch, p_tbl, p_cols in prune_targets:
-            self.ctx.standard_catalog.prune_stale_table_bindings(
-                prof.connection_id, p_sch, p_tbl, p_cols
+        if prune_targets:
+            self.ctx.standard_catalog.prune_stale_tables_bindings_batch(
+                prof.connection_id, prune_targets
             )
 
         if all_compliance_updates:

@@ -8,6 +8,27 @@
 
 ---
 
+## [3.2.3] - 2026-11-24
+
+> **内网环境「落标/跨环境比对」全链路性能核爆级治理（消灭 77s 端到端卡顿、214ms SQLite 反复开关库、684ms 锁竞争与 244ms Gate 1 主线程阻塞）**：基于内网诊断面板实测线索，一次性根除 `get_connection_binding_stats()` 引发的 SQLite O(N×M) 平方级扫描、每次操作重复开闭 SQLite 触发的 EDR 扫描风暴、Gate 1 同步阻塞 FastAPI 事件循环及落标核验/跨环境报告内部的 N+1 逐表读写循环。
+
+### Fixed
+- **根除 `get_connection_binding_stats()` O(N×M) 平方级锁死 (`core/platform/standard_catalog.py`)**：
+  - 将原先包含 3 个未索引 CTE 与三重 `SCAN LEFT-JOIN` 的聚合 SQL（在企业库数千列规模下退化为数十秒全表嵌套循环并长时间死锁 `PlatformStateStore._lock`）重构为 2 次纯索引单表线性扫描 + 释放锁后的 O(N+M) 内存字典聚合，耗时从数秒～数十秒级压降至 **10ms 以内**。
+- **落地 `PlatformStateStore` 持久化 SQLite 连接复用，消灭每次 214ms 开关句柄 + EDR 扫描开销 (`core/platform/storage/{base.py,platform_repos.py}`, `core/platform/workspace_hub.py`, `core/platform/context.py`)**：
+  - 在 `_BaseStateStore` 持有 `"private"` 与 `"workspace"` 双通道持久长连接（`_managed_conn` 深度跟踪 + 外层边界事务自动提交/回滚 + `temp_store = MEMORY` + `cache_size = -16000` + `weakref.finalize` 与 `PlatformContext.close()` 安全释放，并在 `switch_workspace_db()` 时被动 WAL checkpoint 后无缝切换）；`workspace_hub` 对当前活动库复用 `checkpoint_workspace()` 免重开文件；`get_cached_table_meta()` 优先走精确主键索引查找。
+- **消除 Gate 1 鉴权阻塞 FastAPI 主事件循环 (`core/platform/license_hub.py`, `app.py`)**：
+  - 新增 10 秒纯内存零 I/O 热缓存 `try_fast_stamp_request()`（保留单调时钟防回拨检测，锁定/激活即时失效），未命中时通过 `run_in_threadpool` 异步下沉至工作线程池执行；同步将设备探针缓存放宽至 `120s`、时钟水印写盘节流放宽至 `300s`。
+- **消除落标核验与跨环境报告 N+1 查询及只读点击冗余写盘 (`core/platform/standard_catalog.py`, `modules/standard_migrator/bindings_mixin.py`, `modules/cross_comparator/{service.py,io_and_report_mixin.py}`, `static/js/views/cross_comparator_view.js`)**：
+  - 新增 `prune_stale_tables_bindings_batch()` 将 `check_compliance()` 逐表清理僵尸绑标收敛为单次批事务；点选查看表落标时先比对再按需清理并跳过状态/明细未变化的冗余 `UPDATE` 写锁。
+  - `_build_cross_env_report_payload()` 提前一次性批量预加载全量 `cross_column_bindings`、源/目标第 2 步 `field_standard_bindings` 及标准字典并透传 `compare_single_table()` / `_build_dual_bookmark_rows()`，消除报告生成逐表 SQLite 风暴；跨环境工作台首屏后台预热延迟至 `1200ms`、上限调为 `20` 对避免抢占慢网通道。
+
+### Added
+- **诊断面板复用指标与高规模回归测试 (`core/platform/diagnostics_hub.py`, `tests/test_diagnostics_benchmark.py`)**：
+  - `sqlite_stats` 新增 `private_reuses` / `workspace_reuses` 计数与启动阶段建连/复用计数回填；新增 `test_persistent_sqlite_reuse_and_gate1_fast_path_non_blocking` 与 `test_binding_stats_large_scale_speed_batch_prune_and_readonly_view` 回归测试（总测试增至 95 项）。
+
+---
+
 ## [3.2.2] - 2026-11-24
 
 > **CI 纯打包瘦身与 2 秒冻结态 `--smoke-test` 启动冒烟闭环**：将全量单元测试彻底收口至发布前本地执行，消除 GitHub Actions 与 `build_exe.py` 重复跑 4 次全量单测导致的耗时拖慢，将云端 Windows 构建发版链路压缩至纯打包 + 2 秒冻结态启动冒烟校验，同时把客户发行包内的 `tests/` 目录彻底剥离。

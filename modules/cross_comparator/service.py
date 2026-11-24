@@ -476,6 +476,11 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
         prefetched_tgt_skipped: Optional[Set[Tuple[str, str]]] = None,
         prefetched_src_warning: str = "",
         prefetched_tgt_warning: str = "",
+        prefetched_table_binding: Optional[Dict[str, Any]] = None,
+        prefetched_saved_cols: Optional[List[Dict[str, Any]]] = None,
+        prefetched_src_field_binds: Optional[Dict[str, Dict[str, Any]]] = None,
+        prefetched_tgt_field_binds: Optional[Dict[str, Dict[str, Any]]] = None,
+        prefetched_std_dict_map: Optional[Dict[str, Dict[str, Any]]] = None,
         progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
@@ -501,11 +506,14 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
             override_target_schema, override_target_table
         )
 
-        t_bind = (
-            self.ctx.store.get_cross_table_binding(std_table_key)
-            if load_saved_binding
-            else None
-        )
+        if prefetched_table_binding is not None and load_saved_binding:
+            t_bind = dict(prefetched_table_binding)
+        else:
+            t_bind = (
+                self.ctx.store.get_cross_table_binding(std_table_key)
+                if load_saved_binding
+                else None
+            )
         if not t_bind:
             if persist_missing_binding:
                 t_bind = self.ctx.store.upsert_cross_table_binding(
@@ -748,11 +756,14 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
             tgt_col_map[clean_identifier_input(c.column_name).lower()] = c
             tgt_col_map[c.column_name.lower()] = c
 
-        all_saved_std_cols = (
-            self.ctx.store.list_cross_columns(t_bind["std_table_key"])
-            if load_saved_binding and t_bind.get("std_table_key")
-            else []
-        )
+        if prefetched_saved_cols is not None:
+            all_saved_std_cols = list(prefetched_saved_cols) if load_saved_binding else []
+        else:
+            all_saved_std_cols = (
+                self.ctx.store.list_cross_columns(t_bind["std_table_key"])
+                if load_saved_binding and t_bind.get("std_table_key")
+                else []
+            )
         std_cols = [
             sc
             for sc in all_saved_std_cols
@@ -995,6 +1006,9 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
             format_profile=format_profile,
             source_format_profile=eff_src_fmt,
             target_format_profile=eff_tgt_fmt,
+            prefetched_src_field_binds=prefetched_src_field_binds,
+            prefetched_tgt_field_binds=prefetched_tgt_field_binds,
+            prefetched_std_dict_map=prefetched_std_dict_map,
         )
 
         return {
@@ -1070,6 +1084,9 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
         format_profile: str = "AUTO",
         source_format_profile: str = "AUTO",
         target_format_profile: str = "AUTO",
+        prefetched_src_field_binds: Optional[Dict[str, Dict[str, Any]]] = None,
+        prefetched_tgt_field_binds: Optional[Dict[str, Dict[str, Any]]] = None,
+        prefetched_std_dict_map: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
         """构建双列 + 内侧中缝拟物书签行模型（自动继承第 2 步字段级数标绑定）."""
         src_cid = str(src_conn.get("connection_id") or "")
@@ -1083,16 +1100,22 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
             tgt_conn, target_format_profile, format_profile
         )
 
-        src_field_binds = (
-            self.ctx.standard_catalog.get_table_field_bindings(src_cid, src_schema, src_table)
-            if src_cid and src_table
-            else {}
-        )
-        tgt_field_binds = (
-            self.ctx.standard_catalog.get_table_field_bindings(tgt_cid, tgt_schema, tgt_table)
-            if tgt_cid and tgt_table
-            else {}
-        )
+        if prefetched_src_field_binds is not None:
+            src_field_binds = dict(prefetched_src_field_binds)
+        else:
+            src_field_binds = (
+                self.ctx.standard_catalog.get_table_field_bindings(src_cid, src_schema, src_table)
+                if src_cid and src_table
+                else {}
+            )
+        if prefetched_tgt_field_binds is not None:
+            tgt_field_binds = dict(prefetched_tgt_field_binds)
+        else:
+            tgt_field_binds = (
+                self.ctx.standard_catalog.get_table_field_bindings(tgt_cid, tgt_schema, tgt_table)
+                if tgt_cid and tgt_table
+                else {}
+            )
 
         src_col_map: Dict[str, ColumnMeta] = {}
         for c in src_meta.columns:
@@ -1306,7 +1329,10 @@ class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
             if t_code:
                 needed_codes.append(t_code)
 
-        std_map = self.ctx.standard_catalog.get_items_by_codes(needed_codes)
+        if prefetched_std_dict_map is not None:
+            std_map = prefetched_std_dict_map
+        else:
+            std_map = self.ctx.standard_catalog.get_items_by_codes(needed_codes)
 
         def _std_brief(code: str, db_type: str, side_fmt: str) -> Optional[Dict[str, Any]]:
             if not code:

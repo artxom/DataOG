@@ -712,12 +712,23 @@ class _PlatformReposMixin:
                 """
                 SELECT * FROM meta_tables
                 WHERE connection_id = ?
-                  AND LOWER(schema_name) = LOWER(?)
-                  AND LOWER(table_name) = LOWER(?)
+                  AND schema_name = ?
+                  AND table_name = ?
                 LIMIT 1
                 """,
                 (connection_id, schema_name, table_name),
             ).fetchone()
+            if not t_row:
+                t_row = conn.execute(
+                    """
+                    SELECT * FROM meta_tables
+                    WHERE connection_id = ?
+                      AND LOWER(schema_name) = LOWER(?)
+                      AND LOWER(table_name) = LOWER(?)
+                    LIMIT 1
+                    """,
+                    (connection_id, schema_name, table_name),
+                ).fetchone()
             if not t_row or not int(t_row["columns_cached"] or 0):
                 return None
             c_rows = conn.execute(
