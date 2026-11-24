@@ -8,10 +8,11 @@
  */
 
 import { badge, clearEl, el, statusDot, svgIcon } from "../../core/dom.js";
+import { isAbortError } from "../../core/http.js";
 import { store } from "../../core/state.js";
 import { DataGrid } from "../../ui/data_grid.js";
 import { Modal } from "../../ui/modal.js";
-import { TaskActivityBar, createTaskId } from "../../ui/task_activity_bar.js";
+import { TaskActivityBar } from "../../ui/task_activity_bar.js";
 import { Toast } from "../../ui/toast.js";
 import { assistantApi } from "./api.js";
 import { AssistantInspectorDrawer } from "./drawer_pane.js";
@@ -97,6 +98,7 @@ export class AiAssistantView {
     this.sessionSearch = "";
     this.currentSession = null;
     this.draftPrompt = "";
+    this._pendingUserPrompt = "";
     this.expandedStepsMsgIds = new Set();
 
     this.activityBar = new TaskActivityBar({ graceMs: 120 });
@@ -138,9 +140,11 @@ export class AiAssistantView {
       this.selectedModelKey = "";
       return;
     }
-    const exists = models.some((m) => `${m.provider_id}::${m.model}` === this.selectedModelKey);
-    if (!exists) {
-      const def = models.find((m) => m.is_default) || models[0];
+    const readyModels = models.filter((m) => m.ready || m.has_api_key);
+    const currentModel = models.find((m) => `${m.provider_id}::${m.model}` === this.selectedModelKey);
+    if (!currentModel || (readyModels.length > 0 && !(currentModel.ready || currentModel.has_api_key))) {
+      const pool = readyModels.length ? readyModels : models;
+      const def = pool.find((m) => m.is_default) || pool[0];
       this.selectedModelKey = `${def.provider_id}::${def.model}`;
     }
   }
@@ -452,17 +456,15 @@ export class AiAssistantView {
     if (overrideText === null) {
       this.draftPrompt = "";
     }
+    this._pendingUserPrompt = text;
     this.loading = true;
     this.render();
 
-    const taskId = createTaskId("asst");
     try {
-      const res = await this.activityBar.run({
-        taskId,
-        title: "Data.O.G 智能分析探索",
-        initialStage: "建立推理与上下文...",
-        executor: (signal) =>
-          assistantApi.sendChatTurn(
+      const res = await this.activityBar.track(
+        "Data.O.G 智能分析探索",
+        async ({ taskId, signal }) => {
+          const out = await assistantApi.sendChatTurn(
             {
               session_id: this.currentSession?.session_id || null,
               prompt: text,
@@ -479,8 +481,15 @@ export class AiAssistantView {
               clarification_reply: clarificationReply,
             },
             { taskId, signal }
-          ),
-      });
+          );
+          const stepCnt = out?.assistant_message?.steps?.length ?? 0;
+          return {
+            ...out,
+            message: stepCnt > 0 ? `已完成分析（共 ${stepCnt} 步探索）` : "已完成智能分析",
+          };
+        },
+        { prefix: "asst", cancellable: true }
+      );
 
       this.currentSession = res.session || this.currentSession;
       if (res.assistant_message?.id && (res.assistant_message.steps || []).length > 0) {
@@ -492,8 +501,13 @@ export class AiAssistantView {
       if (overrideText === null && !this.draftPrompt) {
         this.draftPrompt = text;
       }
-      Toast.error(err.message || "智能分析请求失败");
+      if (isAbortError(err)) {
+        Toast.info("已取消本次分析");
+      } else {
+        Toast.error(err.message || "智能分析请求失败");
+      }
     } finally {
+      this._pendingUserPrompt = "";
       this.loading = false;
       this.render();
       this.refreshHeader?.();
@@ -844,8 +858,9 @@ export class AiAssistantView {
             if (res?.session) {
               this.currentSession = res.session;
             }
-            if (res?.catalog_refreshed && this.connectionId) {
-              platformApiRefreshHelper(this.connectionId);
+            const refreshCid = res?.proposal?.connection_id || this.connectionId;
+            if (res?.catalog_refreshed && refreshCid) {
+              platformApiRefreshHelper(refreshCid);
             }
             this.render();
             this._scrollToBottom();
@@ -982,11 +997,29 @@ export class AiAssistantView {
           )
         : null;
 
+    const pendingNodes = [];
+    if (this.loading && this._pendingUserPrompt) {
+      pendingNodes.push(
+        this._renderMessageItem({ role: "user", content: this._pendingUserPrompt }),
+        el(
+          "div",
+          { className: "ai-asst-msg ai-asst-msg-assistant" },
+          el(
+            "div",
+            { className: "ai-asst-assistant-card" },
+            statusDot("正在连接模型与执行自主探索...", "info")
+          )
+        )
+      );
+    }
+
     const stream = el(
       "div",
       { className: "ai-asst-stream" },
       msgs.length
-        ? msgs.map((m, idx) => this._renderMessageItem(m, { isLastAssistant: idx === lastAsstIdx }))
+        ? msgs.map((m, idx) => this._renderMessageItem(m, { isLastAssistant: idx === lastAsstIdx })).concat(pendingNodes)
+        : pendingNodes.length
+        ? pendingNodes
         : this._renderWelcomeHero()
     );
 

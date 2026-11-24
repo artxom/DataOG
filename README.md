@@ -1,4 +1,4 @@
-# Data.O.G v3.0.1 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.0.2 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -56,7 +56,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 3.0.1 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
+├── app.py                        # FastAPI 3.0.2 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、动态 Favicon、自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
@@ -133,7 +133,8 @@ DataOG/
 | **`v2.9.1`** | `fix/v2.9.1-ci-frozen-packaging` → `main` | **CI 零 `httpx` 依赖与 Windows `DataOG.exe` 冻结态自检打包修复**：移除 `test_modular_architecture.py` 对 `httpx` 的隐式依赖并补齐零 `httpx` 静态防线；`build_exe.py` 新增客户运行时测试纯净暂存与构建后泄露校验，剔除 `test_admin_console.py`/`test_demo_sandbox.py` 恢复云端 Windows `DataOG.exe` 编译与 GitHub Release 自动发布；同步加固冻结态 `__spec__.loader` 插件发现与私有表越权注册拦截 |
 | **`v2.9.2`** | `feat/v2.9.2-report-schema-bound-scope` → `main` | **单库与跨环境报告支持 Schema 筛选及表级落标范围收敛**：导出离线 HTML / Excel 报告与预填模板新增 Schema 多选过滤，默认启用「仅包含已绑定落标需求的表（表级落标范围）」在探查前剪枝零绑标表与无关 Schema（含探查后僵尸绑标兜底剔除与推荐/单侧清单同步收敛），并在导出弹窗与离线 HTML 顶栏实时标注筛选范围 |
 | **`v3.0.0`** | `feat/v3.0.0-ai-assistant-knowledge-hub` → `main` | **独立 Dock 旗舰应用 `Data.O.G`（智能数据助手）与零依赖离线知识库 (`KnowledgeHub`)**：新增第五个独立懒加载 Dock 应用，支持在线连库与离线纯方言双模式、场景模式芯片与歧义澄清卡、7 工具渐进自主探索（含只读 SQL 报错自修正、`EXPLAIN` 诊断与引用溯源）、DDL/写操作分级二次确认卡片（常规一键确认 / 高危影响行数估算 + `CONFIRM` 门禁 + 服务端重定级防篡改 + 批执行闭环），配套 0 KB 新增依赖 FTS5 离线知识库（9 格式解析、11 篇内置方言速查卡、`.json.gz` 分享包与可选 Embedding 混合排序）（86 项测试全绿） |
-| **`v3.0.1`**（当前正式版） | `fix/v3.0.1-no-cache-and-reload` → `main` | **前端静态资源强制 `no-cache`、桌面顶部「一键重载」按钮与静态目录版本校验**：为非 `/api/*` 的 `.html`/`.js`/`.css` 下发 `Cache-Control: no-store, no-cache, must-revalidate`、`Pragma: no-cache` 与 `Expires: 0` 彻底解决升级后浏览器锁死旧模块问题；顶部菜单栏新增 **「重载」** 按钮支持清理 Cache Storage 并无缓存刷新页面；启动时校验 `_internal/static` 内 `dataog-ui-version` 与 `APP_VERSION` 一致性并在仅替换 `.exe` 时给出醒目提示；同步在 `knowledge_packs/` 提供 DWS 9.1 / Inceptor 9.x / PostgreSQL 19 初始化离线知识库自助下载（87 项测试全绿） |
+| **`v3.0.1`** | `fix/v3.0.1-no-cache-and-reload` → `main` | **前端静态资源强制 `no-cache`、桌面顶部「一键重载」按钮与静态目录版本校验**：为非 `/api/*` 的 `.html`/`.js`/`.css` 下发 `Cache-Control: no-store, no-cache, must-revalidate`、`Pragma: no-cache` 与 `Expires: 0` 彻底解决升级后浏览器锁死旧模块问题；顶部菜单栏新增 **「重载」** 按钮支持清理 Cache Storage 并无缓存刷新页面；启动时校验 `_internal/static` 内 `dataog-ui-version` 与 `APP_VERSION` 一致性并在仅替换 `.exe` 时给出醒目提示；同步在 `knowledge_packs/` 提供 DWS 9.1 / Inceptor 9.x / PostgreSQL 19 初始化离线知识库自助下载（87 项测试全绿） |
+| **`v3.0.2`**（当前正式版） | `fix/v3.0.2-ai-assistant-activitybar-and-e2e-tests` → `main` | **修复 AI 助手与知识库 `activityBar.track` 调用错误、交互体验补全与前端端到端交互测试升级**：将 `AiAssistantView.sendUserMessage()` 与 `KnowledgeSettingsView` 重建向量索引误用的 `this.activityBar.run(...)` 修正为 `this.activityBar.track(...)` 根治发消息阻断崩溃；优先自动选中已就绪 AI 模型、补齐发送中用户气泡占位并修复抽屉库表刷新响应结构读取；在 `test_ai_assistant_and_kb.py` 新增 `.activityBar.run(` 全库静态防线及覆盖发送/提案确认/抽屉/知识库全交互的 Node.js 端到端验证（87 项测试全绿） |
 
 ---
 

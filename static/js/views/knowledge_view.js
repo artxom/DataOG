@@ -13,7 +13,7 @@ import { knowledgeApi } from "../core/platform_api.js";
 import { badge, clearEl, el, formatBytes, pickLocalFile, statusDot, svgIcon } from "../core/dom.js";
 import { store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
-import { TaskActivityBar, createTaskId } from "../ui/task_activity_bar.js";
+import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
 
 const DIALECT_OPTIONS = [
@@ -770,13 +770,11 @@ export class KnowledgeSettingsView {
                 onClick: async () => {
                   try {
                     await knowledgeApi.saveEmbeddingConfig(cfg);
-                    const tid = createTaskId("kb_emb");
-                    const res = await this.activityBar.run({
-                      taskId: tid,
-                      title: "重建知识库向量索引",
-                      initialStage: "计算知识切片向量...",
-                      executor: (signal) => knowledgeApi.reindexEmbeddings("", { taskId: tid, signal }),
-                    });
+                    const res = await this.activityBar.track(
+                      "重建知识库向量索引",
+                      ({ taskId, signal }) => knowledgeApi.reindexEmbeddings("", { taskId, signal }),
+                      { prefix: "kb_emb", cancellable: false }
+                    );
                     Toast.success(res.message || "向量索引重建完成");
                     await this.refreshFromServer();
                   } catch (err) {

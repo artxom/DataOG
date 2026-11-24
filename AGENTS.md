@@ -48,12 +48,12 @@
    - **分支清理**：合并与打标推送完成后及时删除已使命终结的临时工作分支，确认远端 `main` 与新标签就位。
 
 ## 5. 当前代码基线快照
-- **当前主干最新正式版本**：**`v3.0.1`**（在 `v3.0.0` 第五个 Dock 应用 `Data.O.G` 智能数据助手 + 零依赖 `KnowledgeHub` 基础上，新增前端 HTML/JS/CSS 强制 `no-cache` 响应头、桌面菜单栏「一键重载」按钮与 `_internal/static` 版本一致性启动校验，并附带 `knowledge_packs/` 三库初始化离线知识包）。
+- **当前主干最新正式版本**：**`v3.0.2`**（在 `v3.0.1` 基础上修复 `AiAssistantView` 与 `KnowledgeSettingsView` 的 `TaskActivityBar.track` 调用错误、默认就绪模型选择、发送态占位与抽屉目录刷新，并升级 Node.js 真实交互端到端验证与 `.activityBar.run(` 全库静态防线）。
 - **核心入口、脚本与工具**：
-  - `app.py`（FastAPI `3.0.1` 微内核、`APP_VERSION`、前端 `.html/.js/.css` 防缓存头、`check_static_ui_version_sync`、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）、`knowledge_packs/`（DWS 9.1 / Inceptor 9.x / PGSQL 19 离线知识包 `.json.gz` 与源码 `.md`，不打入安装包，含 `build_packs.py` 与 GitHub 自助下载索引）。
+  - `app.py`（FastAPI `3.0.2` 微内核、`APP_VERSION`、前端 `.html/.js/.css` 防缓存头、`check_static_ui_version_sync`、Gate 1 全量 `/api/*` 拦截、安全响应头与私有路径脱敏、`mount_discovered_modules` 自动发现挂载、`--test` 独立自检）、`build_exe.py`（含 `stage_customer_tests_dir` 严防开发期测试入包） / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`（8 项纯运行时依赖，严守 0 KB 增量）、`docs/MODULE_SDK_3_0.md`（3.0 零耦合模块开发指南）、`knowledge_packs/`（DWS 9.1 / Inceptor 9.x / PGSQL 19 离线知识包 `.json.gz` 与源码 `.md`，不打入安装包，含 `build_packs.py` 与 GitHub 自助下载索引）。
   - `tools/admin_console/` & `DataOG_Console.command`、`tools/keygen_src/` & `tools/build_keygen.py`、`demo_sandbox/`（启明商业银行信创三引擎演示沙箱）：全部严格排除于客户安装包之外。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
-  - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.0.1"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（6 领域子路由含 `knowledge.py`）、`schemas.py`、`models.py`。
+  - `module_registry.py`、`http_utils.py`、`context.py`（`version="3.0.2"`、Gate 2 HMAC 复核）、`router.py` + `routes/`（6 领域子路由含 `knowledge.py`）、`schemas.py`、`models.py`。
   - `knowledge_hub.py` & `builtin_dialect_kb.py`（零新增依赖支持 `.md`/`.txt`/`.sql`/`.html`/`.json`/`.csv`/`.docx`/`.xlsx`，FTS5+BM25 中英/错误码切词、方言硬过滤、11 篇内置方言速查卡、`.json.gz` 知识包、可选 `/embeddings` RRF 与离线回退，Layer 2 私有隔离）、`sql_risk_guard.py`（词法多语句切分 + `READONLY`/`STANDARD_WRITE`/`HIGH_RISK` 定级 + 安全影响行数探针）。
   - `storage_paths.py`、`storage/`、`workspace_hub.py`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）、`license_hub.py` & `_license_native_src/`、`asset_store.py`、`standard_catalog.py`、`offline_report/`、`import_progress.py`、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`llm_hub.py`（含 `create_embeddings`）、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`、`core/dws_engine.py`。
 - **五大独立插件模块 (`modules/`, 导出 `MODULE_SPEC`, 严格零互引)**：
