@@ -9,7 +9,7 @@ description: >-
 
 # Data.O.G 发版与自动编译打包闭环规范 (Release & Ship)
 
-在 Data.O.G 仓库中，`.github/workflows/ci.yml` 的 `build-windows-exe`（编译 Windows 独立 `DataOG.exe` 并自动发布至 GitHub Releases）仅在推送 `v*` 标签或手动触发 `workflow_dispatch` 时运行；普通推送 `main` 分支只跑全量单测。因此，**任何涉及代码、前端、打包配置或运行时行为的变更合入 `main` 后，必须执行本发版闭环**。
+在 Data.O.G 仓库中，`.github/workflows/ci.yml` 仅在推送 `v*` 标签或手动触发 `workflow_dispatch` 时运行，专注于纯 Windows 打包（`python build_exe.py --skip-tests`）与 2 秒极速启动冒烟自检（`DataOG.exe --smoke-test`），并自动发布至 GitHub Releases；全量自动化单元测试均在**发布合入 `main` 前于本地完成**。因此，**任何涉及代码、前端、打包配置或运行时行为的变更合入 `main` 后，必须执行本发版闭环**。
 
 ## 1. 确定下一个 SemVer 版本号
 
@@ -24,24 +24,25 @@ description: >-
 
 ## 2. 同步版本声明（必查清单）
 
-将新版本号 `X.Y.Z` 精确同步到以下 5 个位置：
+将新版本号 `X.Y.Z` 精确同步到以下 6 个位置：
 
-1. `app.py`：FastAPI 实例参数 `version="X.Y.Z"`，以及 `__main__` 启动横幅中的 `Data.O.G vX.Y.Z`。
-2. `core/platform/context.py`：`get_bootstrap_payload()` 返回字典中的 `"version": "X.Y.Z"`。
-3. `CHANGELOG.md`：将 `## [Unreleased]` 下已完成的变更归并至新建章节 `## [X.Y.Z] - YYYY-MM-DD`（同类型 `### Added` / `### Changed` / `### Fixed` / `### Security` 合并去重），并保留空的 `## [Unreleased]` 标题供下一次迭代使用。
-4. `README.md`：更新顶部一级标题 `Data.O.G vX.Y.Z`、目录速览中的 `app.py` 版本注释、「里程碑版本演进记录」表格（将新版本行标为 `当前正式版` 并移除上一版本的该标记），以及自动化测试总项数。
-5. `AGENTS.md`：更新第 5 节当前主干版本为 `vX.Y.Z` 与测试总数（同步确保 `AGENTS.md` 文件字节数 `< 24,000` 字节，避免截断）。
+1. `app.py`：FastAPI 实例参数 `version="X.Y.Z"`、`APP_VERSION = "X.Y.Z"` 与启动横幅中的 `Data.O.G vX.Y.Z`。
+2. `core/platform/context.py`：`self.app_version = "X.Y.Z"` 及 `build_platform_bootstrap()` 返回字典中的 `"version": "X.Y.Z"`。
+3. `static/index.html`：`<meta name="dataog-ui-version" content="X.Y.Z" />`。
+4. `CHANGELOG.md`：将 `## [Unreleased]` 下已完成的变更归并至新建章节 `## [X.Y.Z] - YYYY-MM-DD`（同类型 `### Added` / `### Changed` / `### Fixed` / `### Security` 合并去重），并保留空的 `## [Unreleased]` 标题供下一次迭代使用。
+5. `README.md`：更新顶部一级标题 `Data.O.G vX.Y.Z`、目录速览中的 `app.py` 版本注释、「里程碑版本演进记录」表格（将新版本行标为 `当前正式版` 并移除上一版本的该标记），以及自动化测试总项数。
+6. `AGENTS.md`：更新第 5 节当前主干版本为 `vX.Y.Z` 与测试总数（同步确保 `AGENTS.md` 文件字节数 `< 24,000` 字节，避免截断）。
 
 > [!CAUTION]
 > **严禁误改工作区文件格式协议版本号**：`core/platform/workspace_hub.py` 中的 `WORKSPACE_FORMAT_VERSION` 代表 `.dataog.db` 团队共享工作区底层结构兼容协议，**不得**随常规代码发版改动；仅当工作区表结构或导入合并协议发生不兼容演进时才按协议变更规则调整。
 
-## 3. 双门禁全量校验（合并前必过）
+## 3. 本地双门禁全量校验（合并前必过）
 
-版本声明与文档同步完成后，运行全量自动化测试与独立启动自检，确认无回归：
+版本声明与文档同步完成后，在本地运行全量自动化测试与极速启动冒烟自检，确认无回归：
 
 ```bash
 python3 -m unittest discover -s tests -p "test_*.py" -v
-python3 app.py --test
+python3 app.py --smoke-test
 ```
 
 同步执行 `git status -sb` 与 `git diff --stat`，确认工作区干净、无未跟踪临时文件、无 `.db` 状态库或私钥文件。

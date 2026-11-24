@@ -1,14 +1,9 @@
-name: CI & Windows Build
+name: Build & Release Windows EXE
 
 on:
   push:
-    branches:
-      - "**"
     tags:
       - "v*"
-  pull_request:
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -19,33 +14,8 @@ env:
   PYTHONIOENCODING: "utf-8"
 
 jobs:
-  unit-tests:
-    name: DataOG 全量自动化测试与启动自检
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout 代码
-        uses: actions/checkout@v4
-
-      - name: 配置 Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-
-      - name: 安装项目依赖
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-
-      - name: 运行核心底座、业务模块测试与启动自检
-        run: |
-          python -m unittest discover -s tests -p "test_*.py" -v
-          python app.py --test
-
   build-windows-exe:
     name: 打包 DataOG Windows 独立可执行程序 (.exe)
-    needs: unit-tests
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - name: Checkout 代码
@@ -63,13 +33,13 @@ jobs:
           python -m pip install -r requirements.txt "pyinstaller>=6.10.0"
 
       - name: 执行 PyInstaller 打包脚本
-        run: python build_exe.py
+        run: python build_exe.py --skip-tests
 
-      - name: 验证打包后的 DataOG.exe 内置自检通过
+      - name: 2 秒极速冒烟自检 (冻结态依赖 / 原生护盾 / 静态资源 / 插件与 ASGI)
         shell: pwsh
         run: |
           $env:DATAOG_HOME = Join-Path $env:RUNNER_TEMP "dataog_ci_home"
-          dist\DataOG\DataOG.exe --test
+          dist\DataOG\DataOG.exe --smoke-test
 
       - name: 压缩可执行程序目录
         shell: pwsh

@@ -1,4 +1,4 @@
-# Data.O.G v3.2.1 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.2.2 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -58,7 +58,7 @@
 
 ```text
 DataOG/
-├── app.py                        # FastAPI 3.2.1 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、Server-Timing 遥测与全链路中间件追踪、自动发现插件装配）
+├── app.py                        # FastAPI 3.2.2 微内核入口（无状态程序目录、安全/防缓存 no-cache 响应头、前后端静态版本校验、Gate 1 全量 /api 授权拦截、Server-Timing 遥测与全链路中间件追踪、--smoke-test 极速冒烟与自动发现插件装配）
 ├── core/
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
@@ -100,8 +100,8 @@ DataOG/
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 92 项全量自动化测试（全链路性能诊断、全栈 Benchmark 与严格脱敏导出 / 聊天附件与防爆窗分步拆解 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 模块隔离与零 XSS 守卫）
-├── build_exe.py                  # Windows DataOG.exe PyInstaller 轻量化门禁打包脚本（内置 static/dataog.ico 多尺寸品牌图标）
+├── tests/                        # 93 项全量自动化测试（全链路性能诊断、全栈 Benchmark 与严格脱敏导出 / 聊天附件与防爆窗分步拆解 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
+├── build_exe.py                  # Windows DataOG.exe PyInstaller 纯净打包脚本（支持 --skip-tests、内置 static/dataog.ico 图标并严格剔除 tests/）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
 ```
@@ -140,7 +140,8 @@ DataOG/
 | **`v3.0.2`** | `fix/v3.0.2-ai-assistant-activitybar-and-e2e-tests` → `main` | **修复 AI 助手与知识库 `activityBar.track` 调用错误、交互体验补全与前端端到端交互测试升级**：将 `AiAssistantView.sendUserMessage()` 与 `KnowledgeSettingsView` 重建向量索引误用的 `this.activityBar.run(...)` 修正为 `this.activityBar.track(...)` 根治发消息阻断崩溃；优先自动选中已就绪 AI 模型、补齐发送中用户气泡占位并修复抽屉库表刷新响应结构读取；在 `test_ai_assistant_and_kb.py` 新增 `.activityBar.run(` 全库静态防线及覆盖发送/提案确认/抽屉/知识库全交互的 Node.js 端到端验证（87 项测试全绿） |
 | **`v3.1.0`** | `feat/v3.1.0-chat-attachments-and-chunking` → `main` | **AI 助手聊天窗口纯文本/SQL 粘贴、受限 CSV 上传与超长内容防爆窗分步拆解引擎**：聊天输入框支持剪贴板粘贴文件或超长文本（自动转为 `.txt`/`.sql` 附件胶囊）、拖拽与按钮上传（文本/SQL `<=5MB`、CSV/TSV `<=2MB`、二进制零字节拦截及编码自适应）；落地语义智能分片（`CHUNK_HARD_MAX_TOKENS=2800`）、CSV 零 Token 画像 + `:memory:` 只读 SQLite `csv_data` 内存查询沙箱、按需检索与 `stepped_batch` Map-Reduce 滚动摘要接续拆解闭环，配套 `<dialog>` 分片/画像预览弹窗与后端/Node 端到端回归测试（88 项测试全绿） |
 | **`v3.2.0`** | `feat/diagnostics-benchmark-v3.2` → `main` | **全链路性能剖析、全栈基准压测 (`Benchmark`) 与脱敏诊断日志包导出中枢**：新增 `DiagnosticsHub` 全内存零写盘 Span 链路追踪、`_TimedRLock` 与 SQLite 开关库计时、全底座热点埋点及 `Server-Timing` / `X-DataOG-*` 响应头；新增「系统配置 → 性能诊断」与「执行日志」快捷导出入口，支持浏览器 10 串行 + 6 并发环回 RTT 测试、事件循环/线程池/设备探针/DNS/4KB `fsync`/SQLite/Bootstrap/可选 DB 与 AI 端点逐段基准压测、自动瓶颈研判以及 100% 零路径零密钥脱敏 `.json` 诊断包导出（92 项测试全绿） |
-| **`v3.2.1`**（当前正式版） | `fix/v3.2.1-windows-ci-diagnostics-tests` → `main` | **Windows 打包单测 SQLite 句柄泄露与时序竞态修复**：使用 `contextlib.closing` 彻底关闭诊断测试临时 SQLite 句柄避免 Windows `[WinError 32]` 清理失败、消除跨线程锁争用定时器竞态，并加固 `GetDriveTypeW` ctypes 签名、临时压测库 WAL 回收与 `socketserver` 冻结态导入（92 项测试全绿） |
+| **`v3.2.1`** | `fix/v3.2.1-windows-ci-diagnostics-tests` → `main` | **Windows 打包单测 SQLite 句柄泄露与时序竞态修复**：使用 `contextlib.closing` 彻底关闭诊断测试临时 SQLite 句柄避免 Windows `[WinError 32]` 清理失败、消除跨线程锁争用定时器竞态，并加固 `GetDriveTypeW` ctypes 签名、临时压测库 WAL 回收与 `socketserver` 冻结态导入（92 项测试全绿） |
+| **`v3.2.2`**（当前正式版） | `chore/v3.2.2-fast-ci-smoke-test` → `main` | **CI 纯打包瘦身与 2 秒冻结态 `--smoke-test` 启动冒烟闭环**：移除 GitHub Actions 与 CI 打包阶段重复 4 次的冗余全量单元测试（回归「发布前本地一次测试」定位），为 `app.py` 新增 2 秒极速 `--smoke-test` 冒烟校验（覆盖冻结依赖 / 原生护盾 / 静态资源与版本同步 / 5 插件挂载 / 4 路内存 ASGI 探活），`build_exe.py` 支持 `--skip-tests` 并彻底将 `tests/` 目录从客户版安装包移除（93 项测试全绿） |
 
 ---
 
@@ -151,11 +152,11 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（92 项）
+# 运行全量自动化单元测试（93 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
-# 运行应用启动与健康路由自检
-python3 app.py --test
+# 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）
+python3 app.py --smoke-test
 
 # 启动本地 Data.O.G 桌面工作台（严格监听 http://127.0.0.1:18080）
 python3 app.py
@@ -177,9 +178,9 @@ DATAOG_HOME="./demo_sandbox/.demo_home" python3 app.py
 
 ### 3. 在 Windows 下打包为独立免安装程序 (`DataOG.exe`)
 ```bash
-# 安装打包器后直接执行打包脚本（或双击 build_windows.bat，产出于 dist/DataOG/DataOG.exe）
+# 安装打包器后直接执行打包脚本（或双击 build_windows.bat，产出于 dist/DataOG/DataOG.exe；若本地已跑完单测可附加 --skip-tests 跳过重复单测）
 python -m pip install "pyinstaller>=6.10.0"
-python build_exe.py
+python build_exe.py --skip-tests
 ```
 
 ---

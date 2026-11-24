@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import shutil
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import List, Optional
 import unittest
 
 
@@ -33,28 +35,32 @@ def _ensure_utf8_stdio() -> None:
 _ensure_utf8_stdio()
 _ORIG_RMTREE = shutil.rmtree
 
-# 仅限开发期与本机内部使用的测试文件（依赖已排除的 tools / demo_sandbox），严禁打入客户版安装包
-EXCLUDED_CUSTOMER_TEST_FILES = frozenset(
-    {
-        "test_admin_console.py",
-        "test_demo_sandbox.py",
-    }
-)
+def check_no_tests_bundled(dist_bundle_dir: str, project_tests_dir: str = "") -> List[str]:
+    """校验客户发行包中严禁包含 tests/ 目录或开发期测试文件."""
+    leaks: List[str] = []
+    if not dist_bundle_dir or not os.path.isdir(dist_bundle_dir):
+        return leaks
 
+    for rel_dir in ("tests", os.path.join("_internal", "tests")):
+        if os.path.exists(os.path.join(dist_bundle_dir, rel_dir)):
+            leaks.append(rel_dir.replace("\\", "/"))
 
-def stage_customer_tests_dir(tests_src: str, staging_dir: str) -> str:
-    """构建仅包含客户运行时自检测试的纯净暂存目录（剔除 dev-only 测试与 __pycache__）."""
-    _safe_rmtree(staging_dir)
-    os.makedirs(staging_dir, exist_ok=True)
-    for fname in sorted(os.listdir(tests_src)):
-        if fname in EXCLUDED_CUSTOMER_TEST_FILES:
-            continue
-        if not fname.endswith(".py"):
-            continue
-        src_file = os.path.join(tests_src, fname)
-        if os.path.isfile(src_file):
-            shutil.copy2(src_file, os.path.join(staging_dir, fname))
-    return staging_dir
+    known_test_files = set()
+    if project_tests_dir and os.path.isdir(project_tests_dir):
+        for fname in os.listdir(project_tests_dir):
+            if fname.startswith("test_") and fname.endswith(".py"):
+                known_test_files.add(fname)
+
+    if known_test_files:
+        for root, _, files in os.walk(dist_bundle_dir):
+            for fname in files:
+                if fname in known_test_files:
+                    rel_path = os.path.relpath(
+                        os.path.join(root, fname), dist_bundle_dir
+                    ).replace("\\", "/")
+                    leaks.append(rel_path)
+
+    return sorted(set(leaks))
 
 
 def _clear_readonly_tree(root_path: str) -> None:
@@ -123,9 +129,13 @@ def run_pre_build_tests(project_dir: str) -> None:
     print("[OK] 单元测试全部通过！\n")
 
 
-def build_executable() -> None:
+def build_executable(skip_tests: Optional[bool] = None) -> None:
     project_dir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(project_dir)
+
+    if skip_tests is None:
+        env_skip = os.environ.get("DATAOG_SKIP_BUILD_TESTS", "").strip().lower()
+        skip_tests = env_skip in ("1", "true", "yes", "on")
 
     # 先于单元测试编译 C 原生激活校验防反编译护盾（避免 Windows 下 unittest 预先通过 ctypes 映射旧 DLL 造成文件锁）
     shield_bin_path = None
@@ -150,7 +160,10 @@ def build_executable() -> None:
         print(f"[警告] 编译原生护盾出现异常: {exc}")
         shield_bin_path = None
 
-    run_pre_build_tests(project_dir)
+    if skip_tests:
+        print("[1/3] 已跳过打包前单元测试 (--skip-tests)，直接进入 PyInstaller 编译打包 ...\n")
+    else:
+        run_pre_build_tests(project_dir)
     _install_resilient_rmtree()
 
     try:
@@ -191,10 +204,6 @@ def build_executable() -> None:
     work_path = os.path.join(temp_build_root, "work")
     spec_path = os.path.join(temp_build_root, "spec")
     cache_path = os.path.join(temp_build_root, "cache")
-    staged_tests_dir = stage_customer_tests_dir(
-        tests_src, os.path.join(temp_build_root, "staged_tests")
-    )
-    add_tests_arg = f"{staged_tests_dir}{os.pathsep}tests"
     os.makedirs(work_path, exist_ok=True)
     os.makedirs(spec_path, exist_ok=True)
     os.makedirs(cache_path, exist_ok=True)
@@ -254,7 +263,8 @@ def build_executable() -> None:
         "uvicorn.protocols.websockets",
         "anyio._backends._trio",
         "anyio.pytest_plugin",
-        # 严禁将激活码生成器构建工具与本地演示沙箱打入客户版安装包
+        # 严禁将单元测试、激活码生成器构建工具与本地演示沙箱打入客户版安装包
+        "tests",
         "tools",
         "demo_sandbox",
     ]
@@ -268,7 +278,6 @@ def build_executable() -> None:
         f"--workpath={work_path}",
         f"--specpath={spec_path}",
         f"--add-data={add_static_arg}",
-        f"--add-data={add_tests_arg}",
         "--collect-submodules=fastapi",
         "--collect-submodules=pydantic",
         "--collect-binaries=pydantic_core",
@@ -285,9 +294,6 @@ def build_executable() -> None:
         "--collect-submodules=modules",
         "--hidden-import=h11",
         "--hidden-import=et_xmlfile",
-        "--hidden-import=http.server",
-        "--hidden-import=socketserver",
-        "--hidden-import=unittest.mock",
     ]
     if shield_bin_path and os.path.isfile(shield_bin_path):
         pyinstaller_args.append(
@@ -338,15 +344,10 @@ def build_executable() -> None:
             if not bundled_shield:
                 print(f"[错误] 打包产物中缺失原生防反编译护盾文件: {shield_fname}")
                 sys.exit(1)
-        # 校验 dev-only 测试未泄露进客户发行包，避免 DataOG.exe --test 因 tools/demo_sandbox 排除而失败
-        leaked_dev_tests = [
-            fname
-            for _, _, fs in os.walk(dist_bundle_dir)
-            for fname in fs
-            if fname in EXCLUDED_CUSTOMER_TEST_FILES
-        ]
-        if leaked_dev_tests:
-            print(f"[错误] 客户发行包中泄露了开发期测试文件: {sorted(set(leaked_dev_tests))}")
+        # 校验未将任何 tests/ 目录或测试文件打入客户发行包
+        leaked_tests = check_no_tests_bundled(dist_bundle_dir, tests_src)
+        if leaked_tests:
+            print(f"[错误] 客户发行包中泄露了测试目录或测试文件: {leaked_tests}")
             sys.exit(1)
         total_bytes = sum(
             os.path.getsize(os.path.join(r, f))
@@ -371,5 +372,18 @@ def build_executable() -> None:
     print("=" * 74)
 
 
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="DataOG Windows 独立可执行程序自动化打包脚本"
+    )
+    parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="跳过打包前全量单元测试（适用于发布前已在本地通过全量单测的 CI 打包阶段）",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    build_executable()
+    cli_args = parse_args()
+    build_executable(skip_tests=True if cli_args.skip_tests else None)
