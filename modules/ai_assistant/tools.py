@@ -16,6 +16,11 @@ from core.platform.models import ConnectionProfile, TableMeta
 from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
 from core.platform.sql_risk_guard import build_affected_rows_probe_sql, classify_sql_batch
 from modules.ai_assistant.attachments import query_csv_in_memory
+from modules.ai_assistant.sql_static_analyzer import (
+    analyze_sql_static,
+    extract_lineage_subgraph,
+    extract_statement_source,
+)
 
 MAX_TOOL_SAMPLE_ROWS = 200
 LLM_PREVIEW_ROWS_CAP = 30
@@ -144,6 +149,9 @@ class AssistantToolbox:
             "read_attachment_lines": self.tool_read_attachment_lines,
             "inspect_attachment_chunk": self.tool_inspect_attachment_chunk,
             "query_csv_attachment": self.tool_query_csv_attachment,
+            "trace_attachment_lineage": self.tool_trace_attachment_lineage,
+            "read_attachment_statement": self.tool_read_attachment_statement,
+            "get_attachment_static_report": self.tool_get_attachment_static_report,
         }
         fn = handlers.get(name)
         if fn is None:
@@ -675,5 +683,139 @@ class AssistantToolbox:
                 f"CSV 内存只读查询返回 {qres['row_count']} 行（向大模型展示前 {len(preview_rows)} 行）"
                 if qres["row_count"] > len(preview_rows)
                 else f"CSV 内存只读查询共返回 {qres['row_count']} 行"
+            ),
+        }
+
+    def _load_attachment_raw_and_analysis(
+        self, raw_aid: str = ""
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[str]]:
+        if self.storage is None:
+            return None, None, "附件存储尚未就绪"
+        att = self._resolve_attachment(raw_aid)
+        if att is None:
+            return None, None, "未找到指定的附件，请核对 `attachment_id`"
+        full_att = self.storage.get_attachment(att["attachment_id"], include_raw=True, include_chunks=False)
+        if full_att is None:
+            return None, None, "附件不存在或已被移除"
+        analysis = full_att.get("analysis") if isinstance(full_att.get("analysis"), dict) else {}
+        if not analysis.get("statements") and full_att.get("raw_text"):
+            try:
+                analysis = analyze_sql_static(full_att["raw_text"], dialect=self.dialect)
+            except Exception:
+                analysis = {}
+        return full_att, analysis, None
+
+    def tool_trace_attachment_lineage(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        full_att, analysis, err = self._load_attachment_raw_and_analysis(
+            str(params.get("attachment_id") or "")
+        )
+        if err or full_att is None or analysis is None:
+            return {"ok": False, "error": err or "无法加载附件血缘"}
+        table_name = str(params.get("table_name") or params.get("table") or "").strip()
+        if not table_name:
+            return {"ok": False, "error": "缺少参数 `table_name`"}
+        try:
+            depth = max(1, min(6, int(params.get("depth") or 3)))
+        except Exception:
+            depth = 3
+        include_downstream = bool(params.get("include_downstream", True))
+        compact = bool(params.get("compact", False))
+        try:
+            max_tokens = max(2000, min(24000, int(params.get("max_tokens") or 14000)))
+        except Exception:
+            max_tokens = 14000
+
+        res = extract_lineage_subgraph(
+            analysis,
+            full_att.get("raw_text") or "",
+            table_name,
+            depth=depth,
+            include_downstream=include_downstream,
+            compact=compact,
+            max_tokens=max_tokens,
+        )
+        if not res.get("matched"):
+            return {
+                "ok": False,
+                "attachment_id": full_att["attachment_id"],
+                "filename": full_att["filename"],
+                "available_tables": res.get("available_tables") or [],
+                "error": res.get("error") or f"未找到与 `{table_name}` 相关的血缘链路",
+            }
+        return {
+            "ok": True,
+            "attachment_id": full_att["attachment_id"],
+            "filename": full_att["filename"],
+            **res,
+            "note": (
+                f"已提取 `{table_name}` 关联血缘切片：涉及 {len(res.get('related_tables') or [])} 张表、"
+                f"{len(res.get('blocks') or [])} 条核心语句 (~{res.get('estimated_tokens', 0)} tokens)"
+            ),
+        }
+
+    def tool_read_attachment_statement(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        full_att, analysis, err = self._load_attachment_raw_and_analysis(
+            str(params.get("attachment_id") or "")
+        )
+        if err or full_att is None or analysis is None:
+            return {"ok": False, "error": err or "无法加载附件语句"}
+        stmt_id = str(params.get("stmt_id") or "").strip()
+        if not stmt_id:
+            return {"ok": False, "error": "缺少语句编号 `stmt_id`（例如 `S004`）"}
+        compact = bool(params.get("compact", False))
+        res = extract_statement_source(
+            analysis,
+            full_att.get("raw_text") or "",
+            stmt_id,
+            context_before=3,
+            context_after=1,
+            compact=compact,
+        )
+        if res is None:
+            avail = [s.get("stmt_id") for s in (analysis.get("statements") or [])[:25]]
+            return {
+                "ok": False,
+                "error": f"未找到语句 `{stmt_id}`，可用编号示例: {', '.join(str(x) for x in avail)}",
+            }
+        st = res["statement"]
+        return {
+            "ok": True,
+            "attachment_id": full_att["attachment_id"],
+            "filename": full_att["filename"],
+            **res,
+            "note": (
+                f"已完整读取 {full_att['filename']} 语句 {st['stmt_id']} [{st['verb']}] "
+                f"(L{res['start_line']}-L{res['end_line']}, ~{res['estimated_tokens']} tokens)"
+            ),
+        }
+
+    def tool_get_attachment_static_report(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        full_att, analysis, err = self._load_attachment_raw_and_analysis(
+            str(params.get("attachment_id") or "")
+        )
+        if err or full_att is None or analysis is None:
+            return {"ok": False, "error": err or "无法加载静态分析报告"}
+        sev_filter = str(params.get("severity") or "").strip().upper()
+        findings = list(analysis.get("static_findings") or [])
+        if sev_filter in ("HIGH", "MEDIUM", "LOW"):
+            findings = [f for f in findings if str(f.get("severity") or "").upper() == sev_filter]
+        include_stmts = bool(params.get("include_statements", True))
+        dag = analysis.get("lineage_dag") or {}
+        cf = analysis.get("control_flow") or {}
+        return {
+            "ok": True,
+            "attachment_id": full_att["attachment_id"],
+            "filename": full_att["filename"],
+            "line_count": analysis.get("line_count", full_att.get("line_count", 0)),
+            "total_statement_count": analysis.get("total_statement_count", 0),
+            "finding_counts": analysis.get("finding_counts") or {"HIGH": 0, "MEDIUM": 0, "LOW": 0},
+            "static_findings": findings[:80],
+            "lineage_nodes": (dag.get("nodes") or [])[:60],
+            "lineage_summary": (dag.get("summary_lines") or [])[:25],
+            "control_flow": cf,
+            "statements": (analysis.get("statements") or [])[:80] if include_stmts else [],
+            "note": (
+                f"静态分析报告：{full_att['filename']} 共 {analysis.get('total_statement_count', 0)} 条语句，"
+                f"筛出 {len(findings)} 项静态隐患，{len(dag.get('nodes') or [])} 个涉表节点"
             ),
         }

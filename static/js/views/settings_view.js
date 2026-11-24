@@ -55,6 +55,8 @@ export class SettingsView {
     this.selectedProviderId = "deepseek";
     this.llmDraft = null;
     this.newModelInputText = "";
+    this.probingLlm = false;
+    this.lastProbeResult = null;
     this.refreshHeader = null;
 
     this.root = el("div", { className: "mac-split-view" });
@@ -127,6 +129,10 @@ export class SettingsView {
       models: [...(found.models || [])],
       is_default: Boolean(found.is_default),
       context_window: found.extra?.context_window ? String(found.extra.context_window) : "",
+      model_tier: found.extra?.model_tier || "",
+      model_probes: found.extra?.model_probes && typeof found.extra.model_probes === "object"
+        ? { ...found.extra.model_probes }
+        : {},
     };
   }
 
@@ -420,7 +426,10 @@ export class SettingsView {
             models: ["deepseek-ai/DeepSeek-V3"],
             is_default: false,
             context_window: "",
+            model_tier: "",
+            model_probes: {},
           };
+          this.lastProbeResult = null;
           this.render();
         },
       })
@@ -440,6 +449,7 @@ export class SettingsView {
         models: d.models,
         is_default: Boolean(d.is_default),
         context_window: Number.isFinite(cwNum) && cwNum >= 0 ? Math.floor(cwNum) : 0,
+        model_tier: d.model_tier || "",
         ...extra,
       };
     };
@@ -636,19 +646,45 @@ export class SettingsView {
         ),
         el(
           "div",
-          { className: "form-field span-2" },
-          el("label", { className: "form-label", text: "自定义上下文窗口 (Tokens，可选 · 留空按模型自动识别)" }),
+          { className: "form-field" },
+          el("label", { className: "form-label", text: "自定义上下文窗口 (Tokens，留空自动探查)" }),
           el("input", {
             className: "mac-input mono",
             type: "number",
             min: "0",
             step: "1024",
             value: d.context_window ?? "",
-            placeholder: "留空自动识别（DeepSeek 128K / Gemini 1M / 私有网关按需填如 32768）",
+            placeholder: "留空自动探查（如 32768 / 128000）",
             onInput: (e) => (d.context_window = e.target.value),
           })
+        ),
+        el(
+          "div",
+          { className: "form-field" },
+          el("label", { className: "form-label", text: "模型推理档位（控制有效长文甜蜜区）" }),
+          el(
+            "select",
+            {
+              className: "mac-input",
+              "aria-label": "模型推理档位",
+              onChange: (e) => {
+                d.model_tier = e.target.value;
+              },
+            },
+            [
+              { v: "", label: "自动识别（推荐）" },
+              { v: "flagship", label: "旗舰长文 (flagship · 高推理预算)" },
+              { v: "standard", label: "标准均衡 (standard)" },
+              { v: "lightweight", label: "轻量/极速 (lightweight · 强收敛防遗忘)" },
+            ].map((item) => {
+              const opt = el("option", { value: item.v, text: item.label });
+              if ((d.model_tier || "") === item.v) opt.selected = true;
+              return opt;
+            })
+          )
         )
       ),
+      this._renderLlmProbeCard(d),
       el(
         "div",
         { className: "mac-section", style: { marginTop: "4px" } },
@@ -657,7 +693,36 @@ export class SettingsView {
       ),
       el(
         "div",
-        { style: { display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "10px" } },
+        { style: { display: "flex", justifyContent: "flex-end", gap: "8px", marginTop: "10px", flexWrap: "wrap" } },
+        el("button", {
+          type: "button",
+          className: "mac-btn ai-llm-probe-btn",
+          disabled: this.probingLlm,
+          text: this.probingLlm ? "探查中..." : "探查能力与窗口",
+          onClick: async () => {
+            if (this.probingLlm) return;
+            this.probingLlm = true;
+            this.render();
+            try {
+              const res = await platformApi.probeLlmModel(
+                buildPayload({ model: d.default_model.trim(), force_refresh: true })
+              );
+              this.lastProbeResult = res;
+              if (res.providers && res.available_models) {
+                store.updateLlmState(res.providers, res.available_models);
+                if (d.provider_id) {
+                  this._syncLlmDraftFromStore(d.provider_id);
+                }
+              }
+              Toast.success(res.message || "模型能力探查完成");
+            } catch (err) {
+              Toast.error(err.message || "模型能力探查失败");
+            } finally {
+              this.probingLlm = false;
+              this.render();
+            }
+          },
+        }),
         el("button", {
           type: "button",
           className: "mac-btn",
@@ -697,6 +762,72 @@ export class SettingsView {
       { style: { display: "flex", gap: "16px", alignItems: "flex-start" } },
       providerList,
       detailBox
+    );
+  }
+
+  _renderLlmProbeCard(d) {
+    const modelName = String(d?.default_model || "").trim();
+    const cachedProbe = modelName && d?.model_probes ? d.model_probes[modelName] : null;
+    const availModel = (store.state.llmModels || []).find(
+      (m) => m.provider_id === d.provider_id && m.model === modelName
+    );
+    const liveCaps =
+      this.lastProbeResult &&
+      this.lastProbeResult.model === modelName &&
+      (!d.provider_id || this.lastProbeResult.provider_id === d.provider_id)
+        ? this.lastProbeResult.capabilities
+        : null;
+    const caps = liveCaps || availModel || null;
+    if (!caps && !cachedProbe) return null;
+
+    const fmtTok = (n) => {
+      const v = Number(n || 0);
+      if (v >= 1000000) return `${(v / 1000000).toFixed(v % 1000000 === 0 ? 0 : 1)}M`;
+      if (v >= 1000) return `${Math.round(v / 1000)}K`;
+      return String(Math.round(v));
+    };
+    const tierMap = {
+      flagship: "旗舰",
+      standard: "标准",
+      lightweight: "轻量/极速",
+    };
+    const ctxWin = Number(caps?.context_window || cachedProbe?.context_window || 64000);
+    const effBudget = Number(caps?.effective_reasoning_budget || caps?.attachment_budget || 0);
+    const tier = String(caps?.model_tier || "standard");
+    const ttftMs = Number(caps?.ttft_ms || cachedProbe?.ttft_ms || 0);
+    const tokRatio = Number(caps?.token_ratio || cachedProbe?.token_ratio || 0);
+    const source = String(caps?.source || caps?.probe_source || cachedProbe?.source || "heuristic");
+    const probedAt = String(caps?.probed_at || cachedProbe?.probed_at || "");
+
+    return el(
+      "div",
+      {
+        className: "ai-llm-probe-readout",
+        style: {
+          marginTop: "6px",
+          padding: "8px 10px",
+          borderRadius: "8px",
+          border: "1px solid var(--os-border)",
+          background: "var(--os-subtle-bg)",
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          gap: "6px",
+          fontSize: "11.5px",
+        },
+      },
+      el("strong", { text: `模型能力档案 · ${modelName || "未指定"}` }),
+      badge(`窗口 ${fmtTok(ctxWin)}`, "info"),
+      effBudget > 0 ? badge(`甜蜜区 ${fmtTok(effBudget)}`, tier === "lightweight" ? "warn" : "success") : null,
+      badge(`档位: ${tierMap[tier] || tier}`, tier === "lightweight" ? "warn" : "neutral"),
+      ttftMs > 0 ? badge(`TTFT ${(ttftMs / 1000).toFixed(2)}s`, "neutral") : null,
+      tokRatio > 0 && tokRatio !== 1.0 ? badge(`Token系数 ${tokRatio.toFixed(2)}x`, "neutral") : null,
+      caps?.supports_thinking ? badge("支持深度思考", "info") : null,
+      el("span", {
+        className: "muted",
+        style: { marginLeft: "auto", fontSize: "11px" },
+        text: probedAt ? `来源: ${source} · ${probedAt}` : `来源: ${source}`,
+      })
     );
   }
 

@@ -8,9 +8,13 @@
 
 from __future__ import annotations
 
+import datetime
+import http.client
 import json
+import math
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -195,19 +199,326 @@ _UNSUPPORTED_THINKING_PATTERNS: Tuple[str, ...] = (
 )
 
 _SMALL_LOCAL_TAG_RE = re.compile(r"(?:^|[:\-_])(?:0\.5b|1\.5b|3b|4b|7b|8b|9b|14b|32b)(?:$|[:\-_])")
+_TINY_LOCAL_TAG_RE = re.compile(r"(?:^|[:\-_])(?:0\.5b|1\.5b|3b|4b|7b|8b|9b|14b)(?:$|[:\-_])")
+_LIGHTWEIGHT_MODEL_RE = re.compile(
+    r"(?:^|[\-_.:/])(?:flash|mini|lite|fast|nano|tiny|haiku|small)(?:$|[\-_.:/0-9])",
+    re.IGNORECASE,
+)
+_TURBO_LIGHTWEIGHT_RE = re.compile(r"(?:^|[\-_.:/])turbo(?:$|[\-_.:/0-9])", re.IGNORECASE)
+_FLAGSHIP_MODEL_RE = re.compile(
+    r"(?:reasoner|deepseek-r1|(?:^|[\-_.:/])r1(?:$|[\-_.:/])|gemini-(?:2\.5|3)-pro|"
+    r"claude-(?:3[.-]7|4|sonnet-4|opus-4|opus)|gpt-5|gpt-4\.1|^(?:o1|o3|o4)(?:$|-|\.|_)|"
+    r"qwen-max|qwen-long|qwq|qvq|kimi-k2|glm-5|glm-z1)",
+    re.IGNORECASE,
+)
+
+MODEL_PROBE_TTL_SEC = 24 * 3600
+RETRY_BACKOFF_SCHEDULE: Tuple[float, ...] = (2.0, 5.0, 12.0)
+TRANSIENT_HTTP_STATUS_CODES: Tuple[int, ...] = (408, 429, 500, 502, 503, 504)
+_PROBE_CALIBRATION_SQL = (
+    "SELECT a.cust_id, SUM(a.txn_amt) AS total_amt "
+    "FROM dwd.t_txn_daily a JOIN dim.t_branch b ON a.branch_id = b.branch_id "
+    "WHERE a.biz_date = '20261124' GROUP BY a.cust_id; -- 标定Token换算比率，请仅回复OK"
+)
+
+_CTX_LIMIT_NUM_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"(?i)(?:maximum\s+context\s+length(?:\s+is|\s+exceeded)?|max_model_len|context_length|context\s+window|input\s+token\s+limit|token\s+limit|maximum\s+of|limit(?:\s+is)?)\D{0,18}(\d{4,8})\b"
+    ),
+    re.compile(r"(?i)\((\d{4,8})\s*tokens?\)"),
+    re.compile(r"(?i)\b(\d{4,8})\s*tokens?\s*(?:maximum|limit|max|allowed)"),
+    re.compile(r"(?i)\((\d{1,4})\s*k(?:\s*tokens?)?\)"),
+    re.compile(r"(?i)(?:context|limit|window|max)\D{0,12}(\d{1,4})\s*k\b"),
+)
+
+
+def parse_context_limit_from_error(detail: str) -> Optional[int]:
+    """从上游 400/413 上下文超限报错文本中提取真实最大上下文窗口数值（Tokens）."""
+    text = str(detail or "").strip()
+    if not text:
+        return None
+    for idx, pat in enumerate(_CTX_LIMIT_NUM_PATTERNS):
+        m = pat.search(text)
+        if not m:
+            continue
+        try:
+            raw_num = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        # 后两条正则匹配 `32k` / `64k` 单位
+        if idx >= 3:
+            val = raw_num * 1024
+        else:
+            val = raw_num
+        if 4096 <= val <= 10_000_000:
+            return val
+    return None
+
+
+def _estimate_probe_tokens(text: str) -> int:
+    """与 attachments.estimate_tokens 同公式的 O(N) 估算（严禁反向导入 modules.*）."""
+    if not text:
+        return 0
+    char_len = len(text)
+    utf8_len = len(text.encode("utf-8", errors="ignore"))
+    wide_approx = max(0, min(char_len, (utf8_len - char_len) // 2))
+    ascii_approx = max(0, char_len - wide_approx)
+    return max(1, math.ceil(wide_approx * 1.5 + ascii_approx * 0.28))
+
+
+def _stitch_continuation_overlap(existing: str, addition: str) -> str:
+    """续写拼接去重：剥离模型在续写开头偶然重复的末尾 4~48 字符."""
+    if not existing or not addition:
+        return addition or ""
+    tail = existing[-48:]
+    max_k = min(len(tail), len(addition), 48)
+    for k in range(max_k, 3, -1):
+        if tail.endswith(addition[:k]):
+            return addition[k:]
+    return addition
+
+
+def _extract_model_meta_from_item(item: Any) -> Dict[str, Any]:
+    """从 `/models` 列表单条记录提取 L1 扩展元数据（兼容 dict 与 SDK 对象）."""
+    if item is None:
+        return {}
+    if isinstance(item, dict):
+        d = item
+    elif hasattr(item, "model_dump"):
+        try:
+            d = item.model_dump()
+        except Exception:
+            d = vars(item) if hasattr(item, "__dict__") else {}
+    elif hasattr(item, "__dict__"):
+        d = dict(vars(item))
+    else:
+        d = {}
+
+    if not isinstance(d, dict):
+        return {}
+
+    meta: Dict[str, Any] = {}
+    for key in (
+        "context_length",
+        "max_model_len",
+        "context_window",
+        "input_token_limit",
+        "max_input_tokens",
+        "n_ctx_train",
+        "context_size",
+    ):
+        raw_v = d.get(key)
+        if raw_v is None and isinstance(d.get("top_provider"), dict):
+            raw_v = d["top_provider"].get(key)
+        if raw_v is not None:
+            try:
+                iv = int(raw_v)
+                if 4096 <= iv <= 10_000_000:
+                    meta["context_window"] = iv
+                    break
+            except (TypeError, ValueError):
+                pass
+
+    for key in ("max_output_tokens", "output_token_limit", "max_completion_tokens"):
+        raw_v = d.get(key)
+        if raw_v is None and isinstance(d.get("top_provider"), dict):
+            raw_v = d["top_provider"].get(key)
+        if raw_v is not None:
+            try:
+                iv = int(raw_v)
+                if 256 <= iv <= 1_000_000:
+                    meta["max_output_tokens"] = iv
+                    break
+            except (TypeError, ValueError):
+                pass
+
+    caps = d.get("capabilities")
+    if isinstance(caps, dict):
+        if "reasoning" in caps or "thinking" in caps:
+            meta["supports_thinking"] = bool(caps.get("reasoning") or caps.get("thinking"))
+    elif isinstance(d.get("supported_parameters"), list):
+        sp_low = {str(x).lower() for x in d["supported_parameters"]}
+        if "reasoning" in sp_low or "include_reasoning" in sp_low:
+            meta["supports_thinking"] = True
+
+    return meta
 
 
 class ContextLengthExceededError(RuntimeError):
     """上游大模型返回输入上下文超出最大窗口限制时抛出的结构化异常."""
 
+    def __init__(self, message: str, *, detected_limit: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.detected_limit: Optional[int] = (
+            detected_limit if detected_limit is not None else parse_context_limit_from_error(message)
+        )
+
 
 class _LLMHttpError(RuntimeError):
-    """内部 HTTP 状态异常（用于判断参数不支持自动降级）."""
+    """内部 HTTP 状态异常（用于判断参数不支持自动降级与瞬态重试）."""
 
     def __init__(self, status_code: int, detail: str, message: str) -> None:
         super().__init__(message)
         self.status_code = int(status_code or 0)
         self.detail = detail
+
+
+class _LLMTransientError(RuntimeError):
+    """可安全指数退避重试的瞬态网络/超时/5xx 异常."""
+
+    def __init__(self, message: str, *, reason: str = "timeout", status_code: int = 0) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.status_code = int(status_code or 0)
+
+
+def _is_transient_exception(exc: BaseException) -> Tuple[bool, str]:
+    if isinstance(exc, ContextLengthExceededError):
+        return False, ""
+    if isinstance(exc, _LLMTransientError):
+        return True, exc.reason
+    if isinstance(exc, _LLMHttpError):
+        if exc.status_code in TRANSIENT_HTTP_STATUS_CODES:
+            return True, f"HTTP {exc.status_code}"
+        return False, ""
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True, "响应超时"
+    if isinstance(exc, (ConnectionResetError, BrokenPipeError, http.client.IncompleteRead, http.client.RemoteDisconnected)):
+        return True, "上游连接中断"
+    if isinstance(exc, urllib.error.URLError):
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            return False, ""
+        if isinstance(exc.reason, (TimeoutError, socket.timeout, ConnectionResetError, BrokenPipeError, OSError)):
+            return True, f"网络抖动({exc.reason})"
+    return False, ""
+
+
+def _sleep_interruptible(seconds: float, cancel_check: Optional[Callable[[], bool]] = None) -> bool:
+    """可响应取消信号的退避等待，若被取消返回 True."""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if cancel_check and cancel_check():
+            return True
+        rem = deadline - time.monotonic()
+        if rem <= 0:
+            return False
+        time.sleep(min(0.1, rem))
+
+
+def _lookup_model_probe(extra: Optional[Dict[str, Any]], model: str) -> Optional[Dict[str, Any]]:
+    if not isinstance(extra, dict):
+        return None
+    probes = extra.get("model_probes")
+    if not isinstance(probes, dict) or not model:
+        return None
+    if isinstance(probes.get(model), dict):
+        return probes[model]
+    low = model.strip().lower()
+    for k, v in probes.items():
+        if str(k).strip().lower() == low and isinstance(v, dict):
+            return v
+    return None
+
+
+def _is_probe_fresh(probe: Optional[Dict[str, Any]], ttl_sec: int = MODEL_PROBE_TTL_SEC) -> bool:
+    if not isinstance(probe, dict):
+        return False
+    if str(probe.get("source") or "") not in ("live_probe", "error_calibrated"):
+        return False
+    ts = str(probe.get("probed_at") or "").strip()
+    if not ts:
+        return False
+    try:
+        dt = datetime.datetime.fromisoformat(ts.replace("Z", ""))
+        age = (datetime.datetime.now() - dt).total_seconds()
+        return 0 <= age <= ttl_sec
+    except Exception:
+        return False
+
+
+def _infer_model_tier(
+    m: str,
+    m_base: str,
+    context_window: int,
+    *,
+    is_local: bool,
+    has_small_tag: bool,
+    has_tiny_tag: bool,
+    has_colon_small: bool,
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    if isinstance(extra, dict):
+        override = str(extra.get("model_tier") or "").strip().lower()
+        if override in ("flagship", "standard", "lightweight"):
+            return override
+    # 明确轻量后缀 (-flash / -mini / -lite / -fast / -nano / -tiny / -haiku / -small) 优先判轻量
+    if _LIGHTWEIGHT_MODEL_RE.search(m_base) or _LIGHTWEIGHT_MODEL_RE.search(m):
+        return "lightweight"
+    if _TURBO_LIGHTWEIGHT_RE.search(m_base) and "gpt-4-turbo" not in m_base:
+        return "lightweight"
+    if "gpt-3.5" in m_base or "deepseek-v2" in m_base or "deepseek-coder-v1" in m_base:
+        return "lightweight"
+    if (is_local and has_tiny_tag) or (has_colon_small and ":32b" not in m_base):
+        return "lightweight"
+    if context_window <= 32_768 and not _FLAGSHIP_MODEL_RE.search(m_base):
+        return "lightweight"
+    if _FLAGSHIP_MODEL_RE.search(m_base) or _FLAGSHIP_MODEL_RE.search(m):
+        return "flagship"
+    if is_local and has_small_tag and context_window <= 32_768:
+        return "lightweight"
+    return "standard"
+
+
+def _compute_tier_budgets(
+    context_window: int,
+    base_attachment_budget: int,
+    model_tier: str,
+) -> Tuple[int, int, int]:
+    """根据物理窗口与模型分级计算 `(effective_reasoning_budget, attachment_budget, recommended_chunk_tokens)`."""
+    cw = max(4096, int(context_window))
+    if model_tier == "lightweight":
+        if cw >= 200_000:
+            eff_budget = 24_000
+        elif cw >= 64_000:
+            eff_budget = 18_000
+        elif cw >= 32_000:
+            eff_budget = 16_000
+        else:
+            eff_budget = max(3_000, int(cw * 0.50))
+        att_budget = min(base_attachment_budget, eff_budget)
+        rec_chunk = 5_500 if cw >= 32_000 else max(2_000, int(eff_budget * 0.35))
+        return eff_budget, att_budget, rec_chunk
+
+    if model_tier == "flagship":
+        eff_budget = min(240_000, max(base_attachment_budget, int(cw * 0.65)))
+        att_budget = min(base_attachment_budget, eff_budget)
+        rec_chunk = 12_000 if cw >= 64_000 else max(4_000, int(cw * 0.25))
+        return eff_budget, att_budget, rec_chunk
+
+    # standard
+    eff_budget = min(180_000, max(base_attachment_budget, int(cw * 0.62)))
+    att_budget = min(base_attachment_budget, eff_budget)
+    rec_chunk = 8_000 if cw >= 64_000 else max(4_000, int(cw * 0.25))
+    return eff_budget, att_budget, rec_chunk
+
+
+def compute_adaptive_timeout(
+    caps: Optional[Dict[str, Any]],
+    requested_timeout: float,
+    *,
+    stream: bool = True,
+) -> float:
+    """结合探测 TTFT 动态计算流式/非流式读超时（保留单测显式小超时不强行拉长）."""
+    req = max(1.0, float(requested_timeout or (120.0 if stream else 45.0)))
+    if req < 25.0:
+        return req
+    ttft_ms = float((caps or {}).get("ttft_ms") or 0.0)
+    base = max(req, 120.0) if stream else req
+    if ttft_ms >= 3000.0:
+        # 慢供应商按实测首字延迟弹性抬高至 180s~240s
+        scaled = max(base, 120.0 + (ttft_ms / 100.0))
+        return min(240.0, max(180.0 if ttft_ms >= 6000.0 else base, scaled))
+    return base
 
 
 def _is_context_limit_error(detail: str) -> bool:
@@ -358,7 +669,8 @@ def infer_model_capabilities(
     burl = (base_url or "").strip().lower()
     is_local = any(h in burl for h in ("127.0.0.1", "localhost"))
     has_small_tag = bool(_SMALL_LOCAL_TAG_RE.search(m_base))
-    has_colon_small = any(t in m_base for t in (":7b", ":8b", ":14b", ":32b"))
+    has_tiny_tag = bool(_TINY_LOCAL_TAG_RE.search(m_base))
+    has_colon_small = any(t in m_base for t in (":0.5b", ":1.5b", ":3b", ":4b", ":7b", ":8b", ":9b", ":14b", ":32b"))
 
     context_window = 64_000
     attachment_budget = 40_000
@@ -386,20 +698,29 @@ def infer_model_capabilities(
 
     # 2. DeepSeek 系列
     elif "deepseek" in m_base or "deepseek" in m:
-        context_window = 128_000
-        attachment_budget = 80_000
-        if "reasoner" in m_base or "deepseek-r1" in m or m_base.startswith("r1"):
-            max_output_tokens = 16384
-            supports_thinking = True
-            thinking_mode = "native_always"
-            omit_temperature = True
+        if _LIGHTWEIGHT_MODEL_RE.search(m_base):
+            # 轻量快速版如 deepseek-v4-flash：物理窗口保守 64K，有效推理预算由 lightweight 档收敛
+            context_window = 64_000
+            attachment_budget = 40_000
+            max_output_tokens = 8192
+            supports_thinking = False
+            thinking_mode = "none"
             thinking_param_style = "none"
         else:
-            # deepseek-chat / deepseek-v3 / deepseek-coder
-            max_output_tokens = 8192
-            supports_thinking = True
-            thinking_mode = "toggleable"
-            thinking_param_style = "deepseek"
+            context_window = 128_000
+            attachment_budget = 80_000
+            if "reasoner" in m_base or "deepseek-r1" in m or m_base.startswith("r1"):
+                max_output_tokens = 16384
+                supports_thinking = True
+                thinking_mode = "native_always"
+                omit_temperature = True
+                thinking_param_style = "none"
+            else:
+                # deepseek-chat / deepseek-v3 / deepseek-coder
+                max_output_tokens = 8192
+                supports_thinking = True
+                thinking_mode = "toggleable"
+                thinking_param_style = "deepseek"
 
     # 3. OpenAI o1 / o3 / o4 / GPT 系列
     elif re.match(r"^(?:o1|o3|o4)(?:$|-|\.|_)", m_base):
@@ -491,25 +812,112 @@ def infer_model_capabilities(
             supports_thinking = True
             thinking_mode = "native_always"
 
-    # 服务商显式配置的自定义上下文窗口覆盖（>= 4096）
+    source = "heuristic"
+    token_ratio = 1.0
+    ttft_ms = 0.0
+    tokens_per_sec = 0.0
+    stream_supported = True
+    probed_at = ""
+    probe_tier_override = ""
+
+    # 合并持久化四级探针缓存 (L1 models_meta / L2 live_probe / L3 error_calibrated)
+    probe = _lookup_model_probe(extra, model)
+    if isinstance(probe, dict):
+        if probe.get("context_window"):
+            try:
+                p_cw = int(probe["context_window"])
+                if 4096 <= p_cw <= 10_000_000:
+                    context_window = p_cw
+                    attachment_budget = max(4000, min(240_000, int(p_cw * 0.62)))
+            except (TypeError, ValueError):
+                pass
+        if probe.get("max_output_tokens"):
+            try:
+                p_out = int(probe["max_output_tokens"])
+                if 256 <= p_out <= 1_000_000:
+                    max_output_tokens = p_out
+            except (TypeError, ValueError):
+                pass
+        if "supports_thinking" in probe and probe.get("supports_thinking") is not None:
+            supports_thinking = bool(probe["supports_thinking"])
+            if supports_thinking and thinking_mode == "none":
+                thinking_mode = "toggleable"
+        if probe.get("token_ratio"):
+            try:
+                tr = float(probe["token_ratio"])
+                if 0.4 <= tr <= 3.0:
+                    token_ratio = round(tr, 3)
+            except (TypeError, ValueError):
+                pass
+        if probe.get("ttft_ms"):
+            try:
+                ttft_ms = max(0.0, round(float(probe["ttft_ms"]), 1))
+            except (TypeError, ValueError):
+                pass
+        if probe.get("tokens_per_sec"):
+            try:
+                tokens_per_sec = max(0.0, round(float(probe["tokens_per_sec"]), 1))
+            except (TypeError, ValueError):
+                pass
+        if "stream_supported" in probe and probe.get("stream_supported") is not None:
+            stream_supported = bool(probe["stream_supported"])
+        if probe.get("source"):
+            source = str(probe["source"])
+        if probe.get("probed_at"):
+            probed_at = str(probe["probed_at"])
+        if str(probe.get("model_tier") or "").strip().lower() in ("flagship", "standard", "lightweight"):
+            probe_tier_override = str(probe["model_tier"]).strip().lower()
+
+    # 服务商显式配置的自定义上下文窗口覆盖（>= 4096；若存在更小的实测 error_calibrated 物理上限则保护不越界）
     if isinstance(extra, dict) and extra.get("context_window"):
         try:
             custom_ctx = int(extra["context_window"])
             if custom_ctx >= 4096:
-                context_window = custom_ctx
-                attachment_budget = max(4000, min(240_000, int(custom_ctx * 0.62)))
+                if source == "error_calibrated" and context_window < custom_ctx:
+                    pass
+                else:
+                    context_window = custom_ctx
+                    attachment_budget = max(4000, min(240_000, int(custom_ctx * 0.62)))
+                    if source == "heuristic":
+                        source = "custom"
         except (TypeError, ValueError):
             pass
 
+    model_tier = _infer_model_tier(
+        m,
+        m_base,
+        context_window,
+        is_local=is_local,
+        has_small_tag=has_small_tag,
+        has_tiny_tag=has_tiny_tag,
+        has_colon_small=has_colon_small,
+        extra=extra,
+    )
+    if probe_tier_override and not (isinstance(extra, dict) and extra.get("model_tier")):
+        model_tier = probe_tier_override
+
+    effective_reasoning_budget, attachment_budget, recommended_chunk_tokens = _compute_tier_budgets(
+        context_window, attachment_budget, model_tier
+    )
+
     return {
         "context_window": int(context_window),
+        "effective_reasoning_budget": int(effective_reasoning_budget),
         "attachment_budget": int(attachment_budget),
         "max_output_tokens": int(max_output_tokens),
+        "recommended_chunk_tokens": int(recommended_chunk_tokens),
+        "model_tier": model_tier,
         "supports_thinking": bool(supports_thinking),
         "thinking_mode": thinking_mode,
         "omit_temperature": bool(omit_temperature),
         "use_max_completion_tokens": bool(use_max_completion_tokens),
         "thinking_param_style": thinking_param_style,
+        "token_ratio": float(token_ratio),
+        "ttft_ms": float(ttft_ms),
+        "tokens_per_sec": float(tokens_per_sec),
+        "stream_supported": bool(stream_supported),
+        "source": source,
+        "probed_at": probed_at,
     }
 
 
@@ -625,9 +1033,18 @@ class LLMHub:
                         "ready": is_ready,
                         "is_default": bool(p.is_default and mid == p.default_model),
                         "context_window": caps["context_window"],
+                        "effective_reasoning_budget": caps["effective_reasoning_budget"],
                         "attachment_budget": caps["attachment_budget"],
+                        "max_output_tokens": caps["max_output_tokens"],
+                        "recommended_chunk_tokens": caps["recommended_chunk_tokens"],
+                        "model_tier": caps["model_tier"],
                         "supports_thinking": caps["supports_thinking"],
                         "thinking_mode": caps["thinking_mode"],
+                        "token_ratio": caps["token_ratio"],
+                        "ttft_ms": caps["ttft_ms"],
+                        "stream_supported": caps["stream_supported"],
+                        "source": caps["source"],
+                        "probed_at": caps["probed_at"],
                     }
                 )
         return items
@@ -719,6 +1136,14 @@ class LLMHub:
                 if cw_val < 4096:
                     raise ValueError("自定义上下文窗口需 >= 4096 tokens（填 0 或留空则按模型自动识别）")
                 extra["context_window"] = cw_val
+        if "model_tier" in payload:
+            raw_tier = str(payload.get("model_tier") or "").strip().lower()
+            if not raw_tier or raw_tier == "auto":
+                extra.pop("model_tier", None)
+            elif raw_tier in ("flagship", "standard", "lightweight"):
+                extra["model_tier"] = raw_tier
+            else:
+                raise ValueError("模型分级仅支持 auto / flagship / standard / lightweight")
 
         return LLMProviderProfile(
             provider_id=pid,
@@ -887,7 +1312,9 @@ class LLMHub:
             pass
         msg = f"HTTP {exc.code}: {err_detail or exc.reason}"
         if exc.code in (400, 413) and _is_context_limit_error(err_detail):
-            raise ContextLengthExceededError(msg) from None
+            raise ContextLengthExceededError(
+                msg, detected_limit=parse_context_limit_from_error(err_detail)
+            ) from None
         raise _LLMHttpError(exc.code, err_detail or str(exc.reason or ""), msg) from None
 
     @staticmethod
@@ -897,6 +1324,11 @@ class LLMHub:
                 f"连接 AI 服务端失败: {exc.reason}"
                 "（TLS 证书校验未通过：如处于企业代理或私有自签网关环境，"
                 "请将根证书加入系统受信任根证书，或通过环境变量 SSL_CERT_FILE 指定 CA 证书文件）"
+            ) from None
+        if isinstance(exc.reason, (TimeoutError, socket.timeout, ConnectionResetError, BrokenPipeError, OSError)):
+            raise _LLMTransientError(
+                f"连接 AI 服务端失败: {exc.reason}",
+                reason=f"网络抖动({exc.reason})",
             ) from None
         raise RuntimeError(f"连接 AI 服务端失败: {exc.reason}") from None
 
@@ -928,6 +1360,10 @@ class LLMHub:
                 LLMHub._raise_for_http_error(exc)
             except urllib.error.URLError as exc:
                 LLMHub._raise_for_url_error(exc)
+            except (TimeoutError, socket.timeout) as exc:
+                raise _LLMTransientError(f"AI 服务端响应超时: {exc}", reason="响应超时") from None
+            except (ConnectionResetError, BrokenPipeError, http.client.IncompleteRead, http.client.RemoteDisconnected) as exc:
+                raise _LLMTransientError(f"AI 服务端连接中断: {exc}", reason="连接中断") from None
 
         try:
             parsed = json.loads(raw)
@@ -1040,7 +1476,142 @@ class LLMHub:
             cleaned.pop(k, None)
         return cleaned
 
-    def _http_fallback_chat(
+    def _persist_model_probe(
+        self,
+        provider_id: str,
+        model: str,
+        updates: Dict[str, Any],
+        *,
+        preserve_stronger_source: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """将模型探查/校准档案安全落盘至 Layer 2 私有库 `llm_providers.extra_json['model_probes']`."""
+        pid = (provider_id or "").strip().lower()
+        mdl = (model or "").strip()
+        if not pid or not mdl:
+            return None
+        existing = self.store.get_llm_provider(pid)
+        if existing is None:
+            return None
+
+        extra = dict(existing.extra or {})
+        probes = dict(extra.get("model_probes") or {}) if isinstance(extra.get("model_probes"), dict) else {}
+        cur = dict(probes.get(mdl) or {}) if isinstance(probes.get(mdl), dict) else {}
+
+        source_rank = {
+            "heuristic": 0,
+            "models_meta": 1,
+            "live_probe": 2,
+            "error_calibrated": 3,
+            "custom": 3,
+        }
+        cur_src = str(cur.get("source") or "heuristic")
+        new_src = str(updates.get("source") or cur_src)
+        if preserve_stronger_source and source_rank.get(cur_src, 0) > source_rank.get(new_src, 0):
+            # 仅补充缺失字段，不降级更强来源（例如已 error_calibrated / live_probe）
+            merged = dict(cur)
+            for k, v in updates.items():
+                if k == "source":
+                    continue
+                if k not in merged or merged[k] in (None, "", 0, 0.0):
+                    merged[k] = v
+        else:
+            merged = {**cur, **{k: v for k, v in updates.items() if v is not None}}
+            merged["source"] = new_src
+
+        merged.setdefault("probed_at", datetime.datetime.now().isoformat(timespec="seconds"))
+        # 预填派生预算以便外部只读查看
+        temp_extra = {**extra, "model_probes": {**probes, mdl: merged}}
+        caps = infer_model_capabilities(mdl, existing.provider_type, existing.base_url, temp_extra)
+        merged["context_window"] = caps["context_window"]
+        merged["effective_reasoning_budget"] = caps["effective_reasoning_budget"]
+        merged["max_output_tokens"] = caps["max_output_tokens"]
+        merged["recommended_chunk_tokens"] = caps["recommended_chunk_tokens"]
+        merged["model_tier"] = caps["model_tier"]
+        merged["supports_thinking"] = caps["supports_thinking"]
+        merged["token_ratio"] = caps["token_ratio"]
+        merged["ttft_ms"] = caps["ttft_ms"]
+        merged["stream_supported"] = caps["stream_supported"]
+
+        probes[mdl] = merged
+        extra["model_probes"] = probes
+        existing.extra = extra
+        self.store.upsert_llm_provider(existing)
+        return merged
+
+    def record_calibrated_context_limit(
+        self,
+        provider_id: str,
+        model: str,
+        detected_limit: Optional[int],
+    ) -> Optional[Dict[str, Any]]:
+        """L3 运行期 400 超限报错自校准：立即回写实测物理窗口上限."""
+        if not detected_limit or detected_limit < 4096 or detected_limit > 10_000_000:
+            return None
+        return self._persist_model_probe(
+            provider_id,
+            model,
+            {
+                "context_window": int(detected_limit),
+                "source": "error_calibrated",
+                "probed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            },
+            preserve_stronger_source=False,
+        )
+
+    def _probe_ollama_show_meta(
+        self, base_url: str, model_id: str, timeout_sec: float = 3.0
+    ) -> Dict[str, Any]:
+        """L1 扩展：针对本地 Ollama 端点 (`127.0.0.1:11434` / `localhost:11434`) 按需读取 `/api/show`."""
+        parsed = urlparse((base_url or "").strip())
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+        if host not in ("127.0.0.1", "localhost") or port != 11434:
+            return {}
+        root_url = f"{parsed.scheme}://{parsed.netloc}/api/show"
+        try:
+            data = self._request_openai_json(
+                "POST", root_url, "", {"name": model_id}, min(3.0, max(1.0, float(timeout_sec)))
+            )
+        except Exception:
+            return {}
+
+        meta: Dict[str, Any] = {}
+        # 1. 从 parameters 文本提取 num_ctx
+        params_txt = str(data.get("parameters") or "")
+        m_ctx = re.search(r"(?im)^\s*num_ctx\s+(\d{4,7})\b", params_txt)
+        if m_ctx:
+            try:
+                v = int(m_ctx.group(1))
+                if 4096 <= v <= 10_000_000:
+                    meta["context_window"] = v
+            except ValueError:
+                pass
+        # 2. 从 model_info 提取 *.context_length
+        minfo = data.get("model_info")
+        if isinstance(minfo, dict) and "context_window" not in meta:
+            for k, v in minfo.items():
+                if str(k).endswith("context_length"):
+                    try:
+                        iv = int(v)
+                        if 4096 <= iv <= 10_000_000:
+                            meta["context_window"] = iv
+                            break
+                    except (TypeError, ValueError):
+                        pass
+        # 3. 解析参数规模判断轻量档 (<= 14B)
+        details = data.get("details")
+        if isinstance(details, dict):
+            psize = str(details.get("parameter_size") or "").strip().upper()
+            m_b = re.match(r"^(\d+(?:\.\d+)?)\s*B$", psize)
+            if m_b:
+                try:
+                    if float(m_b.group(1)) <= 14.5:
+                        meta["model_tier"] = "lightweight"
+                except ValueError:
+                    pass
+        return meta
+
+    def _http_fallback_chat_full(
         self,
         profile: LLMProviderProfile,
         messages: List[Dict[str, str]],
@@ -1051,7 +1622,7 @@ class LLMHub:
         *,
         thinking_mode: str = "auto",
         reasoning_effort: str = "",
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, str, Dict[str, Any]]:
         endpoint = profile.base_url.rstrip("/") + "/chat/completions"
         body, _, injected = self._build_chat_body(
             profile,
@@ -1078,21 +1649,82 @@ class LLMHub:
                 )
             else:
                 raise
+        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
         choices = data.get("choices") or []
         if not choices or not isinstance(choices[0], dict):
-            return "", ""
+            return "", "", "", usage
+        finish_reason = str(choices[0].get("finish_reason") or "")
         msg = choices[0].get("message") or {}
-        return self._extract_message_reasoning_and_content(msg)
+        r_txt, c_txt = self._extract_message_reasoning_and_content(msg)
+        return r_txt, c_txt, finish_reason, usage
 
-    def _http_fallback_models(
+    def _http_fallback_chat(
+        self,
+        profile: LLMProviderProfile,
+        messages: List[Dict[str, str]],
+        model: str,
+        temperature: float,
+        max_tokens: Optional[int],
+        timeout_sec: float,
+        *,
+        thinking_mode: str = "auto",
+        reasoning_effort: str = "",
+    ) -> Tuple[str, str]:
+        r_txt, c_txt, _, _ = self._http_fallback_chat_full(
+            profile,
+            messages,
+            model,
+            temperature,
+            max_tokens,
+            timeout_sec,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
+        )
+        return r_txt, c_txt
+
+    def _http_fallback_models_with_meta(
         self, profile: LLMProviderProfile, timeout_sec: float
-    ) -> List[str]:
+    ) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
         endpoint = profile.base_url.rstrip("/") + "/models"
         data = self._request_openai_json(
             "GET", endpoint, profile.api_key, None, timeout_sec
         )
         items = data.get("data") or []
-        return [str(it.get("id") or "") for it in items if isinstance(it, dict) and it.get("id")]
+        ids: List[str] = []
+        meta_by_id: Dict[str, Dict[str, Any]] = {}
+        for it in items:
+            if not isinstance(it, dict) or not it.get("id"):
+                continue
+            raw_id = str(it.get("id") or "")
+            ids.append(raw_id)
+            norm_id = _normalize_model_id(raw_id, profile.provider_type, profile.base_url)
+            meta = _extract_model_meta_from_item(it)
+            if meta and norm_id:
+                meta_by_id[norm_id] = meta
+        return ids, meta_by_id
+
+    def _http_fallback_models(
+        self, profile: LLMProviderProfile, timeout_sec: float
+    ) -> List[str]:
+        ids, _ = self._http_fallback_models_with_meta(profile, timeout_sec)
+        return ids
+
+    @staticmethod
+    def _build_continuation_messages(
+        orig_messages: List[Dict[str, str]],
+        accumulated_content: str,
+    ) -> List[Dict[str, str]]:
+        anchor = accumulated_content[-2500:] if len(accumulated_content) > 2500 else accumulated_content
+        return list(orig_messages) + [
+            {"role": "assistant", "content": anchor},
+            {
+                "role": "user",
+                "content": (
+                    "你上一轮的输出因长度上限或连接中断被截断。"
+                    "请严格从上述截断位置紧接着继续输出剩余内容，切勿重复已经输出的部分，也不要添加多余开场白。"
+                ),
+            },
+        ]
 
     def chat_completion(
         self,
@@ -1105,6 +1737,13 @@ class LLMHub:
         timeout_sec: float = 45.0,
         thinking_mode: str = "auto",
         reasoning_effort: str = "",
+        retry_on_transient: bool = True,
+        max_retries: int = 3,
+        retry_delays: Optional[Tuple[float, ...]] = None,
+        on_retry: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        auto_continue_on_length: bool = True,
+        max_continuations: int = 3,
     ) -> Dict[str, Any]:
         resolved = self.resolve_provider_and_model(
             provider_id=provider_id, model=model, require_ready=True
@@ -1120,6 +1759,13 @@ class LLMHub:
             timeout_sec=timeout_sec,
             thinking_mode=thinking_mode,
             reasoning_effort=reasoning_effort,
+            retry_on_transient=retry_on_transient,
+            max_retries=max_retries,
+            retry_delays=retry_delays,
+            on_retry=on_retry,
+            cancel_check=cancel_check,
+            auto_continue_on_length=auto_continue_on_length,
+            max_continuations=max_continuations,
         )
 
     def _execute_chat_with_profile(
@@ -1133,50 +1779,138 @@ class LLMHub:
         timeout_sec: float = 30.0,
         thinking_mode: str = "auto",
         reasoning_effort: str = "",
+        retry_on_transient: bool = True,
+        max_retries: int = 3,
+        retry_delays: Optional[Tuple[float, ...]] = None,
+        on_retry: Optional[Callable[[Dict[str, Any]], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        auto_continue_on_length: bool = True,
+        max_continuations: int = 3,
     ) -> Dict[str, Any]:
         is_local = any(h in (profile.base_url or "") for h in ("127.0.0.1", "localhost"))
         if not profile.api_key and not is_local:
             raise ValueError(f"请先填写 [{profile.name}] 的 API Key")
 
+        caps = infer_model_capabilities(model, profile.provider_type, profile.base_url, profile.extra)
+        eff_timeout = compute_adaptive_timeout(caps, timeout_sec, stream=False)
+        delays = retry_delays if retry_delays is not None else RETRY_BACKOFF_SCHEDULE
+        eff_max_retries = max(0, int(max_retries)) if retry_on_transient else 0
+
         t0 = time.perf_counter()
-        client = self._get_sdk_client(profile, timeout_sec=timeout_sec)
-        reasoning = ""
-        content = ""
-        if client is not None:
-            sdk_kwargs, _, injected = self._build_chat_body(
-                profile,
-                messages=messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                stream=False,
-                thinking_mode=thinking_mode,
-                reasoning_effort=reasoning_effort,
-            )
-            try:
-                resp = client.chat.completions.create(**sdk_kwargs)
-            except TypeError:
-                if injected:
-                    resp = client.chat.completions.create(
-                        **self._strip_optional_thinking_params(sdk_kwargs)
+
+        def _invoke_once(
+            req_msgs: List[Dict[str, str]],
+            req_max_tok: Optional[int],
+            req_tmode: str,
+        ) -> Tuple[str, str, str, Dict[str, Any]]:
+            attempt = 0
+            cur_max_tok = req_max_tok
+            cur_tmode = req_tmode
+            while True:
+                try:
+                    client = self._get_sdk_client(profile, timeout_sec=eff_timeout)
+                    if client is not None:
+                        sdk_kwargs, _, injected = self._build_chat_body(
+                            profile,
+                            messages=req_msgs,
+                            model=model,
+                            temperature=temperature,
+                            max_tokens=cur_max_tok,
+                            stream=False,
+                            thinking_mode=cur_tmode,
+                            reasoning_effort=reasoning_effort,
+                        )
+                        try:
+                            resp = client.chat.completions.create(**sdk_kwargs)
+                        except TypeError:
+                            if injected:
+                                resp = client.chat.completions.create(
+                                    **self._strip_optional_thinking_params(sdk_kwargs)
+                                )
+                            else:
+                                raise
+                        r_txt, c_txt = "", ""
+                        fr = ""
+                        usg: Dict[str, Any] = {}
+                        if getattr(resp, "choices", None):
+                            ch0 = resp.choices[0]
+                            fr = str(getattr(ch0, "finish_reason", "") or "")
+                            r_txt, c_txt = self._extract_message_reasoning_and_content(ch0.message)
+                        raw_u = getattr(resp, "usage", None)
+                        if isinstance(raw_u, dict):
+                            usg = raw_u
+                        return r_txt, c_txt, fr, usg
+                    return self._http_fallback_chat_full(
+                        profile,
+                        req_msgs,
+                        model,
+                        temperature,
+                        cur_max_tok,
+                        eff_timeout,
+                        thinking_mode=cur_tmode,
+                        reasoning_effort=reasoning_effort,
                     )
-                else:
+                except ContextLengthExceededError as ctx_exc:
+                    if ctx_exc.detected_limit:
+                        self.record_calibrated_context_limit(
+                            profile.provider_id, model, ctx_exc.detected_limit
+                        )
                     raise
-            if getattr(resp, "choices", None):
-                reasoning, content = self._extract_message_reasoning_and_content(
-                    resp.choices[0].message
-                )
-        else:
-            reasoning, content = self._http_fallback_chat(
-                profile,
-                messages,
-                model,
-                temperature,
-                max_tokens,
-                timeout_sec,
-                thinking_mode=thinking_mode,
-                reasoning_effort=reasoning_effort,
-            )
+                except Exception as exc:
+                    is_trans, reason = _is_transient_exception(exc)
+                    if not is_trans or attempt >= eff_max_retries:
+                        raise
+                    attempt += 1
+                    wait_sec = float(delays[min(attempt - 1, len(delays) - 1)]) if delays else 0.0
+                    shed_load = attempt >= 2
+                    if shed_load:
+                        if cur_max_tok is not None:
+                            cur_max_tok = max(1024, min(4096, cur_max_tok // 2))
+                        else:
+                            cur_max_tok = min(4096, max(2048, int(caps.get("max_output_tokens") or 4096) // 2))
+                        cur_tmode = "disabled"
+                    if on_retry:
+                        on_retry(
+                            {
+                                "type": "retry_wait",
+                                "attempt": attempt,
+                                "max_retries": eff_max_retries,
+                                "wait_sec": wait_sec,
+                                "reason": reason,
+                                "shed_load": shed_load,
+                                "detail": (
+                                    f"供应商{reason}，正在第 {attempt}/{eff_max_retries} 次自动退避重连"
+                                    + ("（已启用减载降级）" if shed_load else "")
+                                    + "..."
+                                ),
+                            }
+                        )
+                    if _sleep_interruptible(wait_sec, cancel_check):
+                        raise RuntimeError("用户已取消当前大模型调用") from None
+
+        reasoning, content, finish_reason, usage = _invoke_once(messages, max_tokens, thinking_mode)
+        continuations = 0
+        eff_max_cont = max(0, min(5, int(max_continuations))) if auto_continue_on_length else 0
+        while (
+            finish_reason == "length"
+            and content.strip()
+            and continuations < eff_max_cont
+            and not (cancel_check and cancel_check())
+        ):
+            continuations += 1
+            cont_msgs = self._build_continuation_messages(messages, content)
+            c_r, c_c, finish_reason, c_usage = _invoke_once(cont_msgs, max_tokens, thinking_mode)
+            if c_r:
+                reasoning = (reasoning + "\n" + c_r).strip() if reasoning else c_r
+            if not c_c:
+                break
+            stitched = _stitch_continuation_overlap(content, c_c)
+            if not stitched:
+                break
+            content += stitched
+            if c_usage:
+                usage = c_usage
+
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
         return {
             "provider_id": profile.provider_id,
@@ -1184,6 +1918,9 @@ class LLMHub:
             "model": model,
             "content": content,
             "reasoning": reasoning,
+            "finish_reason": finish_reason,
+            "usage": usage,
+            "continuations": continuations,
             "elapsed_ms": elapsed_ms,
         }
 
@@ -1199,8 +1936,13 @@ class LLMHub:
         thinking_mode: str = "auto",
         reasoning_effort: str = "",
         cancel_check: Optional[Callable[[], bool]] = None,
+        retry_on_transient: bool = True,
+        max_retries: int = 3,
+        retry_delays: Optional[Tuple[float, ...]] = None,
+        auto_continue_on_length: bool = True,
+        max_continuations: int = 3,
     ) -> Iterator[Dict[str, Any]]:
-        """零依赖流式调用 OpenAI 兼容 `/chat/completions` 接口，实时增量拆分思考过程与回答正文."""
+        """零依赖流式调用 OpenAI 兼容 `/chat/completions`，支持弹性静默超时、瞬态指数退避重试与 length 自动续写."""
         resolved = self.resolve_provider_and_model(
             provider_id=provider_id, model=model, require_ready=True
         )
@@ -1210,12 +1952,20 @@ class LLMHub:
         if not profile.api_key and not is_local:
             raise ValueError(f"请先填写 [{profile.name}] 的 API Key")
 
+        caps = infer_model_capabilities(eff_model, profile.provider_type, profile.base_url, profile.extra)
+        eff_timeout = compute_adaptive_timeout(caps, timeout_sec, stream=True)
+        delays = retry_delays if retry_delays is not None else RETRY_BACKOFF_SCHEDULE
+        eff_max_retries = max(0, int(max_retries)) if retry_on_transient else 0
+        eff_max_cont = max(0, min(5, int(max_continuations))) if auto_continue_on_length else 0
+
         t0 = time.perf_counter()
-        parser = ThinkingStreamParser()
         reasoning_buf: List[str] = []
         content_buf: List[str] = []
         finish_reason = ""
         usage: Dict[str, Any] = {}
+        continuations = 0
+        retries_used = 0
+        stream_used_sse = False
 
         def _make_done_event(cancelled: bool = False) -> Dict[str, Any]:
             return {
@@ -1227,11 +1977,14 @@ class LLMHub:
                 "reasoning": "".join(reasoning_buf),
                 "finish_reason": finish_reason,
                 "usage": usage,
+                "continuations": continuations,
+                "retries": retries_used,
+                "stream_supported": stream_used_sse,
                 "cancelled": bool(cancelled),
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000.0, 1),
             }
 
-        client = self._get_sdk_client(profile, timeout_sec=timeout_sec)
+        client = self._get_sdk_client(profile, timeout_sec=eff_timeout)
         if client is not None:
             sdk_kwargs, _, injected = self._build_chat_body(
                 profile,
@@ -1252,11 +2005,18 @@ class LLMHub:
                 except TypeError:
                     clean_kwargs.pop("stream", None)
                     resp = client.chat.completions.create(**clean_kwargs)
+            except ContextLengthExceededError as ctx_exc:
+                if ctx_exc.detected_limit:
+                    self.record_calibrated_context_limit(profile.provider_id, eff_model, ctx_exc.detected_limit)
+                raise
 
             # 兼容返回单对象（非流式 Mock 客户端）
             if hasattr(resp, "choices"):
+                ch0 = resp.choices[0] if resp.choices else None
+                if ch0 is not None and getattr(ch0, "finish_reason", None):
+                    finish_reason = str(ch0.finish_reason)
                 r_all, c_all = self._extract_message_reasoning_and_content(
-                    resp.choices[0].message if resp.choices else None
+                    ch0.message if ch0 is not None else None
                 )
                 if r_all:
                     reasoning_buf.append(r_all)
@@ -1267,6 +2027,8 @@ class LLMHub:
                 yield _make_done_event(False)
                 return
 
+            stream_used_sse = True
+            parser = ThinkingStreamParser()
             cancelled = False
             for chunk in resp:
                 if cancel_check and cancel_check():
@@ -1321,18 +2083,8 @@ class LLMHub:
             return
 
         endpoint = profile.base_url.rstrip("/") + "/chat/completions"
-        body, _, injected = self._build_chat_body(
-            profile,
-            messages=messages,
-            model=eff_model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-        )
 
-        def _open_stream(req_body: Dict[str, Any]) -> Tuple[Any, str]:
+        def _open_stream(req_body: Dict[str, Any], read_timeout: float) -> Tuple[Any, str]:
             opener, req, safe_url = self._build_openai_opener_and_request(
                 "POST",
                 endpoint,
@@ -1351,117 +2103,535 @@ class LLMHub:
                 },
             ):
                 try:
-                    resp_obj = opener.open(req, timeout=max(1.0, float(timeout_sec)))
+                    resp_obj = opener.open(req, timeout=max(1.0, float(read_timeout)))
+                    # 确保流式逐行读取按单次静默间隔计时，防止总时长 > 120s 被中途掐断
+                    try:
+                        raw_sock = getattr(getattr(resp_obj, "fp", None), "raw", None)
+                        if raw_sock is not None and hasattr(raw_sock, "_sock") and raw_sock._sock is not None:
+                            raw_sock._sock.settimeout(max(1.0, float(read_timeout)))
+                    except Exception:
+                        pass
                     return resp_obj, safe_url
                 except urllib.error.HTTPError as exc:
                     self._raise_for_http_error(exc)
                 except urllib.error.URLError as exc:
                     self._raise_for_url_error(exc)
+                except (TimeoutError, socket.timeout) as exc:
+                    raise _LLMTransientError(f"AI 流式连接超时: {exc}", reason="响应超时") from None
+                except (ConnectionResetError, BrokenPipeError, http.client.IncompleteRead, http.client.RemoteDisconnected) as exc:
+                    raise _LLMTransientError(f"AI 流式连接中断: {exc}", reason="连接中断") from None
             raise RuntimeError("无法建立 AI 流式连接")
 
-        try:
-            resp_obj, _ = _open_stream(body)
-        except _LLMHttpError as exc:
-            if injected and _is_unsupported_thinking_param_error(exc.status_code, exc.detail):
-                resp_obj, _ = _open_stream(self._strip_optional_thinking_params(body))
-            else:
-                raise
+        def _stream_single_segment(
+            seg_msgs: List[Dict[str, str]],
+            seg_max_tokens: Optional[int],
+            seg_tmode: str,
+            *,
+            stitch_prefix: bool = False,
+        ) -> Iterator[Dict[str, Any]]:
+            nonlocal finish_reason, usage, stream_used_sse
+            body, _, injected = self._build_chat_body(
+                profile,
+                messages=seg_msgs,
+                model=eff_model,
+                temperature=temperature,
+                max_tokens=seg_max_tokens,
+                stream=True,
+                thinking_mode=seg_tmode,
+                reasoning_effort=reasoning_effort,
+            )
+            try:
+                resp_obj, _ = _open_stream(body, eff_timeout)
+            except _LLMHttpError as exc:
+                if injected and _is_unsupported_thinking_param_error(exc.status_code, exc.detail):
+                    resp_obj, _ = _open_stream(self._strip_optional_thinking_params(body), eff_timeout)
+                else:
+                    raise
+
+            parser = ThinkingStreamParser()
+            stitch_buf = ""
+            stitched_done = not stitch_prefix
+            seg_finish = ""
+            seg_cancelled = False
+
+            def _emit_content_delta(chunk_txt: str) -> Optional[Dict[str, Any]]:
+                nonlocal stitch_buf, stitched_done
+                if not chunk_txt:
+                    return None
+                if not stitched_done:
+                    stitch_buf += chunk_txt
+                    if len(stitch_buf) < 48:
+                        return None
+                    stitched_done = True
+                    cleaned = _stitch_continuation_overlap("".join(content_buf), stitch_buf)
+                    stitch_buf = ""
+                    if cleaned:
+                        content_buf.append(cleaned)
+                        return {"type": "content", "delta": cleaned}
+                    return None
+                content_buf.append(chunk_txt)
+                return {"type": "content", "delta": chunk_txt}
+
+            with resp_obj:
+                ctype = (resp_obj.headers.get("Content-Type") or "").lower()
+                if "application/json" in ctype:
+                    try:
+                        raw_json = resp_obj.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+                    except (TimeoutError, socket.timeout, http.client.IncompleteRead, ConnectionResetError) as exc:
+                        raise _LLMTransientError(f"读取 AI 响应超时/中断: {exc}", reason="响应超时") from None
+                    try:
+                        parsed = json.loads(raw_json)
+                    except Exception as exc:
+                        raise RuntimeError("AI 服务端返回了非 JSON 响应") from exc
+                    if not isinstance(parsed, dict):
+                        raise RuntimeError("AI 服务端返回的 JSON 顶层结构异常")
+                    if isinstance(parsed.get("error"), dict):
+                        err_msg = str(parsed["error"].get("message") or parsed["error"])[:400]
+                        if _is_context_limit_error(err_msg):
+                            raise ContextLengthExceededError(
+                                err_msg, detected_limit=parse_context_limit_from_error(err_msg)
+                            )
+                        raise RuntimeError(err_msg)
+                    if isinstance(parsed.get("usage"), dict):
+                        usage = parsed["usage"]
+                    choices = parsed.get("choices") or []
+                    if choices and isinstance(choices[0], dict):
+                        seg_finish = str(choices[0].get("finish_reason") or "")
+                        r_all, c_all = self._extract_message_reasoning_and_content(
+                            choices[0].get("message") or {}
+                        )
+                        if r_all:
+                            reasoning_buf.append(r_all)
+                            yield {"type": "reasoning", "delta": r_all}
+                        if c_all:
+                            ev = _emit_content_delta(c_all)
+                            if ev:
+                                yield ev
+                    if not stitched_done and stitch_buf:
+                        stitched_done = True
+                        cleaned = _stitch_continuation_overlap("".join(content_buf), stitch_buf)
+                        stitch_buf = ""
+                        if cleaned:
+                            content_buf.append(cleaned)
+                            yield {"type": "content", "delta": cleaned}
+                    finish_reason = seg_finish
+                    yield {"type": "_seg_end", "cancelled": False, "finish_reason": seg_finish}
+                    return
+
+                stream_used_sse = True
+                while True:
+                    if cancel_check and cancel_check():
+                        seg_cancelled = True
+                        break
+                    try:
+                        raw_line = resp_obj.readline()
+                    except (TimeoutError, socket.timeout) as exc:
+                        raise _LLMTransientError(f"流式读取静默超时: {exc}", reason="流式静默超时") from None
+                    except (ConnectionResetError, BrokenPipeError, http.client.IncompleteRead, http.client.RemoteDisconnected) as exc:
+                        raise _LLMTransientError(f"流式传输中断: {exc}", reason="流式连接中断") from None
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line or line.startswith(":"):
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if not data_str:
+                        continue
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        chunk_obj = json.loads(data_str)
+                    except Exception:
+                        continue
+                    if not isinstance(chunk_obj, dict):
+                        continue
+                    if isinstance(chunk_obj.get("error"), dict):
+                        err_msg = str(chunk_obj["error"].get("message") or chunk_obj["error"])[:400]
+                        if _is_context_limit_error(err_msg):
+                            raise ContextLengthExceededError(
+                                err_msg, detected_limit=parse_context_limit_from_error(err_msg)
+                            )
+                        raise RuntimeError(err_msg)
+                    if isinstance(chunk_obj.get("usage"), dict):
+                        usage = chunk_obj["usage"]
+                    choices = chunk_obj.get("choices") or []
+                    if not choices or not isinstance(choices[0], dict):
+                        continue
+                    ch0 = choices[0]
+                    if ch0.get("finish_reason"):
+                        seg_finish = str(ch0["finish_reason"])
+                    delta = ch0.get("delta")
+                    if not isinstance(delta, dict):
+                        delta = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
+                    raw_r = str(
+                        delta.get("reasoning_content")
+                        or delta.get("reasoning")
+                        or delta.get("thinking")
+                        or ""
+                    )
+                    blk_r, c_str = self._extract_reasoning_and_content_parts(delta.get("content"))
+                    out_r, out_c = parser.feed(raw_r + blk_r, c_str)
+                    if out_r:
+                        reasoning_buf.append(out_r)
+                        yield {"type": "reasoning", "delta": out_r}
+                    if out_c:
+                        ev = _emit_content_delta(out_c)
+                        if ev:
+                            yield ev
+
+            tail_r, tail_c = parser.flush()
+            if tail_r:
+                reasoning_buf.append(tail_r)
+                yield {"type": "reasoning", "delta": tail_r}
+            if tail_c:
+                ev = _emit_content_delta(tail_c)
+                if ev:
+                    yield ev
+            if not stitched_done and stitch_buf:
+                stitched_done = True
+                cleaned = _stitch_continuation_overlap("".join(content_buf), stitch_buf)
+                stitch_buf = ""
+                if cleaned:
+                    content_buf.append(cleaned)
+                    yield {"type": "content", "delta": cleaned}
+
+            finish_reason = seg_finish
+            yield {"type": "_seg_end", "cancelled": seg_cancelled, "finish_reason": seg_finish}
 
         cancelled = False
-        with resp_obj:
-            ctype = (resp_obj.headers.get("Content-Type") or "").lower()
-            if "application/json" in ctype:
-                raw_json = resp_obj.read(4 * 1024 * 1024).decode("utf-8", errors="replace")
+        cur_msgs = list(messages)
+        cur_max_tok = max_tokens
+        cur_tmode = thinking_mode
+        stitch_next = False
+
+        while True:
+            attempt = 0
+            seg_done_ok = False
+            while not seg_done_ok:
                 try:
-                    parsed = json.loads(raw_json)
+                    for ev in _stream_single_segment(
+                        cur_msgs, cur_max_tok, cur_tmode, stitch_prefix=stitch_next
+                    ):
+                        if ev.get("type") == "_seg_end":
+                            cancelled = bool(ev.get("cancelled"))
+                            seg_done_ok = True
+                            break
+                        yield ev
+                except ContextLengthExceededError as ctx_exc:
+                    if ctx_exc.detected_limit:
+                        self.record_calibrated_context_limit(
+                            profile.provider_id, eff_model, ctx_exc.detected_limit
+                        )
+                    raise
                 except Exception as exc:
-                    raise RuntimeError("AI 服务端返回了非 JSON 响应") from exc
-                if not isinstance(parsed, dict):
-                    raise RuntimeError("AI 服务端返回的 JSON 顶层结构异常")
-                if isinstance(parsed.get("error"), dict):
-                    err_msg = str(parsed["error"].get("message") or parsed["error"])[:400]
-                    if _is_context_limit_error(err_msg):
-                        raise ContextLengthExceededError(err_msg)
-                    raise RuntimeError(err_msg)
-                if isinstance(parsed.get("usage"), dict):
-                    usage = parsed["usage"]
-                choices = parsed.get("choices") or []
-                if choices and isinstance(choices[0], dict):
-                    finish_reason = str(choices[0].get("finish_reason") or "")
-                    r_all, c_all = self._extract_message_reasoning_and_content(
-                        choices[0].get("message") or {}
-                    )
-                    if r_all:
-                        reasoning_buf.append(r_all)
-                        yield {"type": "reasoning", "delta": r_all}
-                    if c_all:
-                        content_buf.append(c_all)
-                        yield {"type": "content", "delta": c_all}
-                yield _make_done_event(False)
-                return
+                    is_trans, reason = _is_transient_exception(exc)
+                    if not is_trans or attempt >= eff_max_retries:
+                        raise
+                    attempt += 1
+                    retries_used += 1
+                    wait_sec = float(delays[min(attempt - 1, len(delays) - 1)]) if delays else 0.0
+                    shed_load = attempt >= 2
+                    if shed_load:
+                        if cur_max_tok is not None:
+                            cur_max_tok = max(1024, min(4096, cur_max_tok // 2))
+                        else:
+                            cur_max_tok = min(4096, max(2048, int(caps.get("max_output_tokens") or 4096) // 2))
+                        cur_tmode = "disabled"
+                    # 若流式已输出局部正文后再中断，续接上下文无缝续写避免重复开头
+                    existing_c = "".join(content_buf)
+                    if existing_c.strip():
+                        cur_msgs = self._build_continuation_messages(messages, existing_c)
+                        stitch_next = True
+                    yield {
+                        "type": "retry_wait",
+                        "attempt": attempt,
+                        "max_retries": eff_max_retries,
+                        "wait_sec": wait_sec,
+                        "reason": reason,
+                        "shed_load": shed_load,
+                        "detail": (
+                            f"供应商{reason}，正在第 {attempt}/{eff_max_retries} 次自动退避重连"
+                            + ("并启用减载降级" if shed_load else "")
+                            + "..."
+                        ),
+                    }
+                    if _sleep_interruptible(wait_sec, cancel_check):
+                        cancelled = True
+                        seg_done_ok = True
+                        break
 
-            while True:
-                if cancel_check and cancel_check():
-                    cancelled = True
-                    break
-                raw_line = resp_obj.readline()
-                if not raw_line:
-                    break
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if not line or line.startswith(":"):
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if not data_str:
-                    continue
-                if data_str == "[DONE]":
-                    break
-                try:
-                    chunk_obj = json.loads(data_str)
-                except Exception:
-                    continue
-                if not isinstance(chunk_obj, dict):
-                    continue
-                if isinstance(chunk_obj.get("error"), dict):
-                    err_msg = str(chunk_obj["error"].get("message") or chunk_obj["error"])[:400]
-                    if _is_context_limit_error(err_msg):
-                        raise ContextLengthExceededError(err_msg)
-                    raise RuntimeError(err_msg)
-                if isinstance(chunk_obj.get("usage"), dict):
-                    usage = chunk_obj["usage"]
-                choices = chunk_obj.get("choices") or []
-                if not choices or not isinstance(choices[0], dict):
-                    continue
-                ch0 = choices[0]
-                if ch0.get("finish_reason"):
-                    finish_reason = str(ch0["finish_reason"])
-                delta = ch0.get("delta")
-                if not isinstance(delta, dict):
-                    delta = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
-                raw_r = str(
-                    delta.get("reasoning_content")
-                    or delta.get("reasoning")
-                    or delta.get("thinking")
-                    or ""
-                )
-                blk_r, c_str = self._extract_reasoning_and_content_parts(delta.get("content"))
-                out_r, out_c = parser.feed(raw_r + blk_r, c_str)
-                if out_r:
-                    reasoning_buf.append(out_r)
-                    yield {"type": "reasoning", "delta": out_r}
-                if out_c:
-                    content_buf.append(out_c)
-                    yield {"type": "content", "delta": out_c}
+            if cancelled:
+                break
+            if (
+                finish_reason == "length"
+                and "".join(content_buf).strip()
+                and continuations < eff_max_cont
+                and not (cancel_check and cancel_check())
+            ):
+                continuations += 1
+                yield {
+                    "type": "status",
+                    "stage": "自动续写衔接",
+                    "detail": f"输出触及单次长度上限，正在无缝自动续写 ({continuations}/{eff_max_cont})...",
+                }
+                cur_msgs = self._build_continuation_messages(messages, "".join(content_buf))
+                stitch_next = True
+                continue
+            break
 
-        tail_r, tail_c = parser.flush()
-        if tail_r:
-            reasoning_buf.append(tail_r)
-            yield {"type": "reasoning", "delta": tail_r}
-        if tail_c:
-            content_buf.append(tail_c)
-            yield {"type": "content", "delta": tail_c}
         yield _make_done_event(cancelled)
+
+    def probe_model_capabilities(
+        self,
+        *,
+        provider_id: str = "",
+        model: str = "",
+        force_refresh: bool = False,
+        timeout_sec: float = 20.0,
+        allow_fallback: bool = True,
+        payload_override: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """四级分层动态模型能力探查器：L1 元数据 + L2 轻量活体探针 + L3 校准合并 + L4 分级预算."""
+        if payload_override:
+            prof = self.build_profile_from_payload(
+                payload_override, provider_id=provider_id or payload_override.get("provider_id")
+            )
+            eff_model = _normalize_model_id(
+                model or prof.default_model or (prof.models[0] if prof.models else ""),
+                prof.provider_type,
+                prof.base_url,
+            )
+            if not eff_model:
+                raise ValueError("请指定要探查的模型名称")
+        else:
+            resolved = self.resolve_provider_and_model(
+                provider_id=provider_id, model=model, require_ready=True
+            )
+            assert resolved is not None
+            prof, eff_model = resolved
+
+        # 检查 24h TTL 缓存命中
+        cached_probe = _lookup_model_probe(prof.extra, eff_model)
+        if not force_refresh and _is_probe_fresh(cached_probe):
+            caps = infer_model_capabilities(eff_model, prof.provider_type, prof.base_url, prof.extra)
+            return {
+                "ok": True,
+                "cached": True,
+                "probe_ok": True,
+                "provider_id": prof.provider_id,
+                "provider_name": prof.name,
+                "model": eff_model,
+                "probe": cached_probe,
+                "capabilities": caps,
+                "message": (
+                    f"{eff_model} 使用已缓存探查档案（窗口 {caps['context_window']:,} · "
+                    f"甜蜜区 {caps['effective_reasoning_budget']:,} · {caps['model_tier']}）"
+                ),
+            }
+
+        l1_meta: Dict[str, Any] = {}
+        # L1a: 尝试低开销拉取 /models 元数据
+        try:
+            client = self._get_sdk_client(prof, timeout_sec=min(6.0, timeout_sec))
+            if client is not None:
+                listing = client.models.list()
+                data_items = getattr(listing, "data", None)
+                if data_items is None:
+                    data_items = list(listing)
+                for it in data_items:
+                    raw_id = getattr(it, "id", None) or (it.get("id") if isinstance(it, dict) else "")
+                    nm = _normalize_model_id(str(raw_id or ""), prof.provider_type, prof.base_url)
+                    if nm.lower() == eff_model.lower():
+                        l1_meta.update(_extract_model_meta_from_item(it))
+                        break
+            else:
+                _, meta_map = self._http_fallback_models_with_meta(prof, min(6.0, timeout_sec))
+                for k, v in meta_map.items():
+                    if k.lower() == eff_model.lower():
+                        l1_meta.update(v)
+                        break
+        except Exception:
+            pass
+
+        # L1b: 本地 Ollama /api/show 探测
+        ollama_meta = self._probe_ollama_show_meta(prof.base_url, eff_model, timeout_sec=3.0)
+        if ollama_meta:
+            for k, v in ollama_meta.items():
+                l1_meta.setdefault(k, v)
+
+        # L2: 轻量活体探针（固定 SQL 标定短文本，max_tokens=32/64，测 TTFT、token_ratio、Thinking、SSE）
+        base_caps = infer_model_capabilities(eff_model, prof.provider_type, prof.base_url, prof.extra)
+        probe_max_tok = 64 if base_caps.get("thinking_mode") == "native_always" else 32
+        probe_msgs = [{"role": "user", "content": _PROBE_CALIBRATION_SQL}]
+        est_prompt_tok = _estimate_probe_tokens(_PROBE_CALIBRATION_SQL)
+
+        live_ok = False
+        probe_error = ""
+        ttft_ms = 0.0
+        tokens_per_sec = 0.0
+        token_ratio = 1.0
+        stream_supported = True
+        observed_thinking: Optional[bool] = None
+        calibrated_limit: Optional[int] = None
+
+        t_start = time.perf_counter()
+        first_chunk_t: Optional[float] = None
+        usage_obj: Dict[str, Any] = {}
+        out_text_len = 0
+
+        try:
+            for ev in self._stream_probe_with_profile(
+                prof,
+                messages=probe_msgs,
+                model=eff_model,
+                max_tokens=probe_max_tok,
+                timeout_sec=min(20.0, float(timeout_sec)),
+            ):
+                et = ev.get("type")
+                if et in ("reasoning", "content"):
+                    delta = str(ev.get("delta") or "")
+                    if delta:
+                        if first_chunk_t is None:
+                            first_chunk_t = time.perf_counter()
+                        out_text_len += len(delta)
+                        if et == "reasoning":
+                            observed_thinking = True
+                elif et == "done":
+                    stream_supported = bool(ev.get("stream_supported", True))
+                    if isinstance(ev.get("usage"), dict):
+                        usage_obj = ev["usage"]
+                    if first_chunk_t is None:
+                        first_chunk_t = time.perf_counter()
+            live_ok = True
+        except ContextLengthExceededError as ctx_exc:
+            probe_error = str(ctx_exc)
+            calibrated_limit = ctx_exc.detected_limit
+            if calibrated_limit:
+                self.record_calibrated_context_limit(prof.provider_id, eff_model, calibrated_limit)
+        except Exception as exc:
+            probe_error = str(exc)
+            if not allow_fallback:
+                raise
+
+        total_sec = max(0.001, time.perf_counter() - t_start)
+        if live_ok:
+            ttft_ms = round(((first_chunk_t or time.perf_counter()) - t_start) * 1000.0, 1)
+            prompt_tokens_srv = 0
+            comp_tokens_srv = 0
+            try:
+                prompt_tokens_srv = int(usage_obj.get("prompt_tokens") or 0)
+                comp_tokens_srv = int(usage_obj.get("completion_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+            if prompt_tokens_srv > 12:
+                # 扣除 ChatML 角色封套开销（约 10 tokens）后估算中英混杂 SQL 的真实比率
+                net_prompt = max(1, prompt_tokens_srv - 10)
+                token_ratio = round(max(0.55, min(2.4, net_prompt / max(1, est_prompt_tok))), 2)
+            gen_sec = max(0.05, total_sec - (ttft_ms / 1000.0))
+            eff_comp = comp_tokens_srv if comp_tokens_srv > 0 else max(1, out_text_len // 4)
+            tokens_per_sec = round(eff_comp / gen_sec, 1)
+
+        probe_record: Dict[str, Any] = dict(l1_meta)
+        if calibrated_limit:
+            probe_record["context_window"] = calibrated_limit
+            probe_record["source"] = "error_calibrated"
+        elif live_ok:
+            probe_record["ttft_ms"] = ttft_ms
+            probe_record["tokens_per_sec"] = tokens_per_sec
+            probe_record["token_ratio"] = token_ratio
+            probe_record["stream_supported"] = stream_supported
+            if observed_thinking is True:
+                probe_record["supports_thinking"] = True
+            probe_record["source"] = "live_probe"
+        elif l1_meta:
+            probe_record["source"] = "models_meta"
+        else:
+            probe_record["source"] = "heuristic"
+        probe_record["probed_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+
+        saved_probe = self._persist_model_probe(
+            prof.provider_id,
+            eff_model,
+            probe_record,
+            preserve_stronger_source=not live_ok and not bool(calibrated_limit),
+        )
+
+        # 重新加载计算最终能力档案
+        refreshed_prof = self.store.get_llm_provider(prof.provider_id) or prof
+        eff_extra = dict(refreshed_prof.extra or {})
+        if saved_probe is None:
+            probes_tmp = dict(eff_extra.get("model_probes") or {})
+            probes_tmp[eff_model] = probe_record
+            eff_extra["model_probes"] = probes_tmp
+        caps = infer_model_capabilities(eff_model, refreshed_prof.provider_type, refreshed_prof.base_url, eff_extra)
+        final_probe = saved_probe or {**probe_record, **caps}
+
+        return {
+            "ok": True,
+            "cached": False,
+            "probe_ok": live_ok,
+            "probe_error": probe_error,
+            "provider_id": prof.provider_id,
+            "provider_name": prof.name,
+            "model": eff_model,
+            "probe": final_probe,
+            "capabilities": caps,
+            "message": (
+                f"已探查 {eff_model}：窗口 {caps['context_window']:,} · 甜蜜区 {caps['effective_reasoning_budget']:,} · "
+                f"分级 {caps['model_tier']} · TTFT {caps['ttft_ms']:.0f}ms · 比率 {caps['token_ratio']}x"
+                if live_ok
+                else f"活体探针未达（{probe_error[:80]}），已优雅降级为 {caps['source']} 档案（窗口 {caps['context_window']:,} · 甜蜜区 {caps['effective_reasoning_budget']:,}）"
+            ),
+        }
+
+    def _stream_probe_with_profile(
+        self,
+        profile: LLMProviderProfile,
+        *,
+        messages: List[Dict[str, str]],
+        model: str,
+        max_tokens: int,
+        timeout_sec: float,
+    ) -> Iterator[Dict[str, Any]]:
+        """供 probe_model_capabilities 使用的轻量流式调用（支持未落盘草稿配置，禁用重试与续写）."""
+        saved = self.store.get_llm_provider(profile.provider_id)
+        if saved is not None and saved.base_url == profile.base_url and saved.api_key == profile.api_key:
+            yield from self.chat_completion_stream(
+                messages=messages,
+                provider_id=profile.provider_id,
+                model=model,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                timeout_sec=timeout_sec,
+                retry_on_transient=False,
+                max_retries=0,
+                auto_continue_on_length=False,
+            )
+            return
+
+        # 未落盘配置直连单次探针
+        res = self._execute_chat_with_profile(
+            profile,
+            messages=messages,
+            model=model,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            timeout_sec=timeout_sec,
+            retry_on_transient=False,
+            max_retries=0,
+            auto_continue_on_length=False,
+        )
+        if res.get("reasoning"):
+            yield {"type": "reasoning", "delta": res["reasoning"]}
+        if res.get("content"):
+            yield {"type": "content", "delta": res["content"]}
+        yield {
+            "type": "done",
+            "usage": res.get("usage") or {},
+            "stream_supported": False,
+        }
 
     def test_provider(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         prof = self.build_profile_from_payload(payload, provider_id=payload.get("provider_id"))
@@ -1477,6 +2647,9 @@ class LLMHub:
             temperature=0.0,
             max_tokens=probe_max_tokens,
             timeout_sec=20.0,
+            retry_on_transient=False,
+            max_retries=0,
+            auto_continue_on_length=False,
         )
         preview = (res.get("content") or "").strip()
         if not preview and res.get("reasoning"):
@@ -1500,6 +2673,7 @@ class LLMHub:
         t0 = time.perf_counter()
         client = self._get_sdk_client(prof, timeout_sec=20.0)
         raw_ids: List[str] = []
+        meta_by_model: Dict[str, Dict[str, Any]] = {}
         if client is not None:
             listing = client.models.list()
             data_items = getattr(listing, "data", None)
@@ -1509,8 +2683,12 @@ class LLMHub:
                 mid = getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else "")
                 if mid:
                     raw_ids.append(str(mid))
+                    norm_mid = _normalize_model_id(str(mid), prof.provider_type, prof.base_url)
+                    ex_meta = _extract_model_meta_from_item(item)
+                    if ex_meta and norm_mid:
+                        meta_by_model[norm_mid] = ex_meta
         else:
-            raw_ids = self._http_fallback_models(prof, timeout_sec=20.0)
+            raw_ids, meta_by_model = self._http_fallback_models_with_meta(prof, timeout_sec=20.0)
 
         cleaned: List[str] = []
         for mid in raw_ids:
@@ -1521,20 +2699,38 @@ class LLMHub:
         if not cleaned:
             raise ValueError("远端接口未返回任何可用模型列表")
 
+        # 本地 Ollama 端点按需补充 `/api/show` 上下文与参数量元数据（最多探测前 8 个，单次 <= 2s）
+        if is_local and ":11434" in (prof.base_url or ""):
+            for mid in cleaned[:8]:
+                if "context_window" not in (meta_by_model.get(mid) or {}):
+                    om = self._probe_ollama_show_meta(prof.base_url, mid, timeout_sec=2.0)
+                    if om:
+                        meta_by_model.setdefault(mid, {}).update(om)
+
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
-        # 若该服务商已存在于数据库，同步更新其模型缓存列表（不覆盖未提交的其它字段）
+        # 若该服务商已存在于数据库，同步更新其模型缓存列表与 L1 元数据（不覆写更强来源）
         saved_existing = self.store.get_llm_provider(prof.provider_id)
         if saved_existing is not None:
             saved_existing.models = cleaned
             if not saved_existing.default_model or saved_existing.default_model not in cleaned:
                 saved_existing.default_model = cleaned[0]
             self.store.upsert_llm_provider(saved_existing)
+            now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+            for mid, mdata in meta_by_model.items():
+                if mdata:
+                    self._persist_model_probe(
+                        prof.provider_id,
+                        mid,
+                        {**mdata, "source": "models_meta", "probed_at": now_iso},
+                        preserve_stronger_source=True,
+                    )
 
         return {
             "ok": True,
             "provider_id": prof.provider_id,
             "models": cleaned,
+            "models_meta": meta_by_model,
             "default_model": (
                 prof.default_model if prof.default_model in cleaned else cleaned[0]
             ),

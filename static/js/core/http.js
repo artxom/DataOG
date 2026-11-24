@@ -317,6 +317,98 @@ export async function downloadApiFile(
   }
 }
 
+async function _consumeSseStream(resp, { onEvent = null, initialLastEventId = 0 } = {}) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let buf = "";
+  let donePayload = null;
+  let terminalPayload = null;
+  let streamError = null;
+  let latestEventId = Number(initialLastEventId || 0) || 0;
+
+  const dispatchFrames = (flushAll = false) => {
+    const parts = buf.split(/\r?\n\r?\n/);
+    if (!flushAll) {
+      buf = parts.pop() ?? "";
+    } else {
+      buf = "";
+    }
+    for (const frame of parts) {
+      if (!frame || !frame.trim()) continue;
+      const lines = frame.split(/\r?\n/);
+      let eventName = "message";
+      let frameId = 0;
+      const dataLines = [];
+      for (const line of lines) {
+        if (!line || line.startsWith(":")) continue;
+        if (line.startsWith("id:")) {
+          const parsedId = Number(line.slice(3).trim());
+          if (Number.isFinite(parsedId) && parsedId > 0) {
+            frameId = parsedId;
+            if (parsedId > latestEventId) {
+              latestEventId = parsedId;
+            }
+          }
+        } else if (line.startsWith("event:")) {
+          eventName = line.slice(6).trim() || "message";
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+      if (!dataLines.length) continue;
+      const rawData = dataLines.join("\n");
+      let parsed = null;
+      try {
+        parsed = JSON.parse(rawData);
+      } catch (_e) {
+        parsed = { raw: rawData };
+      }
+      const effEvent =
+        parsed && typeof parsed === "object" && parsed.type
+          ? String(parsed.type)
+          : eventName;
+      if (effEvent === "done") {
+        donePayload = parsed;
+        terminalPayload = parsed;
+      } else if (effEvent === "run_paused" || effEvent === "run_cancelled") {
+        terminalPayload = parsed;
+      }
+      if (effEvent === "error") {
+        streamError = new Error(
+          (parsed && (parsed.error || parsed.message)) || "流式响应发生错误"
+        );
+        streamError.lastEventId = latestEventId;
+      }
+      if (typeof onEvent === "function") {
+        onEvent(effEvent, parsed, frameId);
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buf += decoder.decode();
+        dispatchFrames(true);
+        break;
+      }
+      if (value) {
+        buf += decoder.decode(value, { stream: true });
+        dispatchFrames(false);
+      }
+    }
+  } finally {
+    try {
+      reader.releaseLock?.();
+    } catch (_e) {
+      // ignore release lock error
+    }
+  }
+
+  return { donePayload, terminalPayload, streamError, latestEventId };
+}
+
 export async function streamSsePost(
   url,
   {
@@ -371,80 +463,8 @@ export async function streamSsePost(
       return { fallbackJson: parsed };
     }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buf = "";
-    let donePayload = null;
-    let streamError = null;
-
-    const dispatchFrames = (flushAll = false) => {
-      const parts = buf.split(/\r?\n\r?\n/);
-      if (!flushAll) {
-        buf = parts.pop() ?? "";
-      } else {
-        buf = "";
-      }
-      for (const frame of parts) {
-        if (!frame || !frame.trim()) continue;
-        const lines = frame.split(/\r?\n/);
-        let eventName = "message";
-        const dataLines = [];
-        for (const line of lines) {
-          if (!line || line.startsWith(":")) continue;
-          if (line.startsWith("event:")) {
-            eventName = line.slice(6).trim() || "message";
-          } else if (line.startsWith("data:")) {
-            dataLines.push(line.slice(5).trimStart());
-          }
-        }
-        if (!dataLines.length) continue;
-        const rawData = dataLines.join("\n");
-        let parsed = null;
-        try {
-          parsed = JSON.parse(rawData);
-        } catch (_e) {
-          parsed = { raw: rawData };
-        }
-        const effEvent =
-          parsed && typeof parsed === "object" && parsed.type
-            ? String(parsed.type)
-            : eventName;
-        if (effEvent === "done") {
-          donePayload = parsed;
-        }
-        if (effEvent === "error") {
-          streamError = new Error(
-            (parsed && (parsed.error || parsed.message)) || "流式响应发生错误"
-          );
-        }
-        if (typeof onEvent === "function") {
-          onEvent(effEvent, parsed);
-        }
-      }
-    };
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          buf += decoder.decode();
-          dispatchFrames(true);
-          break;
-        }
-        if (value) {
-          buf += decoder.decode(value, { stream: true });
-          dispatchFrames(false);
-        }
-      }
-    } finally {
-      try {
-        reader.releaseLock?.();
-      } catch (_e) {
-        // ignore release lock error
-      }
-    }
-
-    if (streamError && !donePayload) {
+    const { donePayload, terminalPayload, streamError } = await _consumeSseStream(resp, { onEvent });
+    if (streamError && !donePayload && !terminalPayload) {
       throw streamError;
     }
     perfMonitor.finishRequest(reqId, {
@@ -454,7 +474,89 @@ export async function streamSsePost(
       bodyDoneMs: perfMonitor.now(),
       headers: respHeaders,
     });
-    return donePayload || { ok: true };
+    return donePayload || terminalPayload || { ok: true };
+  } catch (err) {
+    perfMonitor.finishRequest(reqId, {
+      status: err?.status || respStatus,
+      ok: false,
+      error: err?.message || String(err),
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: err?._headers || respHeaders,
+    });
+    throw err;
+  }
+}
+
+export async function streamSseGet(
+  url,
+  {
+    signal = undefined,
+    lastEventId = 0,
+    onEvent = null,
+    trackInRing = true,
+  } = {}
+) {
+  const opts = {
+    method: "GET",
+    headers: { Accept: "text/event-stream" },
+  };
+  if (signal) {
+    opts.signal = signal;
+  }
+  const parsedInitId = Number(lastEventId || 0) || 0;
+  if (parsedInitId > 0) {
+    opts.headers["Last-Event-ID"] = String(parsedInitId);
+  }
+
+  const reqId = perfMonitor.beginRequest({ method: "GET", url, kind: "sse_get", trackInRing });
+  let fetchDoneMs = null;
+  let respHeaders = null;
+  let respStatus = 0;
+
+  try {
+    const resp = await fetch(url, opts);
+    fetchDoneMs = perfMonitor.now();
+    respHeaders = resp?.headers || null;
+    respStatus = Number(resp?.status || 0);
+
+    if (!resp.ok) {
+      await parseJsonOrThrow(resp);
+    }
+
+    const ct = String(resp.headers?.get("content-type") || "").toLowerCase();
+    if (!ct.includes("text/event-stream") || !resp.body || typeof resp.body.getReader !== "function") {
+      const parsed = await parseJsonOrThrow(resp);
+      perfMonitor.finishRequest(reqId, {
+        status: respStatus,
+        ok: true,
+        fetchDoneMs,
+        bodyDoneMs: perfMonitor.now(),
+        headers: respHeaders,
+      });
+      return { fallbackJson: parsed, lastEventId: parsedInitId };
+    }
+
+    const { donePayload, terminalPayload, streamError, latestEventId } = await _consumeSseStream(
+      resp,
+      { onEvent, initialLastEventId: parsedInitId }
+    );
+    if (streamError && !donePayload && !terminalPayload) {
+      streamError.lastEventId = latestEventId;
+      throw streamError;
+    }
+    perfMonitor.finishRequest(reqId, {
+      status: respStatus,
+      ok: true,
+      fetchDoneMs,
+      bodyDoneMs: perfMonitor.now(),
+      headers: respHeaders,
+    });
+    return {
+      ...(donePayload || terminalPayload || { ok: true }),
+      lastEventId: latestEventId,
+      reachedTerminal: Boolean(donePayload || terminalPayload),
+    };
   } catch (err) {
     perfMonitor.finishRequest(reqId, {
       status: err?.status || respStatus,

@@ -10,7 +10,7 @@ import json
 import threading
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from core.platform.context import PlatformContext, get_platform_context
@@ -26,10 +26,17 @@ from modules.ai_assistant.attachments import (
     MAX_TEXT_BYTES,
     get_attachment_limits,
 )
+from modules.ai_assistant.goal_runner import (
+    TERMINAL_RUN_STATUSES,
+    GoalRunner,
+    get_run_runtime_hub,
+)
 from modules.ai_assistant.schemas import (
     AssistantChatPayload,
     AssistantExportResultPayload,
     AssistantPastedAttachmentPayload,
+    AssistantRunCreatePayload,
+    AssistantRunResumePayload,
     AssistantSessionCreatePayload,
     AssistantSessionUpdatePayload,
     ProposalConfirmPayload,
@@ -199,6 +206,9 @@ def api_delete_assistant_session(
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     svc = AiAssistantService(ctx)
+    active = svc.get_active_run_for_session(session_id)
+    if active and active.get("run_id"):
+        get_run_runtime_hub(ctx).request_cancel(str(active["run_id"]))
     if not svc.delete_session(session_id):
         return json_error("未找到要删除的智能助手会话", 404)
     return {
@@ -206,6 +216,193 @@ def api_delete_assistant_session(
         "sessions": svc.list_sessions(),
         "message": "会话已删除",
     }
+
+
+@router.get("/sessions/{session_id}/active-run")
+def api_get_session_active_run(
+    session_id: str,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    svc = AiAssistantService(ctx)
+    active_run = svc.get_active_run_for_session(session_id)
+    return {
+        "ok": True,
+        "run": active_run,
+    }
+
+
+@router.post("/runs")
+def api_create_assistant_run(
+    payload: AssistantRunCreatePayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        res = GoalRunner(ctx).start_new_run(payload.model_dump())
+        return res
+    except Exception as exc:
+        return json_error(redact_private_storage_paths(str(exc), ctx=ctx), 400)
+
+
+@router.get("/runs/{run_id}")
+def api_get_assistant_run(
+    run_id: str,
+    include_events: bool = Query(default=True),
+    after_event_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=2000),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    svc = AiAssistantService(ctx)
+    run = svc.get_run(run_id)
+    if run is None:
+        return json_error("未找到指定的后台分析任务", 404)
+    events = (
+        svc.list_run_events(run_id, after_event_id=after_event_id, limit=limit)
+        if include_events
+        else []
+    )
+    return {
+        "ok": True,
+        "run": run,
+        "events": events,
+    }
+
+
+@router.get("/runs/{run_id}/events")
+async def api_stream_assistant_run_events(
+    run_id: str,
+    request: Request,
+    after_event_id: int = Query(default=0, ge=0),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    svc = AiAssistantService(ctx)
+    if svc.get_run(run_id) is None:
+        return json_error("未找到指定的后台分析任务", 404)
+
+    hdr_last_id = 0
+    raw_hdr = (request.headers.get("last-event-id") or "").strip()
+    if raw_hdr.isdigit():
+        hdr_last_id = int(raw_hdr)
+    cursor_id = max(int(after_event_id or 0), hdr_last_id)
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+    hub = get_run_runtime_hub(ctx)
+    # 必须先订阅实时通道再读取数据库历史事件，杜绝边界漏帧
+    hub.subscribe(run_id, loop, queue)
+
+    async def _sse_generator():
+        last_sent_id = cursor_id
+        last_event_was_terminal = False
+
+        def _format_db_events(rows):
+            nonlocal last_sent_id, last_event_was_terminal
+            frames = []
+            for ev in rows:
+                ev_id = int(ev.get("event_id") or 0)
+                if ev_id <= last_sent_id:
+                    continue
+                last_sent_id = ev_id
+                ev_type = str(ev.get("event_type") or "message")
+                ev_payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else {}
+                frames.append(
+                    f"id: {ev_id}\nevent: {ev_type}\ndata: {json.dumps(ev_payload, ensure_ascii=False)}\n\n"
+                )
+                last_event_was_terminal = ev_type in ("done", "run_paused", "run_cancelled", "error")
+            return frames
+
+        try:
+            missed = svc.list_run_events(run_id, after_event_id=cursor_id, limit=2000)
+            for frame_str in _format_db_events(missed):
+                yield frame_str
+
+            cur_run = svc.get_run(run_id)
+            if cur_run is None:
+                return
+            cur_status = str(cur_run.get("status") or "")
+            if cur_status in TERMINAL_RUN_STATUSES and (
+                last_event_was_terminal or not hub.is_running(run_id)
+            ):
+                # 二次追平窗口内刚落盘的尾部事件（如 worker 在首次查库与 unregister_run 之间写入的 done）
+                tail_missed = svc.list_run_events(run_id, after_event_id=last_sent_id, limit=2000)
+                for frame_str in _format_db_events(tail_missed):
+                    yield frame_str
+                return
+
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    latest = svc.get_run(run_id)
+                    if latest is None or (
+                        str(latest.get("status") or "") in TERMINAL_RUN_STATUSES
+                        and not hub.is_running(run_id)
+                    ):
+                        tail_missed = svc.list_run_events(run_id, after_event_id=last_sent_id, limit=2000)
+                        for frame_str in _format_db_events(tail_missed):
+                            yield frame_str
+                        break
+                    yield ": keep-alive\n\n"
+                    continue
+                if item is None:
+                    tail_missed = svc.list_run_events(run_id, after_event_id=last_sent_id, limit=2000)
+                    for frame_str in _format_db_events(tail_missed):
+                        yield frame_str
+                    break
+                ev_id = int(item.get("event_id") or 0)
+                if ev_id > 0 and ev_id <= last_sent_id:
+                    continue
+                if ev_id > last_sent_id:
+                    last_sent_id = ev_id
+                ev_type = str(
+                    item.get("event_type")
+                    or (item.get("payload") or {}).get("type")
+                    or "message"
+                )
+                ev_payload = item.get("payload") if isinstance(item.get("payload"), dict) else item
+                id_prefix = f"id: {ev_id}\n" if ev_id > 0 else ""
+                yield f"{id_prefix}event: {ev_type}\ndata: {json.dumps(ev_payload, ensure_ascii=False)}\n\n"
+                if ev_type in ("done", "run_paused", "run_cancelled", "error"):
+                    break
+        finally:
+            # 仅退订当前 SSE 连接，绝不取消后台持续推进中的 GoalRunner 任务
+            hub.unsubscribe(run_id, loop, queue)
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/runs/{run_id}/resume")
+def api_resume_assistant_run(
+    run_id: str,
+    payload: Optional[AssistantRunResumePayload] = Body(default=None),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        extra_steps = int(payload.extra_steps) if payload is not None else 15
+        return GoalRunner(ctx).resume_run(run_id, extra_steps=extra_steps)
+    except KeyError as exc:
+        return json_error(str(exc), 404)
+    except Exception as exc:
+        return json_error(redact_private_storage_paths(str(exc), ctx=ctx), 400)
+
+
+@router.post("/runs/{run_id}/cancel")
+def api_cancel_assistant_run(
+    run_id: str,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return GoalRunner(ctx).cancel_run(run_id)
+    except KeyError as exc:
+        return json_error(str(exc), 404)
+    except Exception as exc:
+        return json_error(redact_private_storage_paths(str(exc), ctx=ctx), 400)
 
 
 @router.post("/chat")
@@ -241,6 +438,7 @@ async def api_assistant_chat(
             "large_payload_strategy": payload.large_payload_strategy,
             "batch_start_chunk": payload.batch_start_chunk,
             "batch_max_chunks": payload.batch_max_chunks,
+            "run_mode": payload.run_mode,
         },
         inject_progress_cb=True,
         inject_cancel_check=True,
@@ -327,6 +525,7 @@ async def api_assistant_chat_stream(
                 large_payload_strategy=payload.large_payload_strategy,
                 batch_start_chunk=payload.batch_start_chunk,
                 batch_max_chunks=payload.batch_max_chunks,
+                run_mode=payload.run_mode,
                 progress_cb=progress_cb,
                 event_cb=_enqueue,
                 cancel_check=_is_cancelled,

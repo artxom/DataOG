@@ -3004,6 +3004,394 @@ class TestDataOGPlatformFoundation(unittest.TestCase):
             finally:
                 ctx.close()
 
+    def test_llm_hub_dynamic_probe_tier_budgets_and_l3_self_calibration(self) -> None:
+        """验证四级动态模型能力探查、lightweight 有效甜蜜区预算收敛、24h 缓存、L3 400 自校准与 /probe-model 路由."""
+        import datetime
+        import io
+        import json
+        import urllib.error
+        from unittest.mock import patch
+
+        from app import create_app
+        from core.platform.context import PlatformContext
+        from core.platform.license_hub import SCOPE_GLOBAL, issue_activation_code_for_seed
+        from core.platform.llm_hub import (
+            ContextLengthExceededError,
+            infer_model_capabilities,
+            parse_context_limit_from_error,
+        )
+        from tests.test_modules_and_api import TestClient
+
+        # 1. 模型档位与有效推理甜蜜区预算校验
+        caps_flash = infer_model_capabilities("deepseek-v4-flash", "DEEPSEEK", "https://api.deepseek.com")
+        self.assertEqual(caps_flash["model_tier"], "lightweight")
+        self.assertEqual(caps_flash["context_window"], 64000)
+        self.assertEqual(caps_flash["effective_reasoning_budget"], 18000)
+        self.assertEqual(caps_flash["attachment_budget"], 18000)
+        self.assertEqual(caps_flash["recommended_chunk_tokens"], 5500)
+
+        caps_mini = infer_model_capabilities("gpt-4o-mini", "OPENAI_COMPATIBLE", "https://api.openai.com/v1")
+        self.assertEqual(caps_mini["model_tier"], "lightweight")
+        self.assertEqual(caps_mini["effective_reasoning_budget"], 18000)
+
+        caps_7b = infer_model_capabilities("qwen2.5-coder:7b", "OPENAI_COMPATIBLE", "http://127.0.0.1:11434/v1")
+        self.assertEqual(caps_7b["model_tier"], "lightweight")
+
+        caps_std = infer_model_capabilities("deepseek-chat", "DEEPSEEK", "https://api.deepseek.com")
+        self.assertEqual(caps_std["model_tier"], "standard")
+        self.assertEqual(caps_std["effective_reasoning_budget"], 80000)
+
+        caps_flag = infer_model_capabilities("gemini-2.5-pro", "GEMINI", "https://generativelanguage.googleapis.com/v1beta/openai")
+        self.assertEqual(caps_flag["model_tier"], "flagship")
+        self.assertGreaterEqual(caps_flag["effective_reasoning_budget"], 200000)
+
+        # 2. L3 400 报错正则提取验证
+        self.assertEqual(
+            parse_context_limit_from_error("This model's maximum context length is 32768 tokens. However, your messages resulted in 41000 tokens."),
+            32768,
+        )
+        self.assertEqual(
+            parse_context_limit_from_error("context_length_exceeded: max_model_len = 65536"),
+            65536,
+        )
+        self.assertIsNone(parse_context_limit_from_error("unrelated error"))
+
+        # 3. 完整探查链路：L1 /models 元数据 + Ollama /api/show + L2 实测校准 + 24h 缓存 + L3 400 写回 + Gate 2 /probe-model
+        class _FakeResp:
+            def __init__(self, body_bytes: bytes, status: int = 200, content_type: str = "application/json") -> None:
+                self._buf = io.BytesIO(body_bytes)
+                self.status = status
+                self.headers = {"Content-Type": content_type}
+
+            def read(self, n: int = -1) -> bytes:
+                return self._buf.read(n)
+
+            def readline(self, size: int = -1) -> bytes:
+                return self._buf.readline(size)
+
+            def __iter__(self):
+                return iter(self._buf.getvalue().splitlines(keepends=True))
+
+            def close(self) -> None:
+                self._buf.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self._buf.close()
+                return False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = create_app(private_root=os.path.join(tmpdir, "vault"))
+            ctx: PlatformContext = app.state.platform_ctx
+            try:
+                # 未激活调用 Gate 2 必须 401
+                unauth_client = TestClient(app, auto_activate=False)
+                unauth = unauth_client.post("/api/platform/llm/probe-model", json={"provider_id": "deepseek", "model": "deepseek-v4-flash"})
+                self.assertEqual(unauth.status_code, 401)
+
+                client = TestClient(app)
+
+                ctx.llm_hub.save_provider(
+                    {
+                        "provider_id": "ollama_local",
+                        "name": "本地Ollama",
+                        "provider_type": "OPENAI_COMPATIBLE",
+                        "enabled": True,
+                        "base_url": "http://127.0.0.1:11434/v1",
+                        "api_key": "ollama",
+                        "default_model": "deepseek-v4-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "is_default": True,
+                    }
+                )
+
+                http_calls: List[str] = []
+
+                def _fake_open(self_opener, req, data=None, timeout=30):
+                    url = req.full_url if hasattr(req, "full_url") else str(req)
+                    http_calls.append(url)
+                    if url.endswith("/models"):
+                        return _FakeResp(
+                            json.dumps(
+                                {
+                                    "data": [
+                                        {"id": "deepseek-v4-flash", "context_length": 65536},
+                                        {"id": "qwen2.5:14b", "max_model_len": 32768},
+                                    ]
+                                }
+                            ).encode("utf-8")
+                        )
+                    if url.endswith("/api/show"):
+                        return _FakeResp(
+                            json.dumps(
+                                {
+                                    "model_info": {"deepseek2.context_length": 49152},
+                                    "parameters": "num_ctx 49152",
+                                }
+                            ).encode("utf-8")
+                        )
+                    if url.endswith("/chat/completions"):
+                        body = json.loads((req.data or b"{}").decode("utf-8"))
+                        if body.get("stream"):
+                            sse_lines = [
+                                'data: {"choices":[{"delta":{"reasoning_content":"check"},"finish_reason":null}]}\n\n',
+                                'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":180,"completion_tokens":4}}\n\n',
+                                "data: [DONE]\n\n",
+                            ]
+                            return _FakeResp("".join(sse_lines).encode("utf-8"), content_type="text/event-stream")
+                        return _FakeResp(
+                            json.dumps(
+                                {
+                                    "choices": [{"message": {"content": "OK"}, "finish_reason": "stop"}],
+                                    "usage": {"prompt_tokens": 180, "completion_tokens": 4},
+                                }
+                            ).encode("utf-8")
+                        )
+                    raise AssertionError(f"Unexpected URL: {url}")
+
+                with patch("urllib.request.OpenerDirector.open", _fake_open):
+                    # L1 fetch_models 抓取 context_length 与 Ollama /api/show 并落盘
+                    fm = ctx.llm_hub.fetch_models({"provider_id": "ollama_local"})
+                    self.assertIn("deepseek-v4-flash", fm["models"])
+                    self.assertIn("deepseek-v4-flash", fm["models_meta"])
+
+                    # L2 首次探查（通过 REST /api/platform/llm/probe-model）
+                    http_calls.clear()
+                    resp1 = client.post(
+                        "/api/platform/llm/probe-model",
+                        json={"provider_id": "ollama_local", "model": "deepseek-v4-flash", "force_refresh": True},
+                    )
+                    self.assertEqual(resp1.status_code, 200)
+                    p1 = resp1.json()
+                    self.assertTrue(p1["ok"])
+                    self.assertFalse(p1["cached"])
+                    self.assertTrue(p1["probe_ok"])
+                    caps1 = p1["capabilities"]
+                    self.assertEqual(caps1["source"], "live_probe")
+                    self.assertTrue(caps1["supports_thinking"])
+                    self.assertTrue(caps1["stream_supported"])
+                    self.assertGreater(caps1["ttft_ms"], 0.0)
+                    self.assertGreater(caps1["token_ratio"], 0.5)
+                    self.assertEqual(caps1["context_window"], 65536)
+                    self.assertEqual(caps1["model_tier"], "lightweight")
+
+                    # 24h 缓存命中：不发 HTTP 请求
+                    http_calls.clear()
+                    resp2 = client.post(
+                        "/api/platform/llm/probe-model",
+                        json={"provider_id": "ollama_local", "model": "deepseek-v4-flash", "force_refresh": False},
+                    ).json()
+                    self.assertTrue(resp2["ok"])
+                    self.assertTrue(resp2["cached"])
+                    self.assertEqual(len(http_calls), 0)
+
+                # L2 探查异常兜底（allow_fallback=True 不抛错）
+                with patch("urllib.request.OpenerDirector.open", side_effect=OSError("connection refused")):
+                    fb = ctx.llm_hub.probe_model_capabilities(
+                        provider_id="ollama_local",
+                        model="deepseek-v4-flash",
+                        force_refresh=True,
+                        allow_fallback=True,
+                    )
+                    self.assertTrue(fb["ok"])
+                    self.assertFalse(fb["probe_ok"])
+                    self.assertIn("capabilities", fb)
+
+                # L3 400 超限报错自校准写回
+                def _fake_400(self_opener, req, data=None, timeout=30):
+                    err_body = io.BytesIO(
+                        b'{"error":{"message":"This model\'s maximum context length is 24576 tokens."}}'
+                    )
+                    raise urllib.error.HTTPError(
+                        req.full_url, 400, "Bad Request", {}, err_body
+                    )
+
+                with patch("urllib.request.OpenerDirector.open", _fake_400):
+                    with self.assertRaises(ContextLengthExceededError) as cm:
+                        ctx.llm_hub.chat_completion(
+                            messages=[{"role": "user", "content": "hi"}],
+                            provider_id="ollama_local",
+                            model="deepseek-v4-flash",
+                            retry_on_transient=False,
+                        )
+                    self.assertEqual(cm.exception.detected_limit, 24576)
+
+                # 校准后立即生效于 available_models
+                avail = [
+                    m for m in ctx.llm_hub.list_available_models()
+                    if m["provider_id"] == "ollama_local" and m["model"] == "deepseek-v4-flash"
+                ][0]
+                self.assertEqual(avail["context_window"], 24576)
+                self.assertEqual(avail["source"], "error_calibrated")
+            finally:
+                ctx.close()
+
+    def test_llm_hub_resilient_retry_load_shedding_and_length_continuation(self) -> None:
+        """验证瞬态 503/超时指数退避重试 + 第 2 次自动减载降级 + finish_reason=='length' 无缝续写去重."""
+        import io
+        import json
+        import socket
+        import urllib.error
+        from unittest.mock import patch
+
+        from core.platform.context import PlatformContext
+        from core.platform import llm_hub as llm_mod
+
+        class _FakeResp:
+            def __init__(self, body_bytes: bytes, content_type: str = "application/json") -> None:
+                self._buf = io.BytesIO(body_bytes)
+                self.headers = {"Content-Type": content_type}
+
+            def read(self, n: int = -1) -> bytes:
+                return self._buf.read(n)
+
+            def readline(self, size: int = -1) -> bytes:
+                return self._buf.readline(size)
+
+            def __iter__(self):
+                return iter(self._buf.getvalue().splitlines(keepends=True))
+
+            def close(self) -> None:
+                self._buf.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                self._buf.close()
+                return False
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=os.path.join(tmpdir, "vault"), legacy_data_dir="")
+            try:
+                ctx.llm_hub.save_provider(
+                    {
+                        "provider_id": "flaky_ds",
+                        "name": "慢速供应商",
+                        "provider_type": "DEEPSEEK",
+                        "enabled": True,
+                        "base_url": "https://api.deepseek.com",
+                        "api_key": "sk-flaky-123456",
+                        "default_model": "deepseek-v4-flash",
+                        "models": ["deepseek-v4-flash"],
+                        "is_default": True,
+                    }
+                )
+
+                # 1. 流式瞬态 503 + 超时 -> 重试 2 次 + 第 2 次减载降级 + length 自动续写拼接
+                seen_bodies: List[Dict[str, Any]] = []
+                call_idx = {"n": 0}
+
+                def _flaky_stream_open(self_opener, req, data=None, timeout=60):
+                    call_idx["n"] += 1
+                    body = json.loads((req.data or b"{}").decode("utf-8"))
+                    seen_bodies.append(body)
+                    if call_idx["n"] == 1:
+                        raise urllib.error.HTTPError(
+                            req.full_url, 503, "Service Unavailable", {}, io.BytesIO(b"upstream busy")
+                        )
+                    if call_idx["n"] == 2:
+                        raise socket.timeout("timed out waiting for token")
+                    if call_idx["n"] == 3:
+                        # 首次成功但触发 length 截断
+                        sse = (
+                            'data: {"choices":[{"delta":{"content":"第一段结论：存在 UNBOUNDED_DML 高危删除"},"finish_reason":null}]}\n\n'
+                            'data: {"choices":[{"delta":{"content":"，详见 L120"},"finish_reason":"length"}]}\n\n'
+                            "data: [DONE]\n\n"
+                        )
+                        return _FakeResp(sse.encode("utf-8"), content_type="text/event-stream")
+                    # 第 4 次调用为自动续写（带轻微重叠 "详见 L120" 验证平滑去重拼接）
+                    sse2 = (
+                        'data: {"choices":[{"delta":{"content":"详见 L120 需补充 WHERE 条件完成修复。"},"finish_reason":"stop"}]}\n\n'
+                        "data: [DONE]\n\n"
+                    )
+                    return _FakeResp(sse2.encode("utf-8"), content_type="text/event-stream")
+
+                with patch.object(llm_mod, "RETRY_BACKOFF_SCHEDULE", (0.01, 0.01, 0.01)), patch(
+                    "urllib.request.OpenerDirector.open", _flaky_stream_open
+                ):
+                    events = list(
+                        ctx.llm_hub.chat_completion_stream(
+                            messages=[{"role": "user", "content": "请分析隐患"}],
+                            provider_id="flaky_ds",
+                            model="deepseek-v4-flash",
+                            thinking_mode="enabled",
+                            retry_on_transient=True,
+                            max_retries=3,
+                            auto_continue_on_length=True,
+                            max_continuations=2,
+                        )
+                    )
+
+                retry_evs = [e for e in events if e.get("type") == "retry_wait"]
+                self.assertEqual(len(retry_evs), 2)
+                self.assertFalse(retry_evs[0]["shed_load"])
+                self.assertTrue(retry_evs[1]["shed_load"])
+                # 第 3 次请求（attempt 2 后）应触发减载降级：max_tokens <= 4096 且不开启 thinking
+                self.assertLessEqual(seen_bodies[2].get("max_tokens", 99999), 4096)
+                self.assertNotIn("thinking", seen_bodies[2])
+                done_ev = [e for e in events if e.get("type") == "done"][-1]
+                self.assertEqual(
+                    done_ev["content"],
+                    "第一段结论：存在 UNBOUNDED_DML 高危删除，详见 L120 需补充 WHERE 条件完成修复。",
+                )
+
+                # 2. 非流式 chat_completion 同样支持 502 重试与 length 自动续写
+                sync_idx = {"n": 0}
+
+                def _flaky_sync_open(self_opener, req, data=None, timeout=60):
+                    sync_idx["n"] += 1
+                    if sync_idx["n"] == 1:
+                        raise urllib.error.HTTPError(
+                            req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b"gateway timeout")
+                        )
+                    if sync_idx["n"] == 2:
+                        return _FakeResp(
+                            json.dumps(
+                                {
+                                    "choices": [
+                                        {
+                                            "message": {"content": "前文：阶段 1 审计完成"},
+                                            "finish_reason": "length",
+                                        }
+                                    ]
+                                }
+                            ).encode("utf-8")
+                        )
+                    return _FakeResp(
+                        json.dumps(
+                            {
+                                "choices": [
+                                    {
+                                        "message": {"content": "审计完成；阶段 2 全部通过。"},
+                                        "finish_reason": "stop",
+                                    }
+                                ]
+                            }
+                        ).encode("utf-8")
+                    )
+
+                with patch.object(llm_mod, "RETRY_BACKOFF_SCHEDULE", (0.01, 0.01, 0.01)), patch(
+                    "urllib.request.OpenerDirector.open", _flaky_sync_open
+                ):
+                    sync_retries: List[Dict[str, Any]] = []
+                    sync_res = ctx.llm_hub.chat_completion(
+                        messages=[{"role": "user", "content": "汇总报告"}],
+                        provider_id="flaky_ds",
+                        model="deepseek-v4-flash",
+                        retry_on_transient=True,
+                        max_retries=3,
+                        auto_continue_on_length=True,
+                        max_continuations=2,
+                        on_retry=sync_retries.append,
+                    )
+                self.assertEqual(len(sync_retries), 1)
+                self.assertEqual(sync_res["content"], "前文：阶段 1 审计完成；阶段 2 全部通过。")
+            finally:
+                ctx.close()
+
 
 if __name__ == "__main__":
     unittest.main()

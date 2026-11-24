@@ -26,6 +26,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.platform.readonly_guard import validate_readonly_sql
 from core.platform.sql_risk_guard import split_sql_statements
+from modules.ai_assistant.sql_static_analyzer import (
+    analyze_sql_static,
+    compact_sql_for_llm,
+    format_static_analysis_brief,
+)
 
 TEXT_EXTENSIONS = frozenset(
     {
@@ -905,12 +910,15 @@ def recommend_strategy(
     return "full_context" if estimated_tokens <= inline_budget else "agentic_explore"
 
 
-def process_attachment_payload(filename: str, raw_bytes: bytes) -> Dict[str, Any]:
-    """统一入口：校验、解码、计算 Token、提取结构大纲、生成 CSV 画像与大粒度语义分块."""
+def process_attachment_payload(
+    filename: str, raw_bytes: bytes, *, dialect: str = ""
+) -> Dict[str, Any]:
+    """统一入口：校验、解码、计算 Token、提取结构大纲、静态 SQL 解剖、生成 CSV 画像与大粒度语义分块."""
     safe_name, ext, text, enc, file_kind = validate_and_decode_attachment(filename, raw_bytes)
     lines_cnt = len(text.splitlines())
     est_tokens = estimate_tokens(text)
     outline = extract_attachment_outline(text, file_kind)
+    analysis: Dict[str, Any] = {}
 
     row_count = 0
     csv_profile: Dict[str, Any] = {}
@@ -924,8 +932,15 @@ def process_attachment_payload(filename: str, raw_bytes: bytes) -> Dict[str, Any
         eff_budget = CSV_INLINE_TOKEN_BUDGET
     elif file_kind == "sql":
         chunks = _chunk_sql_text(text, outline=outline)
+        try:
+            analysis = analyze_sql_static(text, dialect=dialect)
+        except Exception:
+            analysis = {}
         kind_lbl = "存储过程/SQL" if outline.get("is_stored_procedure") else "SQL 脚本"
-        summary = f"{kind_lbl}：{lines_cnt} 行 | 估算 ~{est_tokens} tokens | {len(chunks)} 个语义段"
+        fc = analysis.get("finding_counts") or {}
+        hm_cnt = int(fc.get("HIGH", 0)) + int(fc.get("MEDIUM", 0))
+        risk_tag = f" | 静态疑点 {hm_cnt} 项" if hm_cnt > 0 else ""
+        summary = f"{kind_lbl}：{lines_cnt} 行 | 估算 ~{est_tokens} tokens | {len(chunks)} 个语义段{risk_tag}"
         eff_budget = INLINE_TOKEN_BUDGET
     else:
         chunks = _chunk_plain_text(text, label_prefix="文本段落")
@@ -950,12 +965,13 @@ def process_attachment_payload(filename: str, raw_bytes: bytes) -> Dict[str, Any
         "raw_text": text,
         "csv_profile": csv_profile,
         "outline": outline,
+        "analysis": analysis,
         "chunks": chunks,
     }
 
 
-def format_attachment_manifest(att: Dict[str, Any]) -> str:
-    """生成极致紧凑的文件总览地图（含存储过程结构大纲），供 Agent 按需精准定位阅读."""
+def format_attachment_manifest(att: Dict[str, Any], *, compact_mode: bool = False) -> str:
+    """生成极致紧凑的文件总览地图（含存储过程结构大纲与静态血缘图纸），供 Agent 按需精准定位阅读."""
     lines = [
         f"附件 `{att.get('filename')}` [id={att.get('attachment_id')}, 类型={att.get('file_kind')}, "
         f"{att.get('line_count', 0)} 行, ~{att.get('estimated_tokens', 0)} tokens, 共 {att.get('chunk_count', 0)} 段]"
@@ -969,15 +985,27 @@ def format_attachment_manifest(att: Dict[str, Any]) -> str:
             obj_str = "；".join(f"{o.get('kind')} {o.get('name')} (L{o.get('line')})" for o in objs[:8])
             lines.append(f"  主要对象: {obj_str}")
         secs = outline.get("sections") or []
+        sec_cap = 12 if compact_mode else 20
         if secs:
             lines.append("  逻辑锚点（可用 `read_attachment_lines` 指定 start_line/end_line 精读）:")
-            for sec in secs[:20]:
+            for sec in secs[:sec_cap]:
                 lines.append(f"    - L{sec.get('line')}: {sec.get('title')}")
-            if len(secs) > 20:
-                lines.append(f"    - ... 其余 {len(secs) - 20} 个锚点可通过 `search_attachment` 搜索")
+            if len(secs) > sec_cap:
+                lines.append(f"    - ... 其余 {len(secs) - sec_cap} 个锚点可通过 `search_attachment` 搜索")
         refs = outline.get("referenced_tables") or []
-        if refs:
+        if refs and not (isinstance(att.get("analysis"), dict) and (att["analysis"].get("lineage_dag") or {}).get("nodes")):
             lines.append(f"  涉及表清单: {', '.join(refs[:24])}")
+
+    analysis = att.get("analysis")
+    if isinstance(analysis, dict) and analysis.get("statements"):
+        brief = format_static_analysis_brief(
+            analysis,
+            max_lineage_lines=8 if compact_mode else 12,
+            max_findings=10 if compact_mode else 14,
+            max_statements=14 if compact_mode else 22,
+        )
+        if brief:
+            lines.append(brief)
 
     if att.get("file_kind") == "csv" and isinstance(att.get("csv_profile"), dict):
         prof = att["csv_profile"]

@@ -9,6 +9,7 @@
 
 import { badge, clearEl, el, formatBytes, pickLocalFile, statusDot, svgIcon } from "../../core/dom.js";
 import { isAbortError } from "../../core/http.js";
+import { platformApi } from "../../core/platform_api.js";
 import { store } from "../../core/state.js";
 import { DataGrid } from "../../ui/data_grid.js";
 import { Modal } from "../../ui/modal.js";
@@ -60,11 +61,24 @@ const PASTE_TO_ATTACHMENT_MIN_CHARS = 4000;
 const PASTE_TO_ATTACHMENT_MIN_LINES = 80;
 
 const STRATEGY_OPTIONS = [
-  { id: "auto", label: "智能上下文（窗口内直通全文 · 超出时大纲+按行探索）" },
+  { id: "auto", label: "智能规划（按模型甜蜜区 + SQL血缘图纸自动择优）" },
+  { id: "goal_driven_staged", label: "🎯 甜蜜区分段闭环（轻量模型 / 超长脚本推荐）" },
+  { id: "lineage_sliced", label: "血缘手术刀精准切片（按目标表上下游抽取）" },
   { id: "full_context", label: "强制全量直通（一次性完整送入当前模型）" },
   { id: "agentic_explore", label: "结构大纲 + 按行/正则精准探索（省 Token）" },
   { id: "stepped_batch", label: "强制逐片拆解分析（超大脚本兜底）" },
 ];
+
+const RUN_MODES = [
+  { id: "standard", label: "标准对话" },
+  { id: "goal", label: "🎯 Goal 模式" },
+];
+
+const MODEL_TIER_LABELS = {
+  flagship: "旗舰",
+  standard: "标准",
+  lightweight: "轻量",
+};
 
 const THINKING_MODE_OPTIONS = [
   { id: "auto", label: "思考: 自动" },
@@ -148,6 +162,12 @@ export class AiAssistantView {
     this.pendingAttachments = [];
     this.largePayloadStrategy = "auto";
     this.thinkingMode = "auto";
+    this.runMode = "standard";
+    this.probingModel = false;
+    this.activeRun = null;
+    this._activeRunAbort = null;
+    this._lastRunEventId = 0;
+    this._stopRequested = false;
     this.isDraggingFile = false;
     this.uploadingAttachment = false;
     this.expandedStepsMsgIds = new Set();
@@ -188,6 +208,14 @@ export class AiAssistantView {
     if (this._streamRenderTimer) {
       clearTimeout(this._streamRenderTimer);
       this._streamRenderTimer = null;
+    }
+    if (this._activeRunAbort) {
+      try {
+        this._activeRunAbort.abort();
+      } catch (_e) {
+        // 仅断开本地 SSE 监听，不取消后台持久化任务
+      }
+      this._activeRunAbort = null;
     }
     this.activityBar?.destroy();
     this._unsub?.();
@@ -238,7 +266,48 @@ export class AiAssistantView {
 
   stopStreaming() {
     if (!this.loading) return;
+    if (this._activeRunAbort && this.activeRun?.run_id) {
+      this._stopRequested = true;
+      const rid = this.activeRun.run_id;
+      assistantApi.cancelRun(rid).catch(() => {});
+      try {
+        this._activeRunAbort.abort();
+      } catch (_e) {
+        // ignore abort error
+      }
+      return;
+    }
     this.activityBar?.cancel?.();
+  }
+
+  async probeCurrentModel({ forceRefresh = true } = {}) {
+    if (this.probingModel || this.loading) return null;
+    const { providerId, model } = this._parseSelectedModel();
+    if (!providerId && !model) {
+      Toast.info("请先配置并选择一个可用 AI 模型");
+      return null;
+    }
+    this.probingModel = true;
+    this.render();
+    try {
+      const res = await platformApi.probeLlmModel({
+        provider_id: providerId,
+        model,
+        force_refresh: Boolean(forceRefresh),
+      });
+      if (res?.providers && res?.available_models) {
+        store.updateLlmState(res.providers, res.available_models);
+      }
+      Toast.success(res?.message || `模型 ${model} 能力探查已更新`);
+      return res;
+    } catch (err) {
+      Toast.error(err.message || "模型能力探查失败");
+      return null;
+    } finally {
+      this.probingModel = false;
+      this.render();
+      this.refreshHeader?.();
+    }
   }
 
   _getCurrentConnProfile() {
@@ -482,6 +551,16 @@ export class AiAssistantView {
   }
 
   startNewSession() {
+    if (this._activeRunAbort) {
+      try {
+        this._activeRunAbort.abort();
+      } catch (_e) {
+        // detach previous run watcher
+      }
+      this._activeRunAbort = null;
+    }
+    this.activeRun = null;
+    this._lastRunEventId = 0;
     this.currentSession = null;
     this.taskMode = "auto";
     this.thinkingMode = "auto";
@@ -498,6 +577,14 @@ export class AiAssistantView {
       this.startNewSession();
       return;
     }
+    if (this._activeRunAbort) {
+      try {
+        this._activeRunAbort.abort();
+      } catch (_e) {
+        // detach previous run watcher
+      }
+      this._activeRunAbort = null;
+    }
     try {
       const res = await assistantApi.getSession(sessionId);
       const sess = res.session;
@@ -513,8 +600,25 @@ export class AiAssistantView {
       this.thinkingMode = sess.thinking_mode || "auto";
       this.pendingAttachments = [];
       this.largePayloadStrategy = "auto";
+      this.activeRun = null;
+      this._lastRunEventId = 0;
+
+      try {
+        const activeRes = await assistantApi.getSessionActiveRun(sessionId);
+        if (activeRes?.run && activeRes.run.run_id) {
+          this.activeRun = activeRes.run;
+        }
+      } catch (_e) {
+        // 忽略旧版本或无活跃任务时的查询异常
+      }
+
       this.render();
       this.refreshHeader?.();
+
+      const activeStatuses = ["queued", "probing", "planning", "running", "verifying"];
+      if (this.activeRun?.run_id && activeStatuses.includes(this.activeRun.status)) {
+        this._attachToRunStream(this.activeRun.run_id, { afterEventId: 0 });
+      }
     } catch (err) {
       Toast.error(err.message || "加载会话详情失败");
     }
@@ -782,6 +886,59 @@ export class AiAssistantView {
       );
     }
 
+    const analysis = detail.analysis && typeof detail.analysis === "object" ? detail.analysis : null;
+    if (analysis) {
+      const linLines = Array.isArray(analysis.lineage_dag?.summary_lines)
+        ? analysis.lineage_dag.summary_lines
+        : [];
+      const findings = Array.isArray(analysis.static_findings) ? analysis.static_findings : [];
+      if (linLines.length || findings.length) {
+        blocks.push(
+          el(
+            "div",
+            { className: "mac-group-box ai-asst-outline-box" },
+            el(
+              "div",
+              { style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } },
+              el("strong", { style: { fontSize: "12.5px" }, text: "SQL 静态血缘与隐患雷达（确定性预检）" }),
+              badge(`${(analysis.statements || []).length} 条语句`, "info"),
+              findings.length
+                ? badge(
+                    `${findings.length} 项静态线索`,
+                    findings.some((f) => f.severity === "HIGH") ? "danger" : "warn"
+                  )
+                : badge("零高危静态隐患", "success")
+            ),
+            linLines.length
+              ? el(
+                  "div",
+                  { className: "ai-asst-outline-list" },
+                  linLines.slice(0, 12).map((ln) => el("div", { className: "mono muted", text: ln }))
+                )
+              : null,
+            findings.length
+              ? el(
+                  "div",
+                  { className: "ai-asst-outline-list" },
+                  findings.slice(0, 15).map((f) =>
+                    el(
+                      "div",
+                      { style: { display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" } },
+                      badge(
+                        `${f.finding_id} ${f.severity}`,
+                        f.severity === "HIGH" ? "danger" : f.severity === "MEDIUM" ? "warn" : "neutral"
+                      ),
+                      el("span", { className: "mono", text: `L${f.line || 1}` }),
+                      el("span", { text: `${f.title || f.code}` })
+                    )
+                  )
+                )
+              : null
+          )
+        );
+      }
+    }
+
     const prof = detail.csv_profile || {};
     if (detail.file_kind === "csv" && Array.isArray(prof.columns) && prof.columns.length) {
       const schemaBox = el(
@@ -895,6 +1052,38 @@ export class AiAssistantView {
       this.pendingAttachments = [];
     }
     const effStrategy = strategyOverride || this.largePayloadStrategy || "auto";
+    const effRunMode = clarificationReply ? "standard" : (this.runMode || "standard");
+
+    if (effRunMode === "goal") {
+      return await this._startGoalRun(
+        {
+          session_id: this.currentSession?.session_id || null,
+          prompt: text,
+          work_mode: this.workMode,
+          connection_id: this.workMode === "connection" ? this.connectionId : "",
+          dialect: this.dialect,
+          schema_name: this.schemaName,
+          focus_tables: this.focusTables,
+          task_mode: effTaskMode,
+          provider_id: providerId,
+          model,
+          thinking_mode: this.thinkingMode || "auto",
+          max_steps: this.maxSteps,
+          sample_limit: this.sampleLimit,
+          attachment_ids: effAttachIds,
+          large_payload_strategy: effStrategy,
+          batch_start_chunk: Number(batchStartChunk || 0),
+          batch_max_chunks:
+            batchMaxChunks !== null && batchMaxChunks !== undefined
+              ? Number(batchMaxChunks)
+              : 8,
+          run_mode: "goal",
+          max_goal_steps: 25,
+        },
+        { text, overrideText, useOverrideAttach, sentPendingSnapshot }
+      );
+    }
+
     this._liveSessionId = this.currentSession?.session_id || "";
     this._liveState = {
       statusText: "正在连接模型...",
@@ -905,6 +1094,14 @@ export class AiAssistantView {
       thinkingMs: 0,
       steps: [],
       content: "",
+      plan: null,
+      stages: [],
+      progressPct: 0,
+      retryNotice: null,
+      verifyResult: null,
+      checkpointSummary: null,
+      runId: "",
+      runStatus: "",
       refs: null,
     };
     this._pendingUserAttachments = sentPendingSnapshot;
@@ -934,6 +1131,7 @@ export class AiAssistantView {
         attachment_ids: effAttachIds,
         large_payload_strategy: effStrategy,
         batch_start_chunk: Number(batchStartChunk || 0),
+        run_mode: "standard",
       };
       if (batchMaxChunks !== null && batchMaxChunks !== undefined) {
         payload.batch_max_chunks = Number(batchMaxChunks);
@@ -945,7 +1143,7 @@ export class AiAssistantView {
           const out = await assistantApi.streamChatTurn(payload, {
             taskId,
             signal,
-            onEvent: (evType, ev) => this._handleStreamEvent(evType, ev),
+            onEvent: (evType, ev, frameId) => this._handleStreamEvent(evType, ev, frameId),
           });
           const rawRes = out?.fallbackJson || out || {};
           const stepCnt = rawRes?.assistant_message?.steps?.length ?? 0;
@@ -1017,17 +1215,272 @@ export class AiAssistantView {
     }
   }
 
-  _handleStreamEvent(evType, ev) {
+  async _startGoalRun(
+    payload,
+    { text = "", overrideText = null, useOverrideAttach = false, sentPendingSnapshot = [] } = {}
+  ) {
+    this._pendingUserAttachments = sentPendingSnapshot;
+    this._pendingUserPrompt =
+      text || `请对附带的 ${payload.attachment_ids?.length || 0} 份文件执行 🎯 Goal 全链路闭环分析。`;
+    this.loading = true;
+    this._liveState = {
+      statusText: "正在启动持久化 🎯 Goal 分析引擎...",
+      thinking: "",
+      thinkingStarted: false,
+      thinkingOpen: true,
+      thinkingDone: false,
+      thinkingMs: 0,
+      steps: [],
+      content: "",
+      plan: null,
+      stages: [],
+      progressPct: 2,
+      retryNotice: null,
+      verifyResult: null,
+      checkpointSummary: null,
+      runId: "",
+      runStatus: "queued",
+      refs: null,
+    };
+    this.render();
+    this.refreshHeader?.();
+    this._scrollToBottom();
+
+    let createdRun = null;
+    try {
+      const res = await assistantApi.createRun(payload);
+      createdRun = res?.run || null;
+      if (res?.session) {
+        this.currentSession = res.session;
+        this._liveSessionId = res.session.session_id || "";
+      }
+      if (!createdRun?.run_id) {
+        throw new Error("创建后台 Goal 任务失败");
+      }
+      this.activeRun = createdRun;
+      this._lastRunEventId = 0;
+      this._pendingUserPrompt = "";
+      this._pendingUserAttachments = [];
+    } catch (err) {
+      this._liveState = null;
+      this._pendingUserAttachments = [];
+      this._pendingUserPrompt = "";
+      this.loading = false;
+      if (overrideText === null && !this.draftPrompt) {
+        this.draftPrompt = text;
+      }
+      if (!useOverrideAttach && sentPendingSnapshot.length && !this.pendingAttachments.length) {
+        this.pendingAttachments = sentPendingSnapshot;
+      }
+      Toast.error(err.message || "启动 Goal 后台分析失败");
+      this.render();
+      this.refreshHeader?.();
+      return;
+    }
+
+    await this._attachToRunStream(createdRun.run_id, { afterEventId: 0 });
+  }
+
+  async _attachToRunStream(runId, { afterEventId = 0 } = {}) {
+    if (!runId) return;
+    if (this._activeRunAbort) {
+      try {
+        this._activeRunAbort.abort();
+      } catch (_e) {
+        // detach previous listener
+      }
+      this._activeRunAbort = null;
+    }
+
+    const seedRun = this.activeRun && this.activeRun.run_id === runId ? this.activeRun : null;
+    const seedPlan = seedRun?.plan && typeof seedRun.plan === "object" ? seedRun.plan : null;
+    const seedStages = Array.isArray(seedPlan?.stages)
+      ? seedPlan.stages.map((s) => ({ ...s }))
+      : [];
+
+    this._lastRunEventId = Math.max(Number(afterEventId || 0), 0);
+    this._stopRequested = false;
+    this.loading = true;
+    this._liveState = {
+      statusText: seedRun?.current_stage || "正在连接后台 Goal 任务流...",
+      thinking: "",
+      thinkingStarted: false,
+      thinkingOpen: true,
+      thinkingDone: false,
+      thinkingMs: 0,
+      steps: [],
+      content: "",
+      plan: seedPlan,
+      stages: seedStages,
+      progressPct: Number(seedRun?.progress_pct || 5),
+      retryNotice: null,
+      verifyResult: null,
+      checkpointSummary: null,
+      runId,
+      runStatus: String(seedRun?.status || "running"),
+      refs: null,
+    };
+    this.render();
+    this.refreshHeader?.();
+    this._scrollToBottom();
+
+    const maxReconnects = 3;
+    try {
+      for (let attempt = 0; attempt <= maxReconnects; attempt += 1) {
+        const ac = new AbortController();
+        this._activeRunAbort = ac;
+        try {
+          const out = await assistantApi.streamRunEvents(runId, {
+            afterEventId: this._lastRunEventId,
+            signal: ac.signal,
+            onEvent: (evType, ev, frameId) => this._handleStreamEvent(evType, ev, frameId),
+          });
+          if (Number(out?.lastEventId || 0) > this._lastRunEventId) {
+            this._lastRunEventId = Number(out.lastEventId);
+          }
+
+          const evType = String(out?.type || "");
+          if (evType === "done") {
+            if (out.session) {
+              this.currentSession = out.session;
+              this._liveSessionId = out.session.session_id || this._liveSessionId;
+            } else if (this._liveSessionId) {
+              const sr = await assistantApi.getSession(this._liveSessionId).catch(() => null);
+              if (sr?.session) this.currentSession = sr.session;
+            }
+            if (out.assistant_message?.id && (out.assistant_message.steps || []).length > 0) {
+              this.expandedStepsMsgIds.add(out.assistant_message.id);
+            }
+            this.activeRun = null;
+            const listRes = await assistantApi.listSessions().catch(() => null);
+            if (listRes?.sessions) this.sessions = listRes.sessions;
+            break;
+          }
+          if (evType === "run_paused") {
+            this.activeRun = out.run || {
+              ...(this.activeRun || {}),
+              run_id: runId,
+              session_id: this.currentSession?.session_id || this._liveSessionId,
+              status: "paused_recoverable",
+              plan: out.plan || this._liveState?.plan || {},
+              checkpoint: out.checkpoint || {},
+              progress_pct: Number(out.progress_pct ?? this._liveState?.progressPct ?? 0),
+              error_message: out.reason || "",
+            };
+            Toast.info("已保存执行断点，点击「从断点继续执行」即可无缝接力");
+            const listRes = await assistantApi.listSessions().catch(() => null);
+            if (listRes?.sessions) this.sessions = listRes.sessions;
+            break;
+          }
+          if (evType === "run_cancelled") {
+            this.activeRun = out.run || {
+              ...(this.activeRun || {}),
+              run_id: runId,
+              session_id: this.currentSession?.session_id || this._liveSessionId,
+              status: "cancelled",
+              plan: out.plan || this._liveState?.plan || {},
+              checkpoint: out.checkpoint || {},
+              progress_pct: Number(out.progress_pct ?? this._liveState?.progressPct ?? 0),
+            };
+            Toast.info("已停止后台分析任务");
+            break;
+          }
+
+          // 若未收到终态事件且非主动停止，自动携 Last-Event-ID 断点重连
+          if (!out?.reachedTerminal && !this._stopRequested && attempt < maxReconnects) {
+            if (this._liveState) {
+              this._liveState.statusText = `事件流短暂波动，正从事件 #${this._lastRunEventId} 自动断点续传...`;
+              this._renderLiveStatusDOM();
+            }
+            await new Promise((r) => setTimeout(r, 250));
+            continue;
+          }
+          break;
+        } catch (err) {
+          if (Number(err?.lastEventId || 0) > this._lastRunEventId) {
+            this._lastRunEventId = Number(err.lastEventId);
+          }
+          if (isAbortError(err)) {
+            if (this._stopRequested) {
+              Toast.info("已停止生成");
+              const runDetail = await assistantApi.getRun(runId, { includeEvents: false }).catch(() => null);
+              if (runDetail?.run) {
+                this.activeRun = runDetail.run.status === "completed" ? null : runDetail.run;
+              }
+            }
+            break;
+          }
+          if (attempt < maxReconnects && !this._stopRequested) {
+            if (this._liveState) {
+              this._liveState.retryNotice = {
+                attempt: attempt + 1,
+                max_retries: maxReconnects,
+                wait_sec: 1,
+                reason: "事件流自动重连",
+                detail: `连接暂时中断，正携 Last-Event-ID=${this._lastRunEventId} 零丢帧重连 (${attempt + 1}/${maxReconnects})...`,
+              };
+              this._renderLivePlanDOM();
+            }
+            await new Promise((r) => setTimeout(r, 250));
+            continue;
+          }
+          const runDetail = await assistantApi.getRun(runId, { includeEvents: false }).catch(() => null);
+          if (runDetail?.run && runDetail.run.status !== "completed") {
+            this.activeRun = runDetail.run;
+          }
+          Toast.error(err.message || "后台 Goal 任务流读取失败");
+          break;
+        }
+      }
+    } finally {
+      if (this._streamRenderTimer) {
+        clearTimeout(this._streamRenderTimer);
+        this._streamRenderTimer = null;
+      }
+      this._activeRunAbort = null;
+      this._liveState = null;
+      this._pendingUserAttachments = [];
+      this._pendingUserPrompt = "";
+      this.loading = false;
+      this.render();
+      this.refreshHeader?.();
+      this._scrollToBottom();
+    }
+  }
+
+  async resumeActiveRun(runId = "") {
+    const targetId = runId || this.activeRun?.run_id || "";
+    if (!targetId || this.loading) return;
+    try {
+      const res = await assistantApi.resumeRun(targetId, { extra_steps: 15 });
+      if (res?.run) {
+        this.activeRun = res.run;
+      }
+      await this._attachToRunStream(targetId, { afterEventId: this._lastRunEventId });
+    } catch (err) {
+      Toast.error(err.message || "从断点恢复执行失败");
+    }
+  }
+
+  _handleStreamEvent(evType, ev, frameEventId = 0) {
     const state = this._liveState;
     if (!state) return;
     const refs = state.refs;
+    if (Number(frameEventId || 0) > this._lastRunEventId) {
+      this._lastRunEventId = Number(frameEventId);
+    }
 
     if (evType === "session_init") {
       if (ev?.session?.session_id) {
         this._liveSessionId = ev.session.session_id;
       }
+      if (ev?.run_id) {
+        state.runId = ev.run_id;
+      }
       const stratMap = {
         full_context: `已装入全量上下文（${this._formatTokenCount(ev?.context_window || 0)} 窗口）· 模型分析中...`,
+        lineage_sliced: "已启动 SQL 血缘手术刀精准切片分析...",
+        goal_driven_staged: "已启动 🎯 Goal 甜蜜区分段闭环分析...",
         agentic_explore: "已生成结构大纲 · 智能按行/正则探索中...",
         stepped_batch: "正在分步拆解长文本分析...",
       };
@@ -1036,8 +1489,139 @@ export class AiAssistantView {
       return;
     }
 
+    if (evType === "probe_ready") {
+      const cw = Number(ev?.capabilities?.context_window || 0);
+      const eff = Number(ev?.capabilities?.effective_reasoning_budget || 0);
+      const tier = MODEL_TIER_LABELS[ev?.capabilities?.model_tier] || ev?.capabilities?.model_tier || "";
+      state.statusText = `模型探查完成：${ev?.model || ""} (${this._formatTokenCount(cw)}窗 · 甜蜜区${this._formatTokenCount(eff)}${tier ? ` · ${tier}` : ""})`;
+      state.progressPct = Math.max(state.progressPct || 0, 8);
+      this._renderLiveStatusDOM();
+      this._renderLivePlanDOM();
+      return;
+    }
+
+    if (evType === "plan_ready") {
+      const plan = ev?.plan && typeof ev.plan === "object" ? ev.plan : null;
+      if (plan) {
+        state.plan = plan;
+        const prevById = new Map((state.stages || []).map((s) => [s.stage_id, s]));
+        state.stages = (plan.stages || []).map((st) => {
+          const prev = prevById.get(st.stage_id);
+          return {
+            ...st,
+            status: st.status || prev?.status || "pending",
+            elapsed_ms: st.elapsed_ms || prev?.elapsed_ms || 0,
+            summary: st.summary || prev?.summary || "",
+          };
+        });
+        state.statusText = `执行计划就绪：${plan.strategy_label || plan.strategy || "智能规划"}（共 ${state.stages.length} 个阶段）`;
+        state.progressPct = Math.max(state.progressPct || 0, 12);
+        this._renderLiveStatusDOM();
+        this._renderLivePlanDOM();
+        this._smartScrollToBottom();
+      }
+      return;
+    }
+
+    if (evType === "stage_start") {
+      const sid = String(ev?.stage_id || "");
+      const found = (state.stages || []).find((s) => s.stage_id === sid);
+      if (found) {
+        found.status = "running";
+      } else if (sid) {
+        state.stages.push({
+          stage_id: sid,
+          index: Number(ev?.index || state.stages.length + 1),
+          title: String(ev?.title || sid),
+          kind: String(ev?.kind || "analysis"),
+          status: "running",
+        });
+      }
+      state.retryNotice = null;
+      if (Number(ev?.progress_pct || 0) > 0) {
+        state.progressPct = Number(ev.progress_pct);
+      }
+      state.statusText = `正在推进 ${ev?.title || sid}...`;
+      this._renderLiveStatusDOM();
+      this._renderLivePlanDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "stage_done") {
+      const sid = String(ev?.stage_id || "");
+      const found = (state.stages || []).find((s) => s.stage_id === sid);
+      if (found) {
+        found.status = "done";
+        found.elapsed_ms = Number(ev?.elapsed_ms || 0);
+        found.summary = String(ev?.summary || "");
+      }
+      state.retryNotice = null;
+      if (Number(ev?.progress_pct || 0) > 0) {
+        state.progressPct = Number(ev.progress_pct);
+      }
+      state.statusText = `已完成 ${ev?.title || sid}`;
+      this._renderLiveStatusDOM();
+      this._renderLivePlanDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "checkpoint_saved") {
+      state.checkpointSummary = ev;
+      if (Number(ev?.progress_pct || 0) > 0) {
+        state.progressPct = Number(ev.progress_pct);
+      }
+      this._renderLivePlanDOM();
+      return;
+    }
+
+    if (evType === "retry_wait") {
+      state.retryNotice = {
+        attempt: Number(ev?.attempt || 1),
+        max_retries: Number(ev?.max_retries || 3),
+        wait_sec: Number(ev?.wait_sec || 2),
+        reason: String(ev?.reason || "响应超时"),
+        shed_load: Boolean(ev?.shed_load),
+        detail: String(
+          ev?.detail ||
+            `供应商响应较慢，第 ${ev?.attempt || 1}/${ev?.max_retries || 3} 次自动退避重试（等待 ${ev?.wait_sec || 2}s）...`
+        ),
+      };
+      state.statusText = state.retryNotice.detail;
+      this._renderLiveStatusDOM();
+      this._renderLivePlanDOM();
+      return;
+    }
+
+    if (evType === "verify_result") {
+      state.verifyResult = ev;
+      state.retryNotice = null;
+      state.progressPct = Math.max(state.progressPct || 0, ev?.passed ? 90 : 85);
+      state.statusText = String(
+        ev?.detail || (ev?.passed ? "硬验收通过，正在合成最终报告..." : "验收发现遗漏项，正自动生成补救任务...")
+      );
+      this._renderLiveStatusDOM();
+      this._renderLivePlanDOM();
+      this._smartScrollToBottom();
+      return;
+    }
+
+    if (evType === "run_paused") {
+      state.runStatus = "paused_recoverable";
+      state.retryNotice = null;
+      if (ev?.run) this.activeRun = ev.run;
+      state.statusText = String(ev?.reason || "已保存断点，可随时点击继续执行");
+      this._renderLiveStatusDOM();
+      this._renderLivePlanDOM();
+      return;
+    }
+
     if (evType === "status") {
       state.statusText = String(ev?.detail || ev?.stage || "探索分析中...");
+      if (Number(ev?.percent || 0) > 0) {
+        state.progressPct = Math.max(state.progressPct || 0, Number(ev.percent));
+      }
       this._renderLiveStatusDOM();
       return;
     }
@@ -1173,6 +1757,193 @@ export class AiAssistantView {
     clearEl(slot, statusDot(state.statusText || "正在分析...", "info"));
   }
 
+  _renderPlanCardNode({
+    plan = null,
+    stages = [],
+    progressPct = 0,
+    retryNotice = null,
+    verifyResult = null,
+    runStatus = "",
+    runReason = "",
+    runId = "",
+    checkpoint = null,
+  } = {}) {
+    if (!plan && !retryNotice && !verifyResult && !runReason) return null;
+    const effStages = Array.isArray(stages) && stages.length ? stages : plan?.stages || [];
+    const doneCnt = effStages.filter((s) => s.status === "done").length;
+    const pct = Math.min(100, Math.max(0, Number(progressPct || 0)));
+    const tierLbl = MODEL_TIER_LABELS[plan?.model_tier] || plan?.model_tier || "";
+    const isRecoverable =
+      runId && ["paused_recoverable", "failed", "cancelled"].includes(String(runStatus || ""));
+
+    const lineageLines = Array.isArray(plan?.lineage_summary) ? plan.lineage_summary : [];
+
+    return el(
+      "div",
+      { className: `ai-asst-plan-card ${isRecoverable ? "is-paused" : ""}` },
+      el(
+        "div",
+        { className: "ai-asst-plan-head" },
+        badge(plan?.strategy_label || "🎯 智能执行计划", "info"),
+        tierLbl ? badge(`档位:${tierLbl}`, plan?.model_tier === "lightweight" ? "warn" : "neutral") : null,
+        plan?.effective_reasoning_budget
+          ? badge(`甜蜜区 ${this._formatTokenCount(plan.effective_reasoning_budget)}`, "neutral")
+          : null,
+        (plan?.high_medium_findings_count || plan?.high_medium_finding_count || 0) > 0
+          ? badge(
+              `必核隐患 ${plan.high_medium_findings_count ?? plan.high_medium_finding_count} 项`,
+              "warn"
+            )
+          : null,
+        el("span", {
+          className: "muted mono",
+          style: { marginLeft: "auto", fontSize: "11px" },
+          text: effStages.length ? `${doneCnt}/${effStages.length} 阶段 · ${pct}%` : `${pct}%`,
+        })
+      ),
+      (plan?.reason || plan?.decision_reason)
+        ? el("div", { className: "ai-asst-plan-reason muted", text: plan.reason || plan.decision_reason })
+        : null,
+      pct > 0
+        ? el(
+            "div",
+            { className: "ai-asst-goal-progress" },
+            el("div", { className: "ai-asst-goal-progress-fill", style: { width: `${pct}%` } })
+          )
+        : null,
+      lineageLines.length
+        ? el(
+            "div",
+            { className: "ai-asst-plan-lineage" },
+            el("div", { className: "muted", style: { fontSize: "11px", fontWeight: "600" }, text: "静态血缘摘要:" }),
+            lineageLines.slice(0, 4).map((ln) =>
+              el("div", { className: "mono muted", style: { fontSize: "11px" }, text: ln })
+            )
+          )
+        : null,
+      effStages.length
+        ? el(
+            "div",
+            { className: "ai-asst-checklist" },
+            effStages.map((st) => {
+              const icon =
+                st.status === "done"
+                  ? "✓"
+                  : st.status === "running"
+                  ? "◉"
+                  : st.kind === "remedial"
+                  ? "↻"
+                  : "○";
+              return el(
+                "div",
+                { className: `ai-asst-check-item is-${st.status || "pending"} ${st.kind === "remedial" ? "is-remedial" : ""}` },
+                el("span", { className: "ai-asst-check-icon mono", text: icon }),
+                el("span", { className: "ai-asst-check-title", text: st.title || st.stage_id }),
+                Array.isArray(st.finding_ids) && st.finding_ids.length
+                  ? badge(`${st.finding_ids.length}隐患`, "warn")
+                  : null,
+                st.elapsed_ms > 0
+                  ? el("span", {
+                      className: "muted mono",
+                      style: { marginLeft: "auto", fontSize: "10.5px" },
+                      text: `${Math.round(st.elapsed_ms)}ms`,
+                    })
+                  : null
+              );
+            })
+          )
+        : null,
+      retryNotice
+        ? el(
+            "div",
+            { className: "ai-asst-retry-banner" },
+            badge(`自动重试 ${retryNotice.attempt}/${retryNotice.max_retries}`, "warn"),
+            el("span", { text: retryNotice.detail || retryNotice.reason })
+          )
+        : null,
+      verifyResult
+        ? el(
+            "div",
+            { className: `ai-asst-verify-banner ${verifyResult.passed ? "is-pass" : "is-remedial"}` },
+            badge(
+              verifyResult.passed ? "硬验收通过" : "触发自动补救",
+              verifyResult.passed ? "success" : "warn"
+            ),
+            el("span", { text: verifyResult.detail || "" })
+          )
+        : null,
+      isRecoverable
+        ? el(
+            "div",
+            { className: "ai-asst-resume-bar" },
+            el("div", {
+              className: "muted",
+              style: { fontSize: "12px", flex: "1" },
+              text:
+                runReason ||
+                `已保存 Checkpoint（已完成 ${(checkpoint?.completed_stage_ids || []).length || doneCnt} 个阶段），可随时一键接续剩余目标。`,
+            }),
+            el("button", {
+              type: "button",
+              className: "mac-btn mac-btn-sm mac-btn-primary ai-asst-resume-btn",
+              disabled: this.loading,
+              text: "从断点继续执行",
+              onClick: () => this.resumeActiveRun(runId),
+            })
+          )
+        : null
+    );
+  }
+
+  _renderLivePlanDOM() {
+    const state = this._liveState;
+    const slot = state?.refs?.planSlot;
+    if (!slot) return;
+    const node = this._renderPlanCardNode({
+      plan: state.plan,
+      stages: state.stages,
+      progressPct: state.progressPct,
+      retryNotice: state.retryNotice,
+      verifyResult: state.verifyResult,
+      runStatus: state.runStatus,
+      runId: state.runId,
+    });
+    if (node) {
+      clearEl(slot, node);
+    } else {
+      clearEl(slot);
+    }
+  }
+
+  _renderRecoverableRunCard() {
+    const run = this.activeRun;
+    if (!run || !run.run_id || run.status === "completed") return null;
+    const curSid = this.currentSession?.session_id || this._liveSessionId || "";
+    if (curSid && run.session_id && run.session_id !== curSid) return null;
+    const plan = run.plan && typeof run.plan === "object" ? run.plan : null;
+    const ckpt = run.checkpoint && typeof run.checkpoint === "object" ? run.checkpoint : {};
+    const doneSet = new Set(ckpt.completed_stage_ids || []);
+    const stages = (plan?.stages || []).map((st) => ({
+      ...st,
+      status: doneSet.has(st.stage_id) ? "done" : st.status || "pending",
+    }));
+    const card = this._renderPlanCardNode({
+      plan: plan || { strategy_label: "🎯 后台断点任务", stages },
+      stages,
+      progressPct: Number(run.progress_pct || 0),
+      runStatus: run.status,
+      runReason: run.error_message || run.current_stage || "",
+      runId: run.run_id,
+      checkpoint: ckpt,
+    });
+    if (!card) return null;
+    return el(
+      "div",
+      { className: "ai-asst-msg ai-asst-msg-assistant" },
+      el("div", { className: "ai-asst-assistant-card ai-asst-recoverable-card" }, card)
+    );
+  }
+
   _renderLiveThinkingDOM() {
     const state = this._liveState;
     const refs = state?.refs;
@@ -1299,17 +2070,20 @@ export class AiAssistantView {
     const state = this._liveState;
     if (!state) return null;
     const statusSlot = el("div", { className: "ai-asst-stream-status" });
+    const planSlot = el("div");
     const thinkingSlot = el("div");
     const stepsSlot = el("div");
     const contentSlot = el("div");
     state.refs = {
       statusSlot,
+      planSlot,
       thinkingSlot,
       stepsSlot,
       contentSlot,
       thinkingPreEl: null,
     };
     this._renderLiveStatusDOM();
+    this._renderLivePlanDOM();
     this._renderLiveThinkingDOM();
     this._renderLiveStepsDOM();
     this._renderLiveMarkdownDOM();
@@ -1320,6 +2094,7 @@ export class AiAssistantView {
         "div",
         { className: "ai-asst-assistant-card ai-asst-live-card" },
         statusSlot,
+        planSlot,
         thinkingSlot,
         stepsSlot,
         contentSlot
@@ -1856,6 +2631,53 @@ export class AiAssistantView {
       })
     );
 
+    const runModeToggle = el(
+      "div",
+      { className: "seg-group ai-asst-runmode-group", "aria-label": "执行模式切换" },
+      RUN_MODES.map((rm) =>
+        el("button", {
+          type: "button",
+          className: `seg-btn ai-asst-runmode-btn ${this.runMode === rm.id ? "is-active" : ""}`,
+          disabled: this.loading,
+          title:
+            rm.id === "goal"
+              ? "🎯 Goal 深度闭环模式：后台持久化断点执行 + 覆盖率与高危隐患硬验收 + 自动补救"
+              : "标准实时流式对话模式",
+          text: rm.label,
+          onClick: () => {
+            this.runMode = rm.id;
+            this.render();
+          },
+        })
+      )
+    );
+
+    const probeCapsule = selModel
+      ? (() => {
+          const cw = Number(selModel.context_window || 64000);
+          const eff = Number(selModel.effective_reasoning_budget || selModel.attachment_budget || Math.floor(cw * 0.65));
+          const tier = MODEL_TIER_LABELS[selModel.model_tier] || "标准";
+          const ttft = Number(selModel.ttft_ms || 0);
+          const ttftTxt = ttft > 0 ? ` · TTFT ${(ttft / 1000).toFixed(1)}s` : "";
+          const probedTag = (selModel.source || selModel.probe_source) === "live_probe" ? " ✓实测" : "";
+          return el(
+            "button",
+            {
+              type: "button",
+              className: `ai-asst-probe-capsule ${selModel.model_tier === "lightweight" ? "is-lightweight" : ""}`,
+              disabled: this.probingModel || this.loading,
+              title: "点击动态探查当前模型的真实窗口、Token 换算系数与首字延迟",
+              onClick: () => this.probeCurrentModel({ forceRefresh: true }),
+            },
+            el("span", {
+              text: this.probingModel
+                ? "探查模型能力中..."
+                : `${this._formatTokenCount(cw)}窗 · 甜蜜区${this._formatTokenCount(eff)} · ${tier}${ttftTxt}${probedTag}`,
+            })
+          );
+        })()
+      : null;
+
     const modeChips = el(
       "div",
       { className: "ai-asst-mode-bar" },
@@ -1874,6 +2696,8 @@ export class AiAssistantView {
           })
         )
       ),
+      runModeToggle,
+      probeCapsule,
       thinkingSelect,
       this.workMode === "connection"
         ? el(
@@ -1923,9 +2747,14 @@ export class AiAssistantView {
           role: "user",
           content: this._pendingUserPrompt,
           attachments: this._pendingUserAttachments || [],
-        }),
-        this._renderLiveAssistantCard()
+        })
       );
+    }
+    if (this.loading && this._liveState) {
+      pendingNodes.push(this._renderLiveAssistantCard());
+    } else if (!this.loading && this.activeRun) {
+      const recCard = this._renderRecoverableRunCard();
+      if (recCard) pendingNodes.push(recCard);
     }
 
     const stream = el(
@@ -2153,7 +2982,7 @@ export class AiAssistantView {
                 onClick: () => this.sendUserMessage(),
               },
               svgIcon("send", 13),
-              "发送"
+              this.runMode === "goal" ? "🎯 启动 Goal" : "发送"
             )
       )
     );

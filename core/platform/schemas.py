@@ -91,6 +91,22 @@ class LLMProviderPayload(BaseModel):
     models: Optional[List[str]] = None
     is_default: Optional[bool] = None
     context_window: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    model_tier: Optional[str] = None
+
+
+class LLMProbeModelPayload(BaseModel):
+    provider_id: Optional[str] = None
+    model: Optional[str] = None
+    default_model: Optional[str] = None
+    force_refresh: bool = False
+    name: Optional[str] = None
+    provider_type: Optional[str] = None
+    enabled: Optional[bool] = None
+    base_url: Optional[str] = None
+    api_key: Optional[str] = None
+    models: Optional[List[str]] = None
+    context_window: Optional[int] = Field(default=None, ge=0, le=10_000_000)
+    model_tier: Optional[str] = None
 
 
 class StandardDictItemPayload(BaseModel):

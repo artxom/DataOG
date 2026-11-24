@@ -24,6 +24,8 @@ MODULE_SPEC = ModuleSpec(
         "ai_assistant_proposals",
         "ai_assistant_attachments",
         "ai_assistant_attachment_chunks",
+        "ai_assistant_runs",
+        "ai_assistant_run_events",
     ),
     init_hook=_init_module,
     order=50,
