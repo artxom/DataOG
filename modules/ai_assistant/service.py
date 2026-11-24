@@ -20,6 +20,15 @@ from core.platform.import_progress import ProgressCallback, noop_progress
 from core.platform.llm_hub import extract_json_payload
 from core.platform.models import ConnectionProfile
 from core.platform.sql_risk_guard import classify_sql_batch
+from modules.ai_assistant.attachments import (
+    DEFAULT_BATCH_MAX_CHUNKS,
+    INLINE_TOKEN_BUDGET,
+    MAX_ATTACHMENTS_PER_TURN,
+    MAX_BATCH_CHUNKS_CAP,
+    format_attachment_manifest,
+    infer_pasted_filename_and_ext,
+    process_attachment_payload,
+)
 from modules.ai_assistant.storage_mixin import (
     AssistantStorageMixin,
     _normalize_focus_tables,
@@ -168,6 +177,36 @@ class AiAssistantService(AssistantStorageMixin):
         self.ctx = ctx
         self.ensure_schema(ctx.store)
 
+    def upload_attachment_bytes(
+        self,
+        *,
+        filename: str,
+        raw_bytes: bytes,
+        session_id: str = "",
+    ) -> Dict[str, Any]:
+        clean_sid = (session_id or "").strip()
+        if clean_sid and self.get_session_detail(clean_sid) is None:
+            raise ValueError("目标对话会话不存在，无法绑定附件")
+        parsed = process_attachment_payload(filename, raw_bytes)
+        return self.save_attachment(parsed, session_id=clean_sid)
+
+    def create_pasted_attachment(
+        self,
+        *,
+        content: str,
+        filename: str = "",
+        file_hint: str = "",
+        session_id: str = "",
+    ) -> Dict[str, Any]:
+        clean_sid = (session_id or "").strip()
+        if clean_sid and self.get_session_detail(clean_sid) is None:
+            raise ValueError("目标对话会话不存在，无法绑定粘贴文本")
+        inferred_name, _ = infer_pasted_filename_and_ext(
+            content, filename=filename, file_hint=file_hint
+        )
+        parsed = process_attachment_payload(inferred_name, (content or "").encode("utf-8"))
+        return self.save_attachment(parsed, session_id=clean_sid)
+
     def _resolve_scope(
         self,
         *,
@@ -199,6 +238,7 @@ class AiAssistantService(AssistantStorageMixin):
         dialect: str,
         default_schema: str,
         focus_tables: List[str],
+        session_attachments: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         sections: List[str] = []
         dialect_label = DIALECT_LABEL_MAP.get(dialect, dialect)
@@ -289,6 +329,10 @@ class AiAssistantService(AssistantStorageMixin):
                     + ", ".join(cat_items)
                 )
 
+        if session_attachments:
+            manifests = [format_attachment_manifest(att) for att in session_attachments[:5]]
+            sections.append("当前对话已挂载的本地附件总览（超长内容已按语义分块）:\n\n" + "\n\n".join(manifests))
+
         return "\n\n".join(sections)
 
     @staticmethod
@@ -300,6 +344,7 @@ class AiAssistantService(AssistantStorageMixin):
         max_steps: int,
         sample_limit: int,
         context_block: str,
+        has_attachments: bool = False,
     ) -> str:
         guidance = _TASK_MODE_GUIDANCE.get(task_mode, _TASK_MODE_GUIDANCE["general"])
         online_rules = (
@@ -309,6 +354,13 @@ class AiAssistantService(AssistantStorageMixin):
             if work_mode == "connection"
             else "1. 当前为【离线纯方言模式】，未连接真实数据库，请勿虚构真实表行数或执行计划；"
             "聚焦方言语法规则、知识库检索与标准 SQL 编写；若需产出 DDL/写语句，使用 `propose_write` 卡片规范呈现以便用户审阅或后续连库执行。\n"
+        )
+        attachment_tools_desc = (
+            "- `search_attachment`: {\"attachment_id\":\"att_xxx\",\"keyword\":\"关键字\",\"limit\":8} — 在用户上传的超长文本/SQL/CSV中检索关键词所在行号与分片\n"
+            "- `inspect_attachment_chunk`: {\"attachment_id\":\"att_xxx\",\"chunk_index\":0,\"window\":0} — 按分片序号精读用户附件原文片段\n"
+            "- `query_csv_attachment`: {\"attachment_id\":\"att_xxx\",\"sql\":\"SELECT ... FROM csv_data ...\",\"limit\":50} — 在内存隔离只读 SQLite 沙箱（表名固定 `csv_data`）精确聚合查询 CSV 附件\n"
+            if has_attachments
+            else ""
         )
         return (
             "你是 Data.O.G 首席数据库研发与运维专家助手。\n"
@@ -328,7 +380,8 @@ class AiAssistantService(AssistantStorageMixin):
             "- `read_knowledge_section`: {\"chunk_id\":\"命中片段ID\",\"window\":1} — 深入读取知识库章节上下文与目录\n"
             "- `run_readonly_sql`: {\"sql\":\"SELECT ...\",\"limit\":100} — 在只读沙箱中执行单条 SELECT/WITH/SHOW/DESC 语句\n"
             "- `explain_sql`: {\"sql\":\"SELECT ...\"} — 查看只读查询真实执行计划（严禁 EXPLAIN ANALYZE）\n"
-            "- `propose_write_sql`: {\"title\":\"变更标题\",\"rationale\":\"原因与影响\",\"sql\":\"CREATE/ALTER/INSERT/UPDATE/DELETE...\",\"target_schema\":\"可选\"} — 提交 DDL/写操作待确认提案（不执行）\n\n"
+            "- `propose_write_sql`: {\"title\":\"变更标题\",\"rationale\":\"原因与影响\",\"sql\":\"CREATE/ALTER/INSERT/UPDATE/DELETE...\",\"target_schema\":\"可选\"} — 提交 DDL/写操作待确认提案（不执行）\n"
+            f"{attachment_tools_desc}\n"
             f"【当前全局上下文】\n{context_block}\n\n"
             "【严格 JSON 输出协议（每次回复必须仅输出单个合法 JSON 对象，禁止包裹多余闲聊文本）】\n"
             "1) 调用工具继续探索：\n"
@@ -360,7 +413,17 @@ class AiAssistantService(AssistantStorageMixin):
         for m in history[-12:]:
             role = m.get("role", "user")
             if role == "user":
-                msgs.append({"role": "user", "content": str(m.get("content") or "")})
+                u_content = str(m.get("content") or "")
+                hist_atts = m.get("attachments") or []
+                if hist_atts:
+                    att_refs = ", ".join(
+                        f"{a.get('filename')} (id={a.get('attachment_id')})"
+                        for a in hist_atts
+                        if isinstance(a, dict)
+                    )
+                    if att_refs:
+                        u_content = f"{u_content}\n[已附带文件: {att_refs}]"
+                msgs.append({"role": "user", "content": u_content})
             else:
                 parts: List[str] = []
                 if m.get("content"):
@@ -464,11 +527,183 @@ class AiAssistantService(AssistantStorageMixin):
                 selected.append(cdict)
         return selected[:6]
 
+    @staticmethod
+    def _build_attachment_metadata(att: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "attachment_id": att.get("attachment_id", ""),
+            "filename": att.get("filename", ""),
+            "file_ext": att.get("file_ext", ""),
+            "file_kind": att.get("file_kind", "text"),
+            "size_bytes": int(att.get("size_bytes") or 0),
+            "line_count": int(att.get("line_count") or 0),
+            "row_count": int(att.get("row_count") or 0),
+            "estimated_tokens": int(att.get("estimated_tokens") or 0),
+            "chunk_count": int(att.get("chunk_count") or 0),
+            "oversized": bool(att.get("oversized")),
+            "recommended_strategy": att.get("recommended_strategy") or "inline",
+            "summary": att.get("summary") or "",
+        }
+
+    def _run_stepped_batch_analysis(
+        self,
+        *,
+        turn_attachments: List[Dict[str, Any]],
+        clean_prompt: str,
+        dialect: str,
+        batch_start_chunk: int,
+        batch_max_chunks: int,
+        provider_id: str,
+        model: str,
+        cb: ProgressCallback,
+        cancel_check: Optional[Callable[[], bool]],
+        t_start: float,
+        trace_steps: List[Dict[str, Any]],
+    ) -> Tuple[str, Optional[Dict[str, Any]], str, str]:
+        """Map-Reduce 分步拆解引擎：对超长文件分片依次受控提交大模型并累积滚动摘要."""
+        queue: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        for att in turn_attachments:
+            for ch in (att.get("chunks") or []):
+                queue.append((att, ch))
+
+        total_chunks = len(queue)
+        if total_chunks == 0:
+            return "", None, "", ""
+
+        start_idx = max(0, min(int(batch_start_chunk or 0), total_chunks - 1))
+        safe_batch = max(1, min(MAX_BATCH_CHUNKS_CAP, int(batch_max_chunks or DEFAULT_BATCH_MAX_CHUNKS)))
+        batch = queue[start_idx : start_idx + safe_batch]
+
+        rolling_notes: List[str] = []
+        batch_digests: List[str] = []
+        used_provider_name = ""
+        used_model = ""
+
+        map_system = (
+            f"你是 Data.O.G 数据库研发分析专家（目标方言 `{dialect}`）。"
+            "现在正在执行超长文件的【分步拆解分析（Map 阶段）】，请仅针对当前分片精确提取事实，严禁编造未出现的表名/字段名。"
+            "请尽量输出单个 JSON 对象：{\"summary\":\"本片80字内核心归纳\",\"findings\":[\"关键语句/问题/规则\"],\"sql_or_action\":\"如需后续统一变更或重点注意点简述\"}。"
+        )
+
+        for offset, (att, chunk) in enumerate(batch):
+            if cancel_check and cancel_check():
+                raise RuntimeError("用户已取消分步拆解分析任务")
+            if (time.perf_counter() - t_start) > LOOP_WALLCLOCK_BUDGET_SEC - 15.0 and offset > 0:
+                break
+
+            global_no = start_idx + offset + 1
+            pct = min(68, 10 + int(((offset + 1) / max(1, len(batch))) * 55))
+            cb(
+                pct,
+                "分步拆解分析",
+                f"第 {global_no}/{total_chunks} 片 · {att['filename']} ({chunk['range_label']})",
+                offset,
+                len(batch),
+            )
+
+            rolling_block = ""
+            if rolling_notes:
+                joined_notes = "\n".join(rolling_notes[-6:])[-1400:]
+                rolling_block = f"【前序分片滚动摘要（供上下文衔接）】\n{joined_notes}\n\n"
+
+            map_user = (
+                f"用户总体诉求：{clean_prompt}\n"
+                f"{rolling_block}"
+                f"【当前分片 ({global_no}/{total_chunks}) | 文件={att['filename']} | "
+                f"{chunk['title']} | 范围={chunk['range_label']} | ~{chunk['estimated_tokens']} tokens】\n"
+                f"```\n{chunk['content']}\n```"
+            )
+
+            t_chunk = time.perf_counter()
+            llm_res = self.ctx.llm_hub.chat_completion(
+                messages=[
+                    {"role": "system", "content": map_system},
+                    {"role": "user", "content": map_user},
+                ],
+                provider_id=provider_id,
+                model=model,
+                temperature=0.1,
+                timeout_sec=45.0,
+            )
+            used_provider_name = str(llm_res.get("provider_name") or used_provider_name)
+            used_model = str(llm_res.get("model") or used_model)
+            chunk_ms = round((time.perf_counter() - t_chunk) * 1000.0, 1)
+
+            raw_chunk_reply = str(llm_res.get("content") or "").strip()
+            parsed_map, _ = self._parse_agent_payload(raw_chunk_reply)
+            if isinstance(parsed_map, dict):
+                summary_line = str(parsed_map.get("summary") or "").strip()
+                findings = [
+                    str(x).strip()
+                    for x in (parsed_map.get("findings") or [])
+                    if str(x).strip()
+                ][:5]
+                action_note = str(parsed_map.get("sql_or_action") or "").strip()
+                compact_parts = [p for p in [summary_line, *findings, action_note] if p]
+                compact_text = "；".join(compact_parts)[:420] or raw_chunk_reply[:300]
+            else:
+                summary_line = raw_chunk_reply[:160]
+                compact_text = raw_chunk_reply[:420]
+
+            step_summary = (summary_line or compact_text or "已完成该分片分析")[:180]
+            trace_steps.append(
+                {
+                    "step": len(trace_steps) + 1,
+                    "tool": "analyze_attachment_chunk",
+                    "purpose": f"拆解 {att['filename']} 第 {chunk['chunk_index'] + 1}/{att['chunk_count']} 片 ({chunk['range_label']})",
+                    "args": {
+                        "attachment_id": att["attachment_id"],
+                        "chunk_index": chunk["chunk_index"],
+                        "range_label": chunk["range_label"],
+                    },
+                    "ok": True,
+                    "elapsed_ms": chunk_ms,
+                    "summary": step_summary,
+                }
+            )
+            tag = f"[{att['filename']} · {chunk['range_label']}]"
+            rolling_notes.append(f"- {tag} {step_summary}")
+            batch_digests.append(f"- **{tag} ({chunk['title']})**: {compact_text}")
+
+        analyzed_cnt = len(batch_digests)
+        end_idx = start_idx + analyzed_cnt
+        continuation_chip: Optional[Dict[str, Any]] = None
+        remaining_note = ""
+        if end_idx < total_chunks:
+            next_end = min(total_chunks, end_idx + safe_batch)
+            remaining_note = (
+                f"\n\n> **分步拆解进度提示**：本次已拆解分析全部分片中的第 **{start_idx + 1}~{end_idx}** 片"
+                f"（共 {total_chunks} 片），尚有 **{total_chunks - end_idx}** 片待后续接续处理。"
+                "请先就本批次已拆解片段给出阶段性汇总与明确建议，并提示用户可点击下方「继续拆解」芯片分析下一批。"
+            )
+            continuation_chip = {
+                "label": f"继续拆解第 {end_idx + 1}~{next_end} 片 (共 {total_chunks} 片)",
+                "prompt": f"请继续拆解分析已上传附件的第 {end_idx + 1}~{next_end} 片并衔接前序结论：{clean_prompt}",
+                "batch_start_chunk": end_idx,
+                "batch_max_chunks": safe_batch,
+                "attachment_ids": [a["attachment_id"] for a in turn_attachments],
+                "large_payload_strategy": "stepped_batch",
+            }
+
+        cb(
+            72,
+            "汇总拆解结果",
+            f"已完成 {analyzed_cnt} 片拆解分析，正在跨片归纳最终结论...",
+            analyzed_cnt,
+            len(batch),
+        )
+        digest_block = (
+            f"【超长文件分步拆解 Map-Reduce 逐片结论（第 {start_idx + 1}~{end_idx} / 共 {total_chunks} 片）】\n"
+            + "\n".join(batch_digests)
+            + remaining_note
+            + "\n\n请基于以上全部逐片结论做全局综合分析、去重归纳并响应用户原始诉求；如仍需按分片ID或数据库实表核查，可继续调用工具。"
+        )
+        return digest_block, continuation_chip, used_provider_name, used_model
+
     def chat_turn(
         self,
         *,
         session_id: Optional[str] = None,
-        prompt: str,
+        prompt: str = "",
         work_mode: str = "auto",
         connection_id: str = "",
         dialect: str = "",
@@ -480,18 +715,59 @@ class AiAssistantService(AssistantStorageMixin):
         max_steps: int = 6,
         sample_limit: int = 100,
         clarification_reply: Optional[Dict[str, Any]] = None,
+        attachment_ids: Optional[List[str]] = None,
+        large_payload_strategy: str = "auto",
+        batch_start_chunk: int = 0,
+        batch_max_chunks: int = DEFAULT_BATCH_MAX_CHUNKS,
         progress_cb: Optional[ProgressCallback] = None,
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
+        req_aids: List[str] = []
+        seen_aids: set[str] = set()
+        for raw_aid in (attachment_ids or []):
+            s_aid = str(raw_aid or "").strip()
+            if s_aid and s_aid not in seen_aids:
+                seen_aids.add(s_aid)
+                req_aids.append(s_aid)
+            if len(req_aids) >= MAX_ATTACHMENTS_PER_TURN:
+                break
+
+        turn_attachments: List[Dict[str, Any]] = []
+        for aid in req_aids:
+            att = self.get_attachment(aid, include_raw=True, include_chunks=True)
+            if att is None:
+                raise ValueError(f"找不到指定附件 `{aid}`（可能已被移除或过期）")
+            turn_attachments.append(att)
+
         clean_prompt = (prompt or "").strip()
-        if not clean_prompt:
-            raise ValueError("请输入要咨询或探查的数据库问题")
+        if not clean_prompt and not turn_attachments:
+            raise ValueError("请输入要咨询或探查的数据库问题，或先粘贴/上传文本/SQL/CSV 文件")
+        if not clean_prompt and turn_attachments:
+            names_preview = "、".join(a["filename"] for a in turn_attachments[:3])
+            clean_prompt = f"请结合我附带的文件（{names_preview}）进行深度分析与诊断。"
 
         cb = progress_cb or noop_progress
         t_start = time.perf_counter()
 
-        # 1. 创建或加载会话
+        # 1. 先校验大模型配置可用性（避免空会话消息被错误污染）
+        eff_provider_id = (provider_id or "").strip()
+        eff_model = (model or "").strip()
+
         sess = self.get_session_detail(session_id or "") if session_id else None
+        if sess is not None:
+            eff_provider_id = (eff_provider_id or sess.get("provider_id") or "").strip()
+            eff_model = (eff_model or sess.get("model") or "").strip()
+
+        self.ctx.llm_hub.resolve_provider_and_model(
+            provider_id=eff_provider_id, model=eff_model, require_ready=True
+        )
+
+        # 2. 创建或加载更新会话
+        session_title_seed = (
+            clean_prompt[:32]
+            if (prompt or "").strip()
+            else f"附件分析 · {turn_attachments[0]['filename']}"[:32]
+        )
         if sess is None:
             eff_mode, prof, eff_dialect, eff_schema = self._resolve_scope(
                 work_mode=work_mode,
@@ -500,15 +776,15 @@ class AiAssistantService(AssistantStorageMixin):
                 schema_name=schema_name,
             )
             sess = self.create_session(
-                title=clean_prompt[:32],
+                title=session_title_seed,
                 work_mode=eff_mode,
                 connection_id=prof.connection_id if prof else "",
                 dialect=eff_dialect,
                 schema_name=eff_schema,
                 focus_tables=focus_tables,
                 task_mode=task_mode,
-                provider_id=provider_id,
-                model=model,
+                provider_id=eff_provider_id,
+                model=eff_model,
             )
             sid = sess["session_id"]
         else:
@@ -533,34 +809,45 @@ class AiAssistantService(AssistantStorageMixin):
                     schema_name=eff_schema,
                     focus_tables=eff_focus,
                     task_mode=task_mode if task_mode != "auto" else sess["task_mode"],
-                    provider_id=provider_id or sess["provider_id"],
-                    model=model or sess["model"],
+                    provider_id=eff_provider_id or sess["provider_id"],
+                    model=eff_model or sess["model"],
                 )
                 or sess
             )
+
+        # 将本轮附件绑定至当前会话并汇集全会话附件 Manifest
+        if req_aids:
+            self.bind_attachments_to_session(req_aids, sid)
+        bound_session_atts = self.list_session_attachments(
+            sid, include_raw=False, include_chunks=True
+        )
+        # 确保即使 continuation 时 turn_attachments 为空也能回溯本会话大文件
+        if not turn_attachments and batch_start_chunk > 0 and bound_session_atts:
+            turn_attachments = [
+                a
+                for a in (
+                    self.get_attachment(sa["attachment_id"], include_raw=True, include_chunks=True)
+                    for sa in bound_session_atts[:MAX_ATTACHMENTS_PER_TURN]
+                )
+                if a is not None
+            ]
 
         eff_focus = sess.get("focus_tables") or []
         eff_task_mode = infer_task_mode(
             clean_prompt,
             task_mode if task_mode != "auto" else sess.get("task_mode", "auto"),
         )
-        eff_provider_id = (provider_id or sess.get("provider_id") or "").strip()
-        eff_model = (model or sess.get("model") or "").strip()
         safe_max_steps = max(1, min(MAX_STEPS_CAP, int(max_steps or 6)))
         safe_sample_limit = max(10, min(200, int(sample_limit or 100)))
 
-        # 先验大模型可用性（失败不污染会话记录）
-        self.ctx.llm_hub.resolve_provider_and_model(
-            provider_id=eff_provider_id, model=eff_model, require_ready=True
-        )
-
-        cb(8, "准备上下文", f"正在组装 {eff_dialect} 语法基线与元数据上下文...", 0, safe_max_steps)
+        cb(6, "准备上下文", f"正在组装 {eff_dialect} 语法基线、元数据与附件清单...", 0, safe_max_steps)
         context_block = self._build_context_block(
             work_mode=eff_mode,
             profile=prof,
             dialect=eff_dialect,
             default_schema=eff_schema,
             focus_tables=eff_focus,
+            session_attachments=bound_session_atts,
         )
         system_prompt = self._build_system_prompt(
             work_mode=eff_mode,
@@ -569,8 +856,30 @@ class AiAssistantService(AssistantStorageMixin):
             max_steps=safe_max_steps,
             sample_limit=safe_sample_limit,
             context_block=context_block,
+            has_attachments=bool(bound_session_atts),
         )
 
+        # 3. 确定本轮附件防爆窗策略（inline | on_demand | stepped_batch | none）
+        total_att_tokens = sum(int(a.get("estimated_tokens") or 0) for a in turn_attachments)
+        req_strategy = (large_payload_strategy or "auto").strip().lower()
+        if not turn_attachments:
+            eff_strategy = "none"
+        elif req_strategy == "on_demand":
+            eff_strategy = "on_demand"
+        elif req_strategy == "stepped_batch" and (
+            total_att_tokens > INLINE_TOKEN_BUDGET
+            or any(int(a.get("chunk_count") or 0) > 1 for a in turn_attachments)
+            or batch_start_chunk > 0
+        ):
+            eff_strategy = "stepped_batch"
+        elif total_att_tokens <= INLINE_TOKEN_BUDGET:
+            eff_strategy = "inline"
+        elif all(a.get("file_kind") == "csv" for a in turn_attachments):
+            eff_strategy = "on_demand"
+        else:
+            eff_strategy = "stepped_batch"
+
+        attachments_meta = [self._build_attachment_metadata(a) for a in turn_attachments]
         next_turn = int(sess.get("turn_count") or 0) + 1
         user_msg = self._insert_message(
             session_id=sid,
@@ -579,6 +888,7 @@ class AiAssistantService(AssistantStorageMixin):
             task_mode=eff_task_mode,
             response_type="prompt",
             content=clean_prompt,
+            attachments=attachments_meta,
         )
 
         toolbox = AssistantToolbox(
@@ -588,25 +898,66 @@ class AiAssistantService(AssistantStorageMixin):
             dialect=eff_dialect,
             default_schema=eff_schema,
             sample_limit=safe_sample_limit,
+            attachments=bound_session_atts,
+            storage=self,
         )
-
-        convo = self._build_conversation_messages(sess, clean_prompt, clarification_reply)
-        llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}] + convo
 
         trace_steps: List[Dict[str, Any]] = []
         used_provider_name = ""
         used_model = ""
+        continuation_chip: Optional[Dict[str, Any]] = None
+
+        llm_user_prompt = clean_prompt
+        if eff_strategy == "inline":
+            inline_blocks = []
+            for a in turn_attachments:
+                inline_blocks.append(
+                    f"--- 附件 `{a['filename']}` [id={a['attachment_id']}, {a['summary']}] ---\n"
+                    f"```\n{a.get('raw_text', '')}\n```"
+                )
+            llm_user_prompt = f"{clean_prompt}\n\n【用户本轮附带文件全文】\n" + "\n\n".join(inline_blocks)
+        elif eff_strategy == "on_demand":
+            att_hints = "、".join(f"`{a['filename']}` (id={a['attachment_id']})" for a in turn_attachments)
+            llm_user_prompt = (
+                f"{clean_prompt}\n\n"
+                f"【防爆窗按需探索指引】用户本轮附带大体积文件（{att_hints}，共 ~{total_att_tokens} tokens），"
+                "为避免超出上下文窗口，原文已切片保存。CSV 请优先直接利用全局上下文中的字段画像并使用 `query_csv_attachment` 工具执行 SQLite 只读 SQL（表名固定 `csv_data`），"
+                "文本/SQL 可调用 `search_attachment` 与 `inspect_attachment_chunk` 精准阅读相关片区。"
+            )
+        elif eff_strategy == "stepped_batch":
+            batch_digest, continuation_chip, mp_prov, mp_mdl = self._run_stepped_batch_analysis(
+                turn_attachments=turn_attachments,
+                clean_prompt=clean_prompt,
+                dialect=eff_dialect,
+                batch_start_chunk=batch_start_chunk,
+                batch_max_chunks=batch_max_chunks,
+                provider_id=eff_provider_id,
+                model=eff_model,
+                cb=cb,
+                cancel_check=cancel_check,
+                t_start=t_start,
+                trace_steps=trace_steps,
+            )
+            used_provider_name = mp_prov or used_provider_name
+            used_model = mp_mdl or used_model
+            llm_user_prompt = f"{clean_prompt}\n\n{batch_digest}" if batch_digest else clean_prompt
+
+        convo = self._build_conversation_messages(sess, llm_user_prompt, clarification_reply)
+        llm_messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}] + convo
+
         final_obj: Optional[Dict[str, Any]] = None
         fallback_plain_text = ""
 
-        # 2. 多轮循序渐进工具推理循环
+        # 4. 多轮循序渐进工具推理循环
         for step_idx in range(1, safe_max_steps + 1):
             if cancel_check and cancel_check():
                 raise RuntimeError("用户已取消本次智能会话任务")
             if (time.perf_counter() - t_start) > LOOP_WALLCLOCK_BUDGET_SEC:
                 break
 
-            pct = min(85, 15 + int((step_idx - 1) / max(1, safe_max_steps) * 65))
+            base_pct = 75 if eff_strategy == "stepped_batch" else 15
+            span_pct = 15 if eff_strategy == "stepped_batch" else 65
+            pct = min(90, base_pct + int((step_idx - 1) / max(1, safe_max_steps) * span_pct))
             cb(pct, "智能推理中", f"步骤 {step_idx}/{safe_max_steps} · 正在分析与规划下一步...", step_idx - 1, safe_max_steps)
 
             llm_res = self.ctx.llm_hub.chat_completion(
@@ -797,6 +1148,10 @@ class AiAssistantService(AssistantStorageMixin):
                 else:
                     content_md = body_txt or summary_txt or fallback_plain_text or "处理完成。"
 
+        # 将接续拆解芯片置于下一步建议首位，方便用户一键分析下一批分片
+        if continuation_chip is not None:
+            next_steps_list = [continuation_chip] + next_steps_list[:2]
+
         # 若工具阶段生成了待确认写提案，绑定到当前回复消息
         if toolbox.pending_proposal is not None:
             pp = toolbox.pending_proposal
@@ -851,7 +1206,7 @@ class AiAssistantService(AssistantStorageMixin):
                 SET turn_count = ?, updated_at = ?, title = CASE WHEN turn_count = 0 THEN ? ELSE title END
                 WHERE session_id = ?
                 """,
-                (next_turn, now, clean_prompt[:36], sid),
+                (next_turn, now, session_title_seed[:36], sid),
             )
 
         self._compact_rolling_summary_if_needed(sid)

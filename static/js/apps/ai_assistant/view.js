@@ -7,7 +7,7 @@
  * - 经典可折叠三栏布局（默认左会话栏 + 中央对话流展开，右侧库表/知识库抽屉按需滑出）。
  */
 
-import { badge, clearEl, el, statusDot, svgIcon } from "../../core/dom.js";
+import { badge, clearEl, el, formatBytes, pickLocalFile, statusDot, svgIcon } from "../../core/dom.js";
 import { isAbortError } from "../../core/http.js";
 import { store } from "../../core/state.js";
 import { DataGrid } from "../../ui/data_grid.js";
@@ -26,6 +26,40 @@ const TASK_MODES = [
   { id: "optimize", label: "性能优化" },
   { id: "syntax", label: "语法确认" },
   { id: "ddl", label: "DDL 助手" },
+];
+
+const DEFAULT_ATTACHMENT_LIMITS = {
+  max_csv_bytes: 2 * 1024 * 1024,
+  max_text_bytes: 5 * 1024 * 1024,
+  inline_token_budget: 3500,
+  max_attachments_per_turn: 5,
+  csv_extensions: [".csv", ".tsv"],
+  allowed_extensions: [
+    ".txt",
+    ".sql",
+    ".ddl",
+    ".md",
+    ".log",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".ini",
+    ".conf",
+    ".py",
+    ".sh",
+    ".csv",
+    ".tsv",
+  ],
+};
+
+const PASTE_TO_ATTACHMENT_MIN_CHARS = 4000;
+const PASTE_TO_ATTACHMENT_MIN_LINES = 80;
+
+const STRATEGY_OPTIONS = [
+  { id: "auto", label: "自动策略（SQL/文本分步拆解 · CSV 沙箱查询）" },
+  { id: "stepped_batch", label: "强制分步拆解（逐片汇总防爆窗）" },
+  { id: "on_demand", label: "按需工具检索（省 Token）" },
 ];
 
 const FALLBACK_DIALECTS = [
@@ -99,6 +133,12 @@ export class AiAssistantView {
     this.currentSession = null;
     this.draftPrompt = "";
     this._pendingUserPrompt = "";
+    this._pendingUserAttachments = [];
+    this.attachmentLimits = { ...DEFAULT_ATTACHMENT_LIMITS };
+    this.pendingAttachments = [];
+    this.largePayloadStrategy = "auto";
+    this.isDraggingFile = false;
+    this.uploadingAttachment = false;
     this.expandedStepsMsgIds = new Set();
 
     this.activityBar = new TaskActivityBar({ graceMs: 120 });
@@ -201,6 +241,9 @@ export class AiAssistantView {
       ]);
       if (Array.isArray(dlRes.dialects) && dlRes.dialects.length) {
         this.dialects = dlRes.dialects;
+      }
+      if (dlRes.attachment_limits && typeof dlRes.attachment_limits === "object") {
+        this.attachmentLimits = { ...DEFAULT_ATTACHMENT_LIMITS, ...dlRes.attachment_limits };
       }
       if (Array.isArray(dlRes.llm_models) && dlRes.llm_models.length) {
         store.updateLlmState(null, dlRes.llm_models);
@@ -391,6 +434,8 @@ export class AiAssistantView {
     this.currentSession = null;
     this.taskMode = "auto";
     this.focusTables = [];
+    this.pendingAttachments = [];
+    this.largePayloadStrategy = "auto";
     this.render();
     this.refreshHeader?.();
   }
@@ -411,6 +456,8 @@ export class AiAssistantView {
       this.schemaName = sess.schema_name || "";
       this.focusTables = [...(sess.focus_tables || [])];
       this.taskMode = sess.task_mode || "auto";
+      this.pendingAttachments = [];
+      this.largePayloadStrategy = "auto";
       this.render();
       this.refreshHeader?.();
     } catch (err) {
@@ -439,11 +486,283 @@ export class AiAssistantView {
     }
   }
 
-  async sendUserMessage(overrideText = null, { clarificationReply = null, taskModeOverride = null } = {}) {
-    if (this.loading) return;
+  _validateLocalAttachmentFile(file) {
+    const name = String(file?.name || "").trim();
+    if (!name) {
+      Toast.error("请选择有效的文件");
+      return false;
+    }
+    const ext = name.includes(".") ? `.${name.split(".").pop().toLowerCase()}` : "";
+    const allowed = this.attachmentLimits.allowed_extensions || DEFAULT_ATTACHMENT_LIMITS.allowed_extensions;
+    if (!allowed.includes(ext)) {
+      Toast.error(`暂不支持文件类型 ${ext || "未知"}，仅支持 .txt/.sql/.ddl/.md/.log/.json 及 .csv/.tsv`);
+      return false;
+    }
+    const size = Number(file?.size || 0);
+    if (size <= 0) {
+      Toast.error(`文件「${name}」为空，无法上传`);
+      return false;
+    }
+    const csvExts = this.attachmentLimits.csv_extensions || DEFAULT_ATTACHMENT_LIMITS.csv_extensions;
+    const isCsv = csvExts.includes(ext);
+    const maxBytes = isCsv
+      ? Number(this.attachmentLimits.max_csv_bytes || DEFAULT_ATTACHMENT_LIMITS.max_csv_bytes)
+      : Number(this.attachmentLimits.max_text_bytes || DEFAULT_ATTACHMENT_LIMITS.max_text_bytes);
+    if (size > maxBytes) {
+      Toast.error(
+        `文件「${name}」体积 (${formatBytes(size)}) 超出 ${isCsv ? "CSV" : "文本/SQL"} 上限 (${formatBytes(maxBytes)})`
+      );
+      return false;
+    }
+    return true;
+  }
+
+  async handleUploadFiles(fileList) {
+    const files = [...(fileList || [])].filter(Boolean);
+    if (!files.length || this.uploadingAttachment || this.loading) return;
+    const maxPerTurn = Number(this.attachmentLimits.max_attachments_per_turn || 5);
+    const slots = maxPerTurn - this.pendingAttachments.length;
+    if (slots <= 0) {
+      Toast.info(`单轮最多附带 ${maxPerTurn} 个文件，请先发送或移除部分附件`);
+      return;
+    }
+    const targets = files.slice(0, slots);
+    if (files.length > slots) {
+      Toast.info(`单轮最多附带 ${maxPerTurn} 个文件，本次仅处理前 ${slots} 个`);
+    }
+
+    this.uploadingAttachment = true;
+    this.render();
+    try {
+      for (const file of targets) {
+        if (!this._validateLocalAttachmentFile(file)) continue;
+        const res = await assistantApi.uploadAttachment(
+          file,
+          this.currentSession?.session_id || ""
+        );
+        if (res?.attachment) {
+          this.pendingAttachments = [...this.pendingAttachments, res.attachment];
+          if (res.attachment.oversized) {
+            Toast.info(
+              `已装载大文件「${res.attachment.filename}」（~${res.attachment.estimated_tokens} tokens · 切分 ${res.attachment.chunk_count} 片），发送时将自动防爆窗拆解`
+            );
+          } else {
+            Toast.success(`已附加「${res.attachment.filename}」`);
+          }
+        }
+      }
+    } catch (err) {
+      Toast.error(err.message || "附件上传解析失败");
+    } finally {
+      this.uploadingAttachment = false;
+      this.render();
+    }
+  }
+
+  async handlePastedLongText(rawText, { filename = "", fileHint = "auto" } = {}) {
+    const content = String(rawText || "");
+    if (!content.trim() || this.uploadingAttachment || this.loading) return;
+    const maxPerTurn = Number(this.attachmentLimits.max_attachments_per_turn || 5);
+    if (this.pendingAttachments.length >= maxPerTurn) {
+      Toast.info(`单轮最多附带 ${maxPerTurn} 个附件，请先发送或移除部分附件`);
+      return;
+    }
+    const maxBytes = Number(this.attachmentLimits.max_text_bytes || DEFAULT_ATTACHMENT_LIMITS.max_text_bytes);
+    const estBytes =
+      typeof TextEncoder !== "undefined" ? new TextEncoder().encode(content).length : content.length * 3;
+    if (estBytes > maxBytes) {
+      Toast.error(`粘贴文本超出上限 (${formatBytes(maxBytes)})，请拆分为较小片段后粘贴`);
+      return;
+    }
+
+    this.uploadingAttachment = true;
+    this.render();
+    try {
+      const res = await assistantApi.createPastedAttachment({
+        content,
+        filename,
+        file_hint: fileHint,
+        session_id: this.currentSession?.session_id || "",
+      });
+      if (res?.attachment) {
+        this.pendingAttachments = [...this.pendingAttachments, res.attachment];
+        if (res.attachment.oversized) {
+          Toast.info(
+            `已将超长粘贴内容转为附件「${res.attachment.filename}」（~${res.attachment.estimated_tokens} tokens · ${res.attachment.chunk_count} 片）`
+          );
+        } else {
+          Toast.success(`已将粘贴内容转为附件「${res.attachment.filename}」`);
+        }
+      }
+    } catch (err) {
+      Toast.error(err.message || "处理粘贴文本失败");
+    } finally {
+      this.uploadingAttachment = false;
+      this.render();
+    }
+  }
+
+  async handlePasteEvent(e) {
+    const cd = e?.clipboardData;
+    if (!cd) return;
+    const files = [];
+    if (cd.files && cd.files.length) {
+      for (const f of cd.files) files.push(f);
+    } else if (cd.items && cd.items.length) {
+      for (const it of cd.items) {
+        if (it.kind === "file") {
+          const f = typeof it.getAsFile === "function" ? it.getAsFile() : null;
+          if (f) files.push(f);
+        }
+      }
+    }
+    if (files.length > 0) {
+      e.preventDefault?.();
+      await this.handleUploadFiles(files);
+      return;
+    }
+
+    const plain = typeof cd.getData === "function" ? cd.getData("text/plain") : "";
+    if (!plain) return;
+    const lineCount = plain.split(/\r?\n/).length;
+    if (plain.length >= PASTE_TO_ATTACHMENT_MIN_CHARS || lineCount >= PASTE_TO_ATTACHMENT_MIN_LINES) {
+      e.preventDefault?.();
+      await this.handlePastedLongText(plain);
+    }
+  }
+
+  async removePendingAttachment(attachmentId) {
+    this.pendingAttachments = this.pendingAttachments.filter((a) => a.attachment_id !== attachmentId);
+    this.render();
+    try {
+      await assistantApi.deleteAttachment(attachmentId);
+    } catch (_e) {
+      // 忽略已清理异常
+    }
+  }
+
+  async openAttachmentPreviewModal(attSummary) {
+    if (!attSummary?.attachment_id) return;
+    let detail = attSummary;
+    if (!Array.isArray(detail.chunks) || (detail.file_kind === "csv" && !detail.csv_profile?.columns)) {
+      try {
+        const res = await assistantApi.getAttachment(attSummary.attachment_id, true);
+        if (res?.attachment) detail = res.attachment;
+      } catch (err) {
+        Toast.error(err.message || "加载附件预览失败");
+        return;
+      }
+    }
+
+    const metaRow = el(
+      "div",
+      { style: { display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" } },
+      badge(String(detail.file_kind || "text").toUpperCase(), "info"),
+      badge(formatBytes(detail.size_bytes || 0), "neutral"),
+      badge(`${detail.line_count || 0} 行`, "neutral"),
+      detail.file_kind === "csv" ? badge(`${detail.row_count || 0} 数据行`, "success") : null,
+      badge(`~${detail.estimated_tokens || 0} tokens`, detail.oversized ? "warn" : "neutral"),
+      badge(`共 ${detail.chunk_count || 0} 个分片`, "neutral")
+    );
+
+    const blocks = [metaRow];
+    const prof = detail.csv_profile || {};
+    if (detail.file_kind === "csv" && Array.isArray(prof.columns) && prof.columns.length) {
+      const schemaBox = el(
+        "div",
+        { className: "mac-group-box", style: { padding: "10px 12px" } },
+        el("div", { style: { fontWeight: "600", fontSize: "12.5px", marginBottom: "6px" }, text: `CSV 字段画像 (${prof.row_count || 0} 行 × ${prof.column_count || 0} 列 · 表名 csv_data)` }),
+        el(
+          "div",
+          { style: { display: "flex", flexDirection: "column", gap: "4px", maxHeight: "180px", overflowY: "auto" } },
+          prof.columns.map((c) => {
+            const statParts = [`非空 ${c.non_null_count}`, `唯一 ${c.distinct_count}`];
+            if (c.min !== undefined && c.max !== undefined) {
+              statParts.push(`范围 ${c.min}..${c.max}`, `均值 ${c.mean}`);
+            }
+            return el(
+              "div",
+              { className: "ai-asst-col-row" },
+              el("span", { className: "mono", style: { fontWeight: "600" }, text: `${c.name} (${c.inferred_type})` }),
+              el("span", { className: "muted", text: statParts.join(" · ") })
+            );
+          })
+        )
+      );
+      blocks.push(schemaBox);
+
+      if (Array.isArray(prof.sample_rows) && prof.sample_rows.length) {
+        const cols = prof.columns.map((c, idx) => ({ key: `c_${idx}`, label: c.name, sortable: false }));
+        const rows = prof.sample_rows.map((arr) => {
+          const obj = {};
+          cols.forEach((c, idx) => {
+            obj[c.key] = Array.isArray(arr) ? arr[idx] : "";
+          });
+          return obj;
+        });
+        const sampleGrid = new DataGrid({ columns: cols, rows, maxHeight: "170px" });
+        blocks.push(sampleGrid.root);
+      }
+    }
+
+    const chunks = Array.isArray(detail.chunks) ? detail.chunks : [];
+    if (chunks.length) {
+      blocks.push(
+        el(
+          "div",
+          { style: { display: "flex", flexDirection: "column", gap: "8px", maxHeight: "300px", overflowY: "auto" } },
+          chunks.slice(0, 20).map((ch) =>
+            el(
+              "div",
+              { className: "mac-group-box", style: { padding: "8px 10px" } },
+              el(
+                "div",
+                { style: { display: "flex", justifyContent: "space-between", gap: "8px", marginBottom: "4px" } },
+                el("strong", { style: { fontSize: "12px" }, text: `#${Number(ch.chunk_index) + 1} ${ch.title || ""}` }),
+                el("span", { className: "muted mono", style: { fontSize: "11px" }, text: `${ch.range_label || ""} (~${ch.estimated_tokens || 0} tok)` })
+              ),
+              ch.content
+                ? el("pre", {
+                    className: "mono",
+                    style: { margin: 0, whiteSpace: "pre-wrap", fontSize: "11.5px", maxHeight: "140px", overflowY: "auto" },
+                    text: String(ch.content).slice(0, 1200) + (String(ch.content).length > 1200 ? "\n...（预览已截断）" : ""),
+                  })
+                : null
+            )
+          )
+        )
+      );
+    }
+
+    Modal.open({
+      title: `附件预览 · ${detail.filename}`,
+      width: "min(760px, 94vw)",
+      body: el("div", { style: { display: "flex", flexDirection: "column", gap: "10px" } }, ...blocks),
+      footer: [el("button", { type: "button", className: "mac-btn mac-btn-primary", text: "关闭", onClick: () => Modal.close("ok") })],
+    });
+  }
+
+  async sendUserMessage(
+    overrideText = null,
+    {
+      clarificationReply = null,
+      taskModeOverride = null,
+      attachmentIdsOverride = null,
+      batchStartChunk = 0,
+      batchMaxChunks = null,
+      strategyOverride = null,
+    } = {}
+  ) {
+    if (this.loading || this.uploadingAttachment) return;
     const text = (overrideText !== null ? String(overrideText) : this.draftPrompt).trim();
-    if (!text) {
-      Toast.info("请输入要咨询或执行的数据库问题");
+    const useOverrideAttach = Array.isArray(attachmentIdsOverride);
+    const sentPendingSnapshot = useOverrideAttach ? [] : [...this.pendingAttachments];
+    const effAttachIds = useOverrideAttach
+      ? attachmentIdsOverride
+      : sentPendingSnapshot.map((a) => a.attachment_id);
+
+    if (!text && !effAttachIds.length) {
+      Toast.info("请输入要咨询或执行的数据库问题，或先粘贴/上传文本、SQL 或 CSV 文件");
       return;
     }
     const { providerId, model } = this._parseSelectedModel();
@@ -456,32 +775,43 @@ export class AiAssistantView {
     if (overrideText === null) {
       this.draftPrompt = "";
     }
-    this._pendingUserPrompt = text;
+    if (!useOverrideAttach && sentPendingSnapshot.length) {
+      this.pendingAttachments = [];
+    }
+    const effStrategy = strategyOverride || this.largePayloadStrategy || "auto";
+    this._pendingUserAttachments = sentPendingSnapshot;
+    this._pendingUserPrompt =
+      text || `请结合附带的 ${effAttachIds.length} 份文件进行分析与诊断。`;
     this.loading = true;
     this.render();
 
     try {
+      const payload = {
+        session_id: this.currentSession?.session_id || null,
+        prompt: text,
+        work_mode: this.workMode,
+        connection_id: this.workMode === "connection" ? this.connectionId : "",
+        dialect: this.dialect,
+        schema_name: this.schemaName,
+        focus_tables: this.focusTables,
+        task_mode: effTaskMode,
+        provider_id: providerId,
+        model,
+        max_steps: this.maxSteps,
+        sample_limit: this.sampleLimit,
+        clarification_reply: clarificationReply,
+        attachment_ids: effAttachIds,
+        large_payload_strategy: effStrategy,
+        batch_start_chunk: Number(batchStartChunk || 0),
+      };
+      if (batchMaxChunks !== null && batchMaxChunks !== undefined) {
+        payload.batch_max_chunks = Number(batchMaxChunks);
+      }
+
       const res = await this.activityBar.track(
         "Data.O.G 智能分析探索",
         async ({ taskId, signal }) => {
-          const out = await assistantApi.sendChatTurn(
-            {
-              session_id: this.currentSession?.session_id || null,
-              prompt: text,
-              work_mode: this.workMode,
-              connection_id: this.workMode === "connection" ? this.connectionId : "",
-              dialect: this.dialect,
-              schema_name: this.schemaName,
-              focus_tables: this.focusTables,
-              task_mode: effTaskMode,
-              provider_id: providerId,
-              model,
-              max_steps: this.maxSteps,
-              sample_limit: this.sampleLimit,
-              clarification_reply: clarificationReply,
-            },
-            { taskId, signal }
-          );
+          const out = await assistantApi.sendChatTurn(payload, { taskId, signal });
           const stepCnt = out?.assistant_message?.steps?.length ?? 0;
           return {
             ...out,
@@ -501,12 +831,16 @@ export class AiAssistantView {
       if (overrideText === null && !this.draftPrompt) {
         this.draftPrompt = text;
       }
+      if (!useOverrideAttach && sentPendingSnapshot.length && !this.pendingAttachments.length) {
+        this.pendingAttachments = sentPendingSnapshot;
+      }
       if (isAbortError(err)) {
         Toast.info("已取消本次分析");
       } else {
         Toast.error(err.message || "智能分析请求失败");
       }
     } finally {
+      this._pendingUserAttachments = [];
       this._pendingUserPrompt = "";
       this.loading = false;
       this.render();
@@ -725,12 +1059,38 @@ export class AiAssistantView {
 
   _renderMessageItem(msg, { isLastAssistant = false } = {}) {
     if (msg.role === "user") {
+      const msgAtts = Array.isArray(msg.attachments) ? msg.attachments : [];
+      const attachPills = msgAtts.length
+        ? el(
+            "div",
+            { className: "ai-asst-msg-attachments" },
+            msgAtts.map((att) =>
+              el(
+                "button",
+                {
+                  type: "button",
+                  className: "ai-asst-msg-attach-pill",
+                  title: att.summary || `${att.filename} (点击预览分片/画像)`,
+                  onClick: () => this.openAttachmentPreviewModal(att),
+                },
+                badge(String(att.file_kind || "TXT").toUpperCase(), "info"),
+                el("span", { text: att.filename }),
+                el("span", {
+                  className: "muted mono",
+                  style: { fontSize: "10.5px" },
+                  text: `~${att.estimated_tokens || 0} tok`,
+                })
+              )
+            )
+          )
+        : null;
       return el(
         "div",
         { className: "ai-asst-msg ai-asst-msg-user" },
         el(
           "div",
           { className: "ai-asst-user-bubble" },
+          attachPills,
           el("div", { style: { whiteSpace: "pre-wrap", wordBreak: "break-word" }, text: msg.content })
         )
       );
@@ -889,7 +1249,13 @@ export class AiAssistantView {
                 type: "button",
                 className: "ai-asst-next-chip",
                 disabled: this.loading,
-                onClick: () => this.sendUserMessage(ns.prompt),
+                onClick: () =>
+                  this.sendUserMessage(ns.prompt, {
+                    attachmentIdsOverride: Array.isArray(ns.attachment_ids) ? ns.attachment_ids : null,
+                    batchStartChunk: Number(ns.batch_start_chunk || 0),
+                    batchMaxChunks: ns.batch_max_chunks ? Number(ns.batch_max_chunks) : null,
+                    strategyOverride: ns.large_payload_strategy || null,
+                  }),
               },
               ns.label
             )
@@ -1000,7 +1366,11 @@ export class AiAssistantView {
     const pendingNodes = [];
     if (this.loading && this._pendingUserPrompt) {
       pendingNodes.push(
-        this._renderMessageItem({ role: "user", content: this._pendingUserPrompt }),
+        this._renderMessageItem({
+          role: "user",
+          content: this._pendingUserPrompt,
+          attachments: this._pendingUserAttachments || [],
+        }),
         el(
           "div",
           { className: "ai-asst-msg ai-asst-msg-assistant" },
@@ -1023,9 +1393,118 @@ export class AiAssistantView {
         : this._renderWelcomeHero()
     );
 
+    const totalPendingTokens = this.pendingAttachments.reduce(
+      (sum, a) => sum + Number(a?.estimated_tokens || 0),
+      0
+    );
+    const inlineBudget = Number(
+      this.attachmentLimits.inline_token_budget || DEFAULT_ATTACHMENT_LIMITS.inline_token_budget
+    );
+    const needsChunkProtection =
+      totalPendingTokens > inlineBudget || this.pendingAttachments.some((a) => Boolean(a?.oversized));
+
+    const attachBar = this.pendingAttachments.length
+      ? el(
+          "div",
+          { className: "ai-asst-attach-bar" },
+          this.pendingAttachments.map((att) =>
+            el(
+              "div",
+              { className: `ai-asst-attach-chip ${att.oversized ? "is-oversized" : ""}` },
+              el(
+                "button",
+                {
+                  type: "button",
+                  className: "ai-asst-attach-chip-main",
+                  title: att.summary || `${att.filename} (点击预览画像或分片)`,
+                  onClick: () => this.openAttachmentPreviewModal(att),
+                },
+                badge(String(att.file_kind || "txt").toUpperCase(), att.oversized ? "warn" : "info"),
+                el("span", { className: "ai-asst-attach-name", text: att.filename }),
+                el("span", {
+                  className: "muted mono",
+                  style: { fontSize: "11px" },
+                  text:
+                    att.file_kind === "csv"
+                      ? `${att.row_count || 0}行 · ~${att.estimated_tokens || 0} tok`
+                      : `~${att.estimated_tokens || 0} tok · ${att.chunk_count || 1}片`,
+                })
+              ),
+              el("button", {
+                type: "button",
+                className: "ai-asst-focus-x",
+                title: "移除附件",
+                "aria-label": `移除附件 ${att.filename}`,
+                disabled: this.loading || this.uploadingAttachment,
+                text: "×",
+                onClick: () => this.removePendingAttachment(att.attachment_id),
+              })
+            )
+          )
+        )
+      : null;
+
+    const strategyBar = needsChunkProtection
+      ? el(
+          "div",
+          { className: "ai-asst-strategy-bar" },
+          statusDot(
+            `防爆窗保护（~${totalPendingTokens} > ${inlineBudget} tokens）：`,
+            "warn"
+          ),
+          el(
+            "select",
+            {
+              className: "mac-input mac-input-sm",
+              "aria-label": "大文件提交拆解策略",
+              style: { maxWidth: "300px" },
+              disabled: this.loading,
+              onChange: (e) => {
+                this.largePayloadStrategy = e.target.value;
+              },
+            },
+            STRATEGY_OPTIONS.map((optItem) => {
+              const opt = el("option", { value: optItem.id, text: optItem.label });
+              if (optItem.id === this.largePayloadStrategy) opt.selected = true;
+              return opt;
+            })
+          )
+        )
+      : null;
+
+    const acceptExts = (
+      this.attachmentLimits.allowed_extensions || DEFAULT_ATTACHMENT_LIMITS.allowed_extensions
+    ).join(",");
+
     const composer = el(
       "div",
-      { className: "ai-asst-composer-wrap" },
+      {
+        className: `ai-asst-composer-wrap ${this.isDraggingFile ? "is-dragover" : ""}`,
+        onDragover: (e) => {
+          e.preventDefault();
+          if (!this.isDraggingFile) {
+            this.isDraggingFile = true;
+            composer.classList?.add("is-dragover");
+          }
+        },
+        onDragleave: (e) => {
+          if (!composer.contains?.(e.relatedTarget)) {
+            this.isDraggingFile = false;
+            composer.classList?.remove("is-dragover");
+          }
+        },
+        onDrop: async (e) => {
+          e.preventDefault();
+          this.isDraggingFile = false;
+          composer.classList?.remove("is-dragover");
+          const files = e.dataTransfer?.files;
+          if (files && files.length) {
+            await this.handleUploadFiles(files);
+          }
+        },
+      },
+      attachBar,
+      strategyBar,
       el("textarea", {
         className: "mac-input ai-asst-composer-input",
         rows: 3,
@@ -1033,11 +1512,12 @@ export class AiAssistantView {
         disabled: this.loading,
         placeholder:
           this.workMode === "connection"
-            ? "输入查询需求、慢 SQL、报错日志或建表/改表需求（Enter 发送 · Shift+Enter 换行）..."
-            : `输入 ${this.dialect} 方言语法问题、报错日志或 SQL 优化需求（离线纯方言模式）...`,
+            ? "输入需求，或直接粘贴/拖拽 .txt/.sql/.csv（长文本自动切片防爆窗，Enter 发送 · Shift+Enter 换行）..."
+            : `输入 ${this.dialect} 问题，或粘贴/拖拽 .txt/.sql/.csv（长文本自动分步拆解）...`,
         onInput: (e) => {
           this.draftPrompt = e.target.value;
         },
+        onPaste: (e) => this.handlePasteEvent(e),
         onKeydown: (e) => {
           if (e.key === "Enter" && !e.shiftKey) {
             e.preventDefault();
@@ -1053,6 +1533,20 @@ export class AiAssistantView {
           {
             type: "button",
             className: "btn btn-xs",
+            disabled: this.loading || this.uploadingAttachment,
+            onClick: async () => {
+              const picked = await pickLocalFile(acceptExts);
+              if (picked) await this.handleUploadFiles([picked]);
+            },
+          },
+          svgIcon("upload", 12),
+          this.uploadingAttachment ? "解析分片中..." : "附加 .sql/.txt/.csv"
+        ),
+        el(
+          "button",
+          {
+            type: "button",
+            className: "btn btn-xs",
             onClick: () => {
               this.drawerOpen = true;
               this.drawer.activeTab = "knowledge";
@@ -1063,13 +1557,13 @@ export class AiAssistantView {
           svgIcon("book", 12),
           "上传 / 查阅参考知识库"
         ),
-        el("span", { className: "muted", style: { fontSize: "11.5px", marginRight: "auto" }, text: "DDL 与写语句仅展示卡片，由您二次确认后执行" }),
+        el("span", { className: "muted", style: { fontSize: "11px", marginRight: "auto" }, text: "CSV ≤ 2MB / 文本 ≤ 5MB · 写操作需二次确认" }),
         el(
           "button",
           {
             type: "button",
             className: "mac-btn mac-btn-primary",
-            disabled: this.loading,
+            disabled: this.loading || this.uploadingAttachment,
             onClick: () => this.sendUserMessage(),
           },
           svgIcon("send", 13),

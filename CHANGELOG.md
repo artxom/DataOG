@@ -8,6 +8,27 @@
 
 ---
 
+## [3.1.0] - 2026-11-24
+
+> **AI 助手聊天纯文本/SQL 粘贴、受限 CSV 上传与超长内容防爆窗分步拆解引擎**：聊天输入框原生支持剪贴板文本/文件粘贴（`.txt`/`.sql` 等）与受限 `.csv`/`.tsv` 文件上传/拖拽，并在超出大模型上下文预算时通过语义智能分片、CSV 内存只读 SQLite 沙箱探查、按需检索工具及 Map-Reduce 分步批处理彻底防止爆窗。
+
+### Added
+- **聊天附件解析、防爆窗分片与 CSV 内存沙箱引擎 (`modules/ai_assistant/attachments.py`)**：
+  - 白名单校验与体积上限保护：纯文本/SQL/日志/配置文件（`.txt` / `.sql` / `.ddl` / `.md` / `.json` / `.xml` / `.yaml` / `.yml` / `.log` / `.ini` / `.cfg` / `.conf` / `.py` / `.sh` / `.bat` / `.ps1` 等）上限 `5 MB`，`.csv` / `.tsv` 表格文件上限 `2 MB`，单轮最多 `5` 个附件；拦截空字节二进制伪装，自动兼容 UTF-8 / GB18030 / GBK / latin-1 解码。
+  - **语义智能分片**：基于词法多语句边界切分 `.sql`/`.ddl`（支持最多 5000 条语句，词法报错脚本自动回退行切分）；基于 `csv.Sniffer` 解析 CSV 并保留 `'001024'` 前导零编码列为 `TEXT`、生成零 Token 本地字段画像并让每个 CSV 分片携带表头；Markdown/纯文本按标题与行号区间切分，单行无换行超长内容执行二分硬切，严格将每片控制在 `CHUNK_HARD_MAX_TOKENS = 2800` 以内。
+  - **CSV 内存只读 SQLite 沙箱 (`query_csv_in_memory`)**：复用 `validate_readonly_sql` 白名单并在 `:memory:` 开启 `PRAGMA query_only = ON`、3 秒进度回调与操作数上限熔断，直接在表 `csv_data` 上执行 SQL 统计聚合，无需把数十万字符原文塞入 Prompt。
+- **Layer 2 私有附件存储与防爆窗调度闭环 (`modules/ai_assistant/{__init__.py,storage_mixin.py,tools.py,schemas.py,router.py,service.py}`)**：
+  - 新增私有表 `ai_assistant_attachments` 与 `ai_assistant_attachment_chunks`（已在 `MODULE_SPEC.private_tables` 登记 `scope="private"`），随会话级联删除并清理 24 小时悬空草稿，`.dataog.db` 工作区导出严格零包含。
+  - 新增 `POST /api/modules/ai_assistant/attachments/upload`、`POST /attachments/text`、`GET /attachments/{id}`、`DELETE /attachments/{id}` 接口，`/dialects` 下发前端阈值契约 `attachment_limits`。
+  - `AssistantToolbox` 扩展至 10 个安全工具：新增 `search_attachment`、`inspect_attachment_chunk` 与 `query_csv_attachment`（结果同步渲染为标准 `DataGrid` 内联表并支持一键导出）。
+  - 防爆窗三策略路由：`<= 3500` tokens 走 `inline` 直通（历史消息仅存轻量元数据，不重复污染后续会话上下文）；超大 CSV 默认走 `on_demand` 工具按需探查；超长 `.sql`/`.txt` 自动启用 `stepped_batch` Map-Reduce 逐片拆解分析（每批默认 `8` 片/上限 `12` 片、累积 `<= 1400` 字符滚动摘要，未全覆盖时自动下发「继续拆解下一批」接续芯片）。
+- **AI 助手聊天窗口粘贴/上传/预览交互升级 (`static/js/apps/ai_assistant/{api.js,view.js,style.css}`)**：
+  - 聊天输入框支持 `onPaste` 自动接管剪贴板文件及 `>= 4000` 字符或 `>= 80` 行的长文本生成附件卡片；主面板支持文件拖拽投递，工具栏新增「附加 .sql/.txt/.csv」按钮与客户端体积/后缀前置拦截。
+  - 待发送附件胶囊支持点击弹出 `<dialog>` 原生模态预览（查看 CSV 列画像、样例 `DataGrid` 及分片原文）；包含大文件时自动显现策略选择栏（自动智能策略 / 分步逐片深度拆解 / 按需局部检索），消息区渲染附件徽标与「继续拆解」一键接续执行芯片。
+- **端到端与沙箱测试补强 (`tests/test_ai_assistant_and_kb.py`)**：新增 `test_chat_attachments_csv_query_and_stepped_map_reduce`（校验拦截、GBK 前导零与 `:memory:` SQL 聚合、`DELETE` 只读沙箱阻断、无换行长文本硬切、small `.sql` `inline` 直通与历史隔离、`stepped_batch` Map-Reduce 滚动摘要防爆窗与接续芯片、`on_demand` 大 CSV 三工具闭环及工作区隔离/级联删除）并升级 Node.js 场景 5 前端真机交互验证。
+
+---
+
 ## [3.0.2] - 2026-11-24
 
 > **AI 助手与知识库运行时修复与真实交互测试补强**：根治点击发送消息或重建向量索引时抛出 `this.activityBar.run is not a function` 的前端方法调用错误，并全面排查修复默认就绪模型选择、发送态用户气泡占位及抽屉目录刷新兼容问题，将前端测试升级为真实交互闭环验证。

@@ -31,9 +31,16 @@ class AssistantSessionUpdatePayload(BaseModel):
     model: Optional[str] = None
 
 
+class AssistantPastedAttachmentPayload(BaseModel):
+    content: str = Field(..., min_length=1)
+    filename: str = ""
+    file_hint: str = ""  # auto | text | sql | csv | tsv
+    session_id: str = ""
+
+
 class AssistantChatPayload(BaseModel):
     session_id: Optional[str] = None
-    prompt: str = Field(..., min_length=1, max_length=16000)
+    prompt: str = Field(default="", max_length=32000)
     work_mode: str = "auto"
     connection_id: str = ""
     dialect: str = ""
@@ -45,6 +52,10 @@ class AssistantChatPayload(BaseModel):
     max_steps: int = Field(default=6, ge=1, le=10)
     sample_limit: int = Field(default=100, ge=10, le=200)
     clarification_reply: Optional[Dict[str, Any]] = None
+    attachment_ids: List[str] = Field(default_factory=list)
+    large_payload_strategy: str = "auto"  # auto | stepped_batch | on_demand
+    batch_start_chunk: int = Field(default=0, ge=0)
+    batch_max_chunks: int = Field(default=8, ge=1, le=12)
 
 
 class ProposalConfirmPayload(BaseModel):

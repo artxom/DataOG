@@ -22,6 +22,8 @@ MODULE_SPEC = ModuleSpec(
         "ai_assistant_sessions",
         "ai_assistant_messages",
         "ai_assistant_proposals",
+        "ai_assistant_attachments",
+        "ai_assistant_attachment_chunks",
     ),
     init_hook=_init_module,
     order=50,

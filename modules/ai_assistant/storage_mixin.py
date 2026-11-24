@@ -98,6 +98,7 @@ class AssistantStorageMixin:
                 clarification_json TEXT NOT NULL DEFAULT '{}',
                 next_steps_json TEXT NOT NULL DEFAULT '[]',
                 result_table_json TEXT NOT NULL DEFAULT '{}',
+                attachments_json TEXT NOT NULL DEFAULT '[]',
                 proposal_id TEXT NOT NULL DEFAULT '',
                 provider_name TEXT NOT NULL DEFAULT '',
                 model TEXT NOT NULL DEFAULT '',
@@ -118,11 +119,86 @@ class AssistantStorageMixin:
                 ("clarification_json", "TEXT NOT NULL DEFAULT '{}'"),
                 ("next_steps_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("result_table_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("attachments_json", "TEXT NOT NULL DEFAULT '[]'"),
                 ("proposal_id", "TEXT NOT NULL DEFAULT ''"),
                 ("provider_name", "TEXT NOT NULL DEFAULT ''"),
                 ("model", "TEXT NOT NULL DEFAULT ''"),
                 ("total_elapsed_ms", "REAL NOT NULL DEFAULT 0"),
                 ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            scope="private",
+        )
+        store.register_table_schema(
+            "ai_assistant_attachments",
+            """
+            CREATE TABLE IF NOT EXISTS ai_assistant_attachments (
+                attachment_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL DEFAULT '',
+                filename TEXT NOT NULL DEFAULT '',
+                file_ext TEXT NOT NULL DEFAULT '',
+                file_kind TEXT NOT NULL DEFAULT 'text',
+                encoding TEXT NOT NULL DEFAULT 'utf-8',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                line_count INTEGER NOT NULL DEFAULT 0,
+                row_count INTEGER NOT NULL DEFAULT 0,
+                estimated_tokens INTEGER NOT NULL DEFAULT 0,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                oversized INTEGER NOT NULL DEFAULT 0,
+                recommended_strategy TEXT NOT NULL DEFAULT 'inline',
+                summary TEXT NOT NULL DEFAULT '',
+                raw_text TEXT NOT NULL DEFAULT '',
+                csv_profile_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_asst_att_sid
+                ON ai_assistant_attachments(session_id, created_at ASC);
+            """,
+            [
+                ("session_id", "TEXT NOT NULL DEFAULT ''"),
+                ("filename", "TEXT NOT NULL DEFAULT ''"),
+                ("file_ext", "TEXT NOT NULL DEFAULT ''"),
+                ("file_kind", "TEXT NOT NULL DEFAULT 'text'"),
+                ("encoding", "TEXT NOT NULL DEFAULT 'utf-8'"),
+                ("size_bytes", "INTEGER NOT NULL DEFAULT 0"),
+                ("line_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("row_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("estimated_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("chunk_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("oversized", "INTEGER NOT NULL DEFAULT 0"),
+                ("recommended_strategy", "TEXT NOT NULL DEFAULT 'inline'"),
+                ("summary", "TEXT NOT NULL DEFAULT ''"),
+                ("raw_text", "TEXT NOT NULL DEFAULT ''"),
+                ("csv_profile_json", "TEXT NOT NULL DEFAULT '{}'"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            scope="private",
+        )
+        store.register_table_schema(
+            "ai_assistant_attachment_chunks",
+            """
+            CREATE TABLE IF NOT EXISTS ai_assistant_attachment_chunks (
+                chunk_id TEXT PRIMARY KEY,
+                attachment_id TEXT NOT NULL DEFAULT '',
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL DEFAULT '',
+                range_label TEXT NOT NULL DEFAULT '',
+                start_line INTEGER NOT NULL DEFAULT 0,
+                end_line INTEGER NOT NULL DEFAULT 0,
+                estimated_tokens INTEGER NOT NULL DEFAULT 0,
+                content TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_asst_att_chk_aid
+                ON ai_assistant_attachment_chunks(attachment_id, chunk_index ASC);
+            """,
+            [
+                ("attachment_id", "TEXT NOT NULL DEFAULT ''"),
+                ("chunk_index", "INTEGER NOT NULL DEFAULT 0"),
+                ("title", "TEXT NOT NULL DEFAULT ''"),
+                ("range_label", "TEXT NOT NULL DEFAULT ''"),
+                ("start_line", "INTEGER NOT NULL DEFAULT 0"),
+                ("end_line", "INTEGER NOT NULL DEFAULT 0"),
+                ("estimated_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("content", "TEXT NOT NULL DEFAULT ''"),
             ],
             scope="private",
         )
@@ -226,6 +302,7 @@ class AssistantStorageMixin:
     @staticmethod
     def _row_to_message_dict(row: Any, proposals_by_id: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
         pid = str(row["proposal_id"] or "")
+        att_raw = row["attachments_json"] if "attachments_json" in row.keys() else "[]"
         return {
             "id": int(row["id"]),
             "session_id": str(row["session_id"]),
@@ -239,6 +316,7 @@ class AssistantStorageMixin:
             "clarification": _safe_json_loads(row["clarification_json"], {}),
             "next_steps": _safe_json_loads(row["next_steps_json"], []),
             "result_table": _safe_json_loads(row["result_table_json"], {}),
+            "attachments": _safe_json_loads(att_raw, []),
             "proposal_id": pid,
             "proposal": proposals_by_id.get(pid) if pid else None,
             "provider_name": str(row["provider_name"] or ""),
@@ -246,6 +324,46 @@ class AssistantStorageMixin:
             "total_elapsed_ms": float(row["total_elapsed_ms"] or 0.0),
             "created_at": str(row["created_at"] or ""),
         }
+
+    @staticmethod
+    def _row_to_attachment_dict(row: Any, *, include_raw: bool = False) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "attachment_id": str(row["attachment_id"]),
+            "session_id": str(row["session_id"] or ""),
+            "filename": str(row["filename"] or ""),
+            "file_ext": str(row["file_ext"] or ""),
+            "file_kind": str(row["file_kind"] or "text"),
+            "encoding": str(row["encoding"] or "utf-8"),
+            "size_bytes": int(row["size_bytes"] or 0),
+            "line_count": int(row["line_count"] or 0),
+            "row_count": int(row["row_count"] or 0),
+            "estimated_tokens": int(row["estimated_tokens"] or 0),
+            "chunk_count": int(row["chunk_count"] or 0),
+            "oversized": bool(row["oversized"]),
+            "recommended_strategy": str(row["recommended_strategy"] or "inline"),
+            "summary": str(row["summary"] or ""),
+            "csv_profile": _safe_json_loads(row["csv_profile_json"], {}),
+            "created_at": str(row["created_at"] or ""),
+        }
+        if include_raw:
+            out["raw_text"] = str(row["raw_text"] or "")
+        return out
+
+    @staticmethod
+    def _row_to_attachment_chunk_dict(row: Any, *, include_content: bool = True) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "chunk_id": str(row["chunk_id"]),
+            "attachment_id": str(row["attachment_id"]),
+            "chunk_index": int(row["chunk_index"] or 0),
+            "title": str(row["title"] or ""),
+            "range_label": str(row["range_label"] or ""),
+            "start_line": int(row["start_line"] or 0),
+            "end_line": int(row["end_line"] or 0),
+            "estimated_tokens": int(row["estimated_tokens"] or 0),
+        }
+        if include_content:
+            d["content"] = str(row["content"] or "")
+        return d
 
     def list_sessions(
         self,
@@ -357,6 +475,9 @@ class AssistantStorageMixin:
         session_dict["messages"] = [
             self._row_to_message_dict(mr, proposals_by_id) for mr in mrows
         ]
+        session_dict["attachments"] = self.list_session_attachments(
+            sid, include_raw=False, include_chunks=False
+        )
         return session_dict
 
     def update_session(
@@ -440,6 +561,16 @@ class AssistantStorageMixin:
             )
             conn.execute("DELETE FROM ai_assistant_messages WHERE session_id = ?", (sid,))
             conn.execute("DELETE FROM ai_assistant_proposals WHERE session_id = ?", (sid,))
+            att_rows = conn.execute(
+                "SELECT attachment_id FROM ai_assistant_attachments WHERE session_id = ?",
+                (sid,),
+            ).fetchall()
+            for ar in att_rows:
+                conn.execute(
+                    "DELETE FROM ai_assistant_attachment_chunks WHERE attachment_id = ?",
+                    (str(ar["attachment_id"]),),
+                )
+            conn.execute("DELETE FROM ai_assistant_attachments WHERE session_id = ?", (sid,))
         return cur.rowcount > 0
 
     def _insert_message(
@@ -456,6 +587,7 @@ class AssistantStorageMixin:
         clarification: Optional[Dict[str, Any]] = None,
         next_steps: Optional[List[Dict[str, str]]] = None,
         result_table: Optional[Dict[str, Any]] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
         proposal_id: str = "",
         provider_name: str = "",
         model: str = "",
@@ -468,8 +600,9 @@ class AssistantStorageMixin:
                 INSERT INTO ai_assistant_messages (
                     session_id, turn_index, role, task_mode, response_type, content,
                     steps_json, citations_json, clarification_json, next_steps_json,
-                    result_table_json, proposal_id, provider_name, model, total_elapsed_ms, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    result_table_json, attachments_json, proposal_id, provider_name, model,
+                    total_elapsed_ms, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -483,6 +616,7 @@ class AssistantStorageMixin:
                     json.dumps(clarification or {}, ensure_ascii=False),
                     json.dumps(next_steps or [], ensure_ascii=False),
                     json.dumps(result_table or {}, ensure_ascii=False),
+                    json.dumps(attachments or [], ensure_ascii=False),
                     proposal_id or "",
                     provider_name or "",
                     model or "",
@@ -562,3 +696,279 @@ class AssistantStorageMixin:
                 "SELECT * FROM ai_assistant_proposals WHERE proposal_id = ?", (pid,)
             ).fetchone()
         return self._row_to_proposal_dict(row) if row is not None else None
+
+    def save_attachment(self, parsed: Dict[str, Any], *, session_id: str = "") -> Dict[str, Any]:
+        aid = f"att_{uuid.uuid4().hex[:12]}"
+        now = _now_str()
+        clean_sid = (session_id or "").strip()
+        cutoff = (datetime.datetime.now() - datetime.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        chunks = list(parsed.get("chunks") or [])
+
+        with self.ctx.store.module_db(scope="private") as conn:
+            # 惰性清理超过 24 小时未发送绑定的孤立草稿附件
+            stale_rows = conn.execute(
+                "SELECT attachment_id FROM ai_assistant_attachments WHERE session_id = '' AND created_at < ?",
+                (cutoff,),
+            ).fetchall()
+            for sr in stale_rows:
+                stale_id = str(sr["attachment_id"])
+                conn.execute(
+                    "DELETE FROM ai_assistant_attachment_chunks WHERE attachment_id = ?",
+                    (stale_id,),
+                )
+                conn.execute(
+                    "DELETE FROM ai_assistant_attachments WHERE attachment_id = ?",
+                    (stale_id,),
+                )
+
+            conn.execute(
+                """
+                INSERT INTO ai_assistant_attachments (
+                    attachment_id, session_id, filename, file_ext, file_kind, encoding,
+                    size_bytes, line_count, row_count, estimated_tokens, chunk_count,
+                    oversized, recommended_strategy, summary, raw_text, csv_profile_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    aid,
+                    clean_sid,
+                    str(parsed.get("filename") or "attachment.txt"),
+                    str(parsed.get("file_ext") or ".txt"),
+                    str(parsed.get("file_kind") or "text"),
+                    str(parsed.get("encoding") or "utf-8"),
+                    int(parsed.get("size_bytes") or 0),
+                    int(parsed.get("line_count") or 0),
+                    int(parsed.get("row_count") or 0),
+                    int(parsed.get("estimated_tokens") or 0),
+                    len(chunks),
+                    1 if parsed.get("oversized") else 0,
+                    str(parsed.get("recommended_strategy") or "inline"),
+                    str(parsed.get("summary") or ""),
+                    str(parsed.get("raw_text") or ""),
+                    json.dumps(parsed.get("csv_profile") or {}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            conn.executemany(
+                """
+                INSERT INTO ai_assistant_attachment_chunks (
+                    chunk_id, attachment_id, chunk_index, title, range_label,
+                    start_line, end_line, estimated_tokens, content
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        f"{aid}::c{int(ch.get('chunk_index', idx)):04d}",
+                        aid,
+                        int(ch.get("chunk_index", idx)),
+                        str(ch.get("title") or ""),
+                        str(ch.get("range_label") or ""),
+                        int(ch.get("start_line") or 0),
+                        int(ch.get("end_line") or 0),
+                        int(ch.get("estimated_tokens") or 0),
+                        str(ch.get("content") or ""),
+                    )
+                    for idx, ch in enumerate(chunks)
+                ],
+            )
+        return self.get_attachment(aid, include_raw=False, include_chunks=True) or {}
+
+    def get_attachment(
+        self,
+        attachment_id: str,
+        *,
+        include_raw: bool = False,
+        include_chunks: bool = False,
+        include_chunk_content: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        aid = (attachment_id or "").strip()
+        if not aid:
+            return None
+        with self.ctx.store.module_db(scope="private") as conn:
+            row = conn.execute(
+                "SELECT * FROM ai_assistant_attachments WHERE attachment_id = ?",
+                (aid,),
+            ).fetchone()
+            if row is None:
+                return None
+            item = self._row_to_attachment_dict(row, include_raw=include_raw)
+            if include_chunks:
+                crows = conn.execute(
+                    "SELECT * FROM ai_assistant_attachment_chunks WHERE attachment_id = ? ORDER BY chunk_index ASC",
+                    (aid,),
+                ).fetchall()
+                item["chunks"] = [
+                    self._row_to_attachment_chunk_dict(cr, include_content=include_chunk_content)
+                    for cr in crows
+                ]
+        return item
+
+    def list_session_attachments(
+        self,
+        session_id: str,
+        *,
+        include_raw: bool = False,
+        include_chunks: bool = False,
+    ) -> List[Dict[str, Any]]:
+        sid = (session_id or "").strip()
+        if not sid:
+            return []
+        with self.ctx.store.module_db(scope="private") as conn:
+            rows = conn.execute(
+                "SELECT * FROM ai_assistant_attachments WHERE session_id = ? ORDER BY created_at ASC",
+                (sid,),
+            ).fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                att = self._row_to_attachment_dict(r, include_raw=include_raw)
+                if include_chunks:
+                    crows = conn.execute(
+                        "SELECT * FROM ai_assistant_attachment_chunks WHERE attachment_id = ? ORDER BY chunk_index ASC",
+                        (att["attachment_id"],),
+                    ).fetchall()
+                    att["chunks"] = [
+                        self._row_to_attachment_chunk_dict(cr, include_content=False)
+                        for cr in crows
+                    ]
+                out.append(att)
+        return out
+
+    def bind_attachments_to_session(self, attachment_ids: List[str], session_id: str) -> None:
+        sid = (session_id or "").strip()
+        clean_ids = [str(x).strip() for x in (attachment_ids or []) if str(x).strip()]
+        if not sid or not clean_ids:
+            return
+        with self.ctx.store.module_db(scope="private") as conn:
+            for aid in clean_ids:
+                conn.execute(
+                    """
+                    UPDATE ai_assistant_attachments
+                    SET session_id = ?
+                    WHERE attachment_id = ? AND (session_id = '' OR session_id = ?)
+                    """,
+                    (sid, aid, sid),
+                )
+
+    def get_attachment_chunk(
+        self,
+        attachment_id: str,
+        chunk_index: int,
+        *,
+        window: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        aid = (attachment_id or "").strip()
+        if not aid:
+            return None
+        win = max(0, min(3, int(window or 0)))
+        target_idx = int(chunk_index)
+        with self.ctx.store.module_db(scope="private") as conn:
+            arow = conn.execute(
+                "SELECT * FROM ai_assistant_attachments WHERE attachment_id = ?",
+                (aid,),
+            ).fetchone()
+            if arow is None:
+                return None
+            crows = conn.execute(
+                """
+                SELECT * FROM ai_assistant_attachment_chunks
+                WHERE attachment_id = ? AND chunk_index BETWEEN ? AND ?
+                ORDER BY chunk_index ASC
+                """,
+                (aid, target_idx - win, target_idx + win),
+            ).fetchall()
+        if not crows:
+            return None
+        return {
+            "attachment": self._row_to_attachment_dict(arow, include_raw=False),
+            "target_chunk_index": target_idx,
+            "chunks": [self._row_to_attachment_chunk_dict(cr, include_content=True) for cr in crows],
+        }
+
+    def search_attachment_content(
+        self,
+        attachment_id: str,
+        keyword: str,
+        *,
+        limit: int = 8,
+    ) -> Optional[Dict[str, Any]]:
+        aid = (attachment_id or "").strip()
+        kw = (keyword or "").strip()
+        if not aid:
+            return None
+        with self.ctx.store.module_db(scope="private") as conn:
+            arow = conn.execute(
+                "SELECT * FROM ai_assistant_attachments WHERE attachment_id = ?",
+                (aid,),
+            ).fetchone()
+            if arow is None:
+                return None
+            crows = conn.execute(
+                "SELECT * FROM ai_assistant_attachment_chunks WHERE attachment_id = ? ORDER BY chunk_index ASC",
+                (aid,),
+            ).fetchall()
+
+        terms = [t.lower() for t in kw.split() if t.strip()]
+        cap = max(1, min(20, int(limit or 8)))
+        hits: List[Dict[str, Any]] = []
+        for cr in crows:
+            content = str(cr["content"] or "")
+            start_ln = int(cr["start_line"] or 1)
+            for rel_idx, line in enumerate(content.splitlines()):
+                low = line.lower()
+                if terms and all(t in low for t in terms):
+                    hits.append(
+                        {
+                            "chunk_index": int(cr["chunk_index"] or 0),
+                            "title": str(cr["title"] or ""),
+                            "range_label": str(cr["range_label"] or ""),
+                            "line_no": start_ln + rel_idx,
+                            "snippet": line.strip()[:220],
+                        }
+                    )
+                    break
+            if len(hits) >= cap:
+                break
+
+        # 若整行 AND 未命中，按任意词兜底返回包含任一关键词的片段
+        if not hits and terms:
+            for cr in crows:
+                content = str(cr["content"] or "")
+                start_ln = int(cr["start_line"] or 1)
+                for rel_idx, line in enumerate(content.splitlines()):
+                    low = line.lower()
+                    if any(t in low for t in terms):
+                        hits.append(
+                            {
+                                "chunk_index": int(cr["chunk_index"] or 0),
+                                "title": str(cr["title"] or ""),
+                                "range_label": str(cr["range_label"] or ""),
+                                "line_no": start_ln + rel_idx,
+                                "snippet": line.strip()[:220],
+                            }
+                        )
+                        break
+                if len(hits) >= cap:
+                    break
+
+        return {
+            "attachment_id": aid,
+            "filename": str(arow["filename"] or ""),
+            "keyword": kw,
+            "hit_count": len(hits),
+            "hits": hits,
+        }
+
+    def delete_attachment(self, attachment_id: str) -> bool:
+        aid = (attachment_id or "").strip()
+        if not aid:
+            return False
+        with self.ctx.store.module_db(scope="private") as conn:
+            conn.execute(
+                "DELETE FROM ai_assistant_attachment_chunks WHERE attachment_id = ?",
+                (aid,),
+            )
+            cur = conn.execute(
+                "DELETE FROM ai_assistant_attachments WHERE attachment_id = ?",
+                (aid,),
+            )
+        return cur.rowcount > 0

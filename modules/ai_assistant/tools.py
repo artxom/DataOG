@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from core.platform.models import ConnectionProfile, TableMeta
 from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
 from core.platform.sql_risk_guard import build_affected_rows_probe_sql, classify_sql_batch
+from modules.ai_assistant.attachments import query_csv_in_memory
 
 MAX_TOOL_SAMPLE_ROWS = 200
 LLM_PREVIEW_ROWS_CAP = 30
@@ -96,6 +97,8 @@ class AssistantToolbox:
         dialect: str,
         default_schema: str,
         sample_limit: int = 100,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        storage: Any = None,
     ) -> None:
         self.ctx = ctx
         self.work_mode = work_mode  # connection | dialect
@@ -104,6 +107,12 @@ class AssistantToolbox:
         self.default_schema = default_schema
         self.sample_limit = max(10, min(MAX_TOOL_SAMPLE_ROWS, int(sample_limit or 100)))
         self.secret_values = [profile.password] if (profile and profile.password) else []
+        self.storage = storage
+        self.attachments_map: Dict[str, Dict[str, Any]] = {
+            str(att.get("attachment_id") or ""): att
+            for att in (attachments or [])
+            if isinstance(att, dict) and att.get("attachment_id")
+        }
 
         self.citations_map: Dict[str, Dict[str, Any]] = {}
         self.latest_result_table: Optional[Dict[str, Any]] = None
@@ -131,6 +140,9 @@ class AssistantToolbox:
             "run_readonly_sql": self.tool_run_readonly_sql,
             "explain_sql": self.tool_explain_sql,
             "propose_write_sql": self.tool_propose_write_sql,
+            "search_attachment": self.tool_search_attachment,
+            "inspect_attachment_chunk": self.tool_inspect_attachment_chunk,
+            "query_csv_attachment": self.tool_query_csv_attachment,
         }
         fn = handlers.get(name)
         if fn is None:
@@ -492,5 +504,134 @@ class AssistantToolbox:
             "note": (
                 "已登记为待确认执行提案（系统绝对不会自动执行）。"
                 "请立即使用 `answer` 或 `propose_write` 向用户清晰说明变更意图、影响与注意事项，等待用户在卡片中二次确认。"
+            ),
+        }
+
+    def _resolve_attachment(self, raw_aid: str = "", *, only_csv: bool = False) -> Optional[Dict[str, Any]]:
+        aid = (raw_aid or "").strip()
+        if aid:
+            if aid in self.attachments_map:
+                att = self.attachments_map[aid]
+                if not only_csv or att.get("file_kind") == "csv":
+                    return att
+            if self.storage is not None:
+                found = self.storage.get_attachment(aid, include_raw=False, include_chunks=False)
+                if found and (not only_csv or found.get("file_kind") == "csv"):
+                    return found
+            return None
+        candidates = [
+            a
+            for a in self.attachments_map.values()
+            if (not only_csv or a.get("file_kind") == "csv")
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+        return candidates[-1] if only_csv and candidates else None
+
+    def tool_search_attachment(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self.storage is None:
+            return {"ok": False, "error": "附件检索存储尚未就绪"}
+        att = self._resolve_attachment(str(params.get("attachment_id") or ""))
+        if att is None:
+            return {"ok": False, "error": "未找到指定的附件，请核对 `attachment_id`"}
+        kw = str(params.get("keyword") or "").strip()
+        if not kw:
+            return {"ok": False, "error": "缺少检索关键词 `keyword`"}
+        limit = max(1, min(20, int(params.get("limit") or 8)))
+        res = self.storage.search_attachment_content(att["attachment_id"], kw, limit=limit)
+        if res is None:
+            return {"ok": False, "error": "附件不存在或已被移除"}
+        return {"ok": True, **res}
+
+    def tool_inspect_attachment_chunk(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self.storage is None:
+            return {"ok": False, "error": "附件分片存储尚未就绪"}
+        att = self._resolve_attachment(str(params.get("attachment_id") or ""))
+        if att is None:
+            return {"ok": False, "error": "未找到指定的附件，请核对 `attachment_id`"}
+        try:
+            c_idx = int(params.get("chunk_index", 0))
+        except Exception:
+            c_idx = 0
+        win = max(0, min(2, int(params.get("window") or 0)))
+        res = self.storage.get_attachment_chunk(att["attachment_id"], c_idx, window=win)
+        if res is None:
+            return {
+                "ok": False,
+                "error": f"未找到附件 `{att['filename']}` 的第 {c_idx} 号分片（有效范围 0..{max(0, att.get('chunk_count', 1) - 1)}）",
+            }
+        return {
+            "ok": True,
+            "attachment_id": att["attachment_id"],
+            "filename": att["filename"],
+            "chunks": [
+                {
+                    "chunk_index": ch["chunk_index"],
+                    "title": ch["title"],
+                    "range_label": ch["range_label"],
+                    "content": ch["content"],
+                }
+                for ch in res["chunks"]
+            ],
+        }
+
+    def tool_query_csv_attachment(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        if self.storage is None:
+            return {"ok": False, "error": "CSV 查询存储尚未就绪"}
+        att = self._resolve_attachment(str(params.get("attachment_id") or ""), only_csv=True)
+        if att is None:
+            return {"ok": False, "error": "未找到可查询的 CSV/TSV 附件，请核对 `attachment_id`"}
+        raw_att = self.storage.get_attachment(att["attachment_id"], include_raw=True)
+        if raw_att is None or raw_att.get("file_kind") != "csv":
+            return {"ok": False, "error": "仅支持对 CSV/TSV 附件执行只读 SQL 查询"}
+        sql_text = str(params.get("sql") or "").strip()
+        if not sql_text:
+            return {"ok": False, "error": "缺少查询 SQL（表名固定写作 `csv_data`）"}
+        req_limit = max(1, min(self.sample_limit, int(params.get("limit") or 50)))
+        try:
+            qres = query_csv_in_memory(
+                raw_att["raw_text"],
+                raw_att["file_ext"],
+                sql_text,
+                limit=req_limit,
+            )
+        except ReadOnlyViolationError as vio:
+            return {
+                "ok": False,
+                "blocked_by_sandbox": True,
+                "error": f"CSV 只读查询沙箱已拦截非只读语句: {vio}",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": f"CSV SQL 查询失败: {sanitize_error_text(exc)}（提示：表名固定为 csv_data，含中文/空格列名请用双引号包裹）",
+            }
+
+        self.latest_result_table = {
+            "connection_id": "",
+            "connection_name": f"CSV附件:{raw_att['filename']}",
+            "dialect": "SQLITE",
+            "sql": qres["sql"],
+            "columns": qres["columns"],
+            "rows": qres["rows"],
+            "row_count": qres["row_count"],
+            "truncated": qres["truncated"],
+            "elapsed_ms": qres["elapsed_ms"],
+        }
+        preview_rows = qres["rows"][:LLM_PREVIEW_ROWS_CAP]
+        return {
+            "ok": True,
+            "attachment_id": raw_att["attachment_id"],
+            "filename": raw_att["filename"],
+            "sql": qres["sql"],
+            "columns": [c["name"] for c in qres["columns"]],
+            "rows": preview_rows,
+            "row_count": qres["row_count"],
+            "truncated": qres["truncated"],
+            "elapsed_ms": qres["elapsed_ms"],
+            "note": (
+                f"CSV 内存只读查询返回 {qres['row_count']} 行（向大模型展示前 {len(preview_rows)} 行）"
+                if qres["row_count"] > len(preview_rows)
+                else f"CSV 内存只读查询共返回 {qres['row_count']} 行"
             ),
         }
