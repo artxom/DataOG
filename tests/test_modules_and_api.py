@@ -30,7 +30,7 @@ from urllib.parse import urlencode, urlsplit
 
 import openpyxl
 
-from app import create_app, resolve_static_dir
+from app import APP_VERSION, check_static_ui_version_sync, create_app, resolve_static_dir
 from core.platform.context import PlatformContext
 
 
@@ -355,6 +355,47 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
             )
             self.assertEqual(r_same.status_code, 200)
             self.assertTrue(r_same.json()["ok"])
+
+    def test_frontend_no_cache_headers_reload_button_and_ui_version_sync(self) -> None:
+        """验证前端 HTML/JS/CSS 资源强制 no-cache、桌面一键重载按钮及静态目录版本校验."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = create_app(db_path=os.path.join(tmpdir, "dataog_state.db"))
+            client = TestClient(app)
+
+            for path in (
+                "/",
+                "/js/main.js",
+                "/js/views/settings_view.js",
+                "/js/views/knowledge_view.js",
+                "/css/workbench.css",
+            ):
+                resp = client.get(path)
+                self.assertEqual(resp.status_code, 200, path)
+                self.assertEqual(
+                    resp.headers.get("Cache-Control"),
+                    "no-store, no-cache, must-revalidate",
+                    path,
+                )
+                self.assertEqual(resp.headers.get("Pragma"), "no-cache", path)
+                self.assertEqual(resp.headers.get("Expires"), "0", path)
+
+            r_home = client.get("/")
+            self.assertIn('id="btn-menubar-reload"', r_home.text)
+            self.assertIn(f'<meta name="dataog-ui-version" content="{APP_VERSION}" />', r_home.text)
+
+            r_ico = client.get("/dataog.ico")
+            self.assertEqual(r_ico.status_code, 200)
+            self.assertNotIn("no-store", (r_ico.headers.get("Cache-Control") or "").lower())
+
+            static_dir = resolve_static_dir()
+            self.assertEqual(check_static_ui_version_sync(static_dir, APP_VERSION), (True, APP_VERSION))
+            self.assertEqual(check_static_ui_version_sync(static_dir, "2.9.2"), (False, APP_VERSION))
+
+            stale_dir = os.path.join(tmpdir, "stale_static")
+            os.makedirs(stale_dir, exist_ok=True)
+            with open(os.path.join(stale_dir, "index.html"), "w", encoding="utf-8") as fh:
+                fh.write("<!doctype html><html><head><title>Old</title></head><body></body></html>")
+            self.assertEqual(check_static_ui_version_sync(stale_dir, APP_VERSION), (False, ""))
 
     def test_platform_endpoints_and_three_plugin_modules_closed_loop(self) -> None:
         """端到端验证：平台连接/驱动/查询 API + DDL翻译四层穿透 + 跨环境三栏比对 + 推送至单库贯标台闭环."""

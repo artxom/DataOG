@@ -26,6 +26,7 @@ class WorkbenchStore {
 
     this.state = {
       brandName: "Data.O.G",
+      version: "",
       storageMode: "SEPARATED",
       license: null,
       activeWorkspace: null,
@@ -90,6 +91,9 @@ class WorkbenchStore {
 
   applyBootstrap(data) {
     this.state.brandName = data.brand_name || "Data.O.G";
+    if (data.version) {
+      this.state.version = String(data.version);
+    }
     if (data.storage_mode) {
       this.state.storageMode = data.storage_mode;
     }
