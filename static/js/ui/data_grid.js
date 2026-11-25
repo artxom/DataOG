@@ -12,8 +12,12 @@ export class DataGrid {
    *   columns: Array<{ key: string, label: string, sortable?: boolean, render?: (row: any, idx: number) => Node | string }>,
    *   rows?: any[],
    *   rowKey?: string | ((row: any, idx: number) => string),
+   *   rowClassName?: (row: any, idx: number) => string,
    *   selectable?: boolean,
    *   selectedKeys?: Set<string>,
+   *   initialSortKey?: string,
+   *   initialSortAsc?: boolean,
+   *   onSortChange?: (sortKey: string, sortAsc: boolean) => void,
    *   emptyText?: string,
    *   maxHeight?: string,
    *   onRowClick?: (row: any, idx: number) => void,
@@ -26,6 +30,7 @@ export class DataGrid {
     this.columns = options.columns || [];
     this.rows = options.rows || [];
     this.rowKey = options.rowKey || "id";
+    this.rowClassName = options.rowClassName || null;
     this.selectable = Boolean(options.selectable);
     this.selectedKeys = options.selectedKeys || new Set();
     this.emptyText = options.emptyText || "暂无数据记录";
@@ -33,9 +38,10 @@ export class DataGrid {
     this.onRowClick = options.onRowClick || null;
     this.onRowDblClick = options.onRowDblClick || null;
     this.onSelectionChange = options.onSelectionChange || null;
+    this.onSortChange = options.onSortChange || null;
 
-    this.sortKey = "";
-    this.sortAsc = true;
+    this.sortKey = options.initialSortKey || "";
+    this.sortAsc = options.initialSortAsc !== false;
     this._masterCb = null;
     this._rowDomMap = new Map();
     this._renderedKeys = [];
@@ -147,6 +153,7 @@ export class DataGrid {
                 this.sortKey = col.key;
                 this.sortAsc = true;
               }
+              this.onSortChange?.(this.sortKey, this.sortAsc);
               this.render();
             }
           : undefined,
@@ -201,10 +208,14 @@ export class DataGrid {
         );
       }
 
+      const extraRowCls =
+        typeof this.rowClassName === "function" ? String(this.rowClassName(row, idx) || "").trim() : "";
+      const rowClass = [isSel ? "is-selected" : "", extraRowCls].filter(Boolean).join(" ");
       const tr = el(
         "tr",
         {
-          className: isSel ? "is-selected" : "",
+          className: rowClass,
+          dataset: { rowKey: rk },
           onClick: () => this.onRowClick?.(row, idx),
           onDblclick: () => this.onRowDblClick?.(row, idx),
         },

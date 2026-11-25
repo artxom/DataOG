@@ -219,6 +219,7 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         progress_cb: Optional[ProgressCallback] = noop_progress,
         *,
         progress_start_pct: float = 20.0,
+        tolerate_conn_errors: bool = False,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
         items = self.ctx.store.list_items()
@@ -240,6 +241,10 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
                 resolved_groups.append((cid, eng, prof, grp))
 
         if not resolved_groups:
+            if tolerate_conn_errors:
+                state = self.get_workspace_state()
+                state["warning"] = "尚未绑定贯标目标数据源连接，跳过自动实时核验"
+                return state
             raise ValueError("尚未绑定贯标目标数据源连接，请先在顶部选择连接档案")
 
         start_pct = max(12.0, min(85.0, float(progress_start_pct)))
@@ -260,6 +265,7 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
 
         done_items = 0
         total_items = len(items)
+        verify_warnings: List[str] = []
         for _cid, eng, prof, conn_items in resolved_groups:
             grp_start = start_pct + (92.0 - start_pct) * (done_items / max(1, total_items))
             grp_end = start_pct + (92.0 - start_pct) * (
@@ -268,80 +274,86 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             conn_targets = list(
                 dict.fromkeys((str(it["schema_name"]), str(it["table_name"])) for it in conn_items)
             )
-            if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host and prof.driver_track == "NATIVE":
-                mid_pct = grp_start + (grp_end - grp_start) * 0.35
-                report(
-                    mid_pct,
-                    "核验目标库状态",
-                    f"正在从 [{prof.name}] 批量拉取 {len(conn_targets)} 张表系统目录与列序...",
-                    done_items,
-                    total_items,
-                )
-                eng.sync_all_items_with_db(items_subset=conn_items, dialect=prof.db_type)
-                done_items += len(conn_items)
-            else:
-                # 跨任意驱动（含 SQLite / MySQL / 自定义 JDBC）单会话批量获取元数据并核验
-                probe_start = grp_start + 1.0
-                probe_end = grp_start + (grp_end - grp_start) * 0.68
-                meta_cache, _, _ = self.ctx.metadata_hub.get_tables_metadata_batch(
-                    prof.connection_id,
-                    conn_targets,
-                    force_refresh=True,
-                    on_progress=lambda done_c, tot_c, cs, ct, ps=probe_start, pe=probe_end, pname=prof.name: report(
-                        ps + (pe - ps) * (min(done_c, max(1, tot_c)) / max(1, tot_c)),
+            try:
+                if prof.db_type in ("DWS", "PGSQL", "KINGBASE") and prof.host and prof.driver_track == "NATIVE":
+                    mid_pct = grp_start + (grp_end - grp_start) * 0.35
+                    report(
+                        mid_pct,
                         "核验目标库状态",
-                        f"正在读取 [{pname}] 表结构 ({min(done_c + 1, tot_c)}/{tot_c}): {cs}.{ct}",
-                        done_c,
-                        tot_c,
-                    ),
-                )
-                def_sch = prof.effective_default_schema().lower()
-                tbl_items_map: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-                tbl_meta_map: Dict[Tuple[str, str], EngineTableMeta] = {}
-                for it in conn_items:
-                    key = (str(it["schema_name"]).lower(), str(it["table_name"]).lower())
-                    tbl_items_map.setdefault(key, []).append(it)
-                    if key not in tbl_meta_map:
-                        raw_meta = meta_cache.get(key) or meta_cache.get((def_sch, key[1]))
-                        if raw_meta is None:
-                            raw_meta = self.ctx.metadata_hub.get_table_metadata(
-                                prof.connection_id,
-                                schema_name=it["schema_name"],
-                                table_name=it["table_name"],
-                                force_refresh=False,
-                            )
-                            meta_cache[key] = raw_meta
-                        tbl_meta_map[key] = self._to_engine_table_meta(raw_meta)
+                        f"正在从 [{prof.name}] 批量拉取 {len(conn_targets)} 张表系统目录与列序...",
+                        done_items,
+                        total_items,
+                    )
+                    eng.sync_all_items_with_db(items_subset=conn_items, dialect=prof.db_type)
+                    done_items += len(conn_items)
+                else:
+                    # 跨任意驱动（含 SQLite / MySQL / 自定义 JDBC）单会话批量获取元数据并核验
+                    probe_start = grp_start + 1.0
+                    probe_end = grp_start + (grp_end - grp_start) * 0.68
+                    meta_cache, _, _ = self.ctx.metadata_hub.get_tables_metadata_batch(
+                        prof.connection_id,
+                        conn_targets,
+                        force_refresh=True,
+                        on_progress=lambda done_c, tot_c, cs, ct, ps=probe_start, pe=probe_end, pname=prof.name: report(
+                            ps + (pe - ps) * (min(done_c, max(1, tot_c)) / max(1, tot_c)),
+                            "核验目标库状态",
+                            f"正在读取 [{pname}] 表结构 ({min(done_c + 1, tot_c)}/{tot_c}): {cs}.{ct}",
+                            done_c,
+                            tot_c,
+                        ),
+                    )
+                    def_sch = prof.effective_default_schema().lower()
+                    tbl_items_map: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+                    tbl_meta_map: Dict[Tuple[str, str], EngineTableMeta] = {}
+                    for it in conn_items:
+                        key = (str(it["schema_name"]).lower(), str(it["table_name"]).lower())
+                        tbl_items_map.setdefault(key, []).append(it)
+                        if key not in tbl_meta_map:
+                            raw_meta = meta_cache.get(key) or meta_cache.get((def_sch, key[1]))
+                            if raw_meta is None:
+                                raw_meta = self.ctx.metadata_hub.get_table_metadata(
+                                    prof.connection_id,
+                                    schema_name=it["schema_name"],
+                                    table_name=it["table_name"],
+                                    force_refresh=False,
+                                )
+                                meta_cache[key] = raw_meta
+                            tbl_meta_map[key] = self._to_engine_table_meta(raw_meta)
 
-                updates: List[Dict[str, Any]] = []
-                for key, grp in tbl_items_map.items():
-                    eng_meta = tbl_meta_map[key]
-                    claimed_old_names = {
-                        clean_identifier_input(str(x.get("old_col_name") or "")).lower()
-                        for x in grp
-                        if x.get("status") != "COMPLETED"
-                    }
-                    for it in grp:
-                        upd = eng._build_single_item_sync_update(
-                            it,
-                            eng_meta,
-                            claimed_old_names=claimed_old_names,
-                            dialect=prof.db_type,
-                        )
-                        updates.append(upd)
-                        done_items += 1
-                        if done_items == 1 or done_items % 100 == 0 or done_items == total_items:
-                            pct = probe_end + (grp_end - probe_end) * (
-                                done_items / max(1, total_items)
+                    updates: List[Dict[str, Any]] = []
+                    for key, grp in tbl_items_map.items():
+                        eng_meta = tbl_meta_map[key]
+                        claimed_old_names = {
+                            clean_identifier_input(str(x.get("old_col_name") or "")).lower()
+                            for x in grp
+                            if x.get("status") != "COMPLETED"
+                        }
+                        for it in grp:
+                            upd = eng._build_single_item_sync_update(
+                                it,
+                                eng_meta,
+                                claimed_old_names=claimed_old_names,
+                                dialect=prof.db_type,
                             )
-                            report(
-                                pct,
-                                "同步核验结果",
-                                f"正在比对字段规格 ({done_items}/{total_items}): {it['schema_name']}.{it['table_name']}.{it['old_col_name']}",
-                                done_items,
-                                total_items,
-                            )
-                self.ctx.store.batch_update_items_sync(updates)
+                            updates.append(upd)
+                            done_items += 1
+                            if done_items == 1 or done_items % 100 == 0 or done_items == total_items:
+                                pct = probe_end + (grp_end - probe_end) * (
+                                    done_items / max(1, total_items)
+                                )
+                                report(
+                                    pct,
+                                    "同步核验结果",
+                                    f"正在比对字段规格 ({done_items}/{total_items}): {it['schema_name']}.{it['table_name']}.{it['old_col_name']}",
+                                    done_items,
+                                    total_items,
+                                )
+                    self.ctx.store.batch_update_items_sync(updates)
+            except Exception as exc:
+                if not tolerate_conn_errors:
+                    raise
+                done_items += len(conn_items)
+                verify_warnings.append(f"[{prof.name}] 实时核验未完成: {exc}")
 
         report(
             95.0,
@@ -351,6 +363,8 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             total_items,
         )
         state = self.get_workspace_state()
+        if verify_warnings:
+            state["warning"] = "；".join(verify_warnings)
         state["message"] = f"已完成 {len(items)} 条字段规则的库内元数据实时比对核验"
         return state
 
@@ -605,6 +619,46 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         if sync_meta.get("migrated_tables"):
             state["migrated_tables"] = sync_meta["migrated_tables"]
 
+    def _auto_verify_after_execution(
+        self,
+        report: ProgressCallback,
+        *,
+        progress_start_pct: float = 90.0,
+    ) -> Tuple[bool, str, List[int]]:
+        """执行贯标 DDL 后立刻触发实时核验，并返回已确认达标的任务 ID 列表."""
+        report(
+            progress_start_pct,
+            "实时核验目标库状态",
+            "贯标执行完毕，正在对目标库最新字段结构执行实时核验...",
+            0,
+            1,
+        )
+        try:
+            verify_state = self.sync_items(
+                progress_cb=lambda pct, stg, dtl, proc=0, tot=0: report(
+                    min(98.5, max(progress_start_pct, float(pct))),
+                    stg or "实时核验目标库状态",
+                    dtl,
+                    proc,
+                    tot,
+                ),
+                progress_start_pct=progress_start_pct,
+                tolerate_conn_errors=True,
+            )
+            verified_items = verify_state.get("items") or self.ctx.store.list_items()
+            verified_completed_ids = [
+                int(it["id"])
+                for it in verified_items
+                if str(it.get("status") or "").upper() == "COMPLETED"
+                and int(it.get("id") or 0) > 0
+            ]
+            verify_warn = str(verify_state.get("warning") or "").strip()
+            if verify_warn:
+                return False, verify_warn, verified_completed_ids
+            return True, "", verified_completed_ids
+        except Exception as exc:
+            return False, f"执行后自动实时核验未完全完成：{exc}", []
+
     def execute_single(
         self,
         item_id: int,
@@ -639,15 +693,20 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         sync_meta: Dict[str, Any] = {"table_stats_by_conn": {}, "migrated_tables": []}
         if item.get("status") == "COMPLETED":
             report(
-                86.0,
+                82.0,
                 "同步字段绑标与元数据",
                 f"正在同步 {item_label} 改名后绑定关系与落标统计...",
                 1,
                 1,
             )
             sync_meta = self._post_migration_sync_bindings_and_metadata([item])
+
+        auto_verified, verify_warn, verified_completed_ids = (
+            self._auto_verify_after_execution(report, progress_start_pct=88.0)
+        )
+        item = self.ctx.store.get_item(item_id) or item
         report(
-            92.0,
+            98.5,
             "刷新执行台状态",
             f"{item_label} 状态: {item.get('status', 'DONE')}",
             1,
@@ -655,11 +714,16 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         )
         state = self.get_workspace_state()
         state["item"] = item
+        state["auto_verified"] = auto_verified
+        state["verified_completed_ids"] = verified_completed_ids
         self._attach_post_migration_sync_state(state, sync_meta, fallback_cid=conn_id)
         if item.get("status") in ("FAILED", "MISSING_TABLE", "MISSING_COLUMN"):
             state["warning"] = (
                 item.get("error_message") or item.get("status_detail") or f"{item_label} 贯标执行未通过"
             )
+        elif verify_warn:
+            state["warning"] = verify_warn
+            state["message"] = item.get("status_detail") or f"字段 {item_label} 贯标执行完成"
         else:
             state["message"] = item.get("status_detail") or f"字段 {item_label} 贯标执行完成"
         return state
@@ -680,13 +744,20 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             it for it in initial_items if it["id"] in id_set and it["status"] != "COMPLETED"
         ]
         if not pending_items:
-            report(95.0, "调度并发贯标", "所选记录均已贯标完成，无需重复执行", 0, 0)
+            report(82.0, "调度并发贯标", "所选记录均已贯标完成，正在触发实时核验...", 0, 0)
             batch_res = self.engine.execute_batch_items(
                 item_ids=item_ids, max_workers=max_workers, keep_backup=keep_backup
             )
+            auto_verified, verify_warn, verified_completed_ids = (
+                self._auto_verify_after_execution(report, progress_start_pct=86.0)
+            )
             state = self.get_workspace_state()
             state["batch_result"] = batch_res
+            state["auto_verified"] = auto_verified
+            state["verified_completed_ids"] = verified_completed_ids
             state["message"] = batch_res.get("message", "批量贯标任务执行完毕")
+            if verify_warn:
+                state["warning"] = verify_warn
             return state
 
         conn_pending_groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -847,15 +918,19 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         sync_meta: Dict[str, Any] = {"table_stats_by_conn": {}, "migrated_tables": []}
         if latest_completed:
             report(
-                94.0,
+                88.0,
                 "同步字段绑标与元数据",
                 "正在同步已完成表的新列绑定关系与落标统计...",
                 total_tables,
                 total_tables,
             )
             sync_meta = self._post_migration_sync_bindings_and_metadata(latest_completed)
+
+        auto_verified, verify_warn, verified_completed_ids = (
+            self._auto_verify_after_execution(report, progress_start_pct=91.0)
+        )
         report(
-            96.0,
+            98.5,
             "汇总批量结果",
             batch_res.get("message", "批量贯标任务执行完毕"),
             total_tables,
@@ -864,10 +939,14 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
 
         state = self.get_workspace_state()
         state["batch_result"] = batch_res
+        state["auto_verified"] = auto_verified
+        state["verified_completed_ids"] = verified_completed_ids
         state["message"] = batch_res.get("message", "批量贯标任务执行完毕")
         self._attach_post_migration_sync_state(state, sync_meta)
         if int(batch_res.get("failed_count", 0) or 0) > 0:
             state["warning"] = state["message"]
+        elif verify_warn:
+            state["warning"] = verify_warn
         return state
 
     def preview_rebuild(
@@ -1066,13 +1145,20 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             )
         ]
         sync_meta = self._post_migration_sync_bindings_and_metadata(latest_completed)
+        auto_verified, verify_warn, verified_completed_ids = (
+            self._auto_verify_after_execution(report, progress_start_pct=90.0)
+        )
         state = self.get_workspace_state()
         state["rebuild_result"] = res
+        state["auto_verified"] = auto_verified
+        state["verified_completed_ids"] = verified_completed_ids
         state["message"] = res.get("message", "整表保序重建完成")
         self._attach_post_migration_sync_state(state, sync_meta, fallback_cid=eff_cid)
+        if verify_warn:
+            state["warning"] = verify_warn
         report(
-            96.0,
-            "切换表名与恢复索引",
+            98.5,
+            "切换表名与实时核验",
             state["message"],
             3,
             3,

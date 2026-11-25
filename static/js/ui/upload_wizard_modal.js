@@ -23,6 +23,7 @@ function makeProgressId() {
  * @param {() => Promise<any>} opts.onDownloadBlankTemplate
  * @param {string} [opts.prefillButtonLabel]
  * @param {(() => Promise<any>) | null} [opts.onDownloadPrefilledTemplate]
+ * @param {Array<{label: string, loadingLabel?: string, icon?: string, toastMessage?: string, onDownload: () => Promise<any>}>} [opts.extraTemplateButtons]
  * @param {Array<{value: string, label: string, desc?: string}>} [opts.modes]
  * @param {string} [opts.defaultMode]
  * @param {string} [opts.accept]
@@ -36,6 +37,7 @@ export function openUploadWizardModal(opts) {
     onDownloadBlankTemplate,
     prefillButtonLabel = "",
     onDownloadPrefilledTemplate = null,
+    extraTemplateButtons = [],
     modes = [],
     defaultMode = "",
     accept = ".xlsx",
@@ -278,6 +280,36 @@ export function openUploadWizardModal(opts) {
         )
       : null;
 
+  const extraBtns = [];
+  for (const spec of Array.isArray(extraTemplateButtons) ? extraTemplateButtons : []) {
+    if (!spec || !spec.label || typeof spec.onDownload !== "function") continue;
+    const labelSpan = el("span", { text: spec.label });
+    const btn = el(
+      "button",
+      {
+        type: "button",
+        className: "mac-btn mac-btn-sm",
+        onClick: async () => {
+          if (uploading) return;
+          try {
+            btn.disabled = true;
+            if (spec.loadingLabel) labelSpan.textContent = spec.loadingLabel;
+            await spec.onDownload();
+            Toast.success(spec.toastMessage || "预填模板已开始下载");
+          } catch (err) {
+            Toast.error(err.message);
+          } finally {
+            labelSpan.textContent = spec.label;
+            if (!uploading) btn.disabled = false;
+          }
+        },
+      },
+      svgIcon(spec.icon || "layers", 14),
+      labelSpan
+    );
+    extraBtns.push(btn);
+  }
+
   const step1Box = el(
     "section",
     { className: "upload-wizard-step" },
@@ -304,7 +336,8 @@ export function openUploadWizardModal(opts) {
       "div",
       { style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", marginTop: "2px" } },
       blankBtn,
-      prefillBtn
+      prefillBtn,
+      ...extraBtns
     )
   );
 
@@ -363,6 +396,9 @@ export function openUploadWizardModal(opts) {
     cancelBtn.disabled = locked;
     blankBtn.disabled = locked;
     if (prefillBtn) prefillBtn.disabled = locked;
+    extraBtns.forEach((b) => {
+      b.disabled = locked;
+    });
     radioInputs.forEach((r) => {
       r.disabled = locked;
     });

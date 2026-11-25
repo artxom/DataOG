@@ -5225,6 +5225,687 @@ view.destroy();
             finally:
                 ctx.close()
 
+    def test_standard_migrator_skip_compliant_auto_verify_and_schema_template(self) -> None:
+        """验证落标绑定：跳过已落标字段入队、执行后立刻实时核验、以及 Schema 全量模板导出边界."""
+        from core.platform.models import ColumnMeta, SchemaMeta, TableMeta
+        from modules.standard_migrator.service import StandardMigratorService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            try:
+                app = create_app(ctx=ctx)
+                client = TestClient(app)
+
+                prof = ctx.connection_hub.save_profile(
+                    {
+                        "connection_id": "c_dws_mig_ux",
+                        "name": "测试数仓",
+                        "db_type": "DWS",
+                        "host": "127.0.0.1",
+                        "port": 15432,
+                        "dbname": "dw",
+                        "default_schema": "dwd",
+                    }
+                )
+                cid = prof.connection_id
+
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "S_OK",
+                        "cn_name": "已落标编号",
+                        "en_abbr": "ok_col",
+                        "type_dws": "VARCHAR(32)",
+                    }
+                )
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "S_FIX",
+                        "cn_name": "需改造字段",
+                        "en_abbr": "fix_col",
+                        "type_dws": "VARCHAR(64)",
+                    }
+                )
+
+                ctx.store.save_catalog_snapshot(
+                    cid,
+                    schemas=[
+                        SchemaMeta(schema_name="dwd", table_count=2, view_count=0),
+                        SchemaMeta(schema_name="ods", table_count=1, view_count=0),
+                        SchemaMeta(schema_name="empty_schema", table_count=0, view_count=0),
+                    ],
+                    tables=[
+                        {"schema_name": "dwd", "table_name": "t_mix", "object_type": "TABLE"},
+                        {"schema_name": "dwd", "table_name": "t_all_ok", "object_type": "TABLE"},
+                        {"schema_name": "ods", "table_name": "t_ods_a", "object_type": "TABLE"},
+                    ],
+                )
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name="dwd",
+                        table_name="t_mix",
+                        columns=[
+                            ColumnMeta(1, "ok_col", "VARCHAR(32)", column_comment="已落标编号"),
+                            ColumnMeta(2, "bad_col", "VARCHAR(16)", column_comment="旧注释"),
+                        ],
+                    ),
+                )
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name="dwd",
+                        table_name="t_all_ok",
+                        columns=[
+                            ColumnMeta(1, "ok_col", "VARCHAR(32)", column_comment="已落标编号"),
+                        ],
+                    ),
+                )
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name="ods",
+                        table_name="t_ods_a",
+                        columns=[
+                            ColumnMeta(1, "ods_c1", "VARCHAR(20)", column_comment="ODS字段"),
+                        ],
+                    ),
+                )
+                ctx.standard_catalog.bulk_save_field_bindings(
+                    cid,
+                    [
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": "ok_col", "std_code": "S_OK"},
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": "bad_col", "std_code": "S_FIX"},
+                        {"schema_name": "dwd", "table_name": "t_all_ok", "column_name": "ok_col", "std_code": "S_OK"},
+                    ],
+                )
+
+                # 1. 不勾选任何内容（column_names=[]）或显式混选已落标列，均自动跳过已落标字段且绝不调用 sync_items
+                with mock.patch.object(
+                    StandardMigratorService,
+                    "sync_items",
+                    side_effect=AssertionError("stage-migration must not call sync_items"),
+                ):
+                    r_unselected = client.post(
+                        "/api/modules/standard_migrator/bindings/stage-migration",
+                        json={
+                            "connection_id": cid,
+                            "schema_name": "dwd",
+                            "table_name": "t_mix",
+                            "column_names": [],
+                        },
+                    )
+                    self.assertEqual(r_unselected.status_code, 200, r_unselected.text)
+                    j_u = r_unselected.json()
+                    self.assertEqual(j_u["staged_count"], 1)
+                    self.assertEqual(j_u["skipped_compliant_count"], 1)
+                    self.assertIn("已自动跳过 1 个已落标字段", j_u["message"])
+                    self.assertEqual([it["old_col_name"] for it in j_u["items"]], ["bad_col"])
+
+                    r_mixed = client.post(
+                        "/api/modules/standard_migrator/bindings/stage-migration",
+                        json={
+                            "connection_id": cid,
+                            "schema_name": "dwd",
+                            "table_name": "t_mix",
+                            "column_names": ["ok_col", "bad_col"],
+                        },
+                    )
+                    self.assertEqual(r_mixed.status_code, 200, r_mixed.text)
+                    self.assertEqual(r_mixed.json()["skipped_compliant_count"], 1)
+                    self.assertEqual([it["old_col_name"] for it in r_mixed.json()["items"]], ["bad_col"])
+
+                    r_all_ok = client.post(
+                        "/api/modules/standard_migrator/bindings/stage-migration",
+                        json={
+                            "connection_id": cid,
+                            "schema_name": "dwd",
+                            "table_name": "t_all_ok",
+                            "column_names": [],
+                        },
+                    )
+                    self.assertEqual(r_all_ok.status_code, 400)
+                    self.assertIn("已自动跳过 1 个已落标字段", r_all_ok.json()["error"])
+                    self.assertEqual(len(ctx.store.list_items()), 1)
+
+                # 2. 执行单条 / 批量 / 保序重建后立刻自动实时核验，并返回 verified_completed_ids
+                svc = StandardMigratorService(ctx)
+                item_id = ctx.store.list_items()[0]["id"]
+
+                def _complete_item(iid: int, new_status: str = "COMPLETED") -> Dict[str, Any]:
+                    ctx.store.update_item_execution(
+                        iid,
+                        status=new_status,
+                        strategy="DIRECT_ALTER",
+                        status_detail="执行成功",
+                        generated_sql="ALTER TABLE dwd.t_mix RENAME COLUMN bad_col TO fix_col;",
+                    )
+                    return ctx.store.get_item(iid)  # type: ignore[return-value]
+
+                with (
+                    mock.patch.object(svc, "_get_engine_for_connection") as m_eng,
+                    mock.patch.object(svc, "_post_migration_sync_bindings_and_metadata", return_value={"table_stats_by_conn": {}, "migrated_tables": []}),
+                    mock.patch.object(svc, "sync_items", wraps=svc.sync_items) as m_sync,
+                ):
+                    fake_eng = mock.MagicMock()
+                    fake_eng.execute_single_item_direct.side_effect = lambda iid: _complete_item(iid)
+                    fake_eng.execute_batch_items.side_effect = lambda item_ids, **_kw: (
+                        [_complete_item(x) for x in item_ids],
+                        {"executed_count": len(item_ids), "success_count": len(item_ids), "failed_count": 0, "message": "批量执行完毕"},
+                    )[1]
+                    fake_eng.execute_table_rebuild_migration.side_effect = lambda *_a, item_ids=None, **_kw: (
+                        [_complete_item(x) for x in (item_ids or [item_id])],
+                        {"valid_count": 1, "failed_count": 0, "message": "重建执行完毕"},
+                    )[1]
+                    m_eng.return_value = (fake_eng, prof)
+
+                    res_single = svc.execute_single(item_id)
+                    self.assertEqual(m_sync.call_count, 1)
+                    self.assertTrue(res_single["auto_verified"])
+                    self.assertEqual(res_single["verified_completed_ids"], [item_id])
+
+                    ctx.store.update_item_execution(item_id, status="PENDING", strategy="DIRECT_ALTER", status_detail="重置")
+                    res_batch = svc.execute_batch([item_id])
+                    self.assertEqual(m_sync.call_count, 2)
+                    self.assertTrue(res_batch["auto_verified"])
+                    self.assertEqual(res_batch["verified_completed_ids"], [item_id])
+
+                    ctx.store.update_item_execution(item_id, status="PENDING", strategy="TABLE_REBUILD", status_detail="重置")
+                    res_reb = svc.execute_rebuild("dwd", "t_mix", item_ids=[item_id])
+                    self.assertEqual(m_sync.call_count, 3)
+                    self.assertTrue(res_reb["auto_verified"])
+                    self.assertEqual(res_reb["verified_completed_ids"], [item_id])
+
+                # 若自动核验抛出异常，执行状态与失败容错保留
+                with (
+                    mock.patch.object(svc, "_get_engine_for_connection") as m_eng,
+                    mock.patch.object(svc, "_post_migration_sync_bindings_and_metadata", return_value={"table_stats_by_conn": {}, "migrated_tables": []}),
+                    mock.patch.object(svc, "sync_items", side_effect=RuntimeError("连接抖动")),
+                ):
+                    fake_eng = mock.MagicMock()
+                    fake_eng.execute_single_item_direct.side_effect = lambda iid: _complete_item(iid)
+                    m_eng.return_value = (fake_eng, prof)
+                    res_warn = svc.execute_single(item_id)
+                    self.assertFalse(res_warn["auto_verified"])
+                    self.assertIn("连接抖动", res_warn["warning"])
+
+                # 互换改名（acct_code -> acct_no, acct_no -> acct_legacy_no）均 COMPLETED 后实时核验必须保持 COMPLETED 而非误判 MISSING_COLUMN
+                from core.dws_engine import (
+                    ColumnMeta as EngineColumnMeta,
+                    DWSMigratorEngine,
+                    TableMeta as EngineTableMeta,
+                )
+
+                with tempfile.TemporaryDirectory() as swap_tmp:
+                    swap_ctx = PlatformContext(private_root=swap_tmp, legacy_data_dir="")
+                    try:
+                        swap_ctx.store.replace_all_items(
+                            [
+                                {
+                                    "schema_name": "dwd",
+                                    "table_name": "t_swap",
+                                    "old_col_name": "acct_code",
+                                    "old_col_type": "VARCHAR(24)",
+                                    "old_col_comment": "主账号",
+                                    "new_col_name": "acct_no",
+                                    "new_col_type": "VARCHAR(32)",
+                                    "new_col_comment": "主账号",
+                                    "status": "COMPLETED",
+                                },
+                                {
+                                    "schema_name": "dwd",
+                                    "table_name": "t_swap",
+                                    "old_col_name": "acct_no",
+                                    "old_col_type": "VARCHAR(24)",
+                                    "old_col_comment": "老账号",
+                                    "new_col_name": "acct_legacy_no",
+                                    "new_col_type": "VARCHAR(32)",
+                                    "new_col_comment": "老账号",
+                                    "status": "COMPLETED",
+                                },
+                            ],
+                            "swap_test.xlsx",
+                        )
+                        swap_eng = DWSMigratorEngine(swap_ctx.store)
+                        swap_eng.is_configured = lambda: True  # type: ignore[method-assign]
+                        swap_eng._fetch_real_tables_metadata_batch = lambda _pairs: {  # type: ignore[method-assign]
+                            ("dwd", "t_swap"): EngineTableMeta(
+                                schema_name="dwd",
+                                table_name="t_swap",
+                                exists=True,
+                                columns=[
+                                    EngineColumnMeta(1, "acct_no", "VARCHAR(32)", column_comment="主账号"),
+                                    EngineColumnMeta(2, "acct_legacy_no", "VARCHAR(32)", column_comment="老账号"),
+                                ],
+                            )
+                        }
+                        sync_out = swap_eng.sync_all_items_with_db()
+                        self.assertEqual(
+                            [it["status"] for it in sync_out["items"]],
+                            ["COMPLETED", "COMPLETED"],
+                        )
+                    finally:
+                        swap_ctx.close()
+
+                # 3. 模板下载支持 scope=schema（含仅传 schema_name）与空 Schema 拦截
+                r_sch = client.get(
+                    f"/api/modules/standard_migrator/bindings/template.xlsx?connection_id={cid}&schema_name=ods&schemas=ods&scope=schema"
+                )
+                self.assertEqual(r_sch.status_code, 200, r_sch.text)
+                self.assertEqual(r_sch.headers.get("x-content-type-options"), "nosniff")
+                self.assertIn("filename=binding_template.xlsx", r_sch.headers.get("content-disposition") or "")
+                wb_ods = openpyxl.load_workbook(io.BytesIO(r_sch.content))
+                ods_rows = list(wb_ods["字段与数据标准对照"].iter_rows(min_row=2, values_only=True))
+                self.assertEqual({(r[0], r[1], r[2]) for r in ods_rows}, {("ods", "t_ods_a", "ods_c1")})
+
+                r_sch_only = client.get(
+                    f"/api/modules/standard_migrator/bindings/template.xlsx?connection_id={cid}&schema_name=dwd&scope=schema"
+                )
+                self.assertEqual(r_sch_only.status_code, 200, r_sch_only.text)
+                wb_dwd = openpyxl.load_workbook(io.BytesIO(r_sch_only.content))
+                dwd_rows = list(wb_dwd["字段与数据标准对照"].iter_rows(min_row=2, values_only=True))
+                self.assertEqual({r[1] for r in dwd_rows}, {"t_mix", "t_all_ok"})
+
+                r_empty_sch = client.get(
+                    f"/api/modules/standard_migrator/bindings/template.xlsx?connection_id={cid}&schema_name=empty_schema&schemas=empty_schema&scope=schema"
+                )
+                self.assertEqual(r_empty_sch.status_code, 400)
+                self.assertIn("empty_schema", r_empty_sch.json()["error"])
+            finally:
+                ctx.close()
+
+    def test_standard_migrator_frontend_ux_refinements_via_node(self) -> None:
+        """Node.js 真实执行：验证侧栏拖拽缩放、纳入原位保滚动/保焦点、跳已落标、3 秒渐隐移除、Schema 全量模板与文案更名."""
+        node_bin = shutil.which("node")
+        if getattr(sys, "frozen", False) or not node_bin:
+            return
+
+        project_root = os.path.dirname(resolve_static_dir())
+        with open(
+            os.path.join(project_root, "static", "js", "views", "standard_migrator_view.js"),
+            "r",
+            encoding="utf-8",
+        ) as fh:
+            sm_js = fh.read()
+        self.assertIn("上传字段落标映射关系", sm_js)
+        self.assertNotIn("上传对照关系", sm_js)
+
+        node_script = r"""
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+class MockNode {
+  constructor(tag) {
+    this.tagName = String(tag || "div").toUpperCase();
+    this.children = [];
+    this.attributes = new Map();
+    this.listeners = new Map();
+    this.style = {};
+    this.dataset = {};
+    this.className = "";
+    this.value = "";
+    this.textContent = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.checked = false;
+    this.indeterminate = false;
+    this.open = false;
+    this.returnValue = "";
+    this.scrollTop = 0;
+    this.scrollLeft = 0;
+    this.parentNode = null;
+    const self = this;
+    this.classList = {
+      add(...cs) { self.className = [...new Set([...(self.className||"").split(/\s+/).filter(Boolean), ...cs])].join(" "); },
+      remove(...cs) { const s = new Set(cs); self.className = (self.className||"").split(/\s+/).filter(x => x && !s.has(x)).join(" "); },
+      toggle(c, f) { const has = (self.className||"").split(/\s+/).includes(c); const on = f === undefined ? !has : Boolean(f); if (on) this.add(c); else this.remove(c); },
+      contains(c) { return (self.className||"").split(/\s+/).includes(c); },
+    };
+  }
+  appendChild(c) { if (c) { c.parentNode = this; this.children.push(c); } return c; }
+  replaceChildren(...ns) { this.children = ns.filter(Boolean); this.children.forEach(c => c.parentNode = this); }
+  setAttribute(k, v) { this.attributes.set(k, String(v)); }
+  getAttribute(k) { return this.attributes.get(k) ?? null; }
+  addEventListener(e, fn) { (this.listeners.get(e) || this.listeners.set(e, []).get(e)).push(fn); }
+  removeEventListener(e, fn) { const arr = this.listeners.get(e); if (arr) this.listeners.set(e, arr.filter(x => x !== fn)); }
+  dispatchEvent(ev) {
+    const e = { target: this, currentTarget: this, preventDefault() {}, stopPropagation() {}, ...ev };
+    for (const fn of [...(this.listeners.get(e.type) || [])]) fn(e);
+  }
+  _matches(sel) {
+    if (!sel) return false;
+    const tagMatch = sel.match(/^([a-zA-Z0-9_-]+)/);
+    if (tagMatch && this.tagName !== tagMatch[1].toUpperCase()) return false;
+    const attrRe = /\[([^\]=]+)(?:="([^"]*)")?\]/g;
+    let m;
+    while ((m = attrRe.exec(sel)) !== null) {
+      const attr = m[1];
+      const expected = m[2];
+      let actual = this.attributes.get(attr) ?? null;
+      if (actual === null && attr.startsWith("data-")) {
+        const camel = attr.slice(5).replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+        if (camel in this.dataset) actual = String(this.dataset[camel]);
+      }
+      if (actual === null) return false;
+      if (expected !== undefined && actual !== expected) return false;
+    }
+    return true;
+  }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  querySelectorAll(sel) {
+    const out = [];
+    const walk = (node) => {
+      for (const ch of node.children || []) {
+        if (ch._matches?.(sel)) out.push(ch);
+        walk(ch);
+      }
+    };
+    walk(this);
+    return out;
+  }
+  closest() { return null; }
+  contains(n) { return this === n || this.children.some(c => c.contains?.(n)); }
+  focus() { globalThis.document.activeElement = this; }
+  blur() {}
+  select() {}
+  showModal() { this.open = true; }
+  close(v) { this.open = false; this.returnValue = v || ""; }
+  remove() {
+    if (this.parentNode) {
+      this.parentNode.children = this.parentNode.children.filter(x => x !== this);
+      this.parentNode = null;
+    }
+  }
+  getBoundingClientRect() {
+    if (this.classList?.contains?.("mac-sidebar")) {
+      const w = parseFloat(this.style?.width || "248") || 248;
+      return { top: 0, bottom: 800, left: 0, right: w, width: w, height: 800 };
+    }
+    return { top: 0, bottom: 800, left: 0, right: 1200, width: 1200, height: 800 };
+  }
+}
+
+const byId = new Map();
+for (const id of [
+  "global-modal", "global-modal-title", "global-modal-body", "global-modal-footer", "global-modal-close", "toast-root",
+]) {
+  const n = new MockNode(id === "global-modal" ? "dialog" : "div");
+  n.id = id;
+  byId.set(id, n);
+}
+
+const storageMap = new Map();
+const winListeners = new Map();
+const headNode = new MockNode("head");
+globalThis.Node = MockNode;
+globalThis.HTMLDialogElement = class HTMLDialogElement {};
+globalThis.localStorage = {
+  getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+  setItem: (k, v) => storageMap.set(k, String(v)),
+};
+globalThis.window = {
+  innerWidth: 1440,
+  innerHeight: 900,
+  addEventListener(e, fn) { (winListeners.get(e) || winListeners.set(e, []).get(e)).push(fn); },
+  removeEventListener(e, fn) { const a = winListeners.get(e); if (a) winListeners.set(e, a.filter(x => x !== fn)); },
+  dispatchEvent(ev) { for (const fn of [...(winListeners.get(ev.type) || [])]) fn(ev); },
+};
+globalThis.document = {
+  head: headNode,
+  body: new MockNode("body"),
+  activeElement: null,
+  createElement: (tag) => new MockNode(tag),
+  createElementNS: (_ns, tag) => new MockNode(tag),
+  createTextNode: (t) => Object.assign(new MockNode("#text"), { textContent: String(t) }),
+  getElementById: (id) => byId.get(id) || null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener() {},
+  removeEventListener() {},
+};
+
+const fetchCalls = [];
+globalThis.fetch = async (url, init = {}) => {
+  const u = String(url);
+  fetchCalls.push({ url: u, method: init.method || "GET", body: init.body || "" });
+  if (u.includes("/bindings/stage-migration")) {
+    return {
+      ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
+      json: async () => ({
+        ok: true,
+        staged_count: 1,
+        skipped_compliant_count: 1,
+        message: "已纳入 1 条待改字段",
+        items: [
+          {
+            id: 101, connection_id: "c1", schema_name: "dwd", table_name: "t_mix",
+            old_col_name: "bad_col", new_col_name: "fix_col", old_col_type: "VARCHAR(16)",
+            new_col_type: "VARCHAR(64)", status: "PENDING", strategy: "DIRECT_ALTER",
+          },
+        ],
+        summary: { total: 1, pending: 1, partial: 0, completed: 0, failed: 0, missing: 0 },
+      }),
+    };
+  }
+  if (u.includes("/execute/item/101")) {
+    return {
+      ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
+      json: async () => ({
+        ok: true,
+        auto_verified: true,
+        verified_completed_ids: [101],
+        message: "执行并实时核验完成",
+        item: {
+          id: 101, connection_id: "c1", schema_name: "dwd", table_name: "t_mix",
+          old_col_name: "bad_col", new_col_name: "fix_col", status: "COMPLETED", strategy: "DIRECT_ALTER",
+        },
+        items: [
+          {
+            id: 101, connection_id: "c1", schema_name: "dwd", table_name: "t_mix",
+            old_col_name: "bad_col", new_col_name: "fix_col", status: "COMPLETED", strategy: "DIRECT_ALTER",
+          },
+        ],
+        summary: { total: 1, pending: 0, partial: 0, completed: 1, failed: 0, missing: 0 },
+      }),
+    };
+  }
+  if (u.includes("/checklist/delete-items")) {
+    return {
+      ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
+      json: async () => ({
+        ok: true, deleted_count: 1, items: [],
+        summary: { total: 0, pending: 0, partial: 0, completed: 0, failed: 0, missing: 0 },
+      }),
+    };
+  }
+  if (u.includes("/bindings/template.xlsx")) {
+    return {
+      ok: true, status: 200,
+      headers: new Map([
+        ["content-type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"],
+        ["content-disposition", "attachment; filename=binding_template.xlsx"],
+      ]),
+      blob: async () => ({ size: 16 }),
+    };
+  }
+  return {
+    ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
+    json: async () => ({ ok: true, items: [], summary: {} }),
+  };
+};
+
+const root = process.argv[1];
+const imp = (rel) => import(pathToFileURL(path.join(root, rel)).href);
+
+const { store } = await imp("static/js/core/state.js");
+const { StandardMigratorView } = await imp("static/js/views/standard_migrator_view.js");
+
+store.updateConnections([
+  { connection_id: "c1", name: "测试数仓", db_type: "DWS", default_schema: "dwd", effective_default_schema: "dwd" },
+]);
+store.updateCatalogTree("c1", {
+  schemas: [{ schema_name: "dwd" }, { schema_name: "ods" }],
+  tables: [
+    { schema_name: "dwd", table_name: "t_mix", object_type: "TABLE" },
+    { schema_name: "ods", table_name: "t_ods", object_type: "TABLE" },
+  ],
+});
+
+const mv = new StandardMigratorView();
+mv.activeConnId = "c1";
+mv.activeSchema = "dwd";
+mv.selectedSchema = "dwd";
+mv.activeTable = "t_mix";
+mv.ws = { active_connection_id: "c1", active_connection: { default_schema: "dwd" }, items: [], summary: { total: 0 } };
+
+// 1. 左侧栏拖拽缩放、双击恢复与键盘微调
+mv.render();
+if (mv.root.children.length !== 3 || mv.root.children[1] !== mv.sidebarResizer) {
+  throw new Error("StandardMigratorView root should contain [sidebarMount, sidebarResizer, mainMount]");
+}
+if (!mv.sidebarMount.classList.contains("is-resizable")) {
+  throw new Error("sidebarMount missing is-resizable class");
+}
+mv.sidebarResizer.dispatchEvent({ type: "pointerdown", button: 0, clientX: 248, pointerId: 1 });
+globalThis.window.dispatchEvent({ type: "pointermove", clientX: 348 });
+if (mv._sidebarWidth !== 348 || mv.sidebarMount.style.width !== "348px") {
+  throw new Error(`Expected sidebar width 348 after drag, got ${mv._sidebarWidth}`);
+}
+globalThis.window.dispatchEvent({ type: "pointerup" });
+if (storageMap.get("dataog:standard_migrator:sidebar_width") !== "348") {
+  throw new Error("Sidebar width was not persisted to localStorage");
+}
+mv.sidebarResizer.dispatchEvent({ type: "dblclick" });
+if (mv._sidebarWidth !== 248 || mv.sidebarMount.style.width !== "248px") {
+  throw new Error("Double-click resizer should reset sidebar width to 248px");
+}
+mv.sidebarResizer.dispatchEvent({ type: "keydown", key: "Home" });
+if (mv._sidebarWidth !== 180) {
+  throw new Error("Home key should clamp sidebar width to 180");
+}
+
+// 2. 点击「纳入贯标」保持表格 DOM、滚动条与按钮焦点位置不变，且不勾选跳过已落标字段
+mv.tableCheck = {
+  ok: true,
+  format_profile: "type_dws",
+  table: { schema_name: "dwd", table_name: "t_mix" },
+  summary: { total_cols: 2, bound_cols: 2, compliant_cols: 1, non_compliant_cols: 1, coverage_pct: 100 },
+  columns: [
+    { ordinal_position: 1, column_name: "ok_col", data_type: "VARCHAR(32)", std_code: "S_OK", std_cn_name: "已落标", compliance_status: "COMPLIANT" },
+    { ordinal_position: 2, column_name: "bad_col", data_type: "VARCHAR(16)", std_code: "S_FIX", std_cn_name: "需改造", compliance_status: "NON_COMPLIANT" },
+  ],
+};
+mv.render();
+const gridBefore = mv._bindingsGrid.root;
+gridBefore.scrollTop = 260;
+gridBefore.scrollLeft = 24;
+const badStageBtn = mv._stageBtnByCol.get("bad_col");
+if (!badStageBtn) throw new Error("Missing stage button for bad_col");
+badStageBtn.focus();
+await mv.stageSelectedToQueue(["bad_col"]);
+if (mv._bindingsGrid.root !== gridBefore || mv.gridMount.children[0] !== gridBefore) {
+  throw new Error("In-place staging must NOT recreate grid DOM");
+}
+if (gridBefore.scrollTop !== 260 || gridBefore.scrollLeft !== 24) {
+  throw new Error(`Scroll position jumped after staging: top=${gridBefore.scrollTop}, left=${gridBefore.scrollLeft}`);
+}
+if (globalThis.document.activeElement !== badStageBtn) {
+  throw new Error("Focus moved away from clicked stage button");
+}
+if (badStageBtn.textContent !== "已入队" || mv._queueTabBtn.textContent !== "贯标改造执行队列 (1)") {
+  throw new Error("In-place button or queue tab badge failed to update");
+}
+
+// 3. 全合规表不勾选直接点击纳入时跳过且不发起请求
+mv.tableCheck = {
+  ok: true,
+  format_profile: "type_dws",
+  table: { schema_name: "dwd", table_name: "t_all_ok" },
+  summary: { total_cols: 1, bound_cols: 1, compliant_cols: 1, coverage_pct: 100 },
+  columns: [
+    { ordinal_position: 1, column_name: "ok_col", data_type: "VARCHAR(32)", std_code: "S_OK", std_cn_name: "已落标", compliance_status: "COMPLIANT" },
+  ],
+};
+mv.selectedBindCols.clear();
+const stageCallsBefore = fetchCalls.filter(c => c.url.includes("/bindings/stage-migration")).length;
+await mv.stageSelectedToQueue();
+const stageCallsAfter = fetchCalls.filter(c => c.url.includes("/bindings/stage-migration")).length;
+if (stageCallsAfter !== stageCallsBefore) {
+  throw new Error("All-compliant table should skip staging without issuing POST /stage-migration");
+}
+
+// 4. 按钮更名与 Schema 选择联动（不影响已打开表 activeSchema）与 3 模板按钮
+const hdrText = (n) => (n.textContent || "") + (n.children || []).map(hdrText).join(" ");
+if (!hdrText(mv.renderHeaderActions()).includes("上传字段落标映射关系")) {
+  throw new Error("Header action button must be renamed to 上传字段落标映射关系");
+}
+await mv.tree.setActiveConnection("c1", { expand: true });
+const schemaNodes = mv.tree.treeBody.querySelectorAll("[data-schema-key]");
+const odsSchemaNode = schemaNodes.find(n => n.dataset.schemaKey === "c1::ods");
+if (!odsSchemaNode) throw new Error("Missing ods schema node in DatabaseTree");
+odsSchemaNode.dispatchEvent({ type: "click" });
+if (mv.selectedSchema !== "ods" || mv.activeSchema !== "dwd") {
+  throw new Error(`Expected selectedSchema=ods & activeSchema=dwd, got ${mv.selectedSchema} / ${mv.activeSchema}`);
+}
+
+mv.openBindingUploadWizard();
+if (byId.get("global-modal-title").textContent !== "上传字段落标映射关系") {
+  throw new Error("Upload wizard title should be 上传字段落标映射关系");
+}
+const modalBody = byId.get("global-modal-body");
+const btnTexts = modalBody.querySelectorAll("button").map(b => hdrText(b).trim());
+if (
+  !btnTexts.some(t => t.includes("下载空白系统模板")) ||
+  !btnTexts.some(t => t.includes("dwd.t_mix")) ||
+  !btnTexts.some(t => t.includes("导出「ods」Schema 全量模板"))
+) {
+  throw new Error(`Expected 3 template buttons in wizard, got: ${JSON.stringify(btnTexts)}`);
+}
+const schemaTplBtn = modalBody.querySelectorAll("button").find(b => hdrText(b).includes("导出「ods」Schema 全量模板"));
+schemaTplBtn.dispatchEvent({ type: "click" });
+await new Promise(r => setTimeout(r, 20));
+const tplCall = fetchCalls.find(c => c.url.includes("/bindings/template.xlsx") && c.url.includes("scope=schema"));
+if (!tplCall || !tplCall.url.includes("schemas=ods")) {
+  throw new Error(`Expected schema template download with scope=schema&schemas=ods, got ${tplCall?.url}`);
+}
+
+// 5. 执行完毕后实时核验，已达标任务 3 秒内渐隐并从后台移除
+mv.subMode = "queue";
+mv.statusFilter = "PENDING";
+mv.render();
+await mv.executeSingleItem({ id: 101, schema_name: "dwd", table_name: "t_mix", old_col_name: "bad_col" });
+const clearingRow = mv._queueGrid.root.querySelector('tr[data-row-key="101"]');
+if (!clearingRow || !clearingRow.classList.contains("queue-row-verified-clearing")) {
+  throw new Error("Completed queue item should remain visible with queue-row-verified-clearing class");
+}
+await new Promise(r => setTimeout(r, 2600));
+if (!clearingRow.classList.contains("is-collapsing")) {
+  throw new Error("Clearing row should enter is-collapsing phase before 3s removal");
+}
+await new Promise(r => setTimeout(r, 600));
+const delCall = fetchCalls.find(c => c.url.includes("/checklist/delete-items"));
+if (!delCall || mv._clearingCompletedIds.size !== 0 || (mv.ws?.items || []).length !== 0) {
+  throw new Error("Completed item should be persisted deleted after 3s fadeout");
+}
+
+mv.destroy();
+console.log("STANDARD_MIGRATOR_UX_OK");
+process.exit(0);
+"""
+        proc = subprocess.run(
+            [node_bin, "--input-type=module", "-e", node_script, project_root],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=25,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"Node 前端落标绑定与贯标交互验证失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+        )
+        self.assertIn("STANDARD_MIGRATOR_UX_OK", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

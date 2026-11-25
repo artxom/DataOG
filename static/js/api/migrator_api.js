@@ -174,7 +174,7 @@ export const migratorApi = {
     if (scope) qs.set("scope", scope);
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
     return downloadApiFile(`/api/modules/standard_migrator/bindings/template.xlsx${suffix}`, {
-      fallbackName: "DataOG_字段与数据标准对照模板.xlsx",
+      fallbackName: "DataOG_字段落标映射关系模板.xlsx",
       taskId,
       signal,
     });

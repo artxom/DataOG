@@ -25,11 +25,39 @@ export class StandardMigratorModalsMixin {
         ? `${this.activeSchema}.${this.activeTable}`
         : this.activeTable
       : "";
+    const conn = this._findConnection?.(connId);
+    const catSchemas = (store.state.catalogTrees?.[connId]?.schemas || [])
+      .map((s) => (typeof s === "string" ? s : s?.schema_name || ""))
+      .filter(Boolean);
+    const targetSchema =
+      this.selectedSchema ||
+      this.activeSchema ||
+      conn?.effective_default_schema ||
+      conn?.default_schema ||
+      (catSchemas.length === 1 ? catSchemas[0] : "") ||
+      "";
+    const extraTemplateButtons = targetSchema
+      ? [
+          {
+            label: `导出「${targetSchema}」Schema 全量模板 (.xlsx)`,
+            loadingLabel: "正在生成 Schema 全量模板...",
+            icon: "layers",
+            toastMessage: `已导出「${targetSchema}」Schema 全量字段映射模板`,
+            onDownload: () =>
+              migratorApi.downloadBindingTemplate({
+                connectionId: connId,
+                schemaName: targetSchema,
+                schemas: targetSchema,
+                scope: "schema",
+              }),
+          },
+        ]
+      : [];
 
     openUploadWizardModal({
-      title: "导入「表字段 ↔ 数据标准」对照关系",
+      title: "上传字段落标映射关系",
       description:
-        "先下载系统标准模板（支持直接导出当前已选表的全部物理字段预填模板），在「数据项编号」列填写对应标准编码后上传。",
+        "先下载系统标准模板（提供空白模板、当前选中表模板及当前选中 Schema 全量模板），在「数据项编号」列填写对应标准编码后上传。",
       templateColumns: [
         { name: "模式名" },
         { name: "表名", required: true },
@@ -38,7 +66,7 @@ export class StandardMigratorModalsMixin {
         { name: "标准英文简称 / 中文名称" },
       ],
       onDownloadBlankTemplate: () => migratorApi.downloadBindingTemplate({}),
-      prefillButtonLabel: fqActive ? `导出「${fqActive}」预填字段模板 (.xlsx)` : "",
+      prefillButtonLabel: fqActive ? `导出「${fqActive}」当前表模板 (.xlsx)` : "",
       onDownloadPrefilledTemplate: fqActive
         ? () =>
             migratorApi.downloadBindingTemplate({
@@ -47,6 +75,7 @@ export class StandardMigratorModalsMixin {
               tables: fqActive,
             })
         : null,
+      extraTemplateButtons,
       modes: [
         {
           value: "merge",
@@ -66,7 +95,7 @@ export class StandardMigratorModalsMixin {
           file,
           {
             connectionId: connId,
-            defaultSchema: this.activeSchema || "",
+            defaultSchema: this.activeSchema || targetSchema || "",
             mode: mode || "merge",
             formatProfile: this.formatProfile,
           },
@@ -76,6 +105,7 @@ export class StandardMigratorModalsMixin {
         if (res.active_table) {
           this.tableCheck = res.active_table;
           this.activeSchema = res.active_table.table?.schema_name || this.activeSchema;
+          this.selectedSchema = this.activeSchema || this.selectedSchema;
           this.activeTable = res.active_table.table?.table_name || this.activeTable;
         } else if (res.tables?.length) {
           const picked =
@@ -92,8 +122,10 @@ export class StandardMigratorModalsMixin {
             res.tables[0];
           this.tableCheck = picked;
           this.activeSchema = picked.table?.schema_name || this.activeSchema;
+          this.selectedSchema = this.activeSchema || this.selectedSchema;
           this.activeTable = picked.table?.table_name || this.activeTable;
         }
+        this._pruneSelectedBindCols?.();
         Toast.success(res.message || "对照关系导入完成");
         if (res.warning) Toast.warn(res.warning);
         this.tree.renderTreeBody();
@@ -645,7 +677,7 @@ export class StandardMigratorModalsMixin {
             );
             if (this._destroyed) return;
             Modal.close("done");
-            this._applyStateResponse(res);
+            this._applyStateResponse(res, { animateCompletedOut: true });
           } catch (err) {
             if (isAbortError(err)) return;
             Toast.error(err.message);

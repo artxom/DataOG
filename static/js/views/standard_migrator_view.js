@@ -24,6 +24,11 @@ function makeAbortError() {
   return err;
 }
 
+const SIDEBAR_WIDTH_STORAGE_KEY = "dataog:standard_migrator:sidebar_width";
+const SIDEBAR_WIDTH_DEFAULT = 248;
+const SIDEBAR_WIDTH_MIN = 180;
+const SIDEBAR_WIDTH_MAX = 560;
+
 const MIG_STATUS_META = {
   COMPLETED: { label: "已达标", tone: "success" },
   PENDING: { label: "待改造", tone: "warn" },
@@ -80,6 +85,7 @@ export class StandardMigratorView {
     // 绑定与落标检查状态
     this.activeConnId = "";
     this.activeSchema = "";
+    this.selectedSchema = "";
     this.activeTable = "";
     this.formatProfile = "AUTO";
     this.formatProfiles = DEFAULT_FORMAT_PROFILES;
@@ -95,6 +101,15 @@ export class StandardMigratorView {
     this._bindingStageBtn = null;
     this._queueExecBatchBtn = null;
     this._queueRemoveBtn = null;
+    this._bindingsGrid = null;
+    this._bindingsGridTableKey = "";
+    this._bindingsSort = { sortKey: "", sortAsc: true };
+    this._stageBtnByCol = new Map();
+    this._queueTabBtn = null;
+    this._queueGrid = null;
+    this._queueSort = { sortKey: "", sortAsc: true };
+    this._clearingCompletedIds = new Set();
+    this._clearingBatches = new Set();
 
     // 贯标改造执行队列状态
     this.ws = null;
@@ -104,10 +119,45 @@ export class StandardMigratorView {
     this.maxWorkers = 5;
     this.keepBackup = true;
 
+    let initWidth = SIDEBAR_WIDTH_DEFAULT;
+    try {
+      const savedW = globalThis.localStorage?.getItem?.(SIDEBAR_WIDTH_STORAGE_KEY);
+      if (savedW !== null && savedW !== undefined && savedW !== "") {
+        initWidth = Math.max(
+          SIDEBAR_WIDTH_MIN,
+          Math.min(SIDEBAR_WIDTH_MAX, Math.round(Number(savedW) || SIDEBAR_WIDTH_DEFAULT))
+        );
+      }
+    } catch (_e) {
+      // ignore storage access errors
+    }
+    this._sidebarWidth = initWidth;
+    this._resizeCleanup = null;
+
     this.root = el("div", {
       className: "mac-split-view",
     });
-    this.sidebarMount = el("aside", { className: "mac-sidebar mac-sidebar-wide" });
+    this.sidebarMount = el("aside", {
+      className: "mac-sidebar mac-sidebar-wide is-resizable",
+      style: { width: `${this._sidebarWidth}px` },
+    });
+    this.sidebarResizer = el("div", {
+      className: "mac-split-resizer",
+      role: "separator",
+      "aria-orientation": "vertical",
+      "aria-label": "调整左侧栏宽度",
+      "aria-valuemin": String(SIDEBAR_WIDTH_MIN),
+      "aria-valuemax": String(SIDEBAR_WIDTH_MAX),
+      "aria-valuenow": String(this._sidebarWidth),
+      tabindex: "0",
+      title: "左右拖拽调整侧栏宽度（双击恢复默认宽度）",
+      onPointerdown: (e) => this._startSidebarResize(e),
+      onDblclick: (e) => {
+        e.preventDefault?.();
+        this._applySidebarWidth(SIDEBAR_WIDTH_DEFAULT, { persist: true });
+      },
+      onKeydown: (e) => this._handleSidebarResizerKeydown(e),
+    });
     this.sidebarFormatMount = el("div", { className: "sidebar-format-inspector" });
     this.treeMount = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
@@ -137,6 +187,7 @@ export class StandardMigratorView {
         if (cid && cid !== this.activeConnId) {
           this.activeConnId = cid;
           this.activeSchema = "";
+          this.selectedSchema = "";
           this.activeTable = "";
           this.tableCheck = null;
           this.selectedBindCols.clear();
@@ -144,10 +195,26 @@ export class StandardMigratorView {
           await this.loadBindingsOverview();
         }
       },
+      onSelectSchema: async ({ connectionId, schemaName }) => {
+        const switchedConn = connectionId && connectionId !== this.activeConnId;
+        if (switchedConn) {
+          this.activeConnId = connectionId;
+          this.activeSchema = "";
+          this.activeTable = "";
+          this.tableCheck = null;
+          this.selectedBindCols.clear();
+          this.selectedSchema = schemaName || "";
+          this._syncFormatFromConnection(connectionId);
+          await this.loadBindingsOverview();
+          return;
+        }
+        this.selectedSchema = schemaName || "";
+      },
       onPreviewTable: async ({ connectionId, schemaName, tableName }) => {
         const switchedConn = connectionId !== this.activeConnId;
         this.activeConnId = connectionId;
         this.activeSchema = schemaName;
+        this.selectedSchema = schemaName;
         this.activeTable = tableName;
         this.selectedBindCols.clear();
         if (this.subMode !== "bindings") {
@@ -230,12 +297,118 @@ export class StandardMigratorView {
 
   destroy() {
     this._destroyed = true;
+    this._stopSidebarResize();
     clearTimeout(this._bindingSearchTimer);
     clearTimeout(this._queueSearchTimer);
+    for (const batch of [...this._clearingBatches]) {
+      clearTimeout(batch.collapseTimer);
+      clearTimeout(batch.removeTimer);
+    }
+    this._clearingBatches.clear();
+    if (this._clearingCompletedIds.size > 0) {
+      const pendingDelete = [...this._clearingCompletedIds];
+      this._clearingCompletedIds.clear();
+      migratorApi.deleteItems(pendingDelete).catch(() => {});
+    }
     this._unsubStore?.();
     this._unsubStore = null;
     this.activityBar?.destroy();
     this.tree?.destroy();
+  }
+
+  _applySidebarWidth(widthPx, { persist = false, maxWidth = SIDEBAR_WIDTH_MAX } = {}) {
+    const clamped = Math.max(
+      SIDEBAR_WIDTH_MIN,
+      Math.min(maxWidth, Math.round(Number(widthPx) || SIDEBAR_WIDTH_DEFAULT))
+    );
+    this._sidebarWidth = clamped;
+    this.sidebarMount.style.width = `${clamped}px`;
+    this.sidebarResizer.setAttribute("aria-valuenow", String(clamped));
+    if (persist) {
+      try {
+        globalThis.localStorage?.setItem?.(SIDEBAR_WIDTH_STORAGE_KEY, String(clamped));
+      } catch (_e) {
+        // ignore storage restriction
+      }
+    }
+  }
+
+  _stopSidebarResize() {
+    if (typeof this._resizeCleanup === "function") {
+      this._resizeCleanup();
+      this._resizeCleanup = null;
+    }
+  }
+
+  _startSidebarResize(e) {
+    if (e.button !== undefined && e.button !== 0) return;
+    e.preventDefault?.();
+    this._stopSidebarResize();
+
+    const startX = Number(e.clientX ?? 0);
+    const rectW = this.sidebarMount.getBoundingClientRect?.().width;
+    const startWidth = Number.isFinite(rectW) && rectW > 0 ? rectW : this._sidebarWidth;
+    const rootW = this.root.getBoundingClientRect?.().width || globalThis.window?.innerWidth || 1200;
+    const dynamicMax = Math.max(320, Math.min(SIDEBAR_WIDTH_MAX, Math.floor(rootW * 0.55)));
+    const pointerId = e.pointerId;
+
+    this.sidebarResizer.classList.add("is-resizing");
+    this.root.classList.add("is-col-resizing");
+    globalThis.document?.body?.classList?.add?.("is-col-resizing");
+    if (pointerId !== undefined && typeof this.sidebarResizer.setPointerCapture === "function") {
+      try {
+        this.sidebarResizer.setPointerCapture(pointerId);
+      } catch (_e) {
+        // ignore in synthetic test environments
+      }
+    }
+
+    const onMove = (ev) => {
+      const dx = Number(ev.clientX ?? 0) - startX;
+      this._applySidebarWidth(startWidth + dx, { persist: false, maxWidth: dynamicMax });
+    };
+
+    const finish = () => {
+      this._stopSidebarResize();
+      this._applySidebarWidth(this._sidebarWidth, { persist: true, maxWidth: dynamicMax });
+    };
+
+    const win = globalThis.window || globalThis;
+    win.addEventListener?.("pointermove", onMove);
+    win.addEventListener?.("pointerup", finish);
+    win.addEventListener?.("pointercancel", finish);
+
+    this._resizeCleanup = () => {
+      win.removeEventListener?.("pointermove", onMove);
+      win.removeEventListener?.("pointerup", finish);
+      win.removeEventListener?.("pointercancel", finish);
+      this.sidebarResizer.classList.remove("is-resizing");
+      this.root.classList.remove("is-col-resizing");
+      globalThis.document?.body?.classList?.remove?.("is-col-resizing");
+      if (pointerId !== undefined && typeof this.sidebarResizer.releasePointerCapture === "function") {
+        try {
+          this.sidebarResizer.releasePointerCapture(pointerId);
+        } catch (_e) {
+          // ignore
+        }
+      }
+    };
+  }
+
+  _handleSidebarResizerKeydown(e) {
+    if (e.key === "ArrowLeft") {
+      e.preventDefault?.();
+      this._applySidebarWidth(this._sidebarWidth - 16, { persist: true });
+    } else if (e.key === "ArrowRight") {
+      e.preventDefault?.();
+      this._applySidebarWidth(this._sidebarWidth + 16, { persist: true });
+    } else if (e.key === "Home") {
+      e.preventDefault?.();
+      this._applySidebarWidth(SIDEBAR_WIDTH_MIN, { persist: true });
+    } else if (e.key === "Enter" || e.key === "0") {
+      e.preventDefault?.();
+      this._applySidebarWidth(SIDEBAR_WIDTH_DEFAULT, { persist: true });
+    }
   }
 
   async _runTracked(title, fn, { cancellable = true, exclusive = true } = {}) {
@@ -477,8 +650,10 @@ export class StandardMigratorView {
       if (res.table_stats) this.tableStats = res.table_stats;
       if (res.table) {
         this.activeSchema = res.table.schema_name || this.activeSchema;
+        this.selectedSchema = this.activeSchema || this.selectedSchema;
         this.activeTable = res.table.table_name || this.activeTable;
       }
+      this._pruneSelectedBindCols();
       this.tree.renderTreeBody();
       this.render();
       this.onStateUpdate?.();
@@ -488,26 +663,157 @@ export class StandardMigratorView {
     }
   }
 
-  _applyStateResponse(res) {
+  _pruneSelectedBindCols() {
+    const cols = this.tableCheck?.columns || [];
+    if (!cols.length || !this.selectedBindCols.size) return;
+    const blocked = new Set();
+    const present = new Set();
+    for (const c of cols) {
+      const name = String(c.column_name || "");
+      present.add(name);
+      if (!c.std_code || c.compliance_status === "COMPLIANT" || c.compliance_status === "STD_MISSING") {
+        blocked.add(name);
+      }
+    }
+    for (const k of [...this.selectedBindCols]) {
+      if (!present.has(k) || blocked.has(k)) {
+        this.selectedBindCols.delete(k);
+      }
+    }
+  }
+
+  _refreshBindingsStageStateInPlace() {
+    const queueCount = (this.ws?.items || []).length;
+    if (this._queueTabBtn) {
+      this._queueTabBtn.textContent = `贯标改造执行队列 (${queueCount})`;
+    }
+    const sch = this.tableCheck?.table?.schema_name || this.activeSchema;
+    const tbl = this.tableCheck?.table?.table_name || this.activeTable;
+    if (this._stageBtnByCol && this._stageBtnByCol.size > 0) {
+      for (const [colLower, btn] of this._stageBtnByCol.entries()) {
+        const rawCol = btn.dataset?.stageCol || colLower;
+        const inQueue = this._isColumnInQueue(this.activeConnId, sch, tbl, rawCol);
+        btn.className = inQueue ? "btn btn-xs btn-ghost" : "btn btn-xs";
+        btn.textContent = inQueue ? "已入队" : "纳入贯标";
+        btn.title = inQueue
+          ? "已在全局贯标队列中，点击可按当前标准重新同步"
+          : "加入全局贯标改造执行队列";
+      }
+    }
+    this._bindingsGrid?._syncSelectionDom?.();
+    if (this._bindingStageBtn) {
+      this._bindingStageBtn.textContent =
+        this.selectedBindCols.size > 0
+          ? `纳入贯标任务 (${this.selectedBindCols.size})`
+          : "纳入本表待改字段";
+    }
+  }
+
+  _scheduleCompletedFadeOut(ids) {
+    const targetIds = [...new Set((ids || []).map((x) => Number(x)).filter((n) => n > 0))];
+    if (!targetIds.length) return;
+    const idKeySet = new Set(targetIds.map((id) => String(id)));
+    const entry = {
+      ids: targetIds,
+      collapseTimer: null,
+      removeTimer: null,
+    };
+    this._clearingBatches.add(entry);
+
+    entry.collapseTimer = setTimeout(() => {
+      if (this._destroyed) return;
+      const rootEl = this._queueGrid?.root;
+      if (rootEl && typeof rootEl.querySelectorAll === "function") {
+        const rows = rootEl.querySelectorAll("tr[data-row-key]");
+        for (const tr of rows) {
+          if (idKeySet.has(String(tr.dataset?.rowKey || ""))) {
+            tr.classList.add("is-collapsing");
+          }
+        }
+      }
+    }, 2450);
+
+    entry.removeTimer = setTimeout(async () => {
+      this._clearingBatches.delete(entry);
+      if (this._destroyed) return;
+      try {
+        const delRes = await migratorApi.deleteItems(targetIds);
+        if (this._destroyed) return;
+        for (const id of targetIds) {
+          this._clearingCompletedIds.delete(id);
+          this.selectedIds.delete(String(id));
+        }
+        this.ws = delRes;
+        if (delRes?.logs) store.updateLogs(delRes.logs);
+        this.render();
+        this.onStateUpdate?.();
+      } catch (err) {
+        for (const id of targetIds) {
+          this._clearingCompletedIds.delete(id);
+        }
+        if (!this._destroyed) {
+          this.render();
+          Toast.error(err?.message || "清理已达标队列任务失败");
+        }
+      }
+    }, 3000);
+  }
+
+  _applyStateResponse(res, { inPlaceBindingsStage = false, animateCompletedOut = false } = {}) {
     this.ws = res;
     if (res.logs) store.updateLogs(res.logs);
     if (res.table_stats_by_conn && this.activeConnId && res.table_stats_by_conn[this.activeConnId]) {
       this.tableStats = res.table_stats_by_conn[this.activeConnId];
-      this.tree?.render();
+      this.tree?.renderTreeBody?.();
     } else if (
       res.table_stats &&
       (!res.table_stats_connection_id || res.table_stats_connection_id === this.activeConnId)
     ) {
       this.tableStats = res.table_stats;
-      this.tree?.render();
+      this.tree?.renderTreeBody?.();
     }
     if (Array.isArray(res.migrated_tables) && res.migrated_tables.length > 0) {
       this._bindingsDirtyAfterMigration = true;
     }
     if (res.warning) Toast.warn(res.warning);
     else if (res.message) Toast.success(res.message);
+
+    const curTableKey = this.tableCheck
+      ? `${this.activeConnId}::${this.tableCheck.table?.schema_name || this.activeSchema}::${this.tableCheck.table?.table_name || this.activeTable}`
+      : "";
+    if (
+      inPlaceBindingsStage &&
+      this.subMode === "bindings" &&
+      this._bindingsGrid &&
+      this._bindingsGridTableKey === curTableKey &&
+      this.gridMount.children?.[0] === this._bindingsGrid.root
+    ) {
+      this._refreshBindingsStageStateInPlace();
+      this.onStateUpdate?.();
+      return;
+    }
+
+    let newlyCompletedIds = [];
+    if (animateCompletedOut) {
+      const rawIds = Array.isArray(res.verified_completed_ids)
+        ? res.verified_completed_ids
+        : (res.items || [])
+            .filter((it) => it.status === "COMPLETED")
+            .map((it) => it.id);
+      newlyCompletedIds = [
+        ...new Set(rawIds.map((x) => Number(x)).filter((n) => n > 0)),
+      ].filter((id) => !this._clearingCompletedIds.has(id));
+      for (const id of newlyCompletedIds) {
+        this._clearingCompletedIds.add(id);
+        this.selectedIds.delete(String(id));
+      }
+    }
+
     this.render();
     this.onStateUpdate?.();
+    if (newlyCompletedIds.length > 0) {
+      this._scheduleCompletedFadeOut(newlyCompletedIds);
+    }
   }
 
   _activeDbType() {
@@ -545,6 +851,7 @@ export class StandardMigratorView {
       } else if (this.activeTable && res.tables?.length) {
         this.tableCheck = res.tables[0];
       }
+      this._pruneSelectedBindCols();
       if (res.warning) Toast.warn(res.warning);
       else Toast.success(res.message || "落标检查完成");
       this.tree.renderTreeBody();
@@ -580,6 +887,7 @@ export class StandardMigratorView {
       if (res.table_stats) this.tableStats = res.table_stats;
       if (res.columns && res.table) {
         this.tableCheck = { ...res, ok: true };
+        this._pruneSelectedBindCols();
       } else if (this.activeTable) {
         await this.loadTableCompliance(false);
       }
@@ -640,7 +948,7 @@ export class StandardMigratorView {
         migratorApi.executeSingle(itemRow.id, { taskId, signal })
       );
       if (this._destroyed) return;
-      this._applyStateResponse(res);
+      this._applyStateResponse(res, { animateCompletedOut: true });
     } catch (err) {
       if (isAbortError(err)) return;
       Toast.error(err.message);
@@ -653,7 +961,63 @@ export class StandardMigratorView {
       Toast.warn("请先在左侧选择目标库表");
       return;
     }
-    const cols = explicitCols || [...this.selectedBindCols];
+    const colsMeta = this.tableCheck?.columns || [];
+    const colByLower = new Map(
+      colsMeta.map((c) => [String(c.column_name || "").trim().toLowerCase(), c])
+    );
+
+    let targetCols = [];
+    if (Array.isArray(explicitCols) && explicitCols.length > 0) {
+      targetCols = explicitCols.filter((name) => {
+        const meta = colByLower.get(String(name || "").trim().toLowerCase());
+        return !meta || meta.compliance_status !== "COMPLIANT";
+      });
+      if (!targetCols.length) {
+        Toast.info("所选字段已落标，已自动跳过，无需纳入贯标队列");
+        return;
+      }
+    } else if (this.selectedBindCols.size === 0) {
+      if (colsMeta.length > 0) {
+        const compliantCnt = colsMeta.filter((c) => c.compliance_status === "COMPLIANT").length;
+        const stageable = colsMeta.filter(
+          (c) =>
+            c.std_code &&
+            c.compliance_status !== "COMPLIANT" &&
+            c.compliance_status !== "STD_MISSING"
+        );
+        if (!stageable.length) {
+          Toast.info(
+            compliantCnt > 0
+              ? `已自动跳过 ${compliantCnt} 个已落标字段，本表暂无需要纳入贯标的待改字段`
+              : "本表暂无需要纳入贯标的已绑标待改字段"
+          );
+          return;
+        }
+      }
+      targetCols = [];
+    } else {
+      const selectedList = [...this.selectedBindCols];
+      const nonCompliant = selectedList.filter((name) => {
+        const meta = colByLower.get(String(name || "").trim().toLowerCase());
+        return (
+          !meta ||
+          (meta.std_code &&
+            meta.compliance_status !== "COMPLIANT" &&
+            meta.compliance_status !== "STD_MISSING")
+        );
+      });
+      if (!nonCompliant.length) {
+        this.selectedBindCols.clear();
+        this._bindingsGrid?._syncSelectionDom?.();
+        if (this._bindingStageBtn) {
+          this._bindingStageBtn.textContent = "纳入本表待改字段";
+        }
+        Toast.info("所选字段均已落标或未绑标，已自动跳过，无需纳入贯标队列");
+        return;
+      }
+      targetCols = nonCompliant;
+    }
+
     this._stagingInFlight = true;
     if (this._bindingStageBtn) this._bindingStageBtn.disabled = true;
     try {
@@ -661,8 +1025,8 @@ export class StandardMigratorView {
         connection_id: this.activeConnId,
         schema_name: this.activeSchema,
         table_name: this.activeTable,
-        column_names: cols,
-        format_profile: this.formatProfile,
+        column_names: targetCols,
+        format_profile: this.tableCheck?.format_profile || this.formatProfile,
         append: true,
       });
       if (!explicitCols) {
@@ -675,7 +1039,9 @@ export class StandardMigratorView {
       if (!stayInBindings) {
         this.subMode = "queue";
       }
-      this._applyStateResponse(res);
+      this._applyStateResponse(res, {
+        inPlaceBindingsStage: stayInBindings && this.subMode === "bindings",
+      });
     } catch (err) {
       Toast.error(err.message);
     } finally {
@@ -698,6 +1064,7 @@ export class StandardMigratorView {
           if (!cid) return;
           this.activeConnId = cid;
           this.activeSchema = "";
+          this.selectedSchema = "";
           this.activeTable = "";
           this.tableCheck = null;
           this.selectedBindCols.clear();
@@ -777,7 +1144,7 @@ export class StandardMigratorView {
           onClick: () => this.openBindingUploadWizard(),
         },
         svgIcon("upload", 13),
-        el("span", { text: "上传对照关系" })
+        el("span", { text: "上传字段落标映射关系" })
       ),
       el("button", {
         type: "button",
@@ -823,7 +1190,7 @@ export class StandardMigratorView {
       );
       if (this._destroyed) return;
       this.selectedIds.clear();
-      this._applyStateResponse(res);
+      this._applyStateResponse(res, { animateCompletedOut: true });
     } catch (err) {
       if (isAbortError(err)) return;
       Toast.error(err.message);
@@ -860,12 +1227,15 @@ export class StandardMigratorView {
     const all = this.ws?.items || [];
     const kw = this.searchKeyword.trim().toLowerCase();
     return all.filter((it) => {
-      if (this.statusFilter === "REBUILD") {
-        if (!this._isRebuildItem(it)) return false;
-      } else if (this.statusFilter === "FAILED") {
-        if (!["FAILED", "MISSING_TABLE", "MISSING_COLUMN"].includes(it.status)) return false;
-      } else if (this.statusFilter !== "ALL" && it.status !== this.statusFilter) {
-        return false;
+      const isClearing = this._clearingCompletedIds.has(Number(it.id));
+      if (!isClearing) {
+        if (this.statusFilter === "REBUILD") {
+          if (!this._isRebuildItem(it)) return false;
+        } else if (this.statusFilter === "FAILED") {
+          if (!["FAILED", "MISSING_TABLE", "MISSING_COLUMN"].includes(it.status)) return false;
+        } else if (this.statusFilter !== "ALL" && it.status !== this.statusFilter) {
+          return false;
+        }
       }
       if (!kw) return true;
       return [
@@ -922,6 +1292,7 @@ export class StandardMigratorView {
       });
       this.tableCheck = res;
       if (res.table_stats) this.tableStats = res.table_stats;
+      this._pruneSelectedBindCols();
       Toast.success(pickedItem ? `已绑定 [${pickedItem.std_code} · ${pickedItem.cn_name}]` : "已解除绑定");
       this.tree.renderTreeBody();
       this.render();
@@ -945,14 +1316,15 @@ export class StandardMigratorView {
   render() {
     this._renderSidebarFormatCard();
     const queueCount = (this.ws?.items || []).length;
+    this._queueTabBtn = null;
     const tablist = el(
       "div",
       { className: "content-tablist", role: "tablist", "aria-label": "落标绑定与贯标子模式" },
       [
         { id: "bindings", label: "字段落标绑定与核验" },
         { id: "queue", label: `贯标改造执行队列 (${queueCount})` },
-      ].map((t) =>
-        el("button", {
+      ].map((t) => {
+        const btn = el("button", {
           type: "button",
           role: "tab",
           className: "content-tab",
@@ -973,8 +1345,10 @@ export class StandardMigratorView {
             this.render();
             this.onStateUpdate?.();
           },
-        })
-      )
+        });
+        if (t.id === "queue") this._queueTabBtn = btn;
+        return btn;
+      })
     );
     clearEl(this.tablistMount, tablist);
 
@@ -995,15 +1369,17 @@ export class StandardMigratorView {
       clearEl(this.mainMount, this.tablistMount, this.subbarMount, this.activityBar.el, this.gridMount);
     }
     if (
-      this.root.children.length !== 2 ||
+      this.root.children.length !== 3 ||
       this.root.children[0] !== this.sidebarMount ||
-      this.root.children[1] !== this.mainMount
+      this.root.children[1] !== this.sidebarResizer ||
+      this.root.children[2] !== this.mainMount
     ) {
-      clearEl(this.root, this.sidebarMount, this.mainMount);
+      clearEl(this.root, this.sidebarMount, this.sidebarResizer, this.mainMount);
     }
   }
 
   _renderBindingsView() {
+    this._queueGrid = null;
     const tc = this.tableCheck;
     const sum = tc?.summary || {};
     const tMeta = tc?.table || {};
@@ -1048,7 +1424,7 @@ export class StandardMigratorView {
                 })
               )
             )
-          : el("span", { style: { fontSize: "12px", color: "var(--os-muted)" }, text: "请从左侧目录树选择数据表，或点击右上角「上传对照关系」批量铺底" })
+          : el("span", { style: { fontSize: "12px", color: "var(--os-muted)" }, text: "请从左侧目录树选择数据表，或点击右上角「上传字段落标映射关系」批量铺底" })
       ),
       el(
         "div",
@@ -1058,6 +1434,7 @@ export class StandardMigratorView {
           ? (this._bindingStageBtn = el("button", {
               type: "button",
               className: "btn btn-xs mac-btn-primary",
+              title: "不勾选时自动纳入本表待改字段，并自动跳过「已落标」字段",
               text:
                 this.selectedBindCols.size > 0
                   ? `纳入贯标任务 (${this.selectedBindCols.size})`
@@ -1076,6 +1453,9 @@ export class StandardMigratorView {
     clearEl(this.subbarMount, subbar);
 
     if (!tc) {
+      this._bindingsGrid = null;
+      this._bindingsGridTableKey = "";
+      this._stageBtnByCol = new Map();
       clearEl(
         this.gridMount,
         el(
@@ -1096,7 +1476,7 @@ export class StandardMigratorView {
               el("button", {
                 type: "button",
                 className: "mac-btn mac-btn-sm mac-btn-primary",
-                text: "上传对照关系（含系统模板）",
+                text: "上传字段落标映射关系（含系统模板）",
                 onClick: () => this.openBindingUploadWizard(),
               }),
               el("button", {
@@ -1112,11 +1492,39 @@ export class StandardMigratorView {
       return;
     }
 
+    const curTableKey = `${this.activeConnId}::${tMeta.schema_name || this.activeSchema}::${tMeta.table_name || this.activeTable}`;
+    const sameTable = Boolean(
+      curTableKey &&
+        curTableKey === this._bindingsGridTableKey &&
+        this._bindingsGrid &&
+        this.gridMount.children?.[0] === this._bindingsGrid.root
+    );
+    const prevScrollTop = sameTable ? this._bindingsGrid.root.scrollTop || 0 : 0;
+    const prevScrollLeft = sameTable ? this._bindingsGrid.root.scrollLeft || 0 : 0;
+    let focusedAction = null;
+    if (sameTable) {
+      const activeEl = globalThis.document?.activeElement;
+      if (activeEl && this._bindingsGrid.root.contains?.(activeEl)) {
+        const ds = activeEl.dataset || {};
+        if (ds.stageCol) focusedAction = { attr: "stageCol", val: ds.stageCol };
+        else if (ds.bindCol) focusedAction = { attr: "bindCol", val: ds.bindCol };
+        else if (ds.unbindCol) focusedAction = { attr: "unbindCol", val: ds.unbindCol };
+      }
+    } else {
+      this._bindingsSort = { sortKey: "", sortAsc: true };
+    }
+
+    this._stageBtnByCol = new Map();
     const rows = this._filteredBindingCols();
     const grid = new DataGrid({
       ariaLabel: "表字段落标核验清单",
       selectable: true,
       selectedKeys: this.selectedBindCols,
+      initialSortKey: this._bindingsSort.sortKey,
+      initialSortAsc: this._bindingsSort.sortAsc,
+      onSortChange: (k, a) => {
+        this._bindingsSort = { sortKey: k, sortAsc: a };
+      },
       onSelectionChange: (sel) => {
         if (this._bindingStageBtn) {
           this._bindingStageBtn.textContent =
@@ -1260,12 +1668,29 @@ export class StandardMigratorView {
                   r.column_name
                 )
               : false;
+            const stageBtn = canStage
+              ? el("button", {
+                  type: "button",
+                  className: inQueue ? "btn btn-xs btn-ghost" : "btn btn-xs",
+                  dataset: { stageCol: r.column_name },
+                  text: inQueue ? "已入队" : "纳入贯标",
+                  title: inQueue ? "已在全局贯标队列中，点击可按当前标准重新同步" : "加入全局贯标改造执行队列",
+                  onClick: (e) => {
+                    e.stopPropagation();
+                    this.stageSelectedToQueue([r.column_name]);
+                  },
+                })
+              : null;
+            if (stageBtn) {
+              this._stageBtnByCol.set(String(r.column_name || "").trim().toLowerCase(), stageBtn);
+            }
             return el(
               "div",
               { style: { display: "flex", gap: "4px" } },
               el("button", {
                 type: "button",
                 className: "btn btn-xs",
+                dataset: { bindCol: r.column_name },
                 text: r.std_code ? "换绑" : "选标",
                 onClick: (e) => {
                   e.stopPropagation();
@@ -1276,6 +1701,7 @@ export class StandardMigratorView {
                 ? el("button", {
                     type: "button",
                     className: "btn btn-xs btn-ghost",
+                    dataset: { unbindCol: r.column_name },
                     text: "解绑",
                     onClick: (e) => {
                       e.stopPropagation();
@@ -1283,28 +1709,43 @@ export class StandardMigratorView {
                     },
                   })
                 : null,
-              canStage
-                ? el("button", {
-                    type: "button",
-                    className: inQueue ? "btn btn-xs btn-ghost" : "btn btn-xs",
-                    text: inQueue ? "已入队" : "纳入贯标",
-                    title: inQueue ? "已在全局贯标队列中，点击可按当前标准重新同步" : "加入全局贯标改造执行队列",
-                    onClick: (e) => {
-                      e.stopPropagation();
-                      this.stageSelectedToQueue([r.column_name]);
-                    },
-                  })
-                : null
+              stageBtn
             );
           },
         },
       ],
     });
     clearEl(this.gridMount, grid.root);
+    this._bindingsGrid = grid;
+    this._bindingsGridTableKey = curTableKey;
+    if (sameTable) {
+      grid.root.scrollTop = prevScrollTop;
+      grid.root.scrollLeft = prevScrollLeft;
+      if (focusedAction) {
+        let targetBtn = null;
+        if (focusedAction.attr === "stageCol") {
+          targetBtn = this._stageBtnByCol.get(String(focusedAction.val).trim().toLowerCase());
+        } else {
+          const cssAttr = focusedAction.attr === "bindCol" ? "data-bind-col" : "data-unbind-col";
+          const safeVal = String(focusedAction.val).replace(/"/g, '\\"');
+          targetBtn = grid.root.querySelector?.(`[${cssAttr}="${safeVal}"]`) || null;
+        }
+        targetBtn?.focus?.({ preventScroll: true });
+      }
+    }
   }
 
   _renderQueueView() {
+    this._bindingsGrid = null;
+    this._bindingsGridTableKey = "";
+    this._stageBtnByCol = new Map();
     this.searchInput.value = this.searchKeyword;
+    const sameQueue = Boolean(
+      this._queueGrid && this.gridMount.children?.[0] === this._queueGrid.root
+    );
+    const prevScrollTop = sameQueue ? this._queueGrid.root.scrollTop || 0 : 0;
+    const prevScrollLeft = sameQueue ? this._queueGrid.root.scrollLeft || 0 : 0;
+
     const ws = this.ws || { items: [], summary: {} };
     const summary = ws.summary || {};
     const rebuildCount =
@@ -1397,6 +1838,13 @@ export class StandardMigratorView {
       ariaLabel: "贯标字段队列",
       selectable: true,
       selectedKeys: this.selectedIds,
+      initialSortKey: this._queueSort.sortKey,
+      initialSortAsc: this._queueSort.sortAsc,
+      onSortChange: (k, a) => {
+        this._queueSort = { sortKey: k, sortAsc: a };
+      },
+      rowClassName: (r) =>
+        this._clearingCompletedIds.has(Number(r.id)) ? "queue-row-verified-clearing" : "",
       onSelectionChange: (sel) => {
         if (this._queueExecBatchBtn) {
           this._queueExecBatchBtn.textContent = `执行 (${sel.size})`;
@@ -1496,15 +1944,16 @@ export class StandardMigratorView {
           key: "actions",
           label: "操作",
           sortable: false,
-          render: (r) =>
-            el(
+          render: (r) => {
+            const isClearing = this._clearingCompletedIds.has(Number(r.id));
+            return el(
               "div",
               { style: { display: "flex", gap: "4px" } },
               el("button", {
                 type: "button",
                 className: "btn btn-xs",
                 text: "执行",
-                disabled: r.status === "COMPLETED",
+                disabled: isClearing || r.status === "COMPLETED",
                 onClick: async (e) => {
                   e.stopPropagation();
                   if (this._isRebuildItem(r)) {
@@ -1522,6 +1971,7 @@ export class StandardMigratorView {
                 type: "button",
                 className: "btn btn-xs btn-ghost",
                 text: "SQL",
+                disabled: isClearing,
                 onClick: (e) => {
                   e.stopPropagation();
                   this.openItemSqlPreviewModal(r);
@@ -1531,19 +1981,26 @@ export class StandardMigratorView {
                 type: "button",
                 className: "btn btn-xs btn-ghost",
                 text: "移出",
+                disabled: isClearing,
                 title: "从贯标队列移除",
                 onClick: (e) => {
                   e.stopPropagation();
                   this.removeQueueItems([r.id], { skipConfirm: true });
                 },
               })
-            ),
+            );
+          },
         },
       ],
     });
 
     clearEl(this.subbarMount, subbar);
     clearEl(this.gridMount, grid.root);
+    this._queueGrid = grid;
+    if (sameQueue) {
+      grid.root.scrollTop = prevScrollTop;
+      grid.root.scrollLeft = prevScrollLeft;
+    }
   }
 }
 

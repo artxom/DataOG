@@ -24,6 +24,7 @@ export class DatabaseTree {
     mountEl,
     {
       onPreviewTable = null,
+      onSelectSchema = null,
       onFocusSelectionChange = null,
       onActiveConnectionChange = null,
       renderTableBadge = null,
@@ -33,6 +34,7 @@ export class DatabaseTree {
   ) {
     this.mountEl = mountEl;
     this.onPreviewTable = onPreviewTable;
+    this.onSelectSchema = onSelectSchema;
     this.onFocusSelectionChange = onFocusSelectionChange;
     this.onActiveConnectionChange = onActiveConnectionChange;
     this.renderTableBadge = renderTableBadge;
@@ -46,6 +48,7 @@ export class DatabaseTree {
     this.expandedTables = new Set();
     this.tableColumnsCache = new Map();
     this.selectedTableKey = "";
+    this.selectedSchemaKey = "";
     this.activeConnectionId = store.state.connections[0]?.connection_id || "";
     this.focusTablesByConn = new Map(); // connId -> Set<"schema.table">
 
@@ -338,6 +341,7 @@ export class DatabaseTree {
     const key = `${connId}::${schemaName}::${tableName}`;
     this.activeConnectionId = connId;
     this.selectedTableKey = key;
+    this.selectedSchemaKey = schemaName ? `${connId}::${schemaName}` : "";
     if (this.treeBody && typeof this.treeBody.querySelectorAll === "function") {
       const nodes = this.treeBody.querySelectorAll("[data-table-key]");
       let matched = false;
@@ -345,6 +349,10 @@ export class DatabaseTree {
         const isSel = n.dataset?.tableKey === key;
         n.classList.toggle("is-selected", isSel);
         if (isSel) matched = true;
+      }
+      const schemaNodes = this.treeBody.querySelectorAll("[data-schema-key]");
+      for (const sn of schemaNodes) {
+        sn.classList.toggle("is-schema-active", sn.dataset?.schemaKey === this.selectedSchemaKey);
       }
       if (!matched) {
         this.renderTreeBody();
@@ -371,6 +379,7 @@ export class DatabaseTree {
   }
 
   renderTreeBody() {
+    const prevScrollTop = this.treeBody?.scrollTop || 0;
     const conns = store.state.connections || [];
     if (!conns.length) {
       clearEl(
@@ -484,13 +493,17 @@ export class DatabaseTree {
           const allSchemaChecked = schemaTables.length > 0 && checkedInSchema === schemaTables.length;
           const someSchemaChecked = checkedInSchema > 0 && checkedInSchema < schemaTables.length;
 
+          const isSchemaSelected = !isMulti && this.selectedSchemaKey === skey;
           const schemaRow = el(
             "div",
             {
-              className: "tree-node-row",
+              className: `tree-node-row ${isSchemaSelected ? "is-schema-active" : ""}`.trim(),
               role: "treeitem",
               "aria-expanded": String(schemaExpanded),
+              dataset: { schemaKey: skey },
               onClick: () => {
+                this.activeConnectionId = cid;
+                this.selectedSchemaKey = skey;
                 if (schemaExpanded) {
                   this.expandedSchemas.delete(skey);
                   this.collapsedSchemas.add(skey);
@@ -499,6 +512,7 @@ export class DatabaseTree {
                   this.expandedSchemas.add(skey);
                 }
                 this.renderTreeBody();
+                this.onSelectSchema?.({ connectionId: cid, schemaName });
               },
             },
             el("span", {
@@ -642,6 +656,9 @@ export class DatabaseTree {
       clearEl(this.treeBody, frag);
     } else {
       clearEl(this.treeBody, cards);
+    }
+    if (this.treeBody) {
+      this.treeBody.scrollTop = prevScrollTop;
     }
   }
 }
