@@ -19,6 +19,7 @@ from core.platform.excel_io import (
     ResolvedWorkbook,
     clean_excel_cell_str,
     parse_excel_checklist,
+    sanitize_excel_row,
     validate_xlsx_bytes,
 )
 from core.platform.import_progress import ProgressCallback, noop_progress
@@ -121,7 +122,7 @@ class _CrossIoAndReportMixin:
 
         if prefilled:
             for r in prefilled:
-                ws.append(r)
+                ws.append(sanitize_excel_row(r))
         else:
             for r in (
                 ["ods", "ods_cust_info", "cust_no", "CUST000101", "dwd", "dwd_cust_info", "cust_id", "CUST000101"],
@@ -715,31 +716,33 @@ class _CrossIoAndReportMixin:
                 tgt_m = sc.get("target_col_meta") or {}
                 cc = sc.get("cross_compat") or {}
                 ws.append(
-                    [
-                        row_num,
-                        t_bind.get("std_schema_name", "public"),
-                        t_bind.get("std_table_name", ""),
-                        t_bind.get("source_schema", ""),
-                        t_bind.get("source_table", ""),
-                        sc.get("effective_source_col", ""),
-                        src_m.get("data_type", ""),
-                        src_m.get("column_comment", ""),
-                        sc.get("orig_col_name", ""),
-                        sc.get("orig_col_type", ""),
-                        sc.get("orig_col_comment", ""),
-                        sc.get("std_col_name", ""),
-                        sc.get("std_col_type", ""),
-                        sc.get("std_col_comment", ""),
-                        t_bind.get("target_schema", ""),
-                        t_bind.get("target_table", ""),
-                        sc.get("effective_target_col", ""),
-                        tgt_m.get("data_type", ""),
-                        tgt_m.get("column_comment", ""),
-                        sc.get("target_status", ""),
-                        sc.get("target_detail", ""),
-                        cc.get("capacity_label") or "-",
-                        cc.get("type_conv_label") or "-",
-                    ]
+                    sanitize_excel_row(
+                        [
+                            row_num,
+                            t_bind.get("std_schema_name", "public"),
+                            t_bind.get("std_table_name", ""),
+                            t_bind.get("source_schema", ""),
+                            t_bind.get("source_table", ""),
+                            sc.get("effective_source_col", ""),
+                            src_m.get("data_type", ""),
+                            src_m.get("column_comment", ""),
+                            sc.get("orig_col_name", ""),
+                            sc.get("orig_col_type", ""),
+                            sc.get("orig_col_comment", ""),
+                            sc.get("std_col_name", ""),
+                            sc.get("std_col_type", ""),
+                            sc.get("std_col_comment", ""),
+                            t_bind.get("target_schema", ""),
+                            t_bind.get("target_table", ""),
+                            sc.get("effective_target_col", ""),
+                            tgt_m.get("data_type", ""),
+                            tgt_m.get("column_comment", ""),
+                            sc.get("target_status", ""),
+                            sc.get("target_detail", ""),
+                            cc.get("capacity_label") or "-",
+                            cc.get("type_conv_label") or "-",
+                        ]
+                    )
                 )
                 row_num += 1
 

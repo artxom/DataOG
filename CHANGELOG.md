@@ -8,6 +8,22 @@
 
 ---
 
+## [3.5.1] - 2026-11-25
+
+> **全量 Schema 模板及全平台 Excel 导出非法控制字符清洗修复**：彻底解决数据库元数据注释/名称包含 `PK\x02`、`PK\x0b` 等 XML 1.0 禁用控制字符（界面展示为 `PK□`）时，导出全量 Schema 字段映射模板与全平台 Excel 报告触发 `openpyxl.utils.exceptions.IllegalCharacterError ("... cannot be used in worksheets.")` 的阻断缺陷。
+
+### Fixed
+- **统一底座 Excel 单元格与工作表页签清洗原语 (`core/excel_handler.py`, `core/platform/excel_io.py`)**：
+  - 新增 `EXCEL_ILLEGAL_CHARS_RE`、`sanitize_excel_cell`、`sanitize_excel_row` 与 `sanitize_excel_sheet_title`，在保留合法 `\t`、`\n`、`\r` 与标量类型的同时剔除全部 XML 1.0 非法控制字符、`\x7f`、孤立 UTF-16 代理项及 `\ufffe`/`\uffff`，并按「先清控制字符、再检公式注入前缀（排除单独 `"-"`）」顺序阻断控制字符绕过公式转义；
+  - 统一接入 `export_report_excel` 与 `export_tabular_xlsx_bytes`（覆盖 SQL 结果表头、单元格与页签标题）。
+- **全量 Schema 模板、标准字典、离线单 Sheet Excel 及跨环境比对导出全覆盖 (`modules/standard_migrator/bindings_mixin.py`, `core/platform/standard_catalog.py`, `core/platform/offline_report/runtime.py`, `modules/cross_comparator/io_and_report_mixin.py`)**：
+  - 修复 `generate_binding_template_bytes` 在 `scope=schema` / `scope=all` / 选表预填导出时因库内注释含 `PK\x0b` 等控制字符导致的 `IllegalCharacterError`；
+  - 将 `StandardCatalog._safe_excel_cell`、`offline_report/runtime.py`（`_safe_excel_cell` / `_safe_sheet_title` 同步覆盖 `single_db` 与 `cross_env` 单 Sheet Excel 导出，并同步扩充前端纯 JS XLSX `escXml` 过滤字符集）与 `CrossComparatorService`（`generate_pairing_template_bytes` / `export_comparison_excel_bytes`）全部收口至统一清洗原语。
+- **回归测试与版本发布 (`tests/test_core.py`, `tests/test_modules_and_api.py`)**：
+  - 新增 `test_excel_cell_sanitization_and_illegal_control_chars_export` 与端到端 `test_schema_template_and_reports_sanitize_illegal_excel_chars` 回归测试，覆盖 `scope=schema` 全量模板及全部 Excel 导出通道（全套自动化测试扩充至 **116 项**），并同步发布 `v3.5.1`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变）。
+
+---
+
 ## [3.5.0] - 2026-11-25
 
 > **DGP2 加密混淆增量更新包架构重构（银行邮件网关无阻断传输升级）**：针对企业与银行邮件安全网关递归扫描 `.zip` 附件并拦截内嵌 `code.zip`、`*.py`、`*.js`、`*.html` 明文代码的痛点，将增量更新载荷全面升级为 **DGP2 加密混淆认证二进制信封**；外层标准无密码 `DataOG-Update-vX.Y.Z.zip` 仅含纯文本说明与高熵不透明 `.dgp` 二进制（零明文源码/脚本/嵌套 ZIP 头），客户端通过纯标准库启动器实现双层 Ed25519 + HMAC-SHA256 验签认证、BLAKE2b-512-CTR 解密、限流解包与向后兼容解析。

@@ -1,4 +1,4 @@
-# Data.O.G v3.5.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.5.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -61,9 +61,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.0，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.1，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.5.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.5.1 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -155,7 +155,8 @@ DataOG/
 | **`v3.4.0`** | `feat/ai-long-sql-weak-model-goal` → `main` | **AI 助手超长 SQL 弱模型增幅、四级动态模型能力探查、超时韧性重试与持久化 🎯 `/goal` 闭环引擎**：新增确定性 SQL 静态血缘 DAG/控制流/隐患雷达预解剖与保行号语义压缩 (`sql_static_analyzer.py`) 及 3 个手术刀工具；落地 L1/L2/L3 四级模型能力实测与 `POST /api/platform/llm/probe-model`、`lightweight` 有效推理甜蜜区预算收敛、瞬态超时/5xx 指数退避重试+减载降级+`length` 自动续写；新增战前 `ExecutionPlanner` 最优拆解规划、弱模型工具裁剪与防原地打转护栏；新增 Layer 2 私有表 `ai_assistant_runs`/`ai_assistant_run_events`、后台持久化 `GoalRunner` 状态机（覆盖率与 HIGH/MEDIUM 隐患硬验收 + 自动补救 + `Last-Event-ID` 无损断点续流 + 一键 `/resume`）及前端探查胶囊、Goal 切换与实时 Checklist UI（110 项测试全绿） |
 | **`v3.4.1`** | `fix/ai-goal-and-static-analyzer-hardening` → `main` | **AI 助手静态血缘解析、模型探查校准、孤儿 Goal 断点恢复与前端续流深度加固**：修复 `$$` 闭合标签、嵌入式 CTE、子查询逗号连接列名泄露、Oracle 无 `DECLARE` 变量及字符串内注释符号导致的静态解析与 `DIALECT_COMPAT` 边界缺陷；修复千分位 400 超限解析、`model_tier` 粘滞与草稿流式探查；补齐重启孤儿 Goal 任务自动对账转 `paused_recoverable`、并发 `/resume` 原子防重、SSE 分页无截断续流、多附件 `A1/A2` 隔离、无附件/在线库 Goal 工具探索、`dataog_meta` 剥离与前端切换模型胶囊/断点游标/配置草稿保护（110 项测试全绿） |
 | **`v3.4.2`** | `feat/standard-migrator-ux-refinements` → `main` | **「2. 落标绑定与贯标」交互与执行体验精细化升级**：新增左侧栏拖拽调宽（180px–560px 并持久化记忆、双击复位与键盘微调）；点击「纳入贯标」原位刷新防跳回顶部并保持表格滚动与按钮焦点；未勾选全表纳入及混选自动跳过「已落标」字段；单条/批量/保序重建执行完毕自动实时核验并在 3 秒内通过绿光扫掠渐隐塌缩动画平滑清出已达标任务；按钮更名为「上传字段落标映射关系」并新增「当前选中 Schema 全量模板」导出（112 项测试全绿） |
-| **`v3.5.0`**（当前正式版） | `feat/v3.5.0-encrypted-update-pack` → `main` | **DGP2 加密混淆增量更新包架构重构（兼容银行邮件网关传输）**：将增量更新核心载荷由明文嵌套 ZIP 重构为纯标准库 `BLAKE2b-512-CTR + HMAC-SHA256 + Ed25519` 双域签名高熵密文信封 (`DGP2`) 与紧凑二进制载荷 (`DGPB`)；外层标准无密码 `DataOG-Update-vX.Y.Z.zip` 零明文源码/脚本/可执行特征并内置构建期网关安全扫描与 `>=3.5.0` 防降级保护，客户端透明支持 `.zip`/`.dgp`/`.dat` 双渠道验签解密安装（114 项测试全绿） |
+| **`v3.5.0`** | `feat/v3.5.0-encrypted-update-pack` → `main` | **DGP2 加密混淆增量更新包架构重构（兼容银行邮件网关传输）**：将增量更新核心载荷由明文嵌套 ZIP 重构为纯标准库 `BLAKE2b-512-CTR + HMAC-SHA256 + Ed25519` 双域签名高熵密文信封 (`DGP2`) 与紧凑二进制载荷 (`DGPB`)；外层标准无密码 `DataOG-Update-vX.Y.Z.zip` 零明文源码/脚本/可执行特征并内置构建期网关安全扫描与 `>=3.5.0` 防降级保护，客户端透明支持 `.zip`/`.dgp`/`.dat` 双渠道验签解密安装（114 项测试全绿） |
+| **`v3.5.1`**（当前正式版） | `fix/v3.5.1-excel-illegal-char-sanitize` → `main` | **全量 Schema 模板及全平台 Excel 导出非法控制字符清洗修复**：在底座 `core/excel_handler.py` 与 `core/platform/excel_io.py` 统一提供 `sanitize_excel_cell`/`sanitize_excel_row`/`sanitize_excel_sheet_title`，彻底清除数据库元数据中夹带的 `PK\x02`/`PK\x0b` 等 XML 1.0 非法控制字符并先清后转义公式注入前缀；全覆盖 Schema 全量映射模板、贯标执行报告、SQL 通用导出、标准字典、单库/跨环境离线 Excel 及跨环境比对导出全链路（116 项测试全绿） |
 
 ---
 
@@ -166,7 +167,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（114 项，发布前本地执行）
+# 运行全量自动化单元测试（116 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）

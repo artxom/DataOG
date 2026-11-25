@@ -5906,6 +5906,221 @@ process.exit(0);
         )
         self.assertIn("STANDARD_MIGRATOR_UX_OK", proc.stdout)
 
+    def test_schema_template_and_reports_sanitize_illegal_excel_chars(self) -> None:
+        """端到端回归：元数据注释/名称含 PK\\x02、PK\\x0b 等非法控制字符时，Schema 全量模板与全平台 Excel 导出均正常清洗不抛 IllegalCharacterError."""
+        from core.platform.models import ColumnMeta, SchemaMeta, TableMeta
+        from core.platform.offline_report import build_cross_env_excel_bytes
+        from modules.cross_comparator.service import CrossComparatorService
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            try:
+                app = create_app(ctx=ctx)
+                client = TestClient(app)
+
+                prof = ctx.connection_hub.save_profile(
+                    {
+                        "connection_id": "c_illegal_ctrl",
+                        "name": "控制字符测试库",
+                        "db_type": "DWS",
+                        "host": "127.0.0.1",
+                        "port": 15432,
+                        "dbname": "dw_ctrl",
+                        "default_schema": "dwd",
+                    }
+                )
+                cid = prof.connection_id
+
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_PK_CTRL",
+                        "cn_name": "PK\x0b主键编号",
+                        "en_abbr": "pk_id\x02",
+                        "type_dws": "VARCHAR(32)",
+                        "remark": "标准备注\x00\x0b",
+                    }
+                )
+                ctx.store.save_catalog_snapshot(
+                    cid,
+                    schemas=[SchemaMeta(schema_name="dwd", table_count=1, view_count=0)],
+                    tables=[{"schema_name": "dwd", "table_name": "t_ctrl_pk", "object_type": "TABLE"}],
+                )
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name="dwd",
+                        table_name="t_ctrl_pk",
+                        table_comment="PK\x0b测试表",
+                        columns=[
+                            ColumnMeta(1, "col_pk_raw", "VARCHAR(32)", is_primary_key=True, column_comment="PK\x02"),
+                            ColumnMeta(2, "col_pk_zh", "VARCHAR(64)", is_primary_key=True, column_comment="PK\x0b主键"),
+                            ColumnMeta(3, "col_formula", "VARCHAR(32)", column_comment="\x01=1备注"),
+                        ],
+                    ),
+                )
+                ctx.standard_catalog.bulk_save_field_bindings(
+                    cid,
+                    [
+                        {
+                            "schema_name": "dwd",
+                            "table_name": "t_ctrl_pk",
+                            "column_name": "col_pk_raw",
+                            "std_code": "STD_PK_CTRL",
+                        }
+                    ],
+                )
+
+                # 1. 全量 Schema 模板导出接口返回 200 且清洗全部非法控制字符
+                r_tpl = client.get(
+                    f"/api/modules/standard_migrator/bindings/template.xlsx?connection_id={cid}&schema_name=dwd&schemas=dwd&scope=schema"
+                )
+                self.assertEqual(r_tpl.status_code, 200, r_tpl.text)
+                wb_tpl = openpyxl.load_workbook(io.BytesIO(r_tpl.content))
+                try:
+                    rows = list(wb_tpl["字段与数据标准对照"].iter_rows(min_row=2, values_only=True))
+                finally:
+                    wb_tpl.close()
+                by_col = {r[2]: r for r in rows}
+                self.assertEqual(by_col["col_pk_raw"][4], "PK")
+                self.assertEqual(by_col["col_pk_raw"][6], "pk_id")
+                self.assertEqual(by_col["col_pk_raw"][7], "PK主键编号")
+                self.assertEqual(by_col["col_pk_zh"][4], "PK主键")
+                self.assertEqual(by_col["col_formula"][4], "'=1备注")
+
+                # 2. 单库全库落标 Excel 报告导出（build_single_db_excel_bytes）
+                r_rep = client.get(
+                    f"/api/modules/standard_migrator/bindings/report.xlsx?connection_id={cid}&schemas=dwd&only_bound_tables=false"
+                )
+                self.assertEqual(r_rep.status_code, 200, r_rep.text)
+                wb_rep = openpyxl.load_workbook(io.BytesIO(r_rep.content))
+                try:
+                    rep_rows = list(wb_rep.active.iter_rows(min_row=2, values_only=True))
+                finally:
+                    wb_rep.close()
+                self.assertEqual(len(rep_rows), 3)
+                self.assertEqual(rep_rows[0][4], "PK测试表")
+                self.assertEqual(rep_rows[0][8], "PK")
+                self.assertEqual(rep_rows[1][8], "PK主键")
+                self.assertEqual(rep_rows[2][8], "'=1备注")
+
+                # 3. 标准字典导出（StandardCatalog.export_dictionary_excel_bytes）
+                dict_bytes = ctx.standard_catalog.export_dictionary_excel_bytes()
+                wb_dict = openpyxl.load_workbook(io.BytesIO(dict_bytes))
+                try:
+                    dict_rows = list(wb_dict["数据字典"].iter_rows(min_row=2, values_only=True))
+                finally:
+                    wb_dict.close()
+                self.assertEqual(dict_rows[0][5], "PK主键编号")
+                self.assertEqual(dict_rows[0][8], "pk_id")
+                self.assertEqual(dict_rows[0][45], "标准备注")
+
+                # 4. 跨环境离线 Excel 报告（build_cross_env_excel_bytes）
+                cross_excel = build_cross_env_excel_bytes(
+                    {
+                        "pairs": [
+                            {
+                                "std_table_key": "t_ctrl_pk",
+                                "table_binding": {
+                                    "std_table_key": "t_ctrl_pk",
+                                    "source_schema": "dwd",
+                                    "source_table": "t_ctrl_pk",
+                                    "target_schema": "dwd",
+                                    "target_table": "t_ctrl_pk",
+                                },
+                                "center_rows": [
+                                    {
+                                        "source_col": {
+                                            "column_name": "col_pk_raw",
+                                            "data_type": "VARCHAR(32)",
+                                            "column_comment": "PK\x02",
+                                        },
+                                        "target_col": {
+                                            "column_name": "col_pk_zh",
+                                            "data_type": "VARCHAR(64)",
+                                            "column_comment": "PK\x0b主键",
+                                        },
+                                        "source_std_code": "STD_PK_CTRL",
+                                        "target_std_code": "STD_PK_CTRL",
+                                        "source_std": {"cn_name": "PK\x0b主键编号", "resolved_type": "VARCHAR(32)"},
+                                        "target_std": {"cn_name": "PK\x0b主键编号", "resolved_type": "VARCHAR(32)"},
+                                        "bookmark_state": "UNIFIED",
+                                        "target_compliance": {"status": "COMPLIANT", "label": "已落标"},
+                                        "cross_compat": {"capacity_status": "CONTAINED", "capacity_label": "可容纳"},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                )
+                wb_cross_off = openpyxl.load_workbook(io.BytesIO(cross_excel))
+                try:
+                    c_row = next(wb_cross_off.active.iter_rows(min_row=2, max_row=2, values_only=True))
+                    self.assertEqual(c_row[7], "PK")
+                    self.assertEqual(c_row[15], "PK主键")
+                finally:
+                    wb_cross_off.close()
+
+                # 5. 跨环境铺底模板与比对表导出（generate_pairing_template_bytes / export_comparison_excel_bytes）
+                cc_svc = CrossComparatorService(ctx)
+                cc_svc.bind_role_connection("source", cid, auto_refresh=False)
+                cc_svc.bind_role_connection("target", cid, auto_refresh=False)
+                ctx.store.replace_cross_standards(
+                    [
+                        {
+                            "row_index": 1,
+                            "schema_name": "dwd",
+                            "table_name": "t_ctrl_pk",
+                            "old_col_name": "col_pk_raw",
+                            "old_col_type": "VARCHAR(32)",
+                            "old_col_comment": "PK\x02",
+                            "new_col_name": "col_pk_raw",
+                            "new_col_type": "VARCHAR(32)",
+                            "new_col_comment": "PK\x0b主键",
+                        }
+                    ],
+                    "ctrl_std.xlsx",
+                )
+                ctx.store.upsert_cross_table_binding(
+                    "t_ctrl_pk",
+                    std_schema_name="dwd",
+                    source_schema="dwd",
+                    source_table="t_ctrl_pk",
+                    target_schema="dwd",
+                    target_table="t_ctrl_pk",
+                )
+                ctx.store.upsert_cross_table_column_bindings(
+                    "t_ctrl_pk",
+                    [
+                        {
+                            "std_col_name": "col_pk_raw",
+                            "bound_source_col": "col_pk_raw",
+                            "bound_target_col": "col_pk_raw",
+                        }
+                    ],
+                )
+
+                pair_tpl = cc_svc.generate_pairing_template_bytes(
+                    std_table_key="t_ctrl_pk",
+                    source_schema="dwd",
+                    source_table="t_ctrl_pk",
+                    target_schema="dwd",
+                    target_table="t_ctrl_pk",
+                )
+                wb_pt = openpyxl.load_workbook(io.BytesIO(pair_tpl))
+                wb_pt.close()
+
+                comp_bytes = cc_svc.export_comparison_excel_bytes(std_table_key="t_ctrl_pk")
+                wb_comp = openpyxl.load_workbook(io.BytesIO(comp_bytes))
+                try:
+                    comp_row = next(wb_comp.active.iter_rows(min_row=2, max_row=2, values_only=True))
+                    self.assertEqual(comp_row[7], "PK")
+                    self.assertEqual(comp_row[10], "PK")
+                    self.assertEqual(comp_row[13], "PK主键")
+                finally:
+                    wb_comp.close()
+            finally:
+                ctx.close()
+
 
 if __name__ == "__main__":
     unittest.main()
