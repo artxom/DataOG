@@ -1,15 +1,15 @@
-"""Data.O.G 同二级版本累积增量更新包签名构建工具 (build_update_pack.py).
+"""Data.O.G 同二级版本累积增量更新包加密签名构建工具 (build_update_pack.py).
 
 产出结构：
-- `<output_dir>/DataOG-Update-vX.Y.Z.zip` (~0.9~1.2 MB)
-  ├── updates/DataOG-Update-vX.Y.Z.dgp   # Ed25519 签名载荷（manifest.json + manifest.sig + code.zip + static/）
+- `<output_dir>/DataOG-Update-vX.Y.Z.zip` (~0.9~1.2 MB，兼容银行邮件网关安全扫描)
+  ├── updates/DataOG-Update-vX.Y.Z.dgp   # DGP2 加密混淆认证信封 (Ed25519 + HMAC-SHA256 + BLAKE2b-CTR + zlib，零明文源码/脚本)
   └── UPDATE_README.txt                  # 解压覆盖或应用内上传双渠道升级说明
 
 安全约束：
 1. 默认生产模式强制校验私钥推导出的公钥与客户端内嵌公钥 (`update_bootstrap.reconstruct_prod_pubkey()`) 完全一致；
 2. 严禁将 `.keygen_secrets/`、`tests/`、`tools/`、`demo_sandbox/`、`.git/`、`__pycache__` 或原生二进制打入 `code.zip`；
 3. 严禁向 stdout/stderr 打印签名私钥或种子全文；
-4. 构建完成后立即调用 `update_bootstrap.verify_update_package_bytes()` 执行全包闭环自检后才原子落盘。
+4. 构建完成后立即执行零明文代码暴露检查 (`_assert_gateway_safe_update_zip`) 与 `update_bootstrap.verify_update_package_bytes()` 全包闭环自检后才原子落盘。
 """
 
 from __future__ import annotations
@@ -21,11 +21,13 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 import zipfile
+import zlib
 
 import update_bootstrap
 
@@ -204,25 +206,105 @@ def _collect_static_entries(source_dir: str) -> List[Tuple[str, bytes]]:
     return entries
 
 
+def seal_dgp2_bundle(
+    raw_bundle: bytes,
+    *,
+    seed: bytes,
+    nonce: Optional[bytes] = None,
+) -> bytes:
+    """将 DGPB 二进制载荷压缩并使用 BLAKE2b-512-CTR + HMAC-SHA256 + Ed25519 加密封装为 DGP2 信封."""
+    if len(seed) != 32:
+        raise ValueError("Ed25519 私钥种子必须为 32 字节")
+    if nonce is None:
+        eff_nonce = secrets.token_bytes(24)
+    else:
+        if len(nonce) != 24:
+            raise ValueError("DGP2 Nonce 必须为 24 字节")
+        eff_nonce = bytes(nonce)
+
+    compressed = zlib.compress(raw_bundle, level=9)
+    pubkey = ed25519_derive_pubkey(seed)
+    enc_key, mac_key = update_bootstrap.derive_dgp2_keys(pubkey, eff_nonce)
+    ciphertext = update_bootstrap.dgp2_ctr_xor(compressed, enc_key, eff_nonce)
+
+    header_core = update_bootstrap.DGP2_HEADER_CORE_STRUCT.pack(
+        update_bootstrap.DGP2_MAGIC,
+        update_bootstrap.UPDATE_FORMAT_VERSION,
+        update_bootstrap.DGP2_FLAG_ZLIB | update_bootstrap.DGP2_FLAG_ENCRYPTED,
+        update_bootstrap.DGP2_CIPHER_BLAKE2B_CTR_HMAC,
+        b"\x00\x00\x00",
+        eff_nonce,
+        len(raw_bundle),
+        len(ciphertext),
+    )
+    envelope_mac = update_bootstrap.dgp2_compute_mac(mac_key, header_core, ciphertext)
+    envelope_sig = ed25519_sign_deterministic(
+        update_bootstrap.dgp2_envelope_sign_message(header_core, ciphertext),
+        seed,
+    )
+    return header_core + envelope_mac + envelope_sig + ciphertext
+
+
+def _assert_gateway_safe_update_zip(
+    outer_bytes: bytes,
+    dgp_bytes: bytes,
+    version: str,
+) -> None:
+    """构建期强校验：确保外层 ZIP 无脚本/可执行条目且内部 .dgp 为零明文代码的不透明 DGP2 密文信封."""
+    if not dgp_bytes.startswith(update_bootstrap.DGP2_MAGIC):
+        raise ValueError("构建出的 .dgp 载荷未包含 DGP2 加密魔数头")
+    if zipfile.is_zipfile(io.BytesIO(dgp_bytes)):
+        raise ValueError("DGP2 载荷不允许保留可递归解包的 ZIP 文件头")
+    if dgp_bytes[:2] in (b"PK", b"MZ", b"\x1f\x8b", b"\x78\x9c", b"\x78\xda", b"\x78\x01"):
+        raise ValueError("DGP2 载荷前导字节命中明文压缩或可执行特征头")
+
+    forbidden_plaintext_markers = (
+        b"manifest.json",
+        b"code.zip",
+        b"core/app_kernel.py",
+        b"static/index.html",
+        b"js/main.js",
+        b"bootstrapWorkbench",
+        b"<!DOCTYPE html>",
+    )
+    for marker in forbidden_plaintext_markers:
+        if marker in dgp_bytes:
+            raise ValueError(f"DGP2 密文中检测到未加密明文特征: {marker!r}")
+
+    expected_dgp_name = f"updates/DataOG-Update-v{version}.dgp"
+    forbidden_exts = (
+        ".py", ".pyc", ".pyo", ".js", ".mjs", ".html", ".htm", ".css",
+        ".exe", ".dll", ".bat", ".cmd", ".ps1", ".sh", ".vbs", ".jar", ".zip",
+    )
+    with zipfile.ZipFile(io.BytesIO(outer_bytes), "r") as ozf:
+        names = [zi.filename for zi in ozf.infolist() if not zi.is_dir()]
+        if set(names) != {expected_dgp_name, "UPDATE_README.txt"}:
+            raise ValueError(f"外层发布 ZIP 存在非预期文件集合: {names}")
+        for name in names:
+            if name.lower().endswith(forbidden_exts):
+                raise ValueError(f"外层发布 ZIP 禁止直接暴露敏感后缀条目: {name}")
+
+
 def _build_readme_text(manifest: Dict[str, Any]) -> str:
     ver = manifest["version"]
     series = manifest["series"]
     min_base = manifest["min_base_version"]
     built_at = manifest["built_at"]
     return (
-        f"Data.O.G v{ver} 同系列累积增量更新包\n"
+        f"Data.O.G v{ver} 同系列累积增量更新包（加密混淆安全封装版）\n"
         f"============================================================\n"
         f"- 目标版本     : v{ver}\n"
         f"- 适用底座范围 : DataOG.exe v{min_base} 及以上同 {series}.x 系列客户端\n"
         f"                 （例如 {min_base} ~ {ver} 均可用本包直接平滑升级）\n"
         f"- 跨版本提示   : 若当前客户端低于 v{min_base}（例如 {series} 之前的老版本），请直接下载完整安装包\n"
         f"- 构建时间     : {built_at}\n"
-        f"- 数字签名     : RFC 8032 Ed25519 + 全量 SHA-256 清单校验\n\n"
+        f"- 封装安全机制 : DGP2 加密混淆载荷 (BLAKE2b-512-CTR + HMAC-SHA256) + RFC 8032 Ed25519 双层签名\n"
+        f"                 （包内不含任何明文可执行程序、脚本或源码，适配企业/银行邮件安全网关传输）\n\n"
         f"升级方式（二选一）：\n"
         f"1. 【系统外部覆盖升级】将本压缩包中的 updates/ 文件夹直接解压覆盖到 DataOG 客户端目录\n"
-        f"   （与 DataOG.exe 同级，无需替换 DataOG.exe 或 _internal/），下次启动 DataOG.exe 自动验签生效。\n"
+        f"   （与 DataOG.exe 同级，无需替换 DataOG.exe 或 _internal/），下次启动 DataOG.exe 自动验签解密生效。\n"
         f"2. 【应用内界面上传】打开 Data.O.G -> 系统配置 -> 版本与升级 -> 点击「上传增量更新包」，\n"
-        f"   直接选择本压缩包 DataOG-Update-v{ver}.zip（或内部 .dgp 文件），重启 DataOG 后生效。\n\n"
+        f"   直接选择本压缩包 DataOG-Update-v{ver}.zip（或内部 .dgp / 改名 .dat 文件），重启 DataOG 后生效。\n\n"
         f"说明：本升级包仅更新核心业务逻辑与前端界面，100% 保留原有激活授权、数据库连接、AI 密钥与工作区数据。\n"
     )
 
@@ -238,8 +320,9 @@ def build_update_pack(
     allow_custom_seed: bool = False,
     summary: str = "",
     notes: str = "",
+    nonce: Optional[bytes] = None,
 ) -> Dict[str, Any]:
-    """构建并自检签名增量更新包 DataOG-Update-vX.Y.Z.zip，返回构建统计元数据."""
+    """构建并自检 DGP2 加密混淆签名增量更新包 DataOG-Update-vX.Y.Z.zip，返回构建统计元数据."""
     eff_source = os.path.abspath(source_dir or os.path.dirname(os.path.abspath(__file__)))
     eff_output = os.path.abspath(output_dir or os.path.join(eff_source, "dist"))
     os.makedirs(eff_output, exist_ok=True)
@@ -293,6 +376,11 @@ def build_update_pack(
         "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": (summary or f"Data.O.G v{ver_norm} 同系列累积增量更新包 (适用 v{min_base_norm}+)").strip(),
         "notes": (notes or "").strip(),
+        "packaging": {
+            "envelope": "DGP2",
+            "cipher": update_bootstrap.DGP2_CIPHER_LABEL,
+            "compression": "zlib",
+        },
         "code_zip": {
             "sha256": hashlib.sha256(code_zip_bytes).hexdigest(),
             "size": len(code_zip_bytes),
@@ -301,16 +389,21 @@ def build_update_pack(
         "static_files": static_hashes,
     }
     manifest_raw = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    sig_raw = ed25519_sign_deterministic(update_bootstrap.UPDATE_SIG_DOMAIN + manifest_raw, eff_seed)
+    sig_raw = ed25519_sign_deterministic(
+        update_bootstrap.UPDATE_SIG_DOMAIN_V2_MANIFEST + manifest_raw,
+        eff_seed,
+    )
 
-    dgp_buf = io.BytesIO()
-    with zipfile.ZipFile(dgp_buf, "w") as dzf:
-        _zip_writestr(dzf, "manifest.json", manifest_raw)
-        _zip_writestr(dzf, "manifest.sig", sig_raw)
-        _zip_writestr(dzf, "code.zip", code_zip_bytes, compress_type=zipfile.ZIP_STORED, compresslevel=None)
-        for rel, raw in static_entries:
-            _zip_writestr(dzf, f"static/{rel}", raw)
-    dgp_bytes = dgp_buf.getvalue()
+    bundle_entries: List[Tuple[str, bytes]] = [
+        ("manifest.json", manifest_raw),
+        ("manifest.sig", sig_raw),
+        ("code.zip", code_zip_bytes),
+    ]
+    for rel, raw in static_entries:
+        bundle_entries.append((f"static/{rel}", raw))
+
+    raw_bundle = update_bootstrap.pack_dgp2_bundle(bundle_entries)
+    dgp_bytes = seal_dgp2_bundle(raw_bundle, seed=eff_seed, nonce=nonce)
 
     dgp_name = f"DataOG-Update-v{ver_norm}.dgp"
     readme_bytes = _build_readme_text(manifest).encode("utf-8")
@@ -326,12 +419,15 @@ def build_update_pack(
         _zip_writestr(ozf, "UPDATE_README.txt", readme_bytes)
     outer_bytes = outer_buf.getvalue()
 
-    # 构建后闭环验签自检
+    # 构建后闭环检查：零明文暴露 + 全包 Ed25519/HMAC 解密验签自检
+    _assert_gateway_safe_update_zip(outer_bytes, dgp_bytes, ver_norm)
     verified = update_bootstrap.verify_update_package_bytes(
         outer_bytes,
         base_version=min_base_norm,
         verifier_pubkey=derived_pk,
     )
+    if verified.get("format_version") != update_bootstrap.UPDATE_FORMAT_VERSION or not verified.get("encrypted"):
+        raise RuntimeError("增量包闭环自检未命中预期的 DGP2 加密格式")
 
     outer_filename = f"DataOG-Update-v{ver_norm}.zip"
     outer_path = os.path.join(eff_output, outer_filename)
@@ -352,6 +448,9 @@ def build_update_pack(
         "version": ver_norm,
         "series": series,
         "min_base_version": min_base_norm,
+        "format_version": verified["format_version"],
+        "encrypted": bool(verified["encrypted"]),
+        "cipher": str(verified.get("cipher") or ""),
         "zip_path": outer_path,
         "zip_filename": outer_filename,
         "zip_size": len(outer_bytes),
@@ -364,7 +463,7 @@ def build_update_pack(
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="构建 Data.O.G Ed25519 签名同系列累积增量更新包")
+    parser = argparse.ArgumentParser(description="构建 Data.O.G DGP2 加密混淆 Ed25519 签名同系列累积增量更新包")
     parser.add_argument("--version", default="", help="目标版本号 (默认读取 core/app_kernel.py APP_VERSION)")
     parser.add_argument("--min-base-version", default="", help="最低兼容底座版本 (默认 X.Y.0)")
     parser.add_argument("--output-dir", default="dist", help="产物输出目录 (默认 dist)")
@@ -395,9 +494,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     size_kb = res["zip_size"] / 1024.0
     print("=" * 72)
-    print(f"[OK] Data.O.G v{res['version']} 同系列累积增量更新包构建并验签自检通过！")
+    print(f"[OK] Data.O.G v{res['version']} DGP2 加密混淆增量更新包构建并验签自检通过！")
     print(f"  [*] 产物路径     : {res['zip_path']}")
     print(f"  [*] 压缩包体积   : {size_kb:.1f} KB ({res['zip_size']} bytes)")
+    print(f"  [*] 封装安全格式 : DGP2 ({res['cipher']} + Ed25519，零明文源码/脚本)")
     print(f"  [*] 适用底座范围 : v{res['min_base_version']}+ (系列 {res['series']}.x)")
     print(f"  [*] 载荷统计     : core/modules {res['code_file_count']} 个 .py + static {res['static_file_count']} 项资源")
     print(f"  [*] 外层 ZIP SHA : {res['zip_sha256']}")

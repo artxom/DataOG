@@ -106,6 +106,7 @@ class UpdateHub:
             hist = history_by_ver.get(ver_norm, {})
             code_meta = manifest.get("code_zip") if isinstance(manifest.get("code_zip"), dict) else {}
             static_meta = manifest.get("static_files") if isinstance(manifest.get("static_files"), dict) else {}
+            fmt_ver = int(manifest.get("format_version") or hist.get("format_version") or 1)
 
             rows.append(
                 {
@@ -115,6 +116,8 @@ class UpdateHub:
                     "min_base_version": str(
                         manifest.get("min_base_version") or update_bootstrap.compute_min_base_version(ver_norm)
                     ),
+                    "format_version": fmt_ver,
+                    "encrypted": bool(fmt_ver >= update_bootstrap.UPDATE_FORMAT_VERSION),
                     "built_at": str(manifest.get("built_at") or hist.get("built_at") or ""),
                     "installed_at": str(hist.get("installed_at") or ""),
                     "source": str(hist.get("source") or ""),
@@ -167,6 +170,7 @@ class UpdateHub:
             "base_version": self.base_version,
             "series": update_bootstrap.format_series(self.base_version),
             "min_compatible_base": update_bootstrap.compute_min_base_version(self.base_version),
+            "package_format_version": update_bootstrap.UPDATE_FORMAT_VERSION,
             "patch_active": running_patch is not None,
             "running_patch_version": running_patch,
             "active_patch_version": active_patch,
@@ -215,6 +219,9 @@ class UpdateHub:
             "version": manifest["version"],
             "series": manifest["series"],
             "min_base_version": manifest["min_base_version"],
+            "format_version": verified["format_version"],
+            "encrypted": bool(verified["encrypted"]),
+            "cipher": verified.get("cipher") or "",
             "built_at": manifest.get("built_at") or "",
             "summary": manifest.get("summary") or "",
             "notes": manifest.get("notes") or "",
@@ -277,6 +284,8 @@ class UpdateHub:
         return {
             "ok": True,
             "installed_version": ver,
+            "format_version": res.get("format_version", update_bootstrap.UPDATE_FORMAT_VERSION),
+            "encrypted": bool(res.get("encrypted", True)),
             "restart_required": restart_req,
             "message": msg,
             "update": status,
@@ -304,7 +313,7 @@ class UpdateHub:
         elif int(scan_res.get("already_ingested_count") or 0) > 0:
             msg = "updates 目录中的增量包此前已安装就绪，无需重复导入。"
         elif int(scan_res.get("found_count") or 0) == 0:
-            msg = "安装目录 updates/ 下暂未发现待导入的 .zip 或 .dgp 增量更新包。"
+            msg = "安装目录 updates/ 下暂未发现待导入的 .zip、.dgp 或 .dat 增量更新包。"
         else:
             msg = "扫描完成，updates/ 目录中的候选包未通过兼容性或签名校验。"
 
