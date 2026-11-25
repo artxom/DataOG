@@ -17,9 +17,13 @@ from core.excel_formula import (
     is_excel_error_value,
 )
 from core.excel_handler import (
+    EXCEL_ILLEGAL_CHARS_RE,
     export_report_excel,
     generate_template_excel,
     parse_excel_checklist,
+    sanitize_excel_cell,
+    sanitize_excel_row,
+    sanitize_excel_sheet_title,
     validate_xlsx_bytes,
 )
 
@@ -42,24 +46,21 @@ def export_tabular_xlsx_bytes(
     """将通用查询结果集导出为格式美观的 .xlsx 字节流."""
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = (sheet_title or "查询结果")[:31]
+    ws.title = sanitize_excel_sheet_title(sheet_title, fallback="查询结果")
 
     header_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
     header_font = Font(name="Microsoft YaHei", size=10, bold=True, color="FFFFFF")
     cell_font = Font(name="Microsoft YaHei", size=10)
 
     for c_idx, col_name in enumerate(columns, start=1):
-        cell = ws.cell(row=1, column=c_idx, value=str(col_name))
+        cell = ws.cell(row=1, column=c_idx, value=sanitize_excel_cell(str(col_name)))
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="left", vertical="center")
 
     for r_idx, row in enumerate(rows, start=2):
         for c_idx, val in enumerate(row, start=1):
-            safe_val: Any = val
-            if isinstance(safe_val, str) and safe_val[:1] in ("=", "+", "-", "@"):
-                safe_val = "'" + safe_val
-            c_cell = ws.cell(row=r_idx, column=c_idx, value=safe_val)
+            c_cell = ws.cell(row=r_idx, column=c_idx, value=sanitize_excel_cell(val))
             c_cell.font = cell_font
 
     for c_idx, col_name in enumerate(columns, start=1):
@@ -75,6 +76,7 @@ def export_tabular_xlsx_bytes(
 
 __all__ = [
     "EXCEL_ERROR_TOKENS",
+    "EXCEL_ILLEGAL_CHARS_RE",
     "ResolvedWorkbook",
     "clean_excel_cell_str",
     "export_report_excel",
@@ -83,5 +85,8 @@ __all__ = [
     "generate_template_excel",
     "is_excel_error_value",
     "parse_excel_checklist",
+    "sanitize_excel_cell",
+    "sanitize_excel_row",
+    "sanitize_excel_sheet_title",
     "validate_xlsx_bytes",
 ]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import io
 import json
 import os
@@ -32,7 +33,11 @@ from core.excel_handler import (
     export_report_excel,
     generate_template_excel,
     parse_excel_checklist,
+    sanitize_excel_cell,
+    sanitize_excel_row,
+    sanitize_excel_sheet_title,
 )
+from core.platform.excel_io import export_tabular_xlsx_bytes
 from core.platform.storage import PlatformStateStore as StateStore
 
 
@@ -1496,6 +1501,87 @@ ENABLE ROW MOVEMENT;"""
                 comment_only_item, matched_col=tmeta.columns[0], table_meta=tmeta, dialect="SQLITE"
             )
             self.assertIn("SQLite 原生 DDL 不支持 COMMENT ON COLUMN", sq_sql)
+
+    def test_excel_cell_sanitization_and_illegal_control_chars_export(self) -> None:
+        """验证 Excel 单元格/工作表标题清洗原语剔除 XML 1.0 非法控制字符并保留合法换行与防公式注入."""
+        illegal_sample = "PK" + "".join(chr(c) for c in list(range(0, 9)) + [11, 12] + list(range(14, 32)) + [127])
+        illegal_sample += "\ufffe\uffff\ud800"
+        self.assertEqual(sanitize_excel_cell(illegal_sample), "PK")
+        self.assertEqual(sanitize_excel_cell("PK\x0b"), "PK")
+        self.assertEqual(sanitize_excel_cell("PK\x02\x00"), "PK")
+
+        # 保留合法空白字符 \t、\n、\r
+        self.assertEqual(sanitize_excel_cell("line1\tcol2\nline2\r\n"), "line1\tcol2\nline2\r\n")
+
+        # 先清除控制字符再执行公式注入转义；单独 '-' 与标量类型保持原样
+        self.assertEqual(sanitize_excel_cell("\x01=SUM(A1:A2)"), "'=SUM(A1:A2)")
+        self.assertEqual(sanitize_excel_cell("\x0b+1+1"), "'+1+1")
+        self.assertEqual(sanitize_excel_cell("-"), "-")
+        self.assertEqual(sanitize_excel_cell("=A1", escape_formula=False), "=A1")
+        self.assertIsNone(sanitize_excel_cell(None))
+        self.assertIs(sanitize_excel_cell(True), True)
+        self.assertEqual(sanitize_excel_cell(42), 42)
+        self.assertEqual(sanitize_excel_cell(3.5), 3.5)
+        self.assertEqual(sanitize_excel_cell(b"PK\x0b\xe4\xb8\xad"), "PK中")
+
+        tz_dt = datetime.datetime(2026, 11, 25, 10, 30, 0, tzinfo=datetime.timezone.utc)
+        self.assertEqual(sanitize_excel_cell(tz_dt), "2026-11-25 10:30:00+00:00")
+
+        self.assertEqual(sanitize_excel_row(["a\x00", "\x02=1", 9]), ["a", "'=1", 9])
+
+        # 工作表页签清洗（控制字符、禁用符号、首尾单引号及 31 字符截断）
+        dirty_title = "'结果:[测试/表*?]\x0b\x02_超长工作表名称填充_1234567890'"
+        cleaned_title = sanitize_excel_sheet_title(dirty_title)
+        self.assertLessEqual(len(cleaned_title), 31)
+        self.assertFalse(cleaned_title.startswith("'"))
+        self.assertNotIn("\x0b", cleaned_title)
+        self.assertNotIn("[", cleaned_title)
+        self.assertEqual(sanitize_excel_sheet_title("\x00\x0b/\\:?*[]"), "_______")
+        self.assertEqual(sanitize_excel_sheet_title("\x00\x0b  '' ", fallback="默认页"), "默认页")
+
+        # 贯标执行报告与通用查询导出在含 PK\x02 / \x0b / \x00 / 公式前缀时均可正常生成并重新加载
+        report_bytes = export_report_excel(
+            [
+                {
+                    "row_index": 1,
+                    "schema_name": "dwd\x00",
+                    "table_name": "t_acct\x02",
+                    "old_col_name": "id",
+                    "old_col_type": "VARCHAR(32)",
+                    "old_col_comment": "PK\x0b主键",
+                    "new_col_name": "acct_id",
+                    "new_col_type": "VARCHAR(64)",
+                    "new_col_comment": "PK\x02\x00",
+                    "status": "FAILED",
+                    "error_message": "\x01=CMD('calc')",
+                }
+            ]
+        )
+        wb_rep = openpyxl.load_workbook(io.BytesIO(report_bytes))
+        try:
+            rep_row = next(wb_rep.active.iter_rows(min_row=2, max_row=2, values_only=True))
+            self.assertEqual(rep_row[1], "dwd")
+            self.assertEqual(rep_row[2], "t_acct")
+            self.assertEqual(rep_row[6], "PK主键")
+            self.assertEqual(rep_row[9], "PK")
+            self.assertEqual(rep_row[15], "'=CMD('calc')")
+        finally:
+            wb_rep.close()
+
+        tab_bytes = export_tabular_xlsx_bytes(
+            ["col\x0b_1", "=hdr\x02"],
+            [["PK\x0b", "\x01=1+1"], ["-", 123]],
+            sheet_title="结果:PK\x02/清单",
+        )
+        wb_tab = openpyxl.load_workbook(io.BytesIO(tab_bytes))
+        try:
+            self.assertEqual(wb_tab.sheetnames, ["结果_PK_清单"])
+            tab_rows = list(wb_tab.active.iter_rows(values_only=True))
+            self.assertEqual(tab_rows[0], ("col_1", "'=hdr"))
+            self.assertEqual(tab_rows[1], ("PK", "'=1+1"))
+            self.assertEqual(tab_rows[2], ("-", 123))
+        finally:
+            wb_tab.close()
 
 
 if __name__ == "__main__":

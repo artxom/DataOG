@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import datetime
 import json
-import re
 from typing import Any, Dict, Sequence
 
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-_ILLEGAL_SHEET_CHARS_RE = re.compile(r"[:\\/?*\[\]]")
+from core.platform.excel_io import sanitize_excel_cell, sanitize_excel_sheet_title
 
 
 def _now_str() -> str:
@@ -22,14 +21,11 @@ def _now_str() -> str:
 
 
 def _safe_excel_cell(val: Any) -> Any:
-    if isinstance(val, str) and val != "-" and val[:1] in ("=", "+", "-", "@"):
-        return "'" + val
-    return val
+    return sanitize_excel_cell(val)
 
 
 def _safe_sheet_title(raw: str, fallback: str = "Report") -> str:
-    cleaned = _ILLEGAL_SHEET_CHARS_RE.sub("_", str(raw or "").strip())
-    return (cleaned or fallback)[:31]
+    return sanitize_excel_sheet_title(raw, fallback=fallback)
 
 
 def _safe_json_for_script_tag(payload: Any) -> str:
@@ -340,7 +336,7 @@ function buildSingleSheetXlsxBlob(sheetTitle, headers, dataRows) {
   }
   function escXml(v) {
     return String(v == null ? "" : v)
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "")
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\uFFFE\uFFFF]/g, "")
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;")

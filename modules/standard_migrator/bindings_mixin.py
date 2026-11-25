@@ -13,6 +13,7 @@ from core.platform.dialects import clean_identifier_input
 from core.platform.excel_io import (
     ResolvedWorkbook,
     clean_excel_cell_str,
+    sanitize_excel_row,
     validate_xlsx_bytes,
 )
 from core.platform.import_progress import ProgressCallback, noop_progress
@@ -1137,7 +1138,7 @@ class _StandardBindingsMixin:
 
         if prefilled_rows:
             for r in prefilled_rows:
-                ws.append(r)
+                ws.append(sanitize_excel_row(r))
         elif selected_schemas:
             raise ValueError(
                 f"所选 Schema（{', '.join(selected_schemas)}）下暂无可导出的字段或表结构"

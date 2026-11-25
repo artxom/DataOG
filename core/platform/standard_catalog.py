@@ -20,7 +20,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from core.excel_formula import EXCEL_ERROR_TOKENS, ResolvedWorkbook, clean_excel_cell_str
-from core.excel_handler import validate_xlsx_bytes
+from core.excel_handler import sanitize_excel_cell, validate_xlsx_bytes
 from core.platform.diagnostics_hub import trace_span
 from core.platform.dialects import (
     clean_identifier_input,
@@ -250,9 +250,7 @@ def _clean_cell(val: Any, *, treat_slash_empty: bool = False) -> str:
 
 
 def _safe_excel_cell(val: Any) -> Any:
-    if isinstance(val, str) and val[:1] in ("=", "+", "-", "@"):
-        return "'" + val
-    return val
+    return sanitize_excel_cell(val)
 
 
 def _style_sheet(ws: Any, col_count: int, required_indices: Optional[set[int]] = None) -> None:

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import datetime
 import io
 import os
 import re
@@ -38,6 +39,40 @@ FORBIDDEN_XML_PATTERNS = re.compile(
     rb"<!DOCTYPE\s+|<!ENTITY\s+|http://www\.w3\.org/2001/XInclude",
     re.IGNORECASE,
 )
+
+# XML 1.0 / openpyxl 禁止写入工作表的控制字符、孤立 UTF-16 代理项及 BOM 非字符（保留合法的 \t、\n、\r）
+EXCEL_ILLEGAL_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ud800-\udfff\ufffe\uffff]"
+)
+_ILLEGAL_SHEET_TITLE_CHARS_RE = re.compile(r"[:\\/?*\[\]]")
+
+
+def sanitize_excel_cell(val: Any, *, escape_formula: bool = True) -> Any:
+    """清洗写入 Excel 单元格的值：剔除 XML 1.0 非法控制字符，并按需转义公式注入前缀."""
+    if val is None or isinstance(val, (bool, int, float)):
+        return val
+    if isinstance(val, (bytes, bytearray, memoryview)):
+        val = bytes(val).decode("utf-8", errors="replace")
+    elif isinstance(val, datetime.datetime) and val.tzinfo is not None:
+        val = val.isoformat(sep=" ")
+    if not isinstance(val, str):
+        return val
+    cleaned = EXCEL_ILLEGAL_CHARS_RE.sub("", val)
+    if escape_formula and cleaned and cleaned != "-" and cleaned[0] in ("=", "+", "-", "@"):
+        return "'" + cleaned
+    return cleaned
+
+
+def sanitize_excel_row(row: Sequence[Any], *, escape_formula: bool = True) -> List[Any]:
+    """批量清洗写入 Excel 单行的全部单元格值."""
+    return [sanitize_excel_cell(v, escape_formula=escape_formula) for v in row]
+
+
+def sanitize_excel_sheet_title(raw: Any, fallback: str = "Sheet1") -> str:
+    """清洗 Excel 工作表页签名称（移除非法控制字符、Excel 禁用符号及首尾单引号并截断至 31 字符）."""
+    text = EXCEL_ILLEGAL_CHARS_RE.sub("", str(raw or "")).strip()
+    cleaned = _ILLEGAL_SHEET_TITLE_CHARS_RE.sub("_", text).strip("'").strip()
+    return (cleaned or fallback)[:31]
 
 # 表头同义词映射表（忽略大小写、空格及括号差异）
 HEADER_SYNONYMS: Dict[str, List[str]] = {
@@ -919,7 +954,7 @@ def export_report_excel(items: List[Dict[str, Any]]) -> bytes:
             item.get("generated_sql", ""),
             item.get("updated_at", ""),
         ]
-        ws.append(row_vals)
+        ws.append(sanitize_excel_row(row_vals))
         row_idx = ws.max_row
         fill = status_fills.get(st)
         if fill:
