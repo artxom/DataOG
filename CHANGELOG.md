@@ -8,6 +8,34 @@
 
 ---
 
+## [3.4.2] - 2026-11-25
+
+> **「2. 落标绑定与贯标」模块交互与执行体验精细化升级**：支持左侧数据标准目录栏自由拖拽调节宽度并自动记忆、点击「纳入贯标」原位刷新防跳回顶部、未勾选全表纳入及混选时自动跳过「已落标」字段、执行完毕自动触发实时核验并将已达标任务在 3 秒内平滑渐隐移出队列，同时将上传入口更名为「上传字段落标映射关系」并补齐「当前选中 Schema 全量模板」导出能力。
+
+### Added
+- **左侧可缩放分隔栏 (`static/js/views/standard_migrator_view.js`, `static/css/workbench.css`)**:
+  - 为「2. 落标绑定与贯标」左侧目录栏新增 `.mac-split-resizer` 垂直拖拽分隔条，支持鼠标拖拽自由拉宽/拉窄（180px–560px 且动态限制不超过窗口 55%）、双击恢复默认 248px、键盘方向键/`Home`/`Enter` 微调及 `localStorage` 自动记忆宽度。
+- **贯标执行后实时核验与 3 秒渐隐退场 (`modules/standard_migrator/service.py`, `static/js/views/standard_migrator_view.js`, `static/js/views/standard_migrator/modals.js`, `static/css/workbench.css`)**:
+  - 后端 `execute_single`、`execute_batch`、`execute_rebuild` 执行完毕后自动触发 `_auto_verify_after_execution` 实时核验目标库字段并回传 `auto_verified` 与 `verified_completed_ids`（多连接队列单库异常容错降级）；
+  - 前端在执行完成并核验达标后，为对应任务行触发 3 秒多阶段退场动画（绿色光泽扫描 + 状态点脉冲 → 平滑右移渐隐 → 行高折叠收拢），随即自动调用 `deleteItems` 从持久化队列移除；`destroy()` 兜底清理未完结定时器与待删 ID。
+- **上传向导支持当前选中 Schema 全量模板 (`static/js/ui/database_tree.js`, `static/js/ui/upload_wizard_modal.js`, `modules/standard_migrator/{bindings_mixin.py,router.py}`)**:
+  - `DatabaseTree` 支持 Schema 节点点击高亮与独立 `selectedSchema` 状态追踪（不污染已打开表的 `activeSchema`）；
+  - `openUploadWizardModal` 支持 `extraTemplateButtons` 扩展，「上传字段落标映射关系」同时提供 **空白系统模板**、**当前选中表模板**、**当前选中 Schema 全量模板** 三档导出；后端 `generate_binding_template_bytes` 与 `/bindings/template.xlsx` 支持 `scope=schema`、按 Schema 动态命名文件并在空 Schema 时精准提示拦截（避免回退假示例表）。
+
+### Changed
+- **原位纳入防跳顶与滚动/焦点保持 (`static/js/views/standard_migrator_view.js`, `static/js/ui/data_grid.js`, `static/js/ui/database_tree.js`)**:
+  - 点击单行「纳入贯标」或顶栏「纳入本表待改字段」时采用零重建 DOM 原位更新路径（原位切换 `已入队` 态并刷新队列 Tab 计数），彻底消除页面跳回顶部与按钮失焦问题；并在同表重绘、`DataGrid` 排序与 `DatabaseTree` 刷新时自动保持滚动条位置与排序状态。
+- **自动跳过「已落标」字段 (`modules/standard_migrator/bindings_mixin.py`, `static/js/views/standard_migrator_view.js`)**:
+  - 无论是否勾选字段，`stage_migration_from_bindings` 均自动跳过 `COMPLIANT` 与实库零变更 `COMPLETED` 字段并在提示中明确告知已跳过数量；前端未勾选或全选已落标字段时直接提示跳过而不再将已落标字段写入贯标队列。
+- **上传入口更名与提示收敛 (`static/js/views/standard_migrator_view.js`, `static/js/views/standard_migrator/modals.js`, `static/js/api/migrator_api.js`)**:
+  - 将模块内「上传对照关系」按钮、空态入口、向导弹窗标题及默认模板文件名统一更新为「上传字段落标映射关系」。
+
+### Fixed
+- **互换改名已完成项实时核验与统计刷新一致性 (`core/dws_engine.py`, `static/js/views/standard_migrator_view.js`)**:
+  - 修复 `DWSMigratorEngine.sync_all_items_with_db` 及 `_build_single_item_sync_update` 在字段互换/链式改名均 `COMPLETED` 后实时核验将已完成项误判为 `MISSING_COLUMN` 或 `PENDING` 的边界缺陷；同步修复前端 `_applyStateResponse` 调用不存在的 `tree.render()` 为 `tree.renderTreeBody()`。
+
+---
+
 ## [3.4.1] - 2026-11-24
 
 > **AI 助手静态血缘解剖、四级模型探查自校准、持久化 🎯 `/goal` 断点续跑与前端续流深度加固**：针对 `v3.4.0` 上线后的边界代码审计与全链路压力测试，彻底修复确定性 SQL 静态解析、动态模型探查与粘滞档位、孤儿后台任务对账与多附件/无附件 Goal 闭环以及前端探查胶囊与断点恢复的 13 处深层缺陷，确保弱模型分析超长存储过程与断点续流在极端边界场景下稳定可靠。

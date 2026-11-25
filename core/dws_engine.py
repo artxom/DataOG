@@ -832,6 +832,7 @@ class DWSMigratorEngine:
                 clean_identifier_input(x["old_col_name"]).lower()
                 for x in group_items
                 if clean_identifier_input(x["old_col_name"])
+                and x.get("status") != "COMPLETED"
             }
             for item in group_items:
                 upd = self._build_single_item_sync_update(
@@ -899,7 +900,13 @@ class DWSMigratorEngine:
 
         matched_col: Optional[ColumnMeta] = None
         if old_name.lower() != new_name.lower():
-            if old_col is not None:
+            if (
+                str(item.get("status") or "").upper() == "COMPLETED"
+                and new_col is not None
+                and new_name.lower() not in (claimed_old_names or set())
+            ):
+                matched_col = new_col
+            elif old_col is not None:
                 matched_col = old_col
             elif new_col is not None and new_name.lower() not in (claimed_old_names or set()):
                 matched_col = new_col

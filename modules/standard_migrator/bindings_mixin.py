@@ -960,7 +960,7 @@ class _StandardBindingsMixin:
         scope: str = "",
         progress_cb: ProgressCallback = noop_progress,
     ) -> bytes:
-        """生成「数据标准-表字段对照关系」系统模板（支持空白模板、按选定库表或全库预填真实字段）."""
+        """生成「字段落标映射关系」系统模板（支持空白模板、按选定库表、当前 Schema 全量或全库预填真实字段）."""
         report = progress_cb or noop_progress
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -979,6 +979,8 @@ class _StandardBindingsMixin:
         ws.append(headers)
 
         prefilled_rows: List[List[str]] = []
+        eff_scope = (scope or "").strip().lower()
+        selected_schemas: List[str] = []
         if connection_id:
             prof = self.ctx.connection_hub.get_profile(connection_id)
             if prof:
@@ -989,7 +991,14 @@ class _StandardBindingsMixin:
                     schema_name=schema_name,
                     default_schema=eff_def,
                 )
-                if not targets and (scope or "").strip().lower() == "all":
+                eff_schemas_param: Union[str, Sequence[str]] = schemas
+                if (
+                    eff_scope == "schema"
+                    and not (isinstance(schemas, str) and schemas.strip())
+                ):
+                    eff_schemas_param = (schema_name or "").strip() or eff_def
+
+                if not targets and eff_scope in ("all", "schema"):
                     catalog = self.ctx.metadata_hub.get_catalog_tree(
                         prof.connection_id, auto_refresh=False
                     )
@@ -997,30 +1006,38 @@ class _StandardBindingsMixin:
                     bound_tables = self.ctx.standard_catalog.list_bound_tables_for_connection(
                         prof.connection_id
                     )
-                    if not cat_tables:
+                    selected_schemas, selected_schema_set, _tpl_schema_matches = self._build_schema_filter(
+                        eff_schemas_param, eff_def, prof.db_type
+                    )
+                    has_matched_cat = any(
+                        bool(clean_identifier_input(t.get("table_name") or ""))
+                        and _tpl_schema_matches(
+                            clean_identifier_input(t.get("schema_name") or eff_def) or eff_def
+                        )
+                        for t in cat_tables
+                    )
+                    if (not cat_tables) or (selected_schema_set and not has_matched_cat):
+                        refresh_schema = selected_schemas[0] if len(selected_schemas) == 1 else None
                         report(
                             8.0,
-                            "采集全库目录",
-                            f"数据源 [{prof.name}] 目录缓存为空，先触发全库目录采集...",
+                            "采集目录结构",
+                            f"数据源 [{prof.name}] {'目标 Schema ' if refresh_schema else '全库'}目录缓存为空，先触发目录采集...",
                             0,
                             1,
                         )
                         try:
                             catalog = self.ctx.metadata_hub.refresh_catalog(
                                 prof.connection_id,
+                                schema_name=refresh_schema,
                                 progress_cb=lambda pct, stg, msg, cur, tot: report(
                                     8.0 + 18.0 * (pct / 100.0), stg, msg, cur, tot
                                 ),
                             )
                             cat_tables = catalog.get("tables") or []
                         except Exception:
-                            if not bound_tables:
+                            if not bound_tables and not cat_tables and not selected_schemas:
                                 raise
                     seen_t: Set[Tuple[str, str]] = set()
-                    _, _, _tpl_schema_matches = self._build_schema_filter(
-                        schemas, eff_def, prof.db_type
-                    )
-
                     for t in cat_tables:
                         s_c = clean_identifier_input(t.get("schema_name") or eff_def) or eff_def
                         t_c = clean_identifier_input(t.get("table_name") or "")
@@ -1033,6 +1050,10 @@ class _StandardBindingsMixin:
                         if t_c and _tpl_schema_matches(s_c) and (s_c.lower(), t_c.lower()) not in seen_t:
                             seen_t.add((s_c.lower(), t_c.lower()))
                             targets.append((s_c, t_c))
+                    if not targets and selected_schemas:
+                        raise ValueError(
+                            f"所选 Schema（{', '.join(selected_schemas)}）下暂无可导出的库表"
+                        )
 
                 if targets:
                     report(
@@ -1117,6 +1138,10 @@ class _StandardBindingsMixin:
         if prefilled_rows:
             for r in prefilled_rows:
                 ws.append(r)
+        elif selected_schemas:
+            raise ValueError(
+                f"所选 Schema（{', '.join(selected_schemas)}）下暂无可导出的字段或表结构"
+            )
         else:
             for r in (
                 [
@@ -1535,13 +1560,14 @@ class _StandardBindingsMixin:
             clean_identifier_input(c).lower() for c in (column_names or []) if str(c or "").strip()
         }
         new_items: List[Dict[str, Any]] = []
+        skipped_compliant = 0
         for col in comp["columns"]:
             if not col.get("std_code") or col.get("compliance_status") == "STD_MISSING":
                 continue
-            if selected_set:
-                if col["column_name"].lower() not in selected_set:
-                    continue
-            elif col["compliance_status"] == "COMPLIANT":
+            if selected_set and col["column_name"].lower() not in selected_set:
+                continue
+            if col.get("compliance_status") == "COMPLIANT":
+                skipped_compliant += 1
                 continue
 
             target_name = (
@@ -1550,7 +1576,10 @@ class _StandardBindingsMixin:
             target_type = (
                 col["data_type"] if col.get("type_ok") else (col["std_target_type"] or col["data_type"])
             )
-            target_comment = col["std_cn_name"] or col["column_comment"]
+            if col.get("comment_ok") and str(col.get("column_comment") or "").strip():
+                target_comment = col["column_comment"]
+            else:
+                target_comment = col["std_cn_name"] or col["column_comment"]
 
             new_items.append(
                 {
@@ -1568,6 +1597,10 @@ class _StandardBindingsMixin:
             )
 
         if not new_items:
+            if skipped_compliant > 0:
+                raise ValueError(
+                    f"已自动跳过 {skipped_compliant} 个已落标字段，暂无需要纳入贯标改造的待改条目"
+                )
             raise ValueError("所选字段暂无需要贯标改造的已绑标条目（或均已达标）")
 
         eng, _ = self._get_engine_for_connection(prof.connection_id)
@@ -1577,6 +1610,7 @@ class _StandardBindingsMixin:
                 clean_identifier_input(str(x.get("old_col_name") or "")).lower()
                 for x in new_items
             }
+            filtered_items: List[Dict[str, Any]] = []
             for idx, it in enumerate(new_items):
                 tmp_item = dict(it)
                 tmp_item["id"] = idx + 1
@@ -1601,6 +1635,19 @@ class _StandardBindingsMixin:
                 ):
                     if k in upd:
                         it[k] = upd[k]
+                if str(it.get("status") or "").upper() == "COMPLETED":
+                    skipped_compliant += 1
+                    continue
+                it["row_index"] = len(filtered_items) + 1
+                filtered_items.append(it)
+            new_items = filtered_items
+
+        if not new_items:
+            if skipped_compliant > 0:
+                raise ValueError(
+                    f"已自动跳过 {skipped_compliant} 个已落标字段，暂无需要纳入贯标改造的待改条目"
+                )
+            raise ValueError("所选字段暂无需要贯标改造的已绑标条目（或均已达标）")
 
         if not self.ctx.store.get_meta("migrator_connection_id", ""):
             self.ctx.store.save_meta("migrator_connection_id", prof.connection_id)
@@ -1617,8 +1664,14 @@ class _StandardBindingsMixin:
 
         state = self.get_workspace_state()
         state["staged_count"] = len(new_items)
+        state["skipped_compliant_count"] = skipped_compliant
+        skip_hint = (
+            f"已自动跳过 {skipped_compliant} 个已落标字段，"
+            if skipped_compliant > 0
+            else ""
+        )
         state["message"] = (
-            f"已将 {actual_sch}.{actual_tbl} 的 {len(new_items)} 个字段纳入全局贯标队列（当前共 {len(state['items'])} 条）"
+            f"已将 {actual_sch}.{actual_tbl} 的 {len(new_items)} 个字段纳入全局贯标队列（{skip_hint}当前共 {len(state['items'])} 条）"
         )
         return state
 

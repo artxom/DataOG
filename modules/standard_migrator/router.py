@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 
 from core.platform.context import PlatformContext, get_platform_context
@@ -392,6 +394,32 @@ async def api_bindings_check_compliance(
     )
 
 
+def _build_binding_template_filename(
+    tables: str = "",
+    schemas: str = "",
+    schema_name: str = "",
+    scope: str = "",
+) -> str:
+    def _safe_part(raw: str) -> str:
+        cleaned = re.sub(r'[\\/:*?"<>|\r\n\s]+', "_", str(raw or "")).strip("._")
+        return cleaned[:48]
+
+    tbl_raw = (tables or "").strip()
+    eff_scope = (scope or "").strip().lower()
+    if tbl_raw:
+        first_tbl = _safe_part(tbl_raw.split(",", 1)[0])
+        suffix = f"_{first_tbl}" if first_tbl else ""
+        return f"DataOG_字段落标映射关系{suffix}_模板.xlsx"
+    if eff_scope in ("schema", "all"):
+        sch_raw = (schemas or schema_name or "").strip()
+        if sch_raw:
+            first_sch = _safe_part(sch_raw.split(",", 1)[0])
+            suffix = f"_{first_sch}" if first_sch else ""
+            return f"DataOG_字段落标映射关系{suffix}_Schema全量模板.xlsx"
+        return "DataOG_字段落标映射关系_全库全量模板.xlsx"
+    return "DataOG_字段落标映射关系_空白模板.xlsx"
+
+
 @router.get("/bindings/template.xlsx")
 async def api_bindings_template(
     request: Request,
@@ -403,11 +431,17 @@ async def api_bindings_template(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    dl_name = _build_binding_template_filename(
+        tables=tables,
+        schemas=schemas,
+        schema_name=schema_name,
+        scope=scope,
+    )
     return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
-        title="生成预填对照模板 (.xlsx)",
+        title="生成字段落标映射关系模板 (.xlsx)",
         start_detail="正在准备读取库表结构与已绑数据标准...",
         fn=StandardMigratorService(ctx).generate_binding_template_bytes,
         kwargs={
@@ -418,10 +452,10 @@ async def api_bindings_template(
             "scope": scope,
         },
         finish_stage="模板已生成",
-        default_detail="字段与数据标准对照模板 (.xlsx) 生成完成",
+        default_detail="字段落标映射关系模板 (.xlsx) 生成完成",
         response_fn=lambda raw: file_download_response(
             raw,
-            "DataOG_字段与数据标准对照模板.xlsx",
+            dl_name,
             media_type=MEDIA_TYPE_XLSX,
             ascii_fallback="binding_template.xlsx",
         ),
