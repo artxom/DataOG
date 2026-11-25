@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -14,6 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 import zipfile
+import zlib
 
 from app import APP_VERSION, create_app, resolve_static_dir
 import build_update_pack
@@ -83,27 +86,81 @@ def _stamp_cloned_version(clone_dir: str, version: str) -> None:
         fh.write(h_src)
 
 
-def _rewrite_dgp_inside_zip(outer_zip_bytes: bytes, mutator) -> bytes:
-    """在测试内重建外层 ZIP / 内层 .dgp 以构造精确篡改攻击样本."""
+def _rewrite_dgp2_inside_zip(outer_zip_bytes: bytes, seed: bytes, mutator) -> bytes:
+    """在测试内解封并重建外层 ZIP / 内层 DGP2 密文信封以构造精确内部篡改攻击样本."""
+    pk = build_update_pack.ed25519_derive_pubkey(seed)
     with zipfile.ZipFile(io.BytesIO(outer_zip_bytes), "r") as ozf:
         outer_items = {zi.filename: ozf.read(zi.filename) for zi in ozf.infolist() if not zi.is_dir()}
 
     dgp_key = next(k for k in outer_items if k.endswith(".dgp"))
-    with zipfile.ZipFile(io.BytesIO(outer_items[dgp_key]), "r") as dzf:
-        dgp_items = {zi.filename: dzf.read(zi.filename) for zi in dzf.infolist() if not zi.is_dir()}
+    entries = update_bootstrap.unseal_dgp2_bytes(outer_items[dgp_key], pubkey=pk)
 
-    mutator(dgp_items)
+    mutator(entries)
 
-    dgp_buf = io.BytesIO()
-    with zipfile.ZipFile(dgp_buf, "w") as ndzf:
-        for name, data in dgp_items.items():
-            ndzf.writestr(name, data)
-    outer_items[dgp_key] = dgp_buf.getvalue()
+    raw_bundle = update_bootstrap.pack_dgp2_bundle(list(entries.items()))
+    outer_items[dgp_key] = build_update_pack.seal_dgp2_bundle(raw_bundle, seed=seed)
 
     out_buf = io.BytesIO()
     with zipfile.ZipFile(out_buf, "w") as nozf:
         for name, data in outer_items.items():
             nozf.writestr(name, data)
+    return out_buf.getvalue()
+
+
+def _build_legacy_v1_outer_zip(source_dir: str, version: str, seed: bytes) -> bytes:
+    """构造历史 v1 明文嵌套 ZIP 增量包（用于测试防降级保护与旧版本兼容诊断）."""
+    ver_norm = update_bootstrap.normalize_semver(version)
+    series = update_bootstrap.format_series(ver_norm)
+    min_base = update_bootstrap.compute_min_base_version(ver_norm)
+    code_entries = build_update_pack._collect_code_entries(source_dir)
+    static_entries = build_update_pack._collect_static_entries(source_dir)
+
+    code_buf = io.BytesIO()
+    with zipfile.ZipFile(code_buf, "w") as czf:
+        for arcname, raw in code_entries:
+            build_update_pack._zip_writestr(czf, arcname, raw, compress_type=zipfile.ZIP_DEFLATED, compresslevel=9)
+    code_zip_bytes = code_buf.getvalue()
+
+    manifest = {
+        "format_version": update_bootstrap.UPDATE_FORMAT_VERSION_V1,
+        "version": ver_norm,
+        "series": series,
+        "min_base_version": min_base,
+        "built_at": "2026-11-24T00:00:00Z",
+        "summary": f"Legacy v1 pack {ver_norm}",
+        "notes": "",
+        "code_zip": {
+            "sha256": hashlib.sha256(code_zip_bytes).hexdigest(),
+            "size": len(code_zip_bytes),
+            "file_count": len(code_entries),
+        },
+        "static_files": {rel: hashlib.sha256(raw).hexdigest() for rel, raw in static_entries},
+    }
+    manifest_raw = json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    sig_raw = build_update_pack.ed25519_sign_deterministic(
+        update_bootstrap.UPDATE_SIG_DOMAIN_V1 + manifest_raw,
+        seed,
+    )
+
+    dgp_buf = io.BytesIO()
+    with zipfile.ZipFile(dgp_buf, "w") as dzf:
+        build_update_pack._zip_writestr(dzf, "manifest.json", manifest_raw)
+        build_update_pack._zip_writestr(dzf, "manifest.sig", sig_raw)
+        build_update_pack._zip_writestr(dzf, "code.zip", code_zip_bytes, compress_type=zipfile.ZIP_STORED, compresslevel=None)
+        for rel, raw in static_entries:
+            build_update_pack._zip_writestr(dzf, f"static/{rel}", raw)
+    dgp_bytes = dgp_buf.getvalue()
+
+    out_buf = io.BytesIO()
+    with zipfile.ZipFile(out_buf, "w") as ozf:
+        build_update_pack._zip_writestr(
+            ozf,
+            f"updates/DataOG-Update-v{ver_norm}.dgp",
+            dgp_bytes,
+            compress_type=zipfile.ZIP_STORED,
+            compresslevel=None,
+        )
+        build_update_pack._zip_writestr(ozf, "UPDATE_README.txt", b"legacy v1")
     return out_buf.getvalue()
 
 
@@ -169,7 +226,7 @@ class TestIncrementalUpdates(unittest.TestCase):
         self.assertIn("最低要求", msg_below)
 
     def test_build_update_pack_and_tamper_defenses(self) -> None:
-        """验证 build_update_pack 轻量构建、Ed25519 域隔离、防篡改、防未签名多余文件与防路径穿越."""
+        """验证 build_update_pack DGP2 加密构建、双层签名域隔离、防篡改、防未签名多余文件与防路径穿越."""
         seed = secrets.token_bytes(32)
         pk = build_update_pack.ed25519_derive_pubkey(seed)
         wrong_pk = build_update_pack.ed25519_derive_pubkey(secrets.token_bytes(32))
@@ -181,19 +238,24 @@ class TestIncrementalUpdates(unittest.TestCase):
                 allow_custom_seed=True,
             )
             self.assertTrue(res["ok"])
+            self.assertEqual(res["format_version"], 2)
+            self.assertTrue(res["encrypted"])
             self.assertLess(res["zip_size"], 2_500_000, "增量包体积应控制在轻量范围 (<2.5MB)")
             with open(res["zip_path"], "rb") as fh:
                 outer_bytes = fh.read()
 
-            # 校验不包含开发/测试/秘密路径，且提供双渠道产物布局
+            # 校验不包含开发/测试/秘密路径，外层仅含 DGP2 .dgp + UPDATE_README.txt，且 .dgp 不再是 ZIP
             with zipfile.ZipFile(io.BytesIO(outer_bytes), "r") as ozf:
                 outer_names = set(ozf.namelist())
-                self.assertIn(f"updates/DataOG-Update-v{APP_VERSION}.dgp", outer_names)
-                self.assertIn("UPDATE_README.txt", outer_names)
+                self.assertEqual(
+                    outer_names,
+                    {f"updates/DataOG-Update-v{APP_VERSION}.dgp", "UPDATE_README.txt"},
+                )
                 dgp_bytes = ozf.read(f"updates/DataOG-Update-v{APP_VERSION}.dgp")
-            with zipfile.ZipFile(io.BytesIO(dgp_bytes), "r") as dzf:
-                code_bytes = dzf.read("code.zip")
-            with zipfile.ZipFile(io.BytesIO(code_bytes), "r") as czf:
+            self.assertFalse(zipfile.is_zipfile(io.BytesIO(dgp_bytes)), "DGP2 载荷严禁保持 ZIP 格式")
+
+            entries = update_bootstrap.unseal_dgp2_bytes(dgp_bytes, pubkey=pk)
+            with zipfile.ZipFile(io.BytesIO(entries["code.zip"]), "r") as czf:
                 for entry in czf.namelist():
                     self.assertTrue(entry.endswith(".py"), entry)
                     for forbidden in ("tests/", "tools/", "demo_sandbox/", ".keygen_secrets/", "__pycache__/"):
@@ -203,24 +265,30 @@ class TestIncrementalUpdates(unittest.TestCase):
             verified_outer = update_bootstrap.verify_update_package_bytes(outer_bytes, verifier_pubkey=pk)
             verified_dgp = update_bootstrap.verify_update_package_bytes(dgp_bytes, verifier_pubkey=pk)
             self.assertEqual(verified_outer["manifest"]["version"], APP_VERSION)
+            self.assertEqual(verified_outer["format_version"], 2)
+            self.assertTrue(verified_outer["encrypted"])
             self.assertEqual(verified_dgp["container_type"], "dgp")
+            self.assertEqual(verified_dgp["format_version"], 2)
 
             # 错公钥拒绝
             with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_pk:
                 update_bootstrap.verify_update_package_bytes(outer_bytes, verifier_pubkey=wrong_pk)
             self.assertEqual(cm_pk.exception.code, "BAD_SIGNATURE")
 
-            # 签名域隔离验证：用 License 签名域签出的合法签名绝不能通过 Update 验签
-            def _swap_license_domain_sig(items: dict) -> None:
-                m_raw = items["manifest.json"]
-                items["manifest.sig"] = build_update_pack.ed25519_sign_deterministic(
-                    b"DataOG-License-v1:" + m_raw, seed
-                )
+            # 签名域隔离验证：用 License / V1 / 外壳V2 签名域签出的清单签名绝不能通过 DGP2 清单验签
+            for wrong_domain in (
+                b"DataOG-License-v1:",
+                update_bootstrap.UPDATE_SIG_DOMAIN_V1,
+                update_bootstrap.UPDATE_SIG_DOMAIN_V2,
+            ):
+                def _swap_domain_sig(items: dict, dom: bytes = wrong_domain) -> None:
+                    m_raw = items["manifest.json"]
+                    items["manifest.sig"] = build_update_pack.ed25519_sign_deterministic(dom + m_raw, seed)
 
-            wrong_domain_zip = _rewrite_dgp_inside_zip(outer_bytes, _swap_license_domain_sig)
-            with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_dom:
-                update_bootstrap.verify_update_package_bytes(wrong_domain_zip, verifier_pubkey=pk)
-            self.assertEqual(cm_dom.exception.code, "BAD_SIGNATURE")
+                wrong_domain_zip = _rewrite_dgp2_inside_zip(outer_bytes, seed, _swap_domain_sig)
+                with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_dom:
+                    update_bootstrap.verify_update_package_bytes(wrong_domain_zip, verifier_pubkey=pk)
+                self.assertEqual(cm_dom.exception.code, "BAD_SIGNATURE")
 
             # 1 字节篡改 manifest.json / manifest.sig / code.zip / static/index.html 全部拦截
             def _flip_byte(data: bytes) -> bytes:
@@ -234,16 +302,20 @@ class TestIncrementalUpdates(unittest.TestCase):
                 ("code.zip", "CHECKSUM_MISMATCH"),
                 ("static/index.html", "CHECKSUM_MISMATCH"),
             ):
-                tampered = _rewrite_dgp_inside_zip(
-                    outer_bytes, lambda items, k=key: items.__setitem__(k, _flip_byte(items[k]))
+                tampered = _rewrite_dgp2_inside_zip(
+                    outer_bytes,
+                    seed,
+                    lambda items, k=key: items.__setitem__(k, _flip_byte(items[k])),
                 )
                 with self.assertRaises(update_bootstrap.UpdateVerificationError, msg=key) as cm:
                     update_bootstrap.verify_update_package_bytes(tampered, verifier_pubkey=pk)
                 self.assertEqual(cm.exception.code, expected_code)
 
             # 添加未签名多余 static 文件必须拒绝
-            extra_static_zip = _rewrite_dgp_inside_zip(
-                outer_bytes, lambda items: items.__setitem__("static/evil.js", b"console.log('x');")
+            extra_static_zip = _rewrite_dgp2_inside_zip(
+                outer_bytes,
+                seed,
+                lambda items: items.__setitem__("static/evil.js", b"console.log('x');"),
             )
             with self.assertRaises(update_bootstrap.UpdateVerificationError):
                 update_bootstrap.verify_update_package_bytes(extra_static_zip, verifier_pubkey=pk)
@@ -256,17 +328,15 @@ class TestIncrementalUpdates(unittest.TestCase):
                 new_code = cbuf.getvalue()
                 items["code.zip"] = new_code
                 m = json.loads(items["manifest.json"].decode("utf-8"))
-                import hashlib
-
                 m["code_zip"]["sha256"] = hashlib.sha256(new_code).hexdigest()
                 m["code_zip"]["size"] = len(new_code)
                 m_raw = json.dumps(m, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 items["manifest.json"] = m_raw
                 items["manifest.sig"] = build_update_pack.ed25519_sign_deterministic(
-                    update_bootstrap.UPDATE_SIG_DOMAIN + m_raw, seed
+                    update_bootstrap.UPDATE_SIG_DOMAIN_V2_MANIFEST + m_raw, seed
                 )
 
-            forbidden_zip = _rewrite_dgp_inside_zip(outer_bytes, _inject_forbidden_code)
+            forbidden_zip = _rewrite_dgp2_inside_zip(outer_bytes, seed, _inject_forbidden_code)
             with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_forb:
                 update_bootstrap.verify_update_package_bytes(forbidden_zip, verifier_pubkey=pk)
             self.assertEqual(cm_forb.exception.code, "FORBIDDEN_CONTENT")
@@ -278,6 +348,224 @@ class TestIncrementalUpdates(unittest.TestCase):
             with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_trav:
                 update_bootstrap.verify_update_package_bytes(trav_buf.getvalue(), verifier_pubkey=pk)
             self.assertEqual(cm_trav.exception.code, "PATH_TRAVERSAL")
+
+    def test_dgp2_mail_gateway_opacity_encryption_and_downgrade_guard(self) -> None:
+        """验证邮件网关零明文代码/脚本防线、高熵加密、随机 Nonce、.dat 兼容及 >=3.5.0 防降级拒收."""
+        project_root = os.path.dirname(resolve_static_dir())
+        seed = secrets.token_bytes(32)
+        pk = build_update_pack.ed25519_derive_pubkey(seed)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out1 = os.path.join(tmp, "p1")
+            out2 = os.path.join(tmp, "p2")
+            res1 = build_update_pack.build_update_pack(output_dir=out1, seed=seed, allow_custom_seed=True)
+            res2 = build_update_pack.build_update_pack(output_dir=out2, seed=seed, allow_custom_seed=True)
+
+            with open(res1["zip_path"], "rb") as fh:
+                outer1 = fh.read()
+            with open(res2["zip_path"], "rb") as fh:
+                outer2 = fh.read()
+
+            # 1. 外层 ZIP 中央目录绝不含可执行或脚本扩展名
+            forbidden_exts = (
+                ".py", ".pyc", ".pyo", ".js", ".mjs", ".html", ".htm", ".css",
+                ".exe", ".dll", ".bat", ".cmd", ".ps1", ".sh", ".vbs", ".jar", ".zip",
+            )
+            with zipfile.ZipFile(io.BytesIO(outer1), "r") as ozf:
+                names = ozf.namelist()
+                self.assertEqual(set(names), {f"updates/DataOG-Update-v{APP_VERSION}.dgp", "UPDATE_README.txt"})
+                for name in names:
+                    self.assertFalse(name.lower().endswith(forbidden_exts), f"发现敏感扩展名: {name}")
+                dgp1 = ozf.read(f"updates/DataOG-Update-v{APP_VERSION}.dgp")
+            with zipfile.ZipFile(io.BytesIO(outer2), "r") as ozf2:
+                dgp2 = ozf2.read(f"updates/DataOG-Update-v{APP_VERSION}.dgp")
+
+            # 2. DGP2 非 ZIP / 非 PE / 非 ELF / 非裸 zlib / 高香农熵 / 零明文源码特征
+            self.assertEqual(dgp1[:4], update_bootstrap.DGP2_MAGIC)
+            self.assertFalse(zipfile.is_zipfile(io.BytesIO(dgp1)))
+            for magic_prefix in (b"PK", b"MZ", b"\x7fELF", b"\x1f\x8b", b"\x78\x9c", b"\x78\xda", b"\x78\x01"):
+                self.assertFalse(dgp1.startswith(magic_prefix))
+
+            body = dgp1[12:]
+            counts = [0] * 256
+            for b in body:
+                counts[b] += 1
+            total = len(body)
+            entropy = -sum((c / total) * math.log2(c / total) for c in counts if c > 0)
+            self.assertGreater(entropy, 7.9, f"DGP2 密文信息熵过低: {entropy:.4f}")
+
+            for marker in (
+                b"manifest.json",
+                b"code.zip",
+                b"core/app_kernel.py",
+                b"static/index.html",
+                b"js/main.js",
+                b"bootstrapWorkbench",
+                b"<!DOCTYPE",
+                b"import ",
+                b"function ",
+                b"DataOG",
+            ):
+                self.assertNotIn(marker, dgp1, f"DGP2 密文中泄露明文标记: {marker!r}")
+
+            # 3. 连续构建两次生成不同 Nonce 与完全不同的密文
+            self.assertNotEqual(dgp1[12:36], dgp2[12:36])
+            self.assertNotEqual(dgp1, dgp2)
+
+            # 4. 改名为 .dat 的直接文件及外层 ZIP 内 .dat 均可正常验签并通过 scan 吸纳
+            v_dat_raw = update_bootstrap.verify_update_package_bytes(dgp1, verifier_pubkey=pk)
+            self.assertEqual(v_dat_raw["format_version"], 2)
+
+            dat_outer_buf = io.BytesIO()
+            with zipfile.ZipFile(dat_outer_buf, "w") as dz:
+                dz.writestr(f"updates/DataOG-Update-v{APP_VERSION}.dat", dgp1)
+                dz.writestr("UPDATE_README.txt", b"renamed dat")
+            v_dat_outer = update_bootstrap.verify_update_package_bytes(dat_outer_buf.getvalue(), verifier_pubkey=pk)
+            self.assertEqual(v_dat_outer["container_type"], "outer_zip")
+            self.assertEqual(v_dat_outer["format_version"], 2)
+
+            install_dir = os.path.join(tmp, "inst")
+            upd_dir = os.path.join(tmp, "vault_upd")
+            os.makedirs(os.path.join(install_dir, "updates"), exist_ok=True)
+            with open(os.path.join(install_dir, "updates", "gateway_safe.dat"), "wb") as fh:
+                fh.write(dgp1)
+            scan_res = update_bootstrap.scan_and_ingest_install_dir_updates(
+                updates_dir=upd_dir,
+                install_dir=install_dir,
+                base_version=APP_VERSION,
+                verifier_pubkey=pk,
+            )
+            self.assertEqual(scan_res["installed_version"], APP_VERSION)
+
+            # 5. 防降级保护：v1 明文包声称 >=3.5.0（即使拥有合法签名）也必须被拒绝；声称 3.4.2 跨版本则拦截
+            clone_src = os.path.join(tmp, "src_clone")
+            _clone_minimal_source(project_root, clone_src)
+
+            _stamp_cloned_version(clone_src, "3.5.1")
+            v1_forged_351 = _build_legacy_v1_outer_zip(clone_src, "3.5.1", seed)
+            with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_dg:
+                update_bootstrap.verify_update_package_bytes(v1_forged_351, verifier_pubkey=pk)
+            self.assertEqual(cm_dg.exception.code, "INVALID_ARCHIVE")
+
+            _stamp_cloned_version(clone_src, "3.4.2")
+            v1_legacy_342 = _build_legacy_v1_outer_zip(clone_src, "3.4.2", seed)
+            ctx = PlatformContext(
+                db_path=os.path.join(tmp, "hub_vault", "idx.dat"),
+                verifier_pubkey=pk,
+                install_dir=install_dir,
+                base_version="3.5.0",
+            )
+            try:
+                ins = ctx.update_hub.inspect_update_bytes(v1_legacy_342, "DataOG-Update-v3.4.2.zip")
+                self.assertTrue(ins["ok"])
+                self.assertEqual(ins["format_version"], 1)
+                self.assertFalse(ins["encrypted"])
+                self.assertFalse(ins["compatible"])
+                self.assertIn("跨二级版本", ins["compatibility_message"])
+
+                with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_incompat:
+                    ctx.update_hub.install_update_bytes(v1_legacy_342, "DataOG-Update-v3.4.2.zip")
+                self.assertEqual(cm_incompat.exception.code, "INCOMPATIBLE_VERSION")
+            finally:
+                ctx.close()
+
+    def test_dgp2_envelope_tamper_and_zlib_bomb_defenses(self) -> None:
+        """验证 DGP2 140 字节信封逐字段篡改、截断、尾字节、错误签名域及 Signed Zlib-Bomb 防御."""
+        self.assertEqual(len(update_bootstrap.reconstruct_envelope_pepper()), 32)
+        seed = secrets.token_bytes(32)
+        pk = build_update_pack.ed25519_derive_pubkey(seed)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res = build_update_pack.build_update_pack(output_dir=tmp, seed=seed, allow_custom_seed=True)
+            with zipfile.ZipFile(res["zip_path"], "r") as ozf:
+                dgp_bytes = ozf.read(f"updates/DataOG-Update-v{APP_VERSION}.dgp")
+
+        # 1. 逐字段 1-bit 翻转检查
+        field_offsets = (
+            ("magic", 0, "INVALID_ARCHIVE"),
+            ("format_version", 5, "INVALID_ARCHIVE"),
+            ("flags", 7, "INVALID_ARCHIVE"),
+            ("cipher_id", 8, "INVALID_ARCHIVE"),
+            ("reserved", 9, "INVALID_ARCHIVE"),
+            ("nonce", 12, "BAD_SIGNATURE"),
+            ("plaintext_len_msb", 36, "BAD_SIGNATURE"),
+            ("plaintext_len_lsb", 39, "BAD_SIGNATURE"),
+            ("ciphertext_len", 43, "INVALID_ARCHIVE"),
+            ("envelope_mac", 44, "BAD_SIGNATURE"),
+            ("envelope_sig", 76, "BAD_SIGNATURE"),
+            ("ciphertext_head", update_bootstrap.DGP2_HEADER_SIZE, "BAD_SIGNATURE"),
+            ("ciphertext_tail", len(dgp_bytes) - 1, "BAD_SIGNATURE"),
+        )
+        for label, offset, expected_code in field_offsets:
+            buf = bytearray(dgp_bytes)
+            buf[offset] ^= 0x01
+            with self.assertRaises(update_bootstrap.UpdateVerificationError, msg=label) as cm:
+                update_bootstrap.unseal_dgp2_bytes(bytes(buf), pubkey=pk)
+            self.assertEqual(cm.exception.code, expected_code, label)
+
+        # 截断与尾部多余字节
+        for truncated in (dgp_bytes[:50], dgp_bytes[:-1]):
+            with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_tr:
+                update_bootstrap.unseal_dgp2_bytes(truncated, pubkey=pk)
+            self.assertEqual(cm_tr.exception.code, "INVALID_ARCHIVE")
+
+        with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_ext:
+            update_bootstrap.unseal_dgp2_bytes(dgp_bytes + b"\x00", pubkey=pk)
+        self.assertEqual(cm_ext.exception.code, "INVALID_ARCHIVE")
+
+        # 2. 外壳签名使用了非 DataOG-Update-v2: 签名域（即使签名有效）必须拒绝
+        header_core = dgp_bytes[: update_bootstrap.DGP2_HEADER_CORE_SIZE]
+        mac_bytes = dgp_bytes[update_bootstrap.DGP2_HEADER_CORE_SIZE : update_bootstrap.DGP2_HEADER_CORE_SIZE + 32]
+        ciphertext = dgp_bytes[update_bootstrap.DGP2_HEADER_SIZE :]
+        for wrong_dom in (
+            update_bootstrap.UPDATE_SIG_DOMAIN_V1,
+            update_bootstrap.UPDATE_SIG_DOMAIN_V2_MANIFEST,
+            b"DataOG-License-v1:",
+        ):
+            bad_sig = build_update_pack.ed25519_sign_deterministic(
+                wrong_dom + header_core + hashlib.sha256(ciphertext).digest(),
+                seed,
+            )
+            forged = header_core + mac_bytes + bad_sig + ciphertext
+            with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_ws:
+                update_bootstrap.unseal_dgp2_bytes(forged, pubkey=pk)
+            self.assertEqual(cm_ws.exception.code, "BAD_SIGNATURE")
+
+        # 3. 合法签名 + 合法 HMAC 的超大声明长度与真实 Zlib-Bomb 防线
+        def _craft_signed_envelope(compressed_payload: bytes, declared_plain_len: int) -> bytes:
+            n = secrets.token_bytes(24)
+            ek, mk = update_bootstrap.derive_dgp2_keys(pk, n)
+            ct = update_bootstrap.dgp2_ctr_xor(compressed_payload, ek, n)
+            hc = update_bootstrap.DGP2_HEADER_CORE_STRUCT.pack(
+                update_bootstrap.DGP2_MAGIC,
+                update_bootstrap.UPDATE_FORMAT_VERSION,
+                update_bootstrap.DGP2_FLAG_ZLIB | update_bootstrap.DGP2_FLAG_ENCRYPTED,
+                update_bootstrap.DGP2_CIPHER_BLAKE2B_CTR_HMAC,
+                b"\x00\x00\x00",
+                n,
+                declared_plain_len,
+                len(ct),
+            )
+            mac = update_bootstrap.dgp2_compute_mac(mk, hc, ct)
+            sig = build_update_pack.ed25519_sign_deterministic(
+                update_bootstrap.dgp2_envelope_sign_message(hc, ct),
+                seed,
+            )
+            return hc + mac + sig + ct
+
+        signed_huge_decl = _craft_signed_envelope(
+            zlib.compress(b"small", level=9),
+            update_bootstrap.MAX_UNCOMPRESSED_BYTES + 1,
+        )
+        with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_decl:
+            update_bootstrap.unseal_dgp2_bytes(signed_huge_decl, pubkey=pk)
+        self.assertEqual(cm_decl.exception.code, "SIZE_LIMIT")
+
+        bomb_plain = b"\x00" * (update_bootstrap.MAX_UNCOMPRESSED_BYTES + 4096)
+        signed_bomb = _craft_signed_envelope(zlib.compress(bomb_plain, level=9), 1024)
+        with self.assertRaises(update_bootstrap.UpdateVerificationError) as cm_bomb:
+            update_bootstrap.unseal_dgp2_bytes(signed_bomb, pubkey=pk)
+        self.assertEqual(cm_bomb.exception.code, "SIZE_LIMIT")
 
     def test_end_to_end_subprocess_dual_channel_patch_activation_and_crash_rollback(self) -> None:
         """真实子进程验证：覆盖 updates/ 目录自动加载新版本 (sys.meta_path zipimport)、升级退役与崩溃自愈回退."""
@@ -703,27 +991,29 @@ globalThis.fetch = async (url) => ({
       return {
         ok: true,
         update: {
-          running_version: "3.3.0",
-          base_version: "3.3.0",
-          series: "3.3",
-          min_compatible_base: "3.3.0",
+          running_version: "3.5.0",
+          base_version: "3.5.0",
+          series: "3.5",
+          min_compatible_base: "3.5.0",
           patch_active: false,
           running_patch_version: null,
-          active_patch_version: "3.3.1",
+          active_patch_version: "3.5.1",
           previous_version: null,
           restart_required: true,
-          pending_target_version: "3.3.1",
+          pending_target_version: "3.5.1",
           can_rollback: false,
           can_reset_to_base: true,
           install_dir_pending_count: 1,
           installed_releases: [
             {
-              version: "3.3.1",
-              series: "3.3",
-              min_base_version: "3.3.0",
-              built_at: "2026-11-24T08:00:00Z",
-              summary: "同系列累积更新测试",
-              code_file_count: 84,
+              version: "3.5.1",
+              series: "3.5",
+              min_base_version: "3.5.0",
+              format_version: 2,
+              encrypted: true,
+              built_at: "2026-11-25T08:00:00Z",
+              summary: "DGP2 加密混淆同系列累积更新测试",
+              code_file_count: 86,
               static_file_count: 54,
               is_active: true,
               is_running: false,
@@ -748,7 +1038,7 @@ sv.mount(host, { section: "updates" }, () => {});
 await sv.updatesPane.refreshFromServer();
 
 const renderedText = host.collectText();
-for (const expected of ["版本与升级", "v3.3.0", "v3.3.1", "上传增量更新包", "扫描安装目录", "同系列"]) {
+for (const expected of ["版本与升级", "v3.5.0", "v3.5.1", "加密混淆包", "上传增量更新包", "扫描安装目录", "同系列"]) {
   if (!renderedText.includes(expected)) {
     throw new Error(`UpdatesView missing expected text: ${expected}\nGot: ${renderedText}`);
   }

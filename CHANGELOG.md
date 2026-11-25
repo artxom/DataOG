@@ -8,6 +8,29 @@
 
 ---
 
+## [3.5.0] - 2026-11-25
+
+> **DGP2 加密混淆增量更新包架构重构（银行邮件网关无阻断传输升级）**：针对企业与银行邮件安全网关递归扫描 `.zip` 附件并拦截内嵌 `code.zip`、`*.py`、`*.js`、`*.html` 明文代码的痛点，将增量更新载荷全面升级为 **DGP2 加密混淆认证二进制信封**；外层标准无密码 `DataOG-Update-vX.Y.Z.zip` 仅含纯文本说明与高熵不透明 `.dgp` 二进制（零明文源码/脚本/嵌套 ZIP 头），客户端通过纯标准库启动器实现双层 Ed25519 + HMAC-SHA256 验签认证、BLAKE2b-512-CTR 解密、限流解包与向后兼容解析。
+
+### Added
+- **DGP2 加密混淆二进制信封与纯标准库解密装载 (`update_bootstrap.py`)**：
+  - 定义 `UPDATE_FORMAT_VERSION = 2`（`DGP2` 外壳头 140 字节 + `DGPB` 二进制打包格式），保持 `update_bootstrap.py` **100% 纯 Python 标准库零第三方依赖**；
+  - 采用基于内嵌混淆盐值 (`reconstruct_envelope_pepper`)、生产验签公钥与每包独立 24B 随机 `Nonce` 派生的 `BLAKE2b-512-CTR` 流加密 + `HMAC-SHA256` 认证，并强制使用 `DataOG-Update-v2:` 外壳签名域与 `DataOG-Update-v2-Manifest:` 清单签名域严格隔离；
+  - 实施 **先验签 -> 再校验 HMAC-SHA256 -> 后解密 -> 最后限流 zlib 解压与严格 DGPB 边界解包** 安全链（`unseal_dgp2_bytes` / `_decompress_zlib_limited`），未通过密码学认证绝不触发解密与解压，彻底免疫 ZIP/zlib 解压膨胀攻击；
+  - 新增 `MIN_V2_ENFORCED_VERSION = (3, 5, 0)` 防降级保护（`>= 3.5.0` 增量包强制采用 `DGP2`），同时兼容在 `extract_inner_dgp_bytes` 与 `scan_and_ingest_install_dir_updates` 中识别外层或目录内改名为 `.dat` 的有效 `DGP2` 载荷。
+- **构建期加密封装与邮件网关零明文代码自检 (`build_update_pack.py`)**：
+  - 升级 `build_update_pack` 通过 `pack_dgp2_bundle` + `seal_dgp2_bundle` 生成纯密文高熵 `updates/DataOG-Update-vX.Y.Z.dgp`（外层 `.zip` 保持无密码标准格式以便通过邮件网关与 Windows 原生解压）；
+  - 新增 `_assert_gateway_safe_update_zip` 构建期强校验，阻断任何 ZIP (`PK`)/PE (`MZ`)/GZIP/zlib 特征头、明文源码/HTML 特征串或 `.py`/`.js`/`.html`/`.exe`/`.zip` 敏感后缀混入外层包，随后立即运行完整解密验签闭环自检。
+
+### Changed
+- **平台更新中枢与前端控制台升级 (`core/platform/update_hub.py`, `static/js/views/updates_view.js`)**：
+  - `UpdateHub` 在状态、预检、安装与历史记录接口透传 `format_version`、`encrypted`、`cipher` 与 `package_format_version`；
+  - `UpdatesView`（严格零 `innerHTML` 与 `<dialog>`）支持上传 `.zip`/`.dgp`/`.dat`，在已缓存补丁条目展示「加密混淆包」徽标，并更新双渠道使用与邮件网关安全说明。
+- **版本基线晋升与全量测试扩充 (`app.py`, `core/app_kernel.py`, `core/platform/context.py`, `static/index.html`, `tests/test_incremental_updates.py`)**：
+  - 同步推进版本至 `v3.5.0`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变），扩充 `tests/test_incremental_updates.py` 覆盖邮件网关零明文高熵自检、随机 Nonce、`.dat` 改名兼容、`>=3.5.0` 防降级拒绝、140B 信封逐字段位翻转/截断/尾字节/跨签名域/zlib-bomb 防御与 Node.js 前端渲染验证（全套自动化测试扩充至 **114 项**）。
+
+---
+
 ## [3.4.2] - 2026-11-25
 
 > **「2. 落标绑定与贯标」模块交互与执行体验精细化升级**：支持左侧数据标准目录栏自由拖拽调节宽度并自动记忆、点击「纳入贯标」原位刷新防跳回顶部、未勾选全表纳入及混选时自动跳过「已落标」字段、执行完毕自动触发实时核验并将已达标任务在 3 秒内平滑渐隐移出队列，同时将上传入口更名为「上传字段落标映射关系」并补齐「当前选中 Schema 全量模板」导出能力。

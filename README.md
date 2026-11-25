@@ -1,4 +1,4 @@
-# Data.O.G v3.4.2 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.5.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -33,7 +33,7 @@
    - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——无密码连接拓扑随工作区协同共享，个人账号与密码严格落盘于本机私有凭据库并支持按 `(db_type, host, port, dbname)` / `jdbc_url` 端点指纹跨工作区自动匹配；免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
    - **参考知识库 (`KnowledgeHub`)**：零新增依赖离线知识库管理中心，内置 11 篇主流数据库方言速查卡并支持上传 `.md` / `.txt` / `.sql` / `.html` / `.json` / `.csv` / `.docx` / `.xlsx` 参考资料，借助 SQLite FTS5 + BM25 实现中英文与报错码毫秒级离线检索，支持按方言导出/导入轻量 `.json.gz` 知识包与团队分享，并可选接入 OpenAI 兼容 `/embeddings` 接口做混合排序（离线自动退回纯 FTS5）。
    - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
-   - **版本与升级 (`UpdateHub`)**：提供基于 RFC 8032 Ed25519 数字签名与全量 SHA-256 校验的 **同二级版本累积增量升级**（约 `0.9 MB` 的 `DataOG-Update-vX.Y.Z.zip` 适用 `vX.Y.0+` 全部同系列客户端）。支持 **系统目录 `updates/` 覆盖解压** 与 **应用内上传 `.zip`/`.dgp`** 双渠道升级，并内置启动自愈自动回退、一键回退上一补丁与恢复内置基础版本。
+   - **版本与升级 (`UpdateHub`)**：提供基于 RFC 8032 Ed25519 双层签名、HMAC-SHA256 认证与 BLAKE2b-512-CTR 加密混淆 (`DGP2`) 的 **同二级版本累积增量升级**（约 `0.95 MB` 的 `DataOG-Update-vX.Y.Z.zip` 适用 `vX.Y.0+` 全部同系列客户端）。包内不含任何明文代码、脚本或嵌套 ZIP 头，可安全通过银行/企业邮件网关；支持 **系统目录 `updates/` 覆盖解压** 与 **应用内上传 `.zip`/`.dgp`/`.dat`** 双渠道升级，并内置启动自愈自动回退、一键回退上一补丁与恢复内置基础版本。
    - **性能诊断 (`DiagnosticsHub`)**：零写盘全内存链路追踪、端到端环回与磁盘/SQLite/DNS/鉴权/DB/AI 全栈基准压测 (`Benchmark`)、自动瓶颈研判（识别企业代理未豁免环回、EDR/慢盘 `fsync`、锁竞争、事件循环阻塞等）以及一键导出全量脱敏 `.json` 诊断日志包（顶部「执行日志」弹窗亦可快捷一键导出）。
 2. **数据探查 (`explorer`)**
    - 顶栏分段切换 **`SQL 查询` | `AI 探查`**，左侧统一维持 **DataGrip 风格四级已连接数据库目录树**（`连接` → `Schema` → `表/视图` → `字段`）。
@@ -60,10 +60,10 @@
 
 ```text
 DataOG/
-├── update_bootstrap.py           # 纯标准库增量更新引导器（Ed25519 独立域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.4.2，引导增量加载并重导出内核公开入口）
+├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.0，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.4.2 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.5.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -105,8 +105,8 @@ DataOG/
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 112 项全量自动化测试（落标绑定侧栏缩放/原位防跳顶/跳已落标/执行核验3秒渐隐/Schema模板、确定性 SQL 静态血缘/隐患剖析与语义压缩、四级动态模型能力探查与超时重试减载续写、ExecutionPlanner 与持久化 🎯 /goal 硬验收补救断点续跑闭环、AI 助手长上下文重构/Thinking 深度思考与 SSE 实时流式输出、Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断与全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与大纲按行探索 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
-├── build_update_pack.py          # 同二级版本累积增量包 (DataOG-Update-vX.Y.Z.zip) Ed25519 签名构建脚本
+├── tests/                        # 114 项全量自动化测试（DGP2 加密混淆增量包与银行邮件网关零明文防线/防降级/信封防篡改、落标绑定侧栏缩放/原位防跳顶/跳已落标/执行核验3秒渐隐/Schema模板、确定性 SQL 静态血缘/隐患剖析与语义压缩、四级动态模型能力探查与超时重试减载续写、ExecutionPlanner 与持久化 🎯 /goal 硬验收补救断点续跑闭环、AI 助手长上下文重构/Thinking 深度思考与 SSE 实时流式输出、Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断与全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与大纲按行探索 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
+├── build_update_pack.py          # 同二级版本累积增量包 (DataOG-Update-vX.Y.Z.zip) DGP2 加密混淆 + Ed25519 签名构建脚本
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 纯净打包脚本（支持 --skip-tests、内置 static/dataog.ico 图标并严格剔除 tests/）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
 └── CHANGELOG.md                  # 遵循 Keep a Changelog 的版本演进日志
@@ -154,7 +154,8 @@ DataOG/
 | **`v3.3.1`** | `feat/ai-long-context-thinking-stream` → `main` | **AI 助手现代模型感知长上下文策略重构、Thinking 深度思考适配与 SSE 实时流式输出**：`LLMHub` 推断现代模型上下文窗口与思考能力并支持自定义 `context_window`；提升分片阈值至 `12K/16K` 避免数千行存储过程碎片化，新增零 Token 结构化大纲与紧凑行号标记，按模型预算在「全量直通」「大纲 + 按行/正则探索 (`read_attachment_lines`)」与「`stepped_batch` 兜底拆解」间自适应切换并支持超限透明降级；全面打通推理模型字段与 `<think>`/`<thought>` 流式解析，新增 `/chat/stream` SSE、前端折叠思考卡、自然 Markdown 边生成边渲染及「停止生成」中断（105 项测试全绿） |
 | **`v3.4.0`** | `feat/ai-long-sql-weak-model-goal` → `main` | **AI 助手超长 SQL 弱模型增幅、四级动态模型能力探查、超时韧性重试与持久化 🎯 `/goal` 闭环引擎**：新增确定性 SQL 静态血缘 DAG/控制流/隐患雷达预解剖与保行号语义压缩 (`sql_static_analyzer.py`) 及 3 个手术刀工具；落地 L1/L2/L3 四级模型能力实测与 `POST /api/platform/llm/probe-model`、`lightweight` 有效推理甜蜜区预算收敛、瞬态超时/5xx 指数退避重试+减载降级+`length` 自动续写；新增战前 `ExecutionPlanner` 最优拆解规划、弱模型工具裁剪与防原地打转护栏；新增 Layer 2 私有表 `ai_assistant_runs`/`ai_assistant_run_events`、后台持久化 `GoalRunner` 状态机（覆盖率与 HIGH/MEDIUM 隐患硬验收 + 自动补救 + `Last-Event-ID` 无损断点续流 + 一键 `/resume`）及前端探查胶囊、Goal 切换与实时 Checklist UI（110 项测试全绿） |
 | **`v3.4.1`** | `fix/ai-goal-and-static-analyzer-hardening` → `main` | **AI 助手静态血缘解析、模型探查校准、孤儿 Goal 断点恢复与前端续流深度加固**：修复 `$$` 闭合标签、嵌入式 CTE、子查询逗号连接列名泄露、Oracle 无 `DECLARE` 变量及字符串内注释符号导致的静态解析与 `DIALECT_COMPAT` 边界缺陷；修复千分位 400 超限解析、`model_tier` 粘滞与草稿流式探查；补齐重启孤儿 Goal 任务自动对账转 `paused_recoverable`、并发 `/resume` 原子防重、SSE 分页无截断续流、多附件 `A1/A2` 隔离、无附件/在线库 Goal 工具探索、`dataog_meta` 剥离与前端切换模型胶囊/断点游标/配置草稿保护（110 项测试全绿） |
-| **`v3.4.2`**（当前正式版） | `feat/standard-migrator-ux-refinements` → `main` | **「2. 落标绑定与贯标」交互与执行体验精细化升级**：新增左侧栏拖拽调宽（180px–560px 并持久化记忆、双击复位与键盘微调）；点击「纳入贯标」原位刷新防跳回顶部并保持表格滚动与按钮焦点；未勾选全表纳入及混选自动跳过「已落标」字段；单条/批量/保序重建执行完毕自动实时核验并在 3 秒内通过绿光扫掠渐隐塌缩动画平滑清出已达标任务；按钮更名为「上传字段落标映射关系」并新增「当前选中 Schema 全量模板」导出（112 项测试全绿） |
+| **`v3.4.2`** | `feat/standard-migrator-ux-refinements` → `main` | **「2. 落标绑定与贯标」交互与执行体验精细化升级**：新增左侧栏拖拽调宽（180px–560px 并持久化记忆、双击复位与键盘微调）；点击「纳入贯标」原位刷新防跳回顶部并保持表格滚动与按钮焦点；未勾选全表纳入及混选自动跳过「已落标」字段；单条/批量/保序重建执行完毕自动实时核验并在 3 秒内通过绿光扫掠渐隐塌缩动画平滑清出已达标任务；按钮更名为「上传字段落标映射关系」并新增「当前选中 Schema 全量模板」导出（112 项测试全绿） |
+| **`v3.5.0`**（当前正式版） | `feat/v3.5.0-encrypted-update-pack` → `main` | **DGP2 加密混淆增量更新包架构重构（兼容银行邮件网关传输）**：将增量更新核心载荷由明文嵌套 ZIP 重构为纯标准库 `BLAKE2b-512-CTR + HMAC-SHA256 + Ed25519` 双域签名高熵密文信封 (`DGP2`) 与紧凑二进制载荷 (`DGPB`)；外层标准无密码 `DataOG-Update-vX.Y.Z.zip` 零明文源码/脚本/可执行特征并内置构建期网关安全扫描与 `>=3.5.0` 防降级保护，客户端透明支持 `.zip`/`.dgp`/`.dat` 双渠道验签解密安装（114 项测试全绿） |
 
 ---
 
@@ -165,7 +166,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（112 项，发布前本地执行）
+# 运行全量自动化单元测试（114 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）
@@ -195,12 +196,12 @@ DATAOG_HOME="./demo_sandbox/.demo_home" python3 app.py
 python -m pip install "pyinstaller>=6.10.0"
 python build_exe.py --skip-tests
 
-# 构建轻量签名同系列累积增量更新包 DataOG-Update-vX.Y.Z.zip（约 0.9 MB，自动自检 Ed25519 签名与白名单）
+# 构建轻量加密混淆签名同系列累积增量更新包 DataOG-Update-vX.Y.Z.zip（约 0.95 MB，自动完成零明文与 Ed25519/HMAC 闭环自检）
 python build_update_pack.py --output-dir dist
 ```
-> **客户升级双渠道**（同二级版本 `v3.3.0+` 均适用后续 `3.3.x` 增量包；跨二级版本请下载完整客户端）：
-> - **方式一（外部解压覆盖）**：将 `DataOG-Update-vX.Y.Z.zip` 解压覆盖到 `DataOG` 客户端目录（掉落 `updates/*.dgp`），下次双击启动 `DataOG.exe` 自动验签生效；
-> - **方式二（应用内上传）**：在 **「系统配置 → 版本与升级」** 上传同一 `.zip`/`.dgp`，重启 `DataOG.exe` 即刻切换，支持随时一键回退或恢复内置基础版本。
+> **客户升级双渠道**（同二级版本 `v3.5.0+` 均适用后续 `3.5.x` 增量包；跨二级版本请下载完整客户端）：
+> - **方式一（外部解压覆盖）**：将 `DataOG-Update-vX.Y.Z.zip` 解压覆盖到 `DataOG` 客户端目录（掉落 `updates/*.dgp` 高熵 `DGP2` 密文载荷，零明文源码/脚本、可安全通过银行邮件网关），下次双击启动 `DataOG.exe` 自动验签解密生效；
+> - **方式二（应用内上传）**：在 **「系统配置 → 版本与升级」** 上传同一 `.zip`/`.dgp`/`.dat`，重启 `DataOG.exe` 即刻切换，支持随时一键回退或恢复内置基础版本。
 
 ---
 

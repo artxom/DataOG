@@ -54,7 +54,7 @@ export class UpdatesView {
 
   async uploadPackage() {
     if (this.busyAction) return;
-    const file = await pickLocalFile(".zip,.dgp");
+    const file = await pickLocalFile(".zip,.dgp,.dat");
     if (!file) return;
     this.busyAction = "upload";
     this.render();
@@ -169,10 +169,10 @@ export class UpdatesView {
   render() {
     const bootSummary = store.state.bootstrap?.update_summary || {};
     const st = this.status || {
-      running_version: store.state.bootstrap?.version || bootSummary.running_version || "3.3.0",
-      base_version: bootSummary.base_version || store.state.bootstrap?.version || "3.3.0",
-      series: bootSummary.series || "3.3",
-      min_compatible_base: `${bootSummary.series || "3.3"}.0`,
+      running_version: store.state.bootstrap?.version || bootSummary.running_version || "3.5.0",
+      base_version: bootSummary.base_version || store.state.bootstrap?.version || "3.5.0",
+      series: bootSummary.series || "3.5",
+      min_compatible_base: `${bootSummary.series || "3.5"}.0`,
       patch_active: Boolean(bootSummary.patch_active),
       running_patch_version: bootSummary.running_patch_version || null,
       active_patch_version: bootSummary.active_patch_version || null,
@@ -302,7 +302,7 @@ export class UpdatesView {
           onClick: () => this.uploadPackage(),
         },
         svgIcon("upload", 14),
-        el("span", { text: this.busyAction === "upload" ? "正在验签安装..." : "上传增量更新包 (.zip / .dgp)" })
+        el("span", { text: this.busyAction === "upload" ? "正在验签解密安装..." : "上传增量更新包 (.zip / .dgp / .dat)" })
       ),
       el(
         "button",
@@ -363,10 +363,10 @@ export class UpdatesView {
       el(
         "div",
         { className: "ws-arch-card" },
-        el("div", { className: "ws-arch-card-head" }, svgIcon("folder", 14), el("span", { text: "方式一：系统目录解压覆盖升级" })),
+        el("div", { className: "ws-arch-card-head" }, svgIcon("folder", 14), el("span", { text: "方式一：系统目录解压覆盖升级（邮件网关友好）" })),
         el("div", {
           className: "ws-security-banner-sub",
-          text: "下载 DataOG-Update-vX.Y.Z.zip（约 1 MB），直接解压覆盖到 DataOG 客户端目录（会在程序旁放入 updates/*.dgp，不改动 DataOG.exe），下次启动自动完成 Ed25519 验签并生效。",
+          text: "下载 DataOG-Update-vX.Y.Z.zip（约 1 MB），内部载荷已采用 DGP2 加密混淆信封封装，不含任何明文代码、脚本或可执行特征头，可安全通过银行/企业邮件网关传输；解压覆盖到 DataOG 目录后，下次启动自动完成 Ed25519 + HMAC 验签解密并生效。",
         })
       ),
       el(
@@ -375,7 +375,7 @@ export class UpdatesView {
         el("div", { className: "ws-arch-card-head" }, svgIcon("shield", 14), el("span", { text: "方式二：应用内上传 & 同系列累积规则" })),
         el("div", {
           className: "ws-security-banner-sub",
-          text: `点击上方「上传增量更新包」直接上传同一份 .zip 或 .dgp 即可就地更新。同二级版本 (v${st.series}.0+) 累积通用，可跨多个修订号直接升级；跨二级版本（如 ${st.series}.x → 下一特性版）请下载完整客户端。`,
+          text: `点击上方「上传增量更新包」直接上传 .zip、.dgp 或改名 .dat 文件即可自动解密校验并就地更新。同二级版本 (v${st.series}.0+) 累积通用；跨二级版本（如 ${st.series}.x → 下一特性版）请下载完整客户端。`,
         })
       )
     );
@@ -402,6 +402,7 @@ export class UpdatesView {
             rel.is_active && !rel.is_running ? badge("下次启动生效", "info") : null,
             rel.is_active && rel.is_running ? badge("已激活", "success") : null,
             rel.is_previous ? badge("上一版本", "neutral") : null,
+            rel.encrypted || Number(rel.format_version || 1) >= 2 ? badge("加密混淆包", "info") : null,
             rel.verified ? badge("签名通过", "success") : badge("校验异常", "danger"),
           ].filter(Boolean);
 
