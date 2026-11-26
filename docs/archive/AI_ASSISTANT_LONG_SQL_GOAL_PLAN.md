@@ -1,3 +1,20 @@
+> **归档状态**：**已归档 / 已于 `v3.4.0`–`v3.4.1` 落地实施**（本设计方案已于 Data.O.G `v3.4.0` 完整落地实施，并于 `v3.4.1` 完成边界加固；当前主干基线已演进至 `v3.5.3`，下文保留原始设计方案供历史架构追溯）。
+>
+> **实际落地路径与关键符号**：
+> - **平台大模型中枢与探查接口**：`core/platform/llm_hub.py`（`probe_model_capabilities`、`parse_context_limit_from_error`、`record_calibrated_context_limit`、`_probe_ollama_show_meta`、`_infer_model_tier`、`_compute_tier_budgets`、`compute_adaptive_timeout`、`_stitch_continuation_overlap`、`chat_completion`、`chat_completion_stream`）、`core/platform/routes/appearance_and_llm.py`（`POST /api/platform/llm/probe-model`）、`core/platform/schemas.py`（`LLMProbeModelPayload`、`context_window`、`model_tier`）。
+> - **AI 助手后端模块**：`modules/ai_assistant/{__init__.py,attachments.py,goal_runner.py,router.py,schemas.py,service.py,sql_static_analyzer.py,storage_mixin.py,tools.py}`（核心包含 `sql_static_analyzer.py` 的 `analyze_sql_static` / `compact_sql_for_llm` / `extract_lineage_subgraph` / `extract_statement_source` / `format_static_analysis_brief`、`service.py` 的 `ExecutionPlanner` 与 `detect_tool_loop_and_build_steering`、`tools.py` 的 `AssistantToolbox` 14 工具、`goal_runner.py` 的 `GoalRunner` 与 `_RunRuntimeHub`、`router.py` 的 `/runs*` 与 `/chat/stream` 路由）。
+> - **前端增量与交互组件**：`static/js/core/{http.js,platform_api.js}`（`streamSseGet`、`_consumeSseStream`、`probeLlmModel`）、`static/js/apps/ai_assistant/{api.js,view.js,style.css}`（探查胶囊、Goal 模式切换、规划卡、Checklist、断点续跑）、`static/js/views/settings_view.js`（`model_tier` 档位选择与「探查能力与窗口」）。
+>
+> **方案与实际落地差异说明（Plan vs. Implementation Deltas）**：
+> 1. **发布版本**：实际以 **`v3.4.0`** 正式发布（非 `v3.3.2`），并于 **`v3.4.1`** 完成静态解析、探查校准、孤儿对账与前端续流加固。
+> 2. **静态词法分析器**：`modules/ai_assistant/sql_static_analyzer.py` 未导入 `core/platform/sql_risk_guard.py`，而是以纯标准库独立实现了容错词法扫描器 `_tokenize_sql_tolerant`（支持 `$tag$...$tag$`、`$$` 闭合标签、嵌入式 CTE 与逗号连接深层括号追踪）。
+> 3. **代码组织形态**：`ExecutionPlanner` 与轻量 Prompt 裁剪及防打转护栏均内置于 `modules/ai_assistant/service.py`（配合 `goal_runner.py` 阶段消息构建），未拆分为独立的 `execution_planner.py` 或 `prompts.py`。
+> 4. **工具集与轻量裁剪数量**：`AssistantToolbox.dispatch` 实际注册 **14 个安全工具**（含 3 个手术刀工具）；`lightweight` 模型在纯方言有附件 SQL 场景下默认暴露 **6** 个核心工具（包含正文遗漏列举的 `get_attachment_static_report`，连同 `trace_attachment_lineage` / `read_attachment_statement` / `read_attachment_lines` / `search_attachment` / `search_knowledge`），并按需条件附加 `query_csv_attachment` 与 `propose_write_sql`（非正文所述的 5 个）。
+> 5. **探查缓存与重试常量**：`probe_model_capabilities` 实际额外部署了 `tokens_per_sec` 吞吐指标与 Ollama 本地 `detected_model_tier` 权威分级字段，且对 `native_always` 思考模型采用 `max_tokens=64`（其余 `32`）；`TRANSIENT_HTTP_STATUS_CODES` 实际包含 `500`（`(408, 429, 500, 502, 503, 504)`）。
+> 6. **表结构与 `GoalRunner` 验收门禁**：`ai_assistant_runs` 表结构额外包含 `assistant_message_id` 与 `request_json` 列；`GoalRunner.verifying` 阶段显式执行 **3 道硬验收门禁**（语句覆盖率 `missing_stmt_ids`、HIGH/MEDIUM 静态隐患逐项判定 `missed_findings`、`temp_staging` 临时表血缘前置写语句连续性 `broken_lineage_sids`）及 `MAX_REMEDIAL_ROUNDS = 3` 补救上限，并在 `v3.4.1` 补齐 `A1-F001` 多附件编号隔离与重启孤儿任务自动对账转 `paused_recoverable` 机制。
+
+---
+
 # Data.O.G AI 助手升级设计方案：弱模型超长 SQL 增幅器、动态窗口探查与持久化 `/goal` 引擎
 
 > **适用基线**：Data.O.G `v3.3.1`（`core/platform/llm_hub.py`、`modules/ai_assistant/`、`static/js/apps/ai_assistant/`）  
@@ -11,7 +28,7 @@
 结合 `v3.3.1` 现行实现，制约轻量/古早模型分析超长 SQL 的三大结构性瓶颈如下：
 
 1. **「标称窗口 ≠ 有效推理注意力窗口」导致的中间失忆（Lost-in-the-Middle）**：
-   - 当前 [llm_hub.py](../core/platform/llm_hub.py) 中 `infer_model_capabilities()` 仅凭字符串前缀将所有含 `deepseek` 的模型一律按 `context_window=128_000`、`attachment_budget=80_000` 处理，既未动态探查远端服务商真实配额/速率/token 比率，也未区分旗舰模型与 `-flash`/`-mini`/`-lite`/古早模型。
+   - 当前 [llm_hub.py](../../core/platform/llm_hub.py) 中 `infer_model_capabilities()` 仅凭字符串前缀将所有含 `deepseek` 的模型一律按 `context_window=128_000`、`attachment_budget=80_000` 处理，既未动态探查远端服务商真实配额/速率/token 比率，也未区分旗舰模型与 `-flash`/`-mini`/`-lite`/古早模型。
    - 轻量模型虽然物理上可能接收 3~8 万 tokens，但在超过 **15K~25K tokens** 的高密度存储过程上极易丢失中段临时表定义、遗漏后半段 `EXCEPTION`/`UPDATE` 分支或臆造字段名。
 2. **纯文本按行数切分缺乏 SQL 语义骨架与数据血缘视图**：
    - `attachments.py` 的 `extract_attachment_outline()` 仅提取对象名、注释章节与扁平表清单，没有形成「语句级 CRUD 血缘图 + 控制流嵌套 + 静态隐患体检」，也缺乏按血缘依赖精准切片的工具，弱模型仍需耗费宝贵步数自行大海捞针。
@@ -220,7 +237,7 @@ probing ─► planning (阶段Checklist) ─► running (甜密区单阶段 + �
 
 ### 支柱四：前端 macOS 桌面级交互升级 (`static/js/`)
 
-严格使用 [dom.js](../static/js/core/dom.js) 节点工厂与 `<dialog>`（零 `innerHTML`、零 `requestAnimationFrame`）：
+严格使用 [dom.js](../../static/js/core/dom.js) 节点工厂与 `<dialog>`（零 `innerHTML`、零 `requestAnimationFrame`）：
 
 1. **工具栏新增「🎯 深度目标模式 (`goal`)」与「模型窗口探查」状态胶囊 (`ai_assistant/view.js`)**：
    - 在工具栏新增模式切换：「标准对话」vs「🎯 Goal 模式（防超时·不达目的不结束）」；
@@ -253,14 +270,14 @@ probing ─► planning (阶段Checklist) ─► running (甜密区单阶段 + �
 
 ## 四、关键工程约束与避坑指南
 
-1. **TestClient + SSE 死锁禁区**：[tests/test_modules_and_api.py](../tests/test_modules_and_api.py) 的自定义异步 ASGI `TestClient` 会在消费完请求体后阻塞等待 `response_complete`，**任何 `StreamingResponse` 生成器内绝不可调用 `await request.is_disconnected()`**；断连清理依赖 `asyncio.Queue` + `finally` 处理，且后台 `goal_runner` 本身与客户端断连解耦（仅响应显式 `/cancel` 接口）。
+1. **TestClient + SSE 死锁禁区**：[tests/test_modules_and_api.py](../../tests/test_modules_and_api.py) 的自定义异步 ASGI `TestClient` 会在消费完请求体后阻塞等待 `response_complete`，**任何 `StreamingResponse` 生成器内绝不可调用 `await request.is_disconnected()`**；断连清理依赖 `asyncio.Queue` + `finally` 处理，且后台 `goal_runner` 本身与客户端断连解耦（仅响应显式 `/cancel` 接口）。
 2. **Python 3.14 `ResourceWarning` 与并发句柄**：所有 `urllib.error.HTTPError` 必须显式 `exc.close()`；Run 事件写入 SQLite 使用短生命周期 `ctx.store.module_db(scope="private")`，防止多线程与 HTTP 线程锁竞争。
 3. **三层存储与 Gate 2 鉴权铁律**：
    - 探针缓存存入私有库 `llm_providers.extra_json`，`ai_assistant_runs`、`ai_assistant_run_events` 与 `analysis_json` 必须严格声明 `scope="private"`，导出 `.dataog.db` 时绝不可包含；
    - 新增每个平台/模块 FastAPI 路由均须注入 `ctx: PlatformContext = Depends(get_platform_context)` 并带完整可由 `typing.get_type_hints(..., include_extras=True)` 解析的类型注解，异常信息经 `redact_private_storage_paths()` 脱敏；
    - **严禁改动 `core/platform/workspace_hub.py` 中的 `WORKSPACE_FORMAT_VERSION = "2.7.0"`**。
 4. **前端静默安全扫描红线**：`static/js/**` 零 `innerHTML` / `outerHTML` / `insertAdjacentHTML` / `document.write`，零 `alert`/`confirm`/`prompt`，流式节流一律使用 `setTimeout`（禁止使用 `MockNode` 中不存在的 `requestAnimationFrame`）。
-5. **发版版本号规划**：本轮改造涉及较大新特性（`/goal` 状态机、SQL 静态血缘分析与模型探查），建议按 SemVer 升为 **`v3.4.0`**（若需继续复用 `3.3.0+` 同二级版本增量更新包通道，也可由需求方在实施前确认选用 **`v3.3.2`**），按 [release-and-ship Skill](../.agents/skills/release-and-ship/SKILL.md) 同步 6 处版本号并完成本地双门禁 (`unittest` + `--smoke-test`) 后再合入 `main` 与推送 Tag。
+5. **发版版本号规划**：本轮改造涉及较大新特性（`/goal` 状态机、SQL 静态血缘分析与模型探查），建议按 SemVer 升为 **`v3.4.0`**（若需继续复用 `3.3.0+` 同二级版本增量更新包通道，也可由需求方在实施前确认选用 **`v3.3.2`**），按 [release-and-ship Skill](../../.agents/skills/release-and-ship/SKILL.md) 同步 6 处版本号并完成本地双门禁 (`unittest` + `--smoke-test`) 后再合入 `main` 与推送 Tag。
 
 ---
 

@@ -3,8 +3,8 @@
 安全机制（严格遵循本地隔离与文件上传安全基线）：
 1. 仅允许安全光栅图像格式（PNG / JPEG / WebP / GIF），双重校验文件扩展名白名单与二进制魔数头，彻底阻断 SVG / HTML 脚本注入；
 2. 强制体积上限（壁纸 <= 12MB，软件与模块图标 <= 4MB）；
-3. 所有上传文件统一重命名为不可预测的随机 UUID 文件名，隔离存放于 Web 静态目录之外的 `data/assets/`，并强制校验 `realpath` 目录边界防路径穿越；
-4. 自动清理被替换或重置的旧资源文件，映射状态持久化于本地 SQLite `data/dataog_state.db`。
+3. 所有上传文件统一重命名为不可预测的随机 UUID 文件名，隔离存放于 Web 静态目录之外的 Layer 2 本地私有资产目录，并强制校验 `realpath` 目录边界防路径穿越；
+4. 自动清理被替换或重置的旧资源文件，映射状态持久化于 Layer 2 本地私有 SQLite。
 """
 
 # TODO(security): 本地单机离线工具未外接云端杀毒沙箱 (AV API) 与 EXIF/CDR 元数据剥离服务；已通过严格光栅魔数白名单、nosniff 与独立 CSP 沙箱头阻断脚本执行。
@@ -25,11 +25,6 @@ APPEARANCE_META_KEY = "desktop_appearance_v1"
 VALID_WALLPAPER_PRESETS = {"default", "sonoma", "sequoia", "aurora", "custom"}
 VALID_WALLPAPER_FITS = {"cover", "contain"}
 VALID_APP_IDS = ("settings", "explorer", "standard", "polyglot")
-VALID_UPLOAD_SLOTS = {
-    "wallpaper",
-    "brand",
-    *(f"app:{aid}" for aid in VALID_APP_IDS),
-}
 
 MAX_WALLPAPER_BYTES = 12 * 1024 * 1024  # 12 MB
 MAX_ICON_BYTES = 4 * 1024 * 1024  # 4 MB
@@ -65,7 +60,7 @@ def detect_safe_raster_image(content: bytes, filename: str = "") -> Tuple[str, s
 
 
 class AssetStore:
-    """管理桌面壁纸、Data.O.G 主图标及四大模块自定义图标的本地持久化."""
+    """管理桌面壁纸、Data.O.G 主图标及各已注册桌面应用自定义图标的本地持久化."""
 
     def __init__(self, store: PlatformStateStore, assets_dir: str) -> None:
         self.store = store

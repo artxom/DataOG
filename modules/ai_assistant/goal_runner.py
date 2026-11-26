@@ -1304,7 +1304,7 @@ class GoalRunner:
                     )
 
                 # =============================================================
-                # Phase D: verifying (四道硬验收门禁)
+                # Phase D: verifying (三道硬验收门禁：语句覆盖率 / HIGH-MEDIUM 隐患核查 / temp_staging 血缘连续性)
                 # =============================================================
                 progress_pct = 87
                 self.svc.update_run(

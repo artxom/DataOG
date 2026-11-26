@@ -19,7 +19,7 @@ from __future__ import annotations
 import datetime
 import os
 import random
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import psycopg2
 from psycopg2.extras import execute_values
@@ -543,7 +543,7 @@ def generate_banking_dataset() -> Dict[str, Any]:
         if i in gap_amts:
             approved = gap_amts[i]
             used = gap_amts[i]
-            etl_dt = None  # 核心系统脏日期导致 DWS ETL 漏采
+            # 核心系统脏日期导致 DWS ETL 漏采
             mysql_corp_credits.append(
                 (f"CL_CORP_{i:04d}", cid, br, approved, used, datetime.date(2026, 10, 15), "01", "CORP_SYNC_MISS")
             )

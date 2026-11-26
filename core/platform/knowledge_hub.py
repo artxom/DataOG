@@ -27,8 +27,7 @@ import json
 import math
 import os
 import re
-import time
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile

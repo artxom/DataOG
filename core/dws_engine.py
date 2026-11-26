@@ -15,22 +15,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import contextlib
 import copy
 import datetime
-import hashlib
 import logging
-import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import psycopg2
-from psycopg2 import sql as pg_sql
 
 from core.platform.dialects import (
     SYSTEM_SCHEMAS,
     analyze_item_changes,
     clean_identifier_input,
     clean_sql_type_input,
-    find_matching_paren as _find_matching_paren,
     format_existing_db_ident,
     format_partition_boundary_val as _format_partition_boundary_val,
     format_reloptions_with_clause,
@@ -156,82 +152,6 @@ class DWSMigratorEngine:
             "discovered_tables": self._catalog_cache.get("tables", [])[:300],
         }
 
-    def configure_connection(
-        self,
-        *,
-        host: str = "",
-        port: int = 8000,
-        dbname: str = "",
-        user: str = "",
-        password: str = "",
-        sslmode: str = "prefer",
-    ) -> Dict[str, Any]:
-        """保存数据库连接配置到本地（含账号密码），测试连接并读取目标库全部模式与表清单."""
-        clean_host = host.strip()
-        clean_port = int(port or 8000)
-        clean_db = dbname.strip()
-        clean_user = user.strip()
-        clean_ssl = sslmode.strip() or "prefer"
-
-        if not clean_host or not clean_db or not clean_user:
-            raise ValueError("请完整填写主机地址 (Host)、数据库名称 (Database) 和用户名 (User)")
-
-        with self._conn_lock:
-            self._conn_config = {
-                "configured": True,
-                "host": clean_host,
-                "port": clean_port,
-                "dbname": clean_db,
-                "user": clean_user,
-                "password": password,
-                "sslmode": clean_ssl,
-            }
-            # 直接在本地持久化保存账号密码，下次打开无需重新输入
-            self.store.save_meta("dws_conn_saved", self._conn_config)
-
-        try:
-            logger.info(
-                "正在连接华为 DWS 数据库 [%s:%s/%s] (用户: %s)...",
-                clean_host,
-                clean_port,
-                clean_db,
-                clean_user,
-            )
-            with contextlib.closing(self._open_dws_connection()) as conn:
-                conn.autocommit = True
-                with conn.cursor() as cur:
-                    cur.execute("SELECT version();")
-                    ver_row = cur.fetchone()
-                    ver_str = ver_row[0] if ver_row else "Huawei GaussDB(DWS)"
-                    catalog = self._query_dws_catalog_on_cursor(cur)
-
-            self._catalog_cache = catalog
-            self.store.save_meta("dws_catalog_cache", catalog)
-
-            schema_cnt = len(catalog.get("schemas", []))
-            tbl_cnt = len(catalog.get("tables", []))
-            msg = (
-                f"成功连接华为 DWS [{clean_host}:{clean_port}/{clean_db}]（账号密码已保存在本地），"
-                f"共读取到 {schema_cnt} 个模式、{tbl_cnt} 张数据表"
-            )
-            logger.info("%s | %s", msg, ver_str)
-            self.store.add_log(
-                "SUCCESS",
-                "数据库连接",
-                f"{msg} | 默认模式: {catalog.get('current_schema')} | 内核: {ver_str}",
-            )
-            return {
-                "connected": True,
-                "server_version": ver_str,
-                "message": msg,
-                "catalog": catalog,
-            }
-        except Exception as exc:
-            err_msg = f"连接华为 DWS 失败: {exc}"
-            logger.error(err_msg)
-            self.store.add_log("ERROR", "数据库连接", err_msg)
-            raise RuntimeError(err_msg) from exc
-
     def _open_dws_connection(self):
         if not self.is_configured():
             raise RuntimeError("尚未配置华为 DWS 数据库连接，请先点击顶部「数据库连接设置」")
@@ -266,98 +186,6 @@ class DWSMigratorEngine:
                 conn.rollback()
         except Exception:
             pass
-
-    def _query_dws_catalog_on_cursor(self, cur: Any) -> Dict[str, Any]:
-        """在已打开的 DWS 游标上快速读取当前库的默认 Schema、所有业务 Schema 与表清单."""
-        current_schema = "public"
-        try:
-            cur.execute("SELECT COALESCE(current_schema(), 'public');")
-            r = cur.fetchone()
-            if r and r[0]:
-                current_schema = str(r[0])
-        except Exception:
-            pass
-
-        cur.execute(
-            """
-            SELECT nspname
-            FROM pg_catalog.pg_namespace
-            WHERE nspname NOT IN %s
-              AND nspname NOT LIKE 'pg_toast%%'
-              AND nspname NOT LIKE 'pg_temp%%'
-            ORDER BY
-                CASE WHEN nspname = %s THEN 0
-                     WHEN nspname = 'public' THEN 1
-                     ELSE 2
-                END,
-                nspname ASC;
-            """,
-            (SYSTEM_SCHEMAS, current_schema),
-        )
-        schemas = [str(row[0]) for row in cur.fetchall() if row and row[0]]
-        if not schemas:
-            schemas = [current_schema]
-
-        cur.execute(
-            """
-            SELECT
-                n.nspname AS schema_name,
-                c.relname AS table_name,
-                COALESCE(pg_catalog.obj_description(c.oid, 'pg_class'), '') AS table_comment,
-                COALESCE(pg_catalog.array_to_string(c.reloptions, ', '), '') AS reloptions,
-                (
-                    SELECT COUNT(*)
-                    FROM pg_catalog.pg_attribute a
-                    WHERE a.attrelid = c.oid
-                      AND a.attnum > 0
-                      AND NOT a.attisdropped
-                ) AS col_count
-            FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname NOT IN %s
-              AND n.nspname NOT LIKE 'pg_toast%%'
-              AND n.nspname NOT LIKE 'pg_temp%%'
-              AND c.relkind NOT IN ('i', 'I', 'S', 't', 'c')
-              AND c.relname NOT LIKE '__mig_%%'
-              AND c.relname NOT LIKE '%%__bak_%%'
-            ORDER BY
-                CASE WHEN n.nspname = %s THEN 0
-                     WHEN n.nspname = 'public' THEN 1
-                     ELSE 2
-                END,
-                n.nspname ASC,
-                c.relname ASC
-            LIMIT 1000;
-            """,
-            (SYSTEM_SCHEMAS, current_schema),
-        )
-        tables = []
-        for row in cur.fetchall():
-            relopts = str(row[3] or "").lower()
-            tables.append(
-                {
-                    "schema_name": str(row[0]),
-                    "table_name": str(row[1]),
-                    "table_comment": str(row[2] or ""),
-                    "orientation": "COLUMN" if "orientation=column" in relopts else "ROW",
-                    "column_count": int(row[4] or 0),
-                }
-            )
-
-        return {
-            "current_schema": current_schema,
-            "schemas": schemas,
-            "tables": tables,
-        }
-
-    def discover_database_catalog(self) -> Dict[str, Any]:
-        """主动刷新并返回当前连接华为 DWS 数据库中的 Schema 与表结构列表."""
-        with contextlib.closing(self._open_dws_connection()) as conn:
-            conn.autocommit = True
-            with conn.cursor() as cur:
-                self._catalog_cache = self._query_dws_catalog_on_cursor(cur)
-                self.store.save_meta("dws_catalog_cache", self._catalog_cache)
-        return self._catalog_cache
 
     def load_tables_from_database(
         self,

@@ -18,7 +18,6 @@ import ctypes
 import datetime
 import hashlib
 import hmac
-import json
 import os
 import platform
 import secrets
@@ -1433,26 +1432,6 @@ class LicenseHub:
         raw = f"{self._session_epoch}:{exp_ts}".encode("utf-8")
         sig = hmac.new(self._runtime_secret, raw, hashlib.sha256).hexdigest()[:24]
         return f"{self._session_epoch}:{exp_ts}:{sig}"
-
-    def _check_session_cookie(self, cookie_val: str) -> bool:
-        if not cookie_val:
-            return False
-        parts = cookie_val.split(":")
-        if len(parts) != 3:
-            return False
-        epoch, exp_str, sig = parts
-        if not hmac.compare_digest(epoch, self._session_epoch):
-            return False
-        try:
-            exp_ts = int(exp_str)
-        except ValueError:
-            return False
-        if self._now_ts() > exp_ts:
-            return False
-        expected = hmac.new(
-            self._runtime_secret, f"{epoch}:{exp_ts}".encode("utf-8"), hashlib.sha256
-        ).hexdigest()[:24]
-        return hmac.compare_digest(sig, expected)
 
     def _stamp_request(self, request: Request) -> None:
         nonce = secrets.token_hex(12)

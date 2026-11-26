@@ -21,7 +21,7 @@
 > “领导好，客户生产上的华为 DWS 和星环集群都在甲方金融内网，物理隔离不允许外连。为了做全真实操作演示，我搭了一套**同源通信协议的本地银行信创沙箱**：
 > 1. 华为 DWS 底层源自 PostgreSQL 内核，我用本地 PG 16 模拟 DWS，`Data.O.G` 走的就是真生产同款 `psycopg2` 驱动，今天演示的 **Metadata 采集、`ALTER` / 保序重建表、`UPDATE` 事务提交与回滚** 全是真实执行的；而 `pg_get_tabledef`、`DISTRIBUTE BY HASH` 这些 DWS 专有语法，工具底层已做了智能识别与优雅降级；
 > 2. 星环 Inceptor 对外走的是标准 HiveServer2 Thrift 协议，我用本地 Spark Thrift Server 暴露标准 `10000` 端口，`Data.O.G` 用内置纯 Python Thrift 客户端真握手、真查 `DESCRIBE FORMATTED`、真跑 `SELECT`；
-> 3. 同时为了展示生产级体量下的响应性能，我还准备了一个 **156 张星环表 × 162 张 DWS 表（约 5,000+ 条绑定与跨环境映射）** 的真实银行工作区快照，一会儿一键热切换给您看百表级比对和离线报告生成速度。”
+> 3. 同时为了展示生产级体量下的响应性能，我还准备了一个 **156 张星环表 × 162 张 DWS 表（5,890 个双端字段、5,222 条跨端绑标与 120 对跨环境映射）** 的真实银行工作区快照，一会儿一键热切换给您看百表级比对和离线报告生成速度。”
 
 ---
 
@@ -38,7 +38,7 @@
    DATAOG_HOME="./demo_sandbox/.demo_home" python3 app.py
    ```
 3. **打开 AI 大模型开关（为第 4 幕 AI 探查做准备）**：
-   - 进入底部 Dock **「系统配置」→「AI 模型」**，配置 DeepSeek 或 Gemini 的 API Key 并点击测试确保连通（注：`bootstrap-demo-home` 仅导入工作区与数据库凭据，AI API Key 保留在你指定的私有目录中）。
+   - 进入底部 Dock **「系统配置」→「AI 模型」**，配置 DeepSeek 或 Gemini 的 API Key 并点击 **「连通检测」** 确保连通，随后点击 **「保存配置」**（注：`bootstrap-demo-home` 仅导入工作区与数据库凭据，AI API Key 保留在你指定的私有目录中）。
 4. **演前确认三库连接可用**：
    - **华为 DWS (仿真)**：`127.0.0.1:15432`，库 `qiming_dws`，账号 `dws_admin`，密码 `DemoDws@2026`，默认 Schema `dwd_bank`
    - **星环 Inceptor (仿真)**：`127.0.0.1:11000`，库 `bank_inceptor`，账号 `hive`，无密码 (`NOSASL`)
@@ -51,8 +51,8 @@
 ### 第 1 幕（2 min）：开场全局视图与银行标准字典底座
 - **操作路径**：
   1. 展示干净的 macOS 桌面工作台，点击顶栏工作区胶囊确认当前为 **「启明银行 · 活库现场演练工作区」**。
-  2. 打开 Dock **「系统配置」→「连接中心」**，点开三库点击「测试连接」，全部秒绿（顺便点出：**账号密码只存本地私有保险箱，团队分享工作区零密钥泄露**）。
-  3. 打开 Dock **「数据标准」**，停留在 **`1. 标准字典`**：展示 **164 条启明商业银行金融数据标准**（覆盖客户/账户/信贷/交易/担保/风控/财务/机构 8 大域，兼容行业 46 列多库物理格式），可演示按 `EAST 5.0` / `反洗钱` 筛选，点击某条标准查看 DWS、星环 ArgoDB、MySQL、Oracle、达梦等 10 种物理格式定义。
+  2. 打开 Dock **「系统配置」→「数据库连接」**，在已保存连接中依次点击三库的 **「测试」**（或点 **「编辑」** 后点击 **「连通检测」**），全部秒绿（顺便点出：**账号密码只存本地私有保险箱，团队分享工作区零密钥泄露**）。
+  3. 打开 Dock **「数据标准」**，停留在 **`1. 标准字典`**：展示 **164 条启明商业银行金融数据标准**（覆盖客户/账户/信贷/交易/担保/风控/财务/机构 8 大域，兼容行业 46 列多库物理格式），可演示按 `EAST 5.0` / `反洗钱` 筛选，并通过子栏 **「展示: ...」** 下拉框切换查阅 DWS、星环 ArgoDB、MySQL、Oracle、达梦等 10 种物理格式定义，或点击某条标准查看 **AN–AS** 6 列数仓物理格式详情。
 - **核心台词**：
   > “过去治理数据标准，全靠架构师维护一份几十兆的 Excel，查标准要翻半天。Data.O.G 把全行标准字典变成平台级底座，配置一次、后续单库核验、跨环境比对、甚至 AI 探查和 DDL 翻译全模块共享。”
 
@@ -62,10 +62,10 @@
 - **操作路径**：
   1. 切换顶部选项卡到 **`2. 落标绑定与贯标`**，确认左侧绑定数据源为 `华为 GaussDB(DWS)`（标准格式档 `仓库DWS数据格式`）。
   2. 点选左侧 **`dwd_bank.dwd_org_branch_info`**：展示全表 7 个字段 100% 绿色 **`已落标`** 样板表。
-  3. 点选 **`dwd_bank.dwd_cust_base_info`**：展示三种差异状态同屏呈现——`khbh`/`cust_nm`/`zjhm`/`reg_addr` 为红色 **`未落标`**，`cert_type_cd`/`mobile_no` 为橙色 **`仅差注释`**，`vip_tier_cd` 留白 **`未绑标`**（可现场点击快速绑定标准，或点击导入预置示范表 `demo_sandbox/output/qiming_dws_binding_import_demo.xlsx`）。
-  4. **高潮真改表 1（`DIRECT_ALTER`）**：切换到 **`dwd_bank.dwd_loan_contract`**（1,500 行合同明细），点击 **`生成待改贯标任务`**（或直接进入执行台），勾选 `htbh -> loan_contract_no`、`dkje -> loan_amt`、`zxlv -> exec_int_rate`、`sign_dt_str -> sign_dt`（`VARCHAR(10)` 转 `DATE`）等规则，执行改造！
-  5. **高潮真改表 2（`TABLE_REBUILD`）**：查看 **`dwd_bank.dwd_acct_swap_demo`**（200 行，存在 `acct_code -> acct_no` 且原 `acct_no -> acct_legacy_no` 链式占名冲突），点击 **`SQL` / `重建贯标`** 预览按原表 `attnum` 1..6 物理列序重建影子表、原子迁移数据并校验行数不变的事务 SQL，点击执行！
-  6. 切回 **`数据探查`** 对 `dwd_loan_contract` 执行 `SELECT COUNT(*), MIN(sign_dt), MAX(loan_amt) FROM dwd_bank.dwd_loan_contract;` 证明 **1,500 行数据零丢失、类型已真实变为 DATE/NUMERIC(18,2)**。
+  3. 点选 **`dwd_bank.dwd_cust_base_info`**：展示三种差异状态同屏呈现——`khbh`/`cust_nm`/`zjhm`/`reg_addr` 为红色 **`未落标`**，`cert_type_cd`/`mobile_no` 为蓝色 **`仅差注释`**，`vip_tier_cd` / `etl_load_ts` 为灰色 **`未绑标`**（可现场点击 **`+ 绑定数据标准`** 快速绑定，或点击右上角 **`上传字段落标映射关系`** 导入预置示范表 `demo_sandbox/output/qiming_dws_binding_import_demo.xlsx`）。
+  4. **高潮真改表 1（`DIRECT_ALTER`）**：切换到 **`dwd_bank.dwd_loan_contract`**（1,500 行合同明细），点击 **`纳入本表待改字段`**（或切换顶部 **`贯标改造执行队列 (11)`** 查看已预置的 11 条规则），勾选 `htbh -> loan_contract_no`、`dkje -> loan_amt`、`zxlv -> exec_int_rate`、`sign_dt_str -> sign_dt`（`VARCHAR(10)` 转 `DATE`）等规则后点击右上角 **`执行 (N)`** 完成改造（执行后自动核验并在 3 秒内渐隐退场）！
+  5. **高潮真改表 2（`TABLE_REBUILD`）**：查看 **`dwd_bank.dwd_acct_swap_demo`**（200 行，存在 `acct_code -> acct_no` 且原 `acct_no -> acct_legacy_no` 链式占名冲突；注意：该靶表预置了 DWS 列存/分布键元数据提示，执行 **`保序重建`** 前请勿先点击 **`刷新元数据`**，否则 PG16 实时探查会覆盖该提示，如误触可执行 `./demo_sandbox/sandbox.sh reset --dws-only` 约 5 秒恢复），查看策略徽标为 **`保序重建`** 的规则，使用 **`SQL`** → **`预览整表保序重建 SQL`**、行内 **`执行`** 或全表批量勾选 **`执行 (N)`**（预览按原表 `attnum` 1..6 物理列序重建影子表、原子迁移数据并校验行数不变的事务 SQL，随后点击 **`执行保序重建`**）！
+  6. 切回 Dock **`数据探查`** → **`SQL 查询`** 对 `dwd_loan_contract` 输入并点击 **`执行`**（或 `⌘+Enter`）运行 `SELECT COUNT(*), MIN(sign_dt), MAX(loan_amt) FROM dwd_bank.dwd_loan_contract;` 证明 **1,500 行数据零丢失、类型已真实变为 DATE/NUMERIC(18,2)**。
 - **核心台词**：
   > “传统改表工具一遇到字段名互换或分布列改类型就报错，或者只能删了字段重加导致物理列序全乱、下游 `SELECT *` 全挂。Data.O.G 会自动识别改名拓扑依赖，必要时用影子表保序原子重建，真正做到改表不丢数据、列序一模一样。”
 
@@ -78,9 +78,9 @@
      - **`UNIFIED`（统一单卡）**：两边绑定同一标准；
      - **`SPLIT_DIFF`（异标双胶囊）**：`zjhm` 在星环误绑 `QM_CUST_006 (统一社会信用代码)` 而 DWS 绑 `QM_CUST_005 (证件号码)`；
      - **`SPLIT_PARTIAL`（单侧绑定）**：`vip_tier_cd` 仅星环绑标；
-     - **底栏兼容诊断告警**：`cust_nm` 星环 `VARCHAR(200)` → DWS `VARCHAR(60)` 标红 **`位长不足 200→60`**；`reg_addr` 星环 `STRING` → DWS `VARCHAR(120)` 提示 **`位长不足 无界→120`**。
-  3. 切到 **`dwd_loan_receipt`**：展示 **`CAST_REQUIRED`（`DOUBLE` → `NUMERIC(10,6)`）** 与 **`DECIMAL(20,4)` → `NUMERIC(18,2)` 精度不足** 告警。
-  4. **高潮热切换 150 表压测工作区**：点击顶栏工作区胶囊 → **「工作区协作」**，切换到 **「启明银行 · 全行150表信创中台工作区」**（156 星环表 × 162 DWS 表、约 5,200+ 条跨端绑标、120 对已映射表 + 20 张推荐同名表 + 单侧独有表），体验顶部搜索框毫秒级搜表/搜字段，点击右上角 **`导出报告`**，生成 **库级离线交互 `.html` 报告** 与 **24 列单 Sheet `.xlsx`** 并现场打开展示！
+     - **目标字段胶囊内的兼容诊断徽标**：`cust_nm` 星环 `VARCHAR(200)` → DWS `VARCHAR(60)` 标红 **`位长不足 200→60`**；`reg_addr` 星环 `STRING` → DWS `VARCHAR(120)` 提示 **`位长不足 无界→120`**。
+  3. 切到 **`dwd_loan_receipt`**：展示 `exec_int_rate` 的 **`定点范围可能不足`** + **`转: 浮点→定点`**（`DOUBLE` → `NUMERIC(10,6)`）与 `disburse_amt`/`loan_bal_amt` 的 **`精度不足 4→2`**（`DECIMAL(20,4)` → `NUMERIC(18,2)`）兼容告警（可用中栏 **`位长/精度不足`** / **`类型转换`** 筛选胶囊一键过滤）。
+  4. **高潮热切换 150 表压测工作区**：点击顶栏工作区胶囊（进入 **「系统配置」→「工作区协作」**），切换到 **「启明银行 · 全行150表信创中台工作区」**（156 星环表 × 162 DWS 表、5,890 个双端字段、5,222 条跨端绑标、120 对已映射表 + 20 张推荐同名表 + 单侧独有表），体验顶部搜索框毫秒级搜表/搜字段，点击右上角 **`导出报告`**，生成 **库级离线交互 `.html` 报告** 与 **24 列单 Sheet `.xlsx`** 并现场打开展示！
 - **核心台词**：
   > “从星环往华为 DWS 迁库，最怕迁到一半报字段截断或隐式转类型丢失小数精度。Data.O.G 把两边字段绑定、长度包络和类型转换全部拉到一张五栏看板上，并且能一键导出不联网也能看的交互式 HTML 报告直接发给甲方的开发组逐项整改。”
 
@@ -110,8 +110,11 @@
   - 精确命中 **`5 笔`** 违规放款，合计 **`90,000,000.00` 元（9,000 万元）**，利率 `0.0000%~0.0200%`，担保方式 `01(信用)` 且 `dwd_collateral_info` 无关联记录！
 
 #### 提问 4（暗雷 3 — 跨库核对口径漂移：核心 MySQL vs DWS 汇总）：
-- 先在 **核心系统 MySQL (`core_bank_ods`)** 执行/问 AI：`SELECT COUNT(*), SUM(approved_limit_amt) FROM t_core_corp_credit;`（500 户）；
-- 再在 **华为 DWS (`dws_bank`)** 查询：`SELECT COUNT(*), SUM(approved_limit_amt) FROM dws_bank.dws_corp_credit_exposure;`（497 户）；
+> **直接复制提问**：
+> `请分别统计核心 MySQL 库 core_bank_ods.t_core_corp_credit 与华为 DWS dws_bank.dws_corp_credit_exposure 的对公授信客户数与核定额度总额，并核对中间是否漏数同步。`
+- 也可在 **SQL 查询** 分别手工核验：
+  - **核心系统 MySQL (`core_bank_ods`)**：`SELECT COUNT(*), SUM(approved_limit_amt) FROM t_core_corp_credit;`（500 户）；
+  - **华为 DWS (`dws_bank`)**：`SELECT COUNT(*), SUM(approved_limit_amt) FROM dws_bank.dws_corp_credit_exposure;`（497 户）；
 - 现场对比或由 AI 查出 **`sync_tag` 缺失的 3 户对公授信（`CUST_C_0498`~`0500`）**：精确差额 **`36,500,000.00` 元（3,650 万元）**！
 
 #### 提问 5（钓鱼测试 — 现场展示四道硬件只读硬防线）：
@@ -123,8 +126,8 @@
 
 ### 彩蛋加分项（可选 2 min）：多邻国智能命名 & 四层视图穿透翻译
 - 打开 Dock **「多邻国」**：
-  - **`智能命名`**：输入中文清单 `对公客户统一编号、逾期本金金额、贷款执行年利率、可疑拆单预警标识`，一键基于企业标准词根与 AI 生成合规英文建表草稿；
-  - **`方言翻译`**：选择来源库 `星环 Inceptor` → `bank_inceptor.v_l4_east_credit_summary`，目标方言选 `DWS`，展示四层递归视图血缘穿透 (`v_l4 -> v_l3 -> v_l2 -> v_l1 -> dwd_loan_receipt`) 并一键输出完整 DWS DDL！
+  - **`智能命名`**：输入中文清单 `对公客户统一编号、逾期本金金额、贷款执行年利率、可疑拆单预警标识`，点击 **`开始命名`** 基于企业标准词根与 AI 生成英文标识符，随后点击 **`查看建表 DDL`** 输出合规建表草稿；
+  - **`方言翻译`**：选择来源库 `星环 Inceptor` → `bank_inceptor.v_l4_east_credit_summary`，目标方言选 **`目标: GaussDB(DWS)`** 并点击 **`开始翻译`**，展示四层递归视图血缘穿透 (`v_l4 -> v_l3 -> v_l2 -> v_l1 -> dwd_loan_receipt` 及关联 `dwd_org_branch_info`) 并一键输出完整 DWS DDL！
 
 ---
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 import datetime
 import io
 import json
-import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import openpyxl
@@ -2279,22 +2278,6 @@ class StandardCatalog:
             if rows:
                 return [self._row_to_item(r) for r in rows]
         return []
-
-    def match_standard_candidates(
-        self,
-        *,
-        col_name: str = "",
-        col_comment: str = "",
-        preferred_code: str = "",
-    ) -> List[Dict[str, Any]]:
-        """按编号 > 英文简称+中文名 > 英文简称 > 中文名在标准字典中智能匹配候选标准."""
-        with self.store.module_db() as conn:
-            return self._query_candidates_on_conn(
-                conn,
-                col_name=col_name,
-                col_comment=col_comment,
-                preferred_code=preferred_code,
-            )
 
     def match_standard_candidates_batch(
         self,

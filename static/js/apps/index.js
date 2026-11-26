@@ -12,7 +12,7 @@ import { registerDesktopApp } from "../core/app_registry.js";
 
 let _builtinsRegistered = false;
 
-export function registerBuiltinDesktopApps() {
+function registerBuiltinDesktopApps() {
   if (_builtinsRegistered) return;
   _builtinsRegistered = true;
 

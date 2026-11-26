@@ -387,13 +387,3 @@ export const diagnosticsApi = {
       body: payload,
     }),
 };
-
-export const updatesApi = {
-  status: () => platformApi.getUpdateStatus(),
-  inspect: (file) => platformApi.inspectUpdatePackage(file),
-  upload: (file) => platformApi.uploadUpdatePackage(file),
-  scan: () => platformApi.scanUpdatePackages(),
-  rollback: () => platformApi.rollbackUpdate(),
-  resetBase: () => platformApi.resetUpdateToBase(),
-  deleteRelease: (version) => platformApi.deleteCachedUpdate(version),
-};

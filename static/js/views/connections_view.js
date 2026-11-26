@@ -428,7 +428,7 @@ export class ConnectionsView {
   }
 }
 
-export async function uploadJdbcDriverFlow(defaultDbHint = "CUSTOM_JDBC") {
+async function uploadJdbcDriverFlow(defaultDbHint = "CUSTOM_JDBC") {
   const file = await pickLocalFile(".jar");
   if (!file) return null;
   const res = await platformApi.uploadDriver(file, {

@@ -8,6 +8,34 @@
 
 ---
 
+## [3.5.4] - 2026-11-26
+
+> **全仓垃圾回收、死代码清理、文档重整与演示沙箱闭环修复**：按工程领域对照源码逐项核查并清理全仓经引用确认的废弃兼容层、未引用符号与失效样式，修复演示沙箱工作区导出元信息覆盖及 `dwd_acct_swap_demo` 保序重建缓存提示，归档已完成的历史演进文档并全仓对齐文档与代码一致性。
+
+### Fixed
+- **演示沙箱工作区导出元信息与保序重建靶表修复 (`demo_sandbox/workspace_builder.py`)**：
+  - 将工作区标题与描述写入由 `save_meta()` 切换为 `ctx.workspace_hub.update_workspace()`，确保导出的 `qiming_live_sandbox.dataog.db` 与 `qiming_enterprise_150tables.dataog.db` 在前端无覆盖导入时完整保留启明银行工作区名称与说明；
+  - 为 `dwd_acct_swap_demo` 补充后置缓存 `TableMeta` 列存与分布键提示（`orientation="COLUMN"`、`distribute_keys=["acct_code"]`、清空 `with_clause`/`distribute_clause` 以兼容 PG16 演示库），并在对应 `migration_items` 写入 `TABLE_REBUILD` 策略，端到端贯通「保序重建」演示链路。
+
+### Removed
+- **底座与平台微内核死代码清理（覆盖 `core/`、`core/platform/`、`tools/admin_console/`、`update_bootstrap.py`、`build_update_pack.py` 等 23 个 Python 文件）**：
+  - 清理经引用核查确认零有效调用的 9 组 13 个冗余符号：`_write_startup_crash_log` (`core/app_kernel.py`)、`_extract_sheet_rows_with_merged_cells` (`core/excel_handler.py`)、legacy v1.x `DWSMigratorEngine.configure_connection` / `_query_dws_catalog_on_cursor` / `discover_database_catalog` (`core/dws_engine.py`)、`LLMHub._http_fallback_chat` / `_http_fallback_models` (`core/platform/llm_hub.py`)、`LicenseHub._check_session_cookie` (`core/platform/license_hub.py`)、`_GovernanceReposMixin.update_item_sync` / `batch_update_cross_column_bindings` (`core/platform/storage/governance_repos.py`)、`_PlatformReposMixin.list_connection_credentials` (`core/platform/storage/platform_repos.py`)、`StandardCatalog.match_standard_candidates` (`core/platform/standard_catalog.py`)、`get_current_trace` / `DiagnosticsHub.run_benchmark` (`core/platform/diagnostics_hub.py`)；
+  - 清理 `asset_store.py`、`http_utils.py`、`offline_report/__init__.py`、`update_bootstrap.py`、`tools/admin_console/service.py` 等文件内的未使用常量、别名、私有重导出与 15 处冗余导入；保留全部对外兼容路由（`/api/bootstrap`、`/.well-known/*`、管理员总控台 `/api/health`）；移除过期本地字节码 `core/platform/__pycache__/storage.cpython-314.pyc`。
+- **业务模块、前端 ES Modules 与演示沙箱冗余清理**：
+  - 删除已废弃的 `static/js/core/api.js` 兼容聚合层（同步将 `tests/test_modules_and_api.py` 对应导入断言迁移至 `http.js`、`platform_api.js` 与 `cross_api.js`）；
+  - 清理 `ColumnBindingUpdateItem` 与未使用 `Optional` (`modules/cross_comparator/schemas.py`)、未使用 `secondary_k` (`modules/standard_migrator/report_mixin.py`)、死代码 `updatesApi` (`static/js/core/platform_api.js`)、`DdlTranslatorView` (`static/js/views/ddl_translator_view.js`)、`polyglotApi` (`static/js/api/ddl_api.js`)、`static/css/workbench.css` 中 3 条无引用样式规则（`.btn-secondary`、`.cross-saved-pair-select`、`.cross-toolbar-sep`）及多处内部未使用导出/导入；
+  - 清理 `modules/ai_assistant/` 冗余正则 `_SQL_PROC_KEYWORD_RE` 与未使用 `import json`（保留 `compact_sql_for_llm` 重导出），以及 `demo_sandbox/` 死函数 `get_standard_by_abbr()`、未使用 `Iterable` 与冗余局部变量 `etl_dt`。
+
+### Changed
+- **全仓文档重整、归档与交叉引用同步**：
+  - 将已完成落地的 `docs/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md` 归档至 `docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md`（添加归档状态横幅、补齐 6 项设计与实际实现差异说明并修正相对链接）；
+  - 同步更新 `docs/MODULE_SDK_3_0.md`（校正 `core/app_kernel.py`、`platform_api.js`、`static/js/core/` 7 个底座模块、`settings_view.js`、`MetadataHub.get_table_metadata` 及 `KnowledgeHub`/`sql_risk_guard`/`DiagnosticsHub`/`excel_io` 契约）、`knowledge_packs/README.md`（修正 `search_knowledge`、界面按钮文案「上传资料」与 Dock 导航描述）、`demo_sandbox/DEMO_PLAYBOOK.md` & `demo_sandbox/README.md` & `demo_sandbox/sandbox_ctl.py`（对齐界面文案、Prompt 4、`65,489` 行与 `156 × 162` 表规模说明）以及相关源码注释/docstring；
+  - 收敛并同步根目录 `AGENTS.md`（修正「五大独立业务应用」、补充私有表与 `core/app_kernel.py` 发版同步清单、更新 §5 基线及 AI 步数熔断说明，严格保持 `< 24,000` 字节）、`README.md` 与 `CHANGELOG.md`。
+- **版本号同步发布 (`v3.5.4`)**：
+  - 同步递增 `3.5.3 -> 3.5.4` 至 `app.py`、`core/app_kernel.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md` 与 `AGENTS.md`（严格维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变；**118 项**自动化单元测试全绿）。
+
+---
+
 ## [3.5.3] - 2026-11-26
 
 > **「1. 标准字典」交互卡顿与光标延迟根治及模板 AN–AS 物理格式栏位精准对齐**：全面消除输入检索与编辑弹窗时的浏览器渲染阻塞、DOM 重建失焦、IME/并发请求堆积与 SQLite 全表临时排序开销，同时将新增/编辑弹窗的物理格式维护栏位严格对齐标准字典模板 `AN`–`AS` 列（`ocenbase-oracle数据格式` 至 `仓库DWS数据格式`）并完整保留非表单字段。

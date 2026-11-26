@@ -412,45 +412,6 @@ class _GovernanceReposMixin:
             ).fetchone()
             return dict(row) if row else None
 
-    def update_item_sync(
-        self,
-        item_id: int,
-        *,
-        status: str,
-        status_detail: str,
-        schema_name: Optional[str] = None,
-        table_name: Optional[str] = None,
-        ordinal_position: Optional[int] = None,
-        total_columns: Optional[int] = None,
-        db_current_col_name: str = "",
-        db_current_type: str = "",
-        db_current_comment: str = "",
-        is_distribute_key: bool = False,
-        table_orientation: str = "",
-        generated_sql: str = "",
-        clear_error: bool = False,
-    ) -> None:
-        self.batch_update_items_sync(
-            [
-                {
-                    "item_id": item_id,
-                    "status": status,
-                    "status_detail": status_detail,
-                    "schema_name": schema_name,
-                    "table_name": table_name,
-                    "ordinal_position": ordinal_position,
-                    "total_columns": total_columns,
-                    "db_current_col_name": db_current_col_name,
-                    "db_current_type": db_current_type,
-                    "db_current_comment": db_current_comment,
-                    "is_distribute_key": is_distribute_key,
-                    "table_orientation": table_orientation,
-                    "generated_sql": generated_sql,
-                    "clear_error": clear_error,
-                }
-            ]
-        )
-
     def batch_update_items_sync(self, updates: List[Dict[str, Any]]) -> None:
         if not updates:
             return
@@ -927,30 +888,6 @@ class _GovernanceReposMixin:
                     "SELECT COUNT(*) FROM cross_column_bindings"
                 ).fetchone()
             return int(row[0]) if row else 0
-
-    def batch_update_cross_column_bindings(
-        self, updates: List[Dict[str, Any]]
-    ) -> None:
-        if not updates:
-            return
-        now = self._now_str()
-        quote_chars = '"\'“”‘’`「」『』 \t\r\n\u200b\u3000\ufeff'
-        with self._lock, self._get_conn() as conn:
-            for u in updates:
-                cid = int(u["id"])
-                bound_src = str(u.get("bound_source_col", "")).strip(quote_chars)
-                bound_tgt = str(u.get("bound_target_col", "")).strip(quote_chars)
-                conn.execute(
-                    """
-                    UPDATE cross_column_bindings
-                    SET bound_source_col = ?,
-                        bound_target_col = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (bound_src, bound_tgt, now, cid),
-                )
-            conn.commit()
 
     def upsert_cross_table_column_bindings(
         self, std_table_key: str, column_bindings: List[Dict[str, Any]]

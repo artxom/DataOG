@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import re
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Set
 
 from core.platform.readonly_guard import ReadOnlyViolationError, validate_readonly_sql
 

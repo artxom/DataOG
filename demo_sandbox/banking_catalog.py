@@ -441,10 +441,6 @@ def get_standard_by_code() -> Dict[str, Dict[str, Any]]:
     return {it["std_code"]: it for it in build_standard_items()}
 
 
-def get_standard_by_abbr() -> Dict[str, Dict[str, Any]]:
-    return {it["en_abbr"].lower(): it for it in build_standard_items()}
-
-
 def _style_demo_sheet(ws: Any, col_count: int, required_indices: Optional[set[int]] = None) -> None:
     req_fill = PatternFill(start_color="1E3A8A", end_color="1E3A8A", fill_type="solid")
     opt_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")

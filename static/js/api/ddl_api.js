@@ -17,5 +17,3 @@ export const ddlApi = {
       withRequestOpts({ method: "POST", body: payload }, opts)
     ),
 };
-
-export const polyglotApi = ddlApi;

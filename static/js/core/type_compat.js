@@ -45,7 +45,7 @@ function cleanSqlTypeInput(rawType) {
     .replace(/\s+/g, " ");
 }
 
-export function parseSqlTypeSpec(rawType, dbType = "") {
+function parseSqlTypeSpec(rawType, dbType = "") {
   const cleaned = cleanSqlTypeInput(rawType);
   const low = cleaned.toLowerCase();
   if (!low || low === "unknown" || low === "any" || low === "void") {

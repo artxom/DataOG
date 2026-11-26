@@ -22,7 +22,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple

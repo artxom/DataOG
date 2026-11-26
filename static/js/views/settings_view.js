@@ -1,7 +1,7 @@
 /**
  * Data.O.G 桌面模块 1：系统配置 (SettingsView)
- * 包含四大分区：
- * 1. 外观与图标 — 内置壁纸预设、上传本地桌面壁纸、上传 Data.O.G 软件主图标与四大模块图标（本地持久化）
+ * 包含八大配置分区：
+ * 1. 外观与图标 — 内置壁纸预设、上传本地桌面壁纸、上传 Data.O.G 软件主图标与五大模块图标（本地持久化）
  * 2. 数据库连接 — 全局共享数据源连接管理
  * 3. JDBC 驱动 — 上传与管理自定义 .jar 驱动包
  * 4. AI 模型 — Cherry Studio 风格多服务商接入（DeepSeek / Google Gemini / OpenAI 兼容网关）
@@ -15,7 +15,6 @@ import {
   pickLocalFile,
   renderAppSquircle,
   renderBrandMark,
-  statusDot,
 } from "../core/dom.js";
 import { DESKTOP_APPS, store } from "../core/state.js";
 import { Modal } from "../ui/modal.js";
@@ -263,7 +262,7 @@ export class SettingsView {
       el("div", { className: "wp-grid" }, swatches)
     );
 
-    // 软件主图标 + 四大模块图标
+    // 软件主图标 + 五大模块图标
     const brandCard = el(
       "div",
       { className: "icon-slot-card" },

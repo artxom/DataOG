@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -91,7 +90,7 @@ def _format_table_meta_detailed(meta: TableMeta) -> str:
 
 
 class AssistantToolbox:
-    """供 Agent 单轮推理循环调度的 7 个安全工具封装."""
+    """供 Agent 单轮推理循环调度的 14 个安全工具封装."""
 
     def __init__(
         self,

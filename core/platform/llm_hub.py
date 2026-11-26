@@ -2,7 +2,7 @@
 
 参考 Cherry Studio / LobeChat 成熟的多服务商管理架构，采用零额外第三方依赖的 Python 标准库原生支持 OpenAI 兼容 REST 协议：
 1. 内置三大主流预设（DeepSeek 官方端点、Google Gemini 官方 OpenAI 兼容端点、本地/内网 OpenAI 兼容网关）；
-2. API Key 仅持久化于本地 SQLite `data/dataog_state.db`，所有对外接口严格脱敏回显，留空或回传掩码时自动保留原密钥；
+2. API Key 仅持久化于 Layer 2 本地私有保险箱 SQLite，所有对外接口严格脱敏回显，留空或回传掩码时自动保留原密钥；
 3. 支持连通性毫秒级测试、远端模型列表拉取（自动兼容剥离 Gemini `models/` 前缀）及结构化 JSON 生成。
 """
 
@@ -1688,30 +1688,6 @@ class LLMHub:
         r_txt, c_txt = self._extract_message_reasoning_and_content(msg)
         return r_txt, c_txt, finish_reason, usage
 
-    def _http_fallback_chat(
-        self,
-        profile: LLMProviderProfile,
-        messages: List[Dict[str, str]],
-        model: str,
-        temperature: float,
-        max_tokens: Optional[int],
-        timeout_sec: float,
-        *,
-        thinking_mode: str = "auto",
-        reasoning_effort: str = "",
-    ) -> Tuple[str, str]:
-        r_txt, c_txt, _, _ = self._http_fallback_chat_full(
-            profile,
-            messages,
-            model,
-            temperature,
-            max_tokens,
-            timeout_sec,
-            thinking_mode=thinking_mode,
-            reasoning_effort=reasoning_effort,
-        )
-        return r_txt, c_txt
-
     def _http_fallback_models_with_meta(
         self, profile: LLMProviderProfile, timeout_sec: float
     ) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
@@ -1732,12 +1708,6 @@ class LLMHub:
             if meta and norm_id:
                 meta_by_id[norm_id] = meta
         return ids, meta_by_id
-
-    def _http_fallback_models(
-        self, profile: LLMProviderProfile, timeout_sec: float
-    ) -> List[str]:
-        ids, _ = self._http_fallback_models_with_meta(profile, timeout_sec)
-        return ids
 
     @staticmethod
     def _build_continuation_messages(

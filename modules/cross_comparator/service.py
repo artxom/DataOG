@@ -1,4 +1,4 @@
-"""16:9 跨环境三栏数标比对中心服务 (CrossComparatorService).
+"""跨环境五虚拟列数标比对中心服务 (CrossComparatorService).
 
 严格遵循插件隔离规范：
 1. 仅依赖 `core.platform` 公共底座，严禁导入任何其他 `modules.*` 私有模块；
@@ -39,7 +39,7 @@ def _supports_kwarg(fn: Any, kw: str) -> bool:
 
 
 class CrossComparatorService(_CrossSearchAndPushMixin, _CrossIoAndReportMixin):
-    """跨环境三栏数标比对中心核心服务."""
+    """跨环境数标比对中心核心服务."""
 
     def __init__(self, ctx: PlatformContext) -> None:
         self.ctx = ctx
