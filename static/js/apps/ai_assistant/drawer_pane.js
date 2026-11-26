@@ -7,7 +7,7 @@
  */
 
 import { knowledgeApi, platformApi } from "../../core/platform_api.js";
-import { badge, clearEl, el, formatBytes, pickLocalFile, svgIcon } from "../../core/dom.js";
+import { badge, clearEl, el, pickLocalFile, svgIcon } from "../../core/dom.js";
 import { store } from "../../core/state.js";
 import { Toast } from "../../ui/toast.js";
 

@@ -4,7 +4,7 @@
 1. `qiming_live_sandbox.dataog.db`：对接本地 3 个活库容器，预置 164 条金融标准字典、真实或等价元数据缓存、
    字段级绑定（涵盖 `COMPLIANT`/`COMMENT_ONLY`/`NON_COMPLIANT`/`UNBOUND`）、15 对跨环境映射与待贯标靶表；
 2. `qiming_enterprise_150tables.dataog.db`：合成覆盖 8 大主题域、ODS/DWD/DWS/ADS 四层的 156 张星环表 +
-   162 张华为 DWS 表（~3,600+ 字段）、120 对跨环境表映射、20 张推荐同名未保存表及全谱系兼容告警，
+   162 张华为 DWS 表（5,890 个双端字段、5,222 条跨端绑标）、120 对跨环境表映射、20 张推荐同名未保存表及全谱系兼容告警，
    用于百表级大中台压测演示与离线兜底。
 
 所有输出文件均经由 `WorkspaceManager.export_workspace_bytes` 净化导出（`DELETE` 日志模式 + `VACUUM` +
@@ -13,10 +13,9 @@
 
 from __future__ import annotations
 
-import datetime
 import os
 import tempfile
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Tuple
 
 from core.platform.context import PlatformContext
 from core.platform.dialects import normalize_cross_type
@@ -702,6 +701,15 @@ def build_live_sandbox_workspace(
             for cid, tbl_list in specs.items():
                 _persist_table_specs(ctx, cid, tbl_list)
 
+        # 为 dwd_acct_swap_demo 补齐 DWS 列存与分布键元数据提示（PG16 无原生 DWS 系统表，保留空 with/distribute 子句以兼容真库重建 DDL）
+        swap_meta = ctx.store.get_cached_table_meta(CONN_DWS_ID, "dwd_bank", "dwd_acct_swap_demo")
+        if swap_meta is not None:
+            swap_meta.orientation = "COLUMN"
+            swap_meta.distribute_keys = ["acct_code"]
+            swap_meta.with_clause = ""
+            swap_meta.distribute_clause = ""
+            ctx.store.save_table_meta(CONN_DWS_ID, swap_meta)
+
         # DWS 核心字段数标绑定（刻意保留 vip_tier_cd/etl_load_ts 及 2 张表末绑定，供现场演示）
         dws_bindings: List[Tuple[str, str, str, str]] = [
             # dwd_org_branch_info (100% COMPLIANT 样板表)
@@ -1085,6 +1093,9 @@ def build_live_sandbox_workspace(
                 "new_col_name": "acct_no",
                 "new_col_type": "VARCHAR(32)",
                 "new_col_comment": "银行账号",
+                "strategy": "TABLE_REBUILD",
+                "is_distribute_key": 1,
+                "table_orientation": "COLUMN",
                 "ordinal_position": 1,
                 "total_columns": 6,
                 "db_current_col_name": "acct_code",
@@ -1101,6 +1112,8 @@ def build_live_sandbox_workspace(
                 "new_col_name": "acct_legacy_no",
                 "new_col_type": "VARCHAR(32)",
                 "new_col_comment": "原旧系统账号",
+                "strategy": "TABLE_REBUILD",
+                "table_orientation": "COLUMN",
                 "ordinal_position": 2,
                 "total_columns": 6,
                 "db_current_col_name": "acct_no",
@@ -1117,6 +1130,8 @@ def build_live_sandbox_workspace(
                 "new_col_name": "acct_bal_amt",
                 "new_col_type": "NUMERIC(18,2)",
                 "new_col_comment": "账户活期余额",
+                "strategy": "TABLE_REBUILD",
+                "table_orientation": "COLUMN",
                 "ordinal_position": 4,
                 "total_columns": 6,
                 "db_current_col_name": "acct_bal_amt",
@@ -1133,6 +1148,8 @@ def build_live_sandbox_workspace(
                 "new_col_name": "open_dt",
                 "new_col_type": "DATE",
                 "new_col_comment": "开户日期",
+                "strategy": "TABLE_REBUILD",
+                "table_orientation": "COLUMN",
                 "ordinal_position": 5,
                 "total_columns": 6,
                 "db_current_col_name": "open_dt_txt",
@@ -1148,10 +1165,11 @@ def build_live_sandbox_workspace(
         ctx.store.save_meta("migrator_connection_id", CONN_DWS_ID)
         ctx.store.save_meta("cross_source_connection_id", CONN_INC_ID)
         ctx.store.save_meta("cross_target_connection_id", CONN_DWS_ID)
-        ctx.store.save_meta("workspace_name", "启明银行 · 活库现场演练工作区")
-        ctx.store.save_meta(
-            "workspace_description",
-            "对接本地 Docker 华为DWS/星环Inceptor/MySQL 活库，含164条金融标准、5大业务暗雷与现场真改表靶表",
+        active_ws_id = ctx.workspace_hub.get_active_workspace_summary()["workspace_id"]
+        ctx.workspace_hub.update_workspace(
+            active_ws_id,
+            name="启明银行 · 活库现场演练工作区",
+            description="对接本地 Docker 华为DWS/星环Inceptor/MySQL 活库，含164条金融标准、5大业务暗雷与现场真改表靶表",
         )
 
         ws_bytes, _ = ctx.workspace_hub.export_workspace_bytes(include_metadata_cache=True)
@@ -1185,7 +1203,7 @@ _ENTERPRISE_DOMAIN_TEMPLATES: Tuple[Tuple[str, str, str, str], ...] = (
 
 
 def build_enterprise_150_workspace(output_dir: str) -> Tuple[str, Dict[str, Any]]:
-    """生成 156 星环表 + 162 DWS 表（~3,600+ 字段）的超大规模压测与离线兜底 `.dataog.db`."""
+    """生成 156 星环表 × 162 DWS 表（5,890 双端字段、5,222 条跨端绑标）的超大规模压测与离线兜底 `.dataog.db`."""
     os.makedirs(output_dir, exist_ok=True)
     all_stds = build_standard_items()
     by_domain: Dict[str, List[Dict[str, Any]]] = {}
@@ -1355,10 +1373,11 @@ def build_enterprise_150_workspace(output_dir: str) -> Tuple[str, Dict[str, Any]
         ctx.store.save_meta("migrator_connection_id", CONN_DWS_ID)
         ctx.store.save_meta("cross_source_connection_id", CONN_INC_ID)
         ctx.store.save_meta("cross_target_connection_id", CONN_DWS_ID)
-        ctx.store.save_meta("workspace_name", "启明银行 · 全行150表信创中台工作区")
-        ctx.store.save_meta(
-            "workspace_description",
-            "156张星环表 × 162张华为DWS表（约3,600+字段）百表级压测与离线报告演示工作区",
+        active_ws_id = ctx.workspace_hub.get_active_workspace_summary()["workspace_id"]
+        ctx.workspace_hub.update_workspace(
+            active_ws_id,
+            name="启明银行 · 全行150表信创中台工作区",
+            description="156 张星环表 × 162 张华为 DWS 表（5,890 双端字段、5,222 条跨端绑标）百表级压测与离线报告演示工作区",
         )
 
         ws_bytes, _ = ctx.workspace_hub.export_workspace_bytes(include_metadata_cache=True)

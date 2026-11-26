@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
-from typing import Any, Dict, List, Sequence
+from typing import Any, Sequence
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill

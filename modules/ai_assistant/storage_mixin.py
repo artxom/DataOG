@@ -42,7 +42,7 @@ def _normalize_focus_tables(raw_list: Optional[List[str]]) -> List[str]:
 
 
 class AssistantStorageMixin:
-    """管理 `ai_assistant_sessions` / `ai_assistant_messages` / `ai_assistant_proposals` 三张 Layer 2 私有表."""
+    """管理 7 张 Layer 2 私有表 (ai_assistant_sessions / ai_assistant_messages / ai_assistant_attachments / ai_assistant_attachment_chunks / ai_assistant_proposals / ai_assistant_runs / ai_assistant_run_events)."""
 
     @staticmethod
     def ensure_schema(store: Any) -> None:
@@ -545,7 +545,7 @@ class AssistantStorageMixin:
                 eff_cid = ""
                 eff_mode = "dialect"
         else:
-            eff_mode = "dialect" if work_mode != "connection" else "dialect"
+            eff_mode = "dialect"
 
         sid = f"asst_{uuid.uuid4().hex[:12]}"
         now = _now_str()

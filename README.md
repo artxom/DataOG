@@ -1,4 +1,4 @@
-# Data.O.G v3.5.3 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.5.4 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -11,7 +11,7 @@
 - **初始化离线知识库下载**：详见 [knowledge_packs/README.md](./knowledge_packs/README.md)（[DWS 9.1](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_DWS_9.1.json.gz) · [Inceptor 9.x](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_INCEPTOR_9.x.json.gz) · [PostgreSQL 19](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_PGSQL_19.json.gz) · [全量合集包](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_ALL_STARTER.json.gz)）
 - **项目架构记忆与工程规范**：详见 [AGENTS.md](./AGENTS.md)
 - **3.0 插件模块化开发指南**：详见 [docs/MODULE_SDK_3_0.md](./docs/MODULE_SDK_3_0.md)
-- **AI 助手弱模型增幅、动态窗口探查与 `/goal` 模式演进方案**：详见 [docs/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md](./docs/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md)
+- **AI 助手弱模型增幅、动态窗口探查与 `/goal` 模式演进方案**：详见 [docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md](./docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md)（已归档 · 已于 v3.4.0–v3.4.1 落地）
 - **版本变更记录**：详见 [CHANGELOG.md](./CHANGELOG.md)
 
 ---
@@ -20,19 +20,20 @@
 
 ### 1. 离线登录授权、桌面 Dock 与窗口控制语义（红黄绿三键）
 - **离线非对称激活码登录门禁（默认开启）**：未激活、到期、跨机拷贝或手动锁定时全屏毛玻璃门禁拦截，默认选中「激活码模式」（「账号密码登录」在离线试用期标注暂未开放），自动采集展示本机 IP 与机器码并支持一键复制设备申请码 (`REQ1-...`)；激活时弹出 `<dialog>` 提示 **`当前激活码可用日期至 YYYY-MM-DD`**，有效期内再次打开直接进入工作台，支持顶部菜单栏查看授权、在线续期或一键锁定退回登录页。
-- **顶部 28px 毛玻璃全局菜单栏**：提供 `Data.O.G` 快速显示桌面、当前活动应用指示、当前团队工作区快速入口胶囊、`授权至 YYYY-MM-DD` 授权胶囊、AI 模型状态胶囊、`⌘K` Spotlight 秒级库表字段检索、SQL 执行审计日志弹窗、自动/浅色/深色外观切换与实时时钟。
+- **顶部 28px 毛玻璃全局菜单栏**：提供 `Data.O.G` 快速显示桌面、当前活动应用指示、当前团队工作区快速入口胶囊、`授权至 YYYY-MM-DD` 授权胶囊、AI 模型状态胶囊、`⌘K` Spotlight 秒级库表字段检索、SQL 执行审计日志弹窗、一键无缓存「重载」、自动/浅色/深色外观切换与实时时钟。
 - **底部居中悬浮毛玻璃 macOS Dock 栏**：纯净桌面壁纸留白，底部居中 Dock 承载五大应用图标（悬停放大上浮、名称气泡与运行圆点），常规窗口态常驻底部，全屏最大化时自动下沉隐藏、鼠标贴底即可唤出。
 - 🔴 **关闭 (`✕`)**：关闭当前窗口返回桌面，并**彻底销毁重置当前工具的运行时界面状态**（已落盘的 SQLite 配置与数据标准不受影响）。
 - 🟡 **最小化 (`−`)**：将当前工作窗口收纳至 **Dock 栏竖直分隔线右侧缩略窗口区**，**100% 保留内存 DOM、未提交的编辑内容与滚动位置**；点击 Dock 缩略窗口即可瞬间恢复回离开前的工作现场。
 - 🟢 **最大化 (`+`)**（或双击窗口标题栏）：在常规留白桌面窗口与全屏沉浸工作区之间平滑切换。
 
 ### 2. 桌面五大独立功能模块
-1. **系统配置 (`settings`)**
+1. **系统配置 (`settings`)**（含八大独立侧栏分区）
    - **外观与图标**：内置多款亮暗自适应壁纸预设，支持上传本地自定义桌面壁纸（支持 `铺满` / `适应`）、上传自定义 `Data.O.G` 软件主图标（同步更新浏览器 Favicon）以及五大模块自定义图标，全部安全持久化于本地私有存储。
    - **工作区协作**：支持多工作区新建（空白/克隆）、重命名、热切换、删除与业务统计看板；一键导出零密钥、自包含的 `.dataog.db` 团队共享工作区（可选是否携带元数据缓存），一键导入同事分享的工作区为独立工作区，或启动 **三步引导式「合并同事进度」向导**（同时兼容 `.dataog.db` 与旧版 `dataog_state.db`，严格白名单只读过滤私密表、按端点指纹自动对齐数据源、支持勾选模块与 `仅补充缺失/未绑定` / `按更新时间保留较新` / `覆盖冲突项` 三大策略，并在落盘前提供跨环境映射表对差异预览）。
-   - **数据库连接 & JDBC 驱动**：双轨驱动连接管理——无密码连接拓扑随工作区协同共享，个人账号与密码严格落盘于本机私有凭据库并支持按 `(db_type, host, port, dbname)` / `jdbc_url` 端点指纹跨工作区自动匹配；免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**；同时支持上传 `.jar` 驱动包连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源。
+   - **数据库连接**：双轨驱动连接管理——无密码连接拓扑随工作区协同共享，个人账号与密码严格落盘于本机私有凭据库并支持按 `(db_type, host, port, dbname)` / `jdbc_url` 端点指纹跨工作区自动匹配；免 Java 原生支持 **华为云 GaussDB(`DWS`)**、**PostgreSQL**、**星环 `Inceptor`/Hive**、**MySQL / StarRocks / Doris / OceanBase / TiDB**、**SQLite**，并支持通过已挂载 JDBC 驱动建立连接。
+   - **JDBC 驱动**：独立驱动管理分区，支持上传 `.jar` 驱动包并通过按需懒加载 JVM 连接达梦 `DM8`、人大金仓 `KingbaseES`、`Oracle`、`DB2`、`GBase` 等任意 JDBC 数据源（无 JRE 时绝不影响原生驱动运行）。
    - **参考知识库 (`KnowledgeHub`)**：零新增依赖离线知识库管理中心，内置 11 篇主流数据库方言速查卡并支持上传 `.md` / `.txt` / `.sql` / `.html` / `.json` / `.csv` / `.docx` / `.xlsx` 参考资料，借助 SQLite FTS5 + BM25 实现中英文与报错码毫秒级离线检索，支持按方言导出/导入轻量 `.json.gz` 知识包与团队分享，并可选接入 OpenAI 兼容 `/embeddings` 接口做混合排序（离线自动退回纯 FTS5）。
-   - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测与远端可用模型拉取。
+   - **AI 模型**：内置 **DeepSeek**（`https://api.deepseek.com`）、**Google Gemini**（`https://generativelanguage.googleapis.com/v1beta/openai/`）及自定义 OpenAI 兼容网关配置，支持密钥脱敏存储、一键连通检测、远端可用模型拉取，以及四级动态模型能力探查（`POST /api/platform/llm/probe-model`）、推理档位分级 (`flagship` / `standard` / `lightweight`) 与 24h `model_probes` 缓存。
    - **版本与升级 (`UpdateHub`)**：提供基于 RFC 8032 Ed25519 双层签名、HMAC-SHA256 认证与 BLAKE2b-512-CTR 加密混淆 (`DGP2`) 的 **同二级版本累积增量升级**（约 `0.95 MB` 的 `DataOG-Update-vX.Y.Z.zip` 适用 `vX.Y.0+` 全部同系列客户端）。包内不含任何明文代码、脚本或嵌套 ZIP 头，可安全通过银行/企业邮件网关；支持 **系统目录 `updates/` 覆盖解压** 与 **应用内上传 `.zip`/`.dgp`/`.dat`** 双渠道升级，并内置启动自愈自动回退、一键回退上一补丁与恢复内置基础版本。
    - **性能诊断 (`DiagnosticsHub`)**：零写盘全内存链路追踪、端到端环回与磁盘/SQLite/DNS/鉴权/DB/AI 全栈基准压测 (`Benchmark`)、自动瓶颈研判（识别企业代理未豁免环回、EDR/慢盘 `fsync`、锁竞争、事件循环阻塞等）以及一键导出全量脱敏 `.json` 诊断日志包（顶部「执行日志」弹窗亦可快捷一键导出）。
 2. **数据探查 (`explorer`)**
@@ -42,17 +43,17 @@
 3. **数据标准 (`standard`)**
    - 顶栏分段切换三步递进工作流：**`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`**：
      - **1. 标准字典**：以「数据项编号」为主键统一维护全行最新数据标准，完整支持 46 列多库物理格式数据字典（含 `仓库DWS数据格式`、`数据仓库 集市`、`ArgoDB`、`MySQL`、`Oracle`、`OceanBase`、`达梦` 等），支持先下载系统模板后按编号增量合并导入或在线增删改查。
-     - **2. 落标绑定与贯标**：左侧常驻数据库目录树（实时呈现各表绑标/达标状态徽标，并支持按数据库粒度设定并持久化各自的落标标准格式，如 `仓库DWS数据格式`、`数据仓库 集市`、`argodb数据格式` 等），右侧读取库表字段绑定标准，支持按当前表或全库（`scope=all`）导出预填字段对照模板批量上传及智能预匹配，一键执行三维分级“检查是否落标”（字段名 + 归一化类型 + 中文注释），支持免勾表直接导出**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集再生成，离线网页支持全库/单表交互筛选与一键导出单 Sheet Excel），并可通过统一「纳入贯标」按钮将未达标字段累积纳入**全局持久化贯标队列**（跨表、跨库不覆盖，支持按单字段预览准确的多方言/仅注释 DDL）执行原地 `ALTER` 或 DWS 物理列保序重建。
+     - **2. 落标绑定与贯标**：左侧常驻数据库目录树（实时呈现各表绑标/达标状态徽标，支持按数据库粒度设定并持久化各自的落标标准格式，如 `仓库DWS数据格式`、`数据仓库 集市`、`argodb数据格式` 等，并配备「忽略部分落标」「忽略未绑标字段」统计口径双开关），右侧读取库表字段绑定标准，支持按当前表、当前选中 Schema（`scope=schema`）或全库（`scope=all`）导出预填字段对照模板批量上传及智能预匹配，一键执行三维分级“检查是否落标”（字段名 + 归一化类型 + 中文注释），支持免勾表直接导出**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集再生成，离线网页支持全库/单表交互筛选与一键导出单 Sheet Excel），并可通过统一「纳入贯标」按钮将未达标字段累积纳入**全局持久化贯标队列**（跨表、跨库不覆盖，支持按单字段预览准确的多方言/仅注释 DDL）执行原地 `ALTER` 或 DWS 物理列保序重建（执行完毕自动核验并 3 秒渐隐清出已达标任务）。
      - **3. 跨环境比对**：采用 macOS Sequoia 桌面级**五虚拟列防重叠图形化工作台**（`来源表待选字段` | `来源表已绑定数标字段` | `数据标准` | `目标表已绑定数标字段` | `目标表待选字段`），自动沿用第 2 步按库设定的标准格式与两侧字段绑定；顶部配备原生感 `NSPopUpButton` 双端配置甲板与支持关键字检索/输入法保护/矮窗自适应翻转的缓存表浮层，中栏内置吸顶毛玻璃三列表头、平静分段状态筛选栏（`全部`/`一致`/`差异`/`单侧`/`待贯标`/`位长/精度不足`/`类型转换`）与实时搜索；支持拖拽或点选待选字段至中栏标准卡片完成绑标配对，中性卡片与桥接线清晰呈现一致（`UNIFIED`）/ 异标对比（`SPLIT_DIFF`）/ 单侧绑定（`SPLIT_PARTIAL`），按需紧凑展示**目标长度/精度包络**与**是否涉及类型转换**（如 `VARCHAR -> DATE`）；左上角 `.mac-subbar` 集成支持按**来源/目标表名及字段名**秒级检索的 `.cross-pair-picker` 映射表对选择器；支持一键导出含 24 列明细及包络/转换诊断的跨环境**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集，同时输出已保存映射表对五栏看板与「推荐同名未配对表」清单，严格仅推荐不自动触发预比对）。
    - **全流程模板先导与智能公式解析**：全系统所有表格导入均采用统一的「先获取系统模板（含按已选库表导出预填模板）→ 再上传解析」两步导入向导，内置双阶段实时进度条（字节上传进度 + 服务端行级/表级解析核验进度与计时），自动提取 Excel 公式最终计算结果（支持跨表 `VLOOKUP` / `XLOOKUP` / `INDEX+MATCH` / 共享公式 / 超级表引用）并将 `#N/A` 等公式错误标记识别为空值。
 4. **多邻国 (`polyglot`)**
-   - **智能命名**：输入中文表名或字段名清单，结合系统配置中的大模型 API（未配密钥时自动回退内置 170+ 金融与通用数仓标准词根引擎），按命名规范（`snake_case` / `UPPER_SNAKE` / `camelCase`、数仓分层前缀 `ods_/dwd_/dws_/ads_/dim_`、标准词根缩写）生成标准英文名、推荐 SQL 类型与建表草稿。
+   - **智能命名**：输入中文表名或字段名清单，结合系统配置中的大模型 API（未配密钥时自动回退内置 147 条金融与通用数仓标准词根引擎），按命名规范（`snake_case` / `UPPER_SNAKE` / `camelCase`、数仓分层前缀 `ods_/dwd_/dws_/ads_/dim_`、标准词根缩写）生成标准英文名、推荐 SQL 类型与建表草稿。
    - **方言翻译**：支持从已连数据库表/视图、数据标准或直接粘贴 `CREATE TABLE` / `CREATE VIEW` / 异构查询 SQL，转换为目标数据库方言（`DWS` / `PGSQL` / `INCEPTOR` / `MYSQL` / `DM8` / `ORACLE` / `SQLITE`），融合确定性四层递归视图血缘穿透 AST 引擎与大模型 `AI 语法适配`。
 5. **Data.O.G 智能数据助手 (`ai_assistant`)**
    - **全局研发运维双模式调度**：可绑定任意已配置数据库连接（实时调取目录元数据、视图血缘、执行计划 `EXPLAIN` 与只读采样验证），也可切换至「离线纯方言模式」指定目标数据库方言（DWS / PGSQL / MySQL / Oracle / DM8 / Kingbase / Inceptor / DB2 / GBase / SQLite / 通用）结合本机参考知识库完成语法确认、报错排障与调优建议。
    - **循序渐进多轮探索**：支持场景芯片路由（`自动识别` / `数据查询` / `报错排障` / `性能优化` / `语法确认` / `DDL 助手`）、歧义场景交互式「澄清确认卡」、只读 SQL 报错自主查表自我修正、`EXPLAIN` 实测诊断、知识库出处角标定位（右侧按需滑出「库表速览 / 参考知识库」抽屉）以及末尾「下一步推进建议」。
    - **DDL / 写操作分级二次确认门禁**：自主探索阶段物理仅开放只读通道；所有建表/改表与数据写入语句均在对话提示框以分级风险卡片展示（常规 DDL/INSERT 一键确认，高危 `DROP`/`TRUNCATE`/`DELETE`/`UPDATE` 预估影响行数并强制输入 `CONFIRM` 解锁），支持卡片内微调 SQL（服务端独立重新定级）、多条有序 DDL 批执行与失败一键转 AI 诊断修复。
-   - **现代模型感知长上下文、Thinking 深度思考与 SSE 实时流式输出**：支持剪贴板粘贴文件或超长文本、面板拖拽与按钮上传 `.txt`/`.sql`/`.log`/`.md`（`<= 5 MB`）及 `.csv`/`.tsv`（`<= 2 MB`），支持 `<dialog>` 结构化大纲/画像/分片预览；根据当前所选大模型上下文窗口（DeepSeek 128K / Gemini 1M / Claude 200K / 自定义 `context_window`）在 **「全量带行号直通」「结构大纲 + 按行/正则自主探索」** 与 **`12K` 语义大块 `stepped_batch` 拆解** 间自适应调度，并支持上游超限透明降级与 CSV 内存只读 SQLite `csv_data` 沙箱；全面适配主流 Thinking 模型与 `<think>`/`<thought>` 流式分离，通过原生 SSE 实现思考过程实时展开/自动收起、自然 Markdown 边生成边排版与随时「停止生成」中断。
+   - **现代模型感知长上下文、Thinking 深度思考、SSE 实时流式输出与持久化 🎯 `/goal` 闭环**：支持剪贴板粘贴文件或超长文本、面板拖拽与按钮上传 13 种文本/代码格式（`.txt`/`.sql`/`.ddl`/`.md`/`.log`/`.json`/`.yaml`/`.yml`/`.xml`/`.ini`/`.conf`/`.py`/`.sh`，`<= 5 MB`）及 `.csv`/`.tsv`（`<= 2 MB`），配套 `<dialog>` 结构化大纲/画像/分片预览与 CSV 内存只读 SQLite `csv_data` 沙箱；配备模型能力实时探查胶囊、`sql_static_analyzer.py` 确定性静态血缘 DAG/隐患雷达与 `compact_sql_for_llm` 保行号语义压缩、`ExecutionPlanner` 五策略（`full_context` / `lineage_sliced` / `goal_driven_staged` / `agentic_explore` / `stepped_batch`）按推理甜蜜区（`flagship 12K` / `standard 8K` / `lightweight 5.5K`）智能调度、14 个工具（含 3 个手术刀工具）与轻量裁剪/防打转护栏、瞬态退避重试+减载降级+`length` 自动续写，以及后台持久化 🎯 `/goal` 模式（战前规划卡 + 实时 Checklist + 三道硬验收补救 + `Last-Event-ID` 断点续流 + 一键「从断点继续执行」`/resume`）；全面适配主流 Thinking 模型与 `<think>`/`<thought>` 流式分离，通过原生 SSE 实现思考过程实时展开/自动收起、自然 Markdown 边生成边排版与随时「停止生成」中断。
 
 ---
 
@@ -61,9 +62,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.3，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.4，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.5.3 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.5.4 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -99,12 +100,12 @@ DataOG/
 │   ├── data_explorer/            # /api/modules/data_explorer     AI 只读智能数据探查多轮会话引擎
 │   └── ai_assistant/             # /api/modules/ai_assistant      Data.O.G 3.0 旗舰多轮渐进式数据库智能助手（含写确认门禁）
 ├── static/                       # 零 Node 构建链原生 ES Modules macOS 桌面工作台
-│   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css（已清理 392 行废弃死样式）
+│   ├── css/                      # tokens.css（明暗双主题与壁纸令牌）与 workbench.css（macOS 桌面与工作台全局样式表）
 │   └── js/                       # main.js（零业务视图静态依赖）、core/（http / perf_monitor / platform_api / app_registry / dom / state / type_compat）、apps/（3.0 独立懒加载应用含 ai_assistant/）、api/（模块独立 API 客户端）、ui/（底座共享组件）、views/（拆解后的高内聚业务视图含 knowledge_view.js、updates_view.js 与 diagnostics_view.js）
-├── docs/                         # 架构与演进文档 (MODULE_SDK_3_0.md / AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md)
+├── docs/                         # 架构与演进文档 (MODULE_SDK_3_0.md / archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md [已归档])
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
-├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
+├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 156×162 表工作区 + 演示剧本；绝不打入 .exe）
 ├── tests/                        # 118 项全量自动化测试（DGP2 加密混淆增量包与银行邮件网关零明文防线/防降级/信封防篡改、标准字典性能优化与AN-AS栏位对齐、落标绑定侧栏缩放/统计口径双开关/原位防跳顶/跳已落标/执行核验3秒渐隐/Schema模板、确定性 SQL 静态血缘/隐患剖析与语义压缩、四级动态模型能力探查与超时重试减载续写、ExecutionPlanner 与持久化 🎯 /goal 硬验收补救断点续跑闭环、AI 助手长上下文重构/Thinking 深度思考与 SSE 实时流式输出、Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断与全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与大纲按行探索 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
 ├── build_update_pack.py          # 同二级版本累积增量包 (DataOG-Update-vX.Y.Z.zip) DGP2 加密混淆 + Ed25519 签名构建脚本
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 纯净打包脚本（支持 --skip-tests、内置 static/dataog.ico 图标并严格剔除 tests/）
@@ -158,7 +159,8 @@ DataOG/
 | **`v3.5.0`** | `feat/v3.5.0-encrypted-update-pack` → `main` | **DGP2 加密混淆增量更新包架构重构（兼容银行邮件网关传输）**：将增量更新核心载荷由明文嵌套 ZIP 重构为纯标准库 `BLAKE2b-512-CTR + HMAC-SHA256 + Ed25519` 双域签名高熵密文信封 (`DGP2`) 与紧凑二进制载荷 (`DGPB`)；外层标准无密码 `DataOG-Update-vX.Y.Z.zip` 零明文源码/脚本/可执行特征并内置构建期网关安全扫描与 `>=3.5.0` 防降级保护，客户端透明支持 `.zip`/`.dgp`/`.dat` 双渠道验签解密安装（114 项测试全绿） |
 | **`v3.5.1`** | `fix/v3.5.1-excel-illegal-char-sanitize` → `main` | **全量 Schema 模板及全平台 Excel 导出非法控制字符清洗修复**：在底座 `core/excel_handler.py` 与 `core/platform/excel_io.py` 统一提供 `sanitize_excel_cell`/`sanitize_excel_row`/`sanitize_excel_sheet_title`，彻底清除数据库元数据中夹带的 `PK\x02`/`PK\x0b` 等 XML 1.0 非法控制字符并先清后转义公式注入前缀；全覆盖 Schema 全量映射模板、贯标执行报告、SQL 通用导出、标准字典、单库/跨环境离线 Excel 及跨环境比对导出全链路（116 项测试全绿） |
 | **`v3.5.2`** | `feat/v3.5.2-sidebar-stat-toggles` → `main` | **「2. 落标绑定与贯标」左侧统计口径 macOS 开关**：`get_cached_catalog` 补齐物理表 `col_count`；左侧「当前库落标标准」卡片下方新增默认开启且持久化记忆的 **「忽略部分落标」** 与 **「忽略未绑标字段」** macOS HIG 胶囊开关，支持实时切换左侧表级徽标统计口径（含部分落标归并、0 绑标表 `0/N` 全量物理列展示与未缓存列数提示）（117 项测试全绿） |
-| **`v3.5.3`**（当前正式版） | `fix/v3.5.3-standard-dict-perf-and-an-as-fields` → `main` | **「1. 标准字典」卡顿根治与模板 AN–AS 物理格式栏位对齐**：`search_standards` 无关键词直走主键索引并支持 `include_summary=false` 按需汇总；移除 `dialog::backdrop` 全屏模糊与 `tr` `contain`，重构 `StandardDictView` 常驻 DOM + `DataGrid.setData()` + IME 防抖 + `AbortController` + `destroy()` 及 `StandardView` 惰性实例化；新增/编辑弹窗物理格式严格对齐模板 `AN`–`AS` 六列（`ocenbase-oracle` 至 `仓库DWS数据格式`）并完整保留历史非表单字段（118 项测试全绿） |
+| **`v3.5.3`** | `fix/v3.5.3-standard-dict-perf-and-an-as-fields` → `main` | **「1. 标准字典」卡顿根治与模板 AN–AS 物理格式栏位对齐**：`search_standards` 无关键词直走主键索引并支持 `include_summary=false` 按需汇总；移除 `dialog::backdrop` 全屏模糊与 `tr` `contain`，重构 `StandardDictView` 常驻 DOM + `DataGrid.setData()` + IME 防抖 + `AbortController` + `destroy()` 及 `StandardView` 惰性实例化；新增/编辑弹窗物理格式严格对齐模板 `AN`–`AS` 六列（`ocenbase-oracle` 至 `仓库DWS数据格式`）并完整保留历史非表单字段（118 项测试全绿） |
+| **`v3.5.4`**（当前正式版） | `chore/v3.5.4-gc-and-docs-reorg` → `main` | **全仓垃圾回收、死代码清理、文档重整与演示沙箱闭环修复**：系统性核查并清理底座/模块/前端/沙箱经确认死代码、旧 `static/js/core/api.js` 兼容层、冗余 CSS 及过期字节码；修复 `demo_sandbox/workspace_builder.py` 导出工作区名称/描述覆盖与 `dwd_acct_swap_demo` 保序重建缓存提示；归档 `docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md` 并全仓同步 `MODULE_SDK_3_0.md`、`knowledge_packs/README.md`、`DEMO_PLAYBOOK.md` 与根文档（118 项测试全绿） |
 
 ---
 
@@ -182,7 +184,7 @@ python3 app.py
 ### 2. 本地银行信创演示沙箱（无甲方集群高保真全链路演练）
 需要向管理层或客户现场演示**华为 DWS / 星环 Inceptor / 核心 MySQL** 全链路治理与 AI 探查能力时，可使用内置独立演示套件 [demo_sandbox/README.md](./demo_sandbox/README.md) 与剧本 [DEMO_PLAYBOOK.md](./demo_sandbox/DEMO_PLAYBOOK.md)：
 ```bash
-# 一键启动三引擎同源容器（PG16 演 DWS + Spark Thrift 演 Inceptor + MySQL8）并灌入 3 万+ 行含 5 大业务暗雷的金融样本
+# 一键启动三引擎同源容器（PG16 演 DWS + Spark Thrift 演 Inceptor + MySQL8）并灌入 65,000+ 行三引擎（其中 DWS 3.3 万+ 行）含 5 大业务暗雷的金融样本
 ./demo_sandbox/sandbox.sh up
 
 # 向隔离演示目录预装双工作区（活库工作区 + 150 表大中台压测工作区）与连接凭据后启动演示桌面
@@ -219,5 +221,5 @@ python build_update_pack.py --output-dir dist
 | **官方 PostgreSQL** (`19 / 18 / 17`) | `DataOG_KB_PGSQL_19.json.gz` | 3 篇 / 15 块（`~7.1 KB`） | [直接下载 (.json.gz)](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_PGSQL_19.json.gz) · [Markdown 源码](https://github.com/artxom/DataOG/tree/main/knowledge_packs/sources/pgsql) |
 | **全量合集包（三库一键导入）** | `DataOG_KB_ALL_STARTER.json.gz` | 9 篇 / 59 块（`~19.4 KB`） | [直接下载 (.json.gz)](https://raw.githubusercontent.com/artxom/DataOG/main/knowledge_packs/packs/DataOG_KB_ALL_STARTER.json.gz) · [完整下载说明](./knowledge_packs/README.md) |
 
-**导入方式**：打开 Data.O.G → **「系统配置」→「参考知识库」→「导入知识包」** 选择下载好的 `.json.gz` 即可；如需单独微调某份手册，也可下载 `sources/` 下对应 `.md` 文件后点击 **「上传参考文档」** 并指定方言导入。
+**导入方式**：打开 Data.O.G → **「系统配置」→「参考知识库」→「导入知识包」** 选择下载好的 `.json.gz` 即可；如需单独微调某份手册，也可下载 `sources/` 下对应 `.md` 文件后点击 **「上传资料」** 并指定方言导入。
 

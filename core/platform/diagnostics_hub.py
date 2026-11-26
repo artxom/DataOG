@@ -200,10 +200,6 @@ class _ActiveRequestTrace:
             self.spans.append(entry)
 
 
-def get_current_trace() -> Optional[_ActiveRequestTrace]:
-    return _CURRENT_TRACE.get()
-
-
 def annotate_current_span(**kwargs: Any) -> None:
     """在当前活动 Span 上追加结构化诊断属性（无活动 Span 时为空操作）."""
     span_ctx = _CURRENT_SPAN.get()
@@ -214,9 +210,6 @@ def annotate_current_span(**kwargs: Any) -> None:
         for k, v in kwargs.items():
             if v is not None:
                 meta[str(k)] = v
-
-
-set_current_span_meta = annotate_current_span
 
 
 def record_instant_metric(
@@ -1245,30 +1238,6 @@ class DiagnosticsHub:
                 "avg_ms": _round_ms(sum(tp_delays) / len(tp_delays)),
                 "max_ms": _round_ms(max(tp_delays)),
             },
-            **sync_part,
-        }
-        sanitized = self.sanitize_payload(bench)
-        with self._lock:
-            self._last_benchmark = sanitized
-        return sanitized
-
-    def run_benchmark(
-        self,
-        *,
-        include_connections: bool = False,
-        include_llm: bool = False,
-    ) -> Dict[str, Any]:
-        """同步便捷入口（主要供单测或无事件循环上下文直接调用）."""
-        sync_part = self._run_sync_benchmarks(
-            include_connections=include_connections,
-            include_llm=include_llm,
-        )
-        bench = {
-            "run_at": datetime.datetime.now().isoformat(timespec="seconds"),
-            "include_connections": bool(include_connections),
-            "include_llm": bool(include_llm),
-            "event_loop_lag": {"iterations": 0, "avg_lag_ms": 0.0, "p95_lag_ms": 0.0, "max_lag_ms": 0.0},
-            "threadpool_dispatch": {"iterations": 0, "avg_ms": 0.0, "max_ms": 0.0},
             **sync_part,
         }
         sanitized = self.sanitize_payload(bench)

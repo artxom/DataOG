@@ -1,6 +1,6 @@
 """DataOG 平台底座公共 API 路由聚合入口 (/api/platform).
 
-所有具体端点按领域拆分为 `core/platform/routes/*` 五个高内聚子路由模块。
+所有具体端点按领域拆分为 `core/platform/routes/*` 八个高内聚子路由模块。
 """
 
 from __future__ import annotations

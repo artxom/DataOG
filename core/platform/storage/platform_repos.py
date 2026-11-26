@@ -185,16 +185,6 @@ class _PlatformReposMixin:
             credential_status=cred_status,
         )
 
-    def list_connection_credentials(self) -> List[Dict[str, Any]]:
-        """列出私有库个人凭据元数据（脱敏，绝不返回明文密码）."""
-        with self._lock, self._get_private_conn() as pconn:
-            rows = pconn.execute(
-                "SELECT cred_id, connection_id, endpoint_fingerprint, db_type, host, port, dbname, "
-                "jdbc_url, user, (CASE WHEN password != '' THEN 1 ELSE 0 END) AS has_password, updated_at "
-                "FROM connection_credentials ORDER BY updated_at DESC"
-            ).fetchall()
-            return [dict(r) for r in rows]
-
     def list_connection_profiles(self) -> List[ConnectionProfile]:
         with self._lock:
             cred_by_cid, cred_by_fp, local_driver_ids = self._load_credential_maps()

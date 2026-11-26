@@ -1,5 +1,5 @@
 /**
- * Data.O.G — macOS Desktop OS & 四大模块极简工作台样式表
+ * Data.O.G — macOS Desktop OS & 五大模块极简工作台样式表
  */
 
 *, *::before, *::after {
@@ -831,10 +831,6 @@ select.input-xs {
 .btn-primary:hover {
   background: var(--os-accent);
   filter: brightness(1.07);
-}
-
-.btn-secondary {
-  background: var(--os-input-bg);
 }
 
 .mac-btn-ghost,
@@ -2673,12 +2669,6 @@ dialog::backdrop {
 }
 
 /* R1 & R2: 跨环境比对 — macOS Sequoia 五虚拟列对标工作台 & Spotlight 映射表对选择器 */
-.cross-saved-pair-select {
-  max-width: 220px;
-  min-width: 150px;
-  text-overflow: ellipsis;
-}
-
 .cross-toolbar {
   min-height: 34px;
   padding: 4px 14px;
@@ -2701,14 +2691,6 @@ dialog::backdrop {
   flex-wrap: wrap;
   gap: 6px;
   margin-left: auto;
-}
-
-.cross-toolbar-sep {
-  width: 1px;
-  height: 16px;
-  background: var(--os-border-strong);
-  margin: 0 2px;
-  flex-shrink: 0;
 }
 
 .cross-pair-picker {

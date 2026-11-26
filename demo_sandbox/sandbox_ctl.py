@@ -140,7 +140,7 @@ def cmd_up(args: argparse.Namespace) -> int:
         _compose_cmd(["up", "-d"], registry_prefix=args.registry_prefix or "")
     print("[2/4] 正在等待三引擎就绪...")
     _wait_for_engines(timeout_sec=args.timeout)
-    print("[3/4] 正在初始化库表与灌入 25,000+ 行金融样本数据...")
+    print("[3/4] 正在初始化库表与灌入 65,000+ 行三引擎金融样本数据（DWS 33,044 行 / MySQL 26,472 行 / 星环 5,973 行）...")
     seed_all()
     print("[4/4] 正在实采活库元数据并生成双 `.dataog.db` 工作区与标准字典 Excel...")
     res = build_all_workspaces(str(DEFAULT_OUTPUT_DIR), live_probe=True)

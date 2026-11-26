@@ -2813,12 +2813,19 @@ class TestModulesAndFastApiWorkbench(unittest.TestCase):
         static_dir = resolve_static_dir()
         with open(os.path.join(static_dir, "js", "ui", "task_activity_bar.js"), "r", encoding="utf-8") as f:
             bar_js = f.read()
-        with open(os.path.join(static_dir, "js", "core", "api.js"), "r", encoding="utf-8") as f:
-            api_js = f.read()
+        with open(os.path.join(static_dir, "js", "core", "http.js"), "r", encoding="utf-8") as f:
+            http_js = f.read()
+        with open(os.path.join(static_dir, "js", "core", "platform_api.js"), "r", encoding="utf-8") as f:
+            plat_js = f.read()
+        with open(os.path.join(static_dir, "js", "api", "cross_api.js"), "r", encoding="utf-8") as f:
+            cross_api_js = f.read()
         for tok in ("class TaskActivityBar", "createTaskId", "graceMs", "EventSource", "cancel"):
             self.assertIn(tok, bar_js)
-        for tok in ("isAbortError", "tasksApi", "comparePair", "prefetchPairs", "X-Task-Id"):
-            self.assertIn(tok, api_js)
+        for tok in ("isAbortError", "X-Task-Id"):
+            self.assertIn(tok, http_js)
+        self.assertIn("tasksApi", plat_js)
+        for tok in ("comparePair", "prefetchPairs"):
+            self.assertIn(tok, cross_api_js)
 
         with tempfile.TemporaryDirectory() as tmp:
             src_db = os.path.join(tmp, "src.db")

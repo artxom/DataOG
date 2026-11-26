@@ -13,14 +13,13 @@ import io
 import os
 import re
 import zipfile
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from core.excel_formula import (
-    EXCEL_ERROR_TOKENS,
     ResolvedWorkbook,
     clean_excel_cell_str,
     is_excel_error_value,
@@ -585,32 +584,6 @@ def _match_headers(header_row: Sequence[Any]) -> Dict[str, int]:
                 mapping["new_col_comment"] = comm_cols[0]
 
     return mapping
-
-
-def _extract_sheet_rows_with_merged_cells(sheet: Any) -> List[List[Any]]:
-    """读取工作表所有行，并将合并单元格的值自动向下/向右填充."""
-    matrix: List[List[Any]] = [list(r) for r in sheet.iter_rows(values_only=True)]
-    if not matrix:
-        return []
-
-    try:
-        for merged_range in sheet.merged_cells.ranges:
-            min_col, min_row, max_col, max_row = merged_range.bounds
-            if min_row - 1 < len(matrix) and min_col - 1 < len(matrix[min_row - 1]):
-                top_left_val = matrix[min_row - 1][min_col - 1]
-            else:
-                top_left_val = None
-            if top_left_val is None:
-                continue
-            for r_idx in range(min_row - 1, min(max_row, len(matrix))):
-                row_list = matrix[r_idx]
-                for c_idx in range(min_col - 1, min(max_col, len(row_list))):
-                    if row_list[c_idx] is None:
-                        row_list[c_idx] = top_left_val
-    except Exception:
-        pass
-
-    return matrix
 
 
 def _guess_table_from_sheet_title(title: str) -> str:

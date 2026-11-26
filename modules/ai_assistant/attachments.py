@@ -28,7 +28,7 @@ from core.platform.readonly_guard import validate_readonly_sql
 from core.platform.sql_risk_guard import split_sql_statements
 from modules.ai_assistant.sql_static_analyzer import (
     analyze_sql_static,
-    compact_sql_for_llm,
+    compact_sql_for_llm as compact_sql_for_llm,  # re-exported for service.py & goal_runner.py
     format_static_analysis_brief,
 )
 
@@ -77,9 +77,6 @@ _SQL_OBJECT_RE = re.compile(
 )
 _SQL_BANNER_RE = re.compile(
     r"^\s*(?:--\s*(?:={2,}|-{3,}|#{1,4}|\*{2,})?\s*((?:Step|阶段|步骤|Part|第[一二三四五六七八九十0-9]+[步章节段]?|[0-9]+[\.、\)])\s*[^\n]{2,76}|[^\n=\-\*]{4,76})\s*(?:={2,}|-{3,}|\*{2,})?)\s*$"
-)
-_SQL_PROC_KEYWORD_RE = re.compile(
-    r"(?im)^\s*(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|PACKAGE|TRIGGER)|DECLARE|BEGIN|EXCEPTION)\b"
 )
 _SQL_TABLE_REF_RE = re.compile(
     r"(?is)\b(?:FROM|JOIN|INTO|UPDATE|TRUNCATE\s+TABLE|DELETE\s+FROM|MERGE\s+INTO|CREATE\s+(?:OR\s+REPLACE\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?|ALTER\s+TABLE)\s+"

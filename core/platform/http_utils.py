@@ -27,7 +27,6 @@ MEDIA_TYPE_XLSX = (
 )
 MEDIA_TYPE_HTML = "text/html; charset=utf-8"
 MEDIA_TYPE_JSON = "application/json; charset=utf-8"
-MEDIA_TYPE_SQLITE = "application/octet-stream"
 
 
 def json_error(message: str, status_code: int = 400) -> JSONResponse:

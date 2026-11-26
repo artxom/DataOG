@@ -1,8 +1,8 @@
-"""16:9 跨环境三栏数标比对中心模块 (cross_comparator) 数据契约."""
+"""跨环境五虚拟列数标比对中心模块 (cross_comparator) 数据契约."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from pydantic import BaseModel, Field
 
@@ -12,12 +12,6 @@ class BindRoleConnectionPayload(BaseModel):
     connection_id: str = ""
     active_table_key: str = ""
     auto_refresh: bool = False
-
-
-class ColumnBindingUpdateItem(BaseModel):
-    id: int
-    bound_source_col: str = ""
-    bound_target_col: str = ""
 
 
 class SaveCrossBindingsPayload(BaseModel):

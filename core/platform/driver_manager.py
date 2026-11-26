@@ -7,7 +7,7 @@
    - `MYSQL` (`PyMySQL`，覆盖 MySQL / OceanBase / Doris / StarRocks / TiDB)
    - `SQLITE` (标准库 `sqlite3`)
 2. 自定义 JDBC 扩展通道 (`JDBC`，用户上传 `.jar` 驱动包)：
-   - 安全隔离存放于 `data/drivers/`（非静态目录），严格校验 `.jar` 后缀、64MB 上限、`PK\\x03\\x04` 魔数头、防路径穿越与 SHA-256 指纹；
+   - 安全隔离存放于 Layer 2 本地私有驱动目录（非静态目录），严格校验 `.jar` 后缀、64MB 上限、`PK\\x03\\x04` 魔数头、防路径穿越与 SHA-256 指纹；
    - 自动扫描 `META-INF/services/java.sql.Driver` 识别驱动主类；
    - 按需懒加载 `JPype1` + 独立 `java.net.URLClassLoader` 直接实例化 `Driver.connect(url, props)`，
      在未安装 JRE 的机器上绝不影响应用启动与内置原生驱动运行。
@@ -24,7 +24,6 @@ import posixpath
 import shutil
 import sqlite3
 import threading
-import uuid
 import zipfile
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 

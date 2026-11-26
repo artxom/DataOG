@@ -30,7 +30,6 @@ from core.platform.dialects import (
     partition_clause_has_child_defs,
     quote_backtick_str,
     quote_ident_str,
-    quote_literal_str,
     validate_identifier,
 )
 from core.platform.driver_manager import JdbcConnectionAdapter

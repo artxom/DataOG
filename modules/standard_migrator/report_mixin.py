@@ -202,11 +202,7 @@ class _StandardReportMixin:
         for it in mig_items:
             s_l = str(it.get("schema_name") or "").lower()
             t_l = str(it.get("table_name") or "").lower()
-            primary_k, secondary_k = (
-                ("new_col_name", "old_col_name")
-                if it.get("status") == "COMPLETED"
-                else ("old_col_name", "new_col_name")
-            )
+            primary_k = "new_col_name" if it.get("status") == "COMPLETED" else "old_col_name"
             p_cn = str(it.get(primary_k) or "").strip().lower()
             if p_cn:
                 queue_by_col.setdefault((s_l, t_l, p_cn), it)

@@ -50,9 +50,6 @@ from demo_sandbox.workspace_builder import build_demo_connection_profiles
 PROJECT_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
-DEFAULT_HISTORY_FILE = os.path.join(
-    PROJECT_ROOT, ".keygen_secrets", "admin_issue_history.json"
-)
 MAX_HISTORY_ITEMS = 200
 MAX_JOB_RECORDS = 30
 

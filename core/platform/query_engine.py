@@ -14,7 +14,7 @@ import decimal
 import re
 import threading
 import time
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, List, Sequence, Tuple
 
 from core.platform.connection_hub import ConnectionHub
 from core.platform.diagnostics_hub import annotate_current_span, trace_span

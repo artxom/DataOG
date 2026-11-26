@@ -3,7 +3,7 @@
  *
  * 3.0 新模块开发规范：新业务模块仅从本文件导入传输原语 (`requestJson` / `uploadFormData` /
  * `downloadApiFile` / `withRequestOpts` / `isAbortError`) 并在自身目录维护独立 API 客户端，
- * 严禁继续向 `core/api.js` 堆积业务模块端点。
+ * 严禁继续向 `core/platform_api.js` 堆积业务模块端点。
  */
 
 import { downloadBlob } from "./dom.js";

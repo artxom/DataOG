@@ -1194,5 +1194,3 @@ export class PolyglotView {
     }
   }
 }
-
-export { PolyglotView as DdlTranslatorView };

@@ -1,4 +1,4 @@
-"""16:9 跨环境三栏数标比对中心 API 路由 (/api/modules/cross_comparator)."""
+"""跨环境五虚拟列数标比对中心 API 路由 (/api/modules/cross_comparator)."""
 
 from __future__ import annotations
 

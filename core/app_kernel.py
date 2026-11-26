@@ -47,7 +47,7 @@ from core.platform.module_registry import mount_discovered_modules
 from core.platform.router import router as platform_router
 from core.platform.storage_paths import redact_private_storage_paths
 
-APP_VERSION = "3.5.3"
+APP_VERSION = "3.5.4"
 _NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
 _UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
 
@@ -102,19 +102,6 @@ def get_runtime_data_dir() -> str:
 
 def _is_test_runtime() -> bool:
     return "--test" in sys.argv or "--smoke-test" in sys.argv or "unittest" in sys.modules
-
-
-def _write_startup_crash_log(err_text: str) -> None:
-    """将启动崩溃栈安全落盘至私有日志目录，不在终端暴露私有目录路径."""
-    try:
-        from core.platform.storage_paths import resolve_private_storage_layout
-
-        layout = resolve_private_storage_layout(create_dirs=True)
-        err_log_path = os.path.join(layout.logs_dir, "startup_error.log")
-        with open(err_log_path, "w", encoding="utf-8") as f:
-            f.write(err_text)
-    except Exception:
-        pass
 
 
 def pause_on_windows_console(prompt_msg: str = "\n请按回车键 (Enter) 关闭此控制台窗口...") -> None:
