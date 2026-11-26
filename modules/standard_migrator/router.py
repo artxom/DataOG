@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 
@@ -26,10 +27,18 @@ from modules.standard_migrator.schemas import (
     LoadDbTablesPayload,
     RollbackRequestPayload,
     SaveFieldBindingsPayload,
+    SqlRewriteAnalyzePayload,
+    SqlRewriteExportZipPayload,
     StageMigrationFromBindingsPayload,
     TableRebuildPayload,
 )
 from modules.standard_migrator.service import StandardMigratorService
+from modules.standard_migrator.sql_rewrite_mixin import (
+    MAX_BATCH_SCRIPTS,
+    MAX_SQL_SCRIPT_BYTES,
+    _decode_sql_bytes,
+    _safe_script_filename,
+)
 
 router = APIRouter(prefix="/api/modules/standard_migrator", tags=["standard_migrator"])
 
@@ -737,3 +746,165 @@ async def api_migrator_rollback_execute(
             int(r.get("total_steps", 0) or 0),
         ),
     )
+
+
+# =========================================================================
+# 第 4 步：基于字段变更历史的 SQL 脚本自动调整（确定性底座 + 轻量模型手术刀增强）
+# =========================================================================
+
+
+@router.get("/sql-rewrite/context")
+def api_migrator_sql_rewrite_context(
+    connection_id: str = Query(default=""),
+    since_checkpoint_id: Optional[int] = Query(default=None),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return StandardMigratorService(ctx).get_sql_rewrite_context(
+            connection_id=connection_id,
+            since_checkpoint_id=since_checkpoint_id,
+        )
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+
+@router.post("/sql-rewrite/analyze")
+async def api_migrator_sql_rewrite_analyze(
+    payload: SqlRewriteAnalyzePayload,
+    request: Request,
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    scripts_in = (
+        [{"filename": s.filename, "content": s.content} for s in payload.scripts]
+        if payload.scripts
+        else (
+            [{"filename": payload.filename or "script.sql", "content": payload.sql_text}]
+            if payload.sql_text.strip()
+            else []
+        )
+    )
+    return await run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="SQL 脚本落标智能改写",
+        start_detail=f"正在基于字段变更历史分析 {len(scripts_in)} 份 SQL 脚本...",
+        fn=StandardMigratorService(ctx).analyze_and_rewrite_scripts,
+        kwargs={
+            "scripts": scripts_in,
+            "connection_id": payload.connection_id,
+            "since_checkpoint_id": payload.since_checkpoint_id,
+            "external_changelog_json": payload.external_changelog_json,
+            "default_schema": payload.default_schema,
+            "cte_alias_policy": payload.cte_alias_policy,
+            "rewrite_ddl_types": payload.rewrite_ddl_types,
+            "rewrite_comments": payload.rewrite_comments,
+            "auto_apply_medium": payload.auto_apply_medium,
+            "mode": payload.mode,
+            "provider_id": payload.provider_id,
+            "model": payload.model,
+            "llm_audit": payload.llm_audit,
+            "dialect": payload.dialect,
+        },
+        inject_cancel_check=True,
+        default_detail="SQL 脚本智能改写分析完成",
+        count_fn=lambda r: (
+            int((r.get("aggregate") or {}).get("total_files", 0) or 0),
+            int((r.get("aggregate") or {}).get("total_files", 0) or 0),
+        ),
+    )
+
+
+@router.post("/sql-rewrite/upload")
+async def api_migrator_sql_rewrite_upload(
+    request: Request,
+    files: List[UploadFile] = File(...),
+    changelog_file: Optional[UploadFile] = File(default=None),
+    connection_id: str = Form(default=""),
+    since_checkpoint_id: str = Form(default=""),
+    default_schema: str = Form(default=""),
+    cte_alias_policy: str = Form(default="propagate"),
+    rewrite_ddl_types: str = Form(default="true"),
+    rewrite_comments: str = Form(default="false"),
+    auto_apply_medium: str = Form(default="false"),
+    mode: str = Form(default="deterministic"),
+    provider_id: str = Form(default=""),
+    model: str = Form(default=""),
+    llm_audit: str = Form(default="false"),
+    dialect: str = Form(default=""),
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    if len(files) > MAX_BATCH_SCRIPTS:
+        return json_error(f"单次最多上传 {MAX_BATCH_SCRIPTS} 个 SQL 脚本文件", 400)
+    try:
+        scripts_in = []
+        for idx, uf in enumerate(files, start=1):
+            fname = _safe_script_filename(uf.filename or f"script_{idx}.sql")
+            raw = await uf.read(MAX_SQL_SCRIPT_BYTES + 1)
+            scripts_in.append({"filename": fname, "content": _decode_sql_bytes(raw, fname)})
+
+        ext_json = ""
+        if changelog_file is not None:
+            raw_json = await changelog_file.read(MAX_SQL_SCRIPT_BYTES + 1)
+            ext_json = _decode_sql_bytes(raw_json, changelog_file.filename or "changelog.json")
+
+        cp_id: Optional[int] = None
+        if since_checkpoint_id and since_checkpoint_id.strip().isdigit():
+            cp_id = int(since_checkpoint_id.strip())
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+    def _as_bool(v: str) -> bool:
+        return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+    return await run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="上传并改写 SQL 脚本",
+        start_detail=f"正在基于变更台账分析上传的 {len(scripts_in)} 份 SQL 脚本...",
+        fn=StandardMigratorService(ctx).analyze_and_rewrite_scripts,
+        kwargs={
+            "scripts": scripts_in,
+            "connection_id": connection_id,
+            "since_checkpoint_id": cp_id,
+            "external_changelog_json": ext_json,
+            "default_schema": default_schema,
+            "cte_alias_policy": cte_alias_policy,
+            "rewrite_ddl_types": _as_bool(rewrite_ddl_types),
+            "rewrite_comments": _as_bool(rewrite_comments),
+            "auto_apply_medium": _as_bool(auto_apply_medium),
+            "mode": mode,
+            "provider_id": provider_id,
+            "model": model,
+            "llm_audit": _as_bool(llm_audit),
+            "dialect": dialect,
+        },
+        inject_cancel_check=True,
+        default_detail="上传 SQL 脚本分析改写完成",
+        count_fn=lambda r: (
+            int((r.get("aggregate") or {}).get("total_files", 0) or 0),
+            int((r.get("aggregate") or {}).get("total_files", 0) or 0),
+        ),
+    )
+
+
+@router.post("/sql-rewrite/export-zip")
+def api_migrator_sql_rewrite_export_zip(
+    payload: SqlRewriteExportZipPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        raw_zip = StandardMigratorService(ctx).export_rewritten_scripts_zip(
+            [f.model_dump() for f in payload.files]
+        )
+        return file_download_response(
+            raw_zip,
+            "DataOG_落标改写SQL脚本包.zip",
+            media_type="application/zip",
+            ascii_fallback="rewritten_sql_bundle.zip",
+        )
+    except Exception as exc:
+        return json_error(str(exc), 400)

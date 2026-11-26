@@ -297,4 +297,29 @@ export const migratorApi = {
       fallbackName: "DataOG_落标变更台账与Checkpoint.xlsx",
     });
   },
+
+  // 第 4 步：基于字段变更历史的 SQL 脚本自动改写
+  getSqlRewriteContext: ({ connectionId = "", sinceCheckpointId = null } = {}, opts = {}) => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    if (sinceCheckpointId) qs.set("since_checkpoint_id", String(sinceCheckpointId));
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return requestJson(
+      `/api/modules/standard_migrator/sql-rewrite/context${suffix}`,
+      withRequestOpts({}, opts)
+    );
+  },
+  analyzeSqlRewrite: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/sql-rewrite/analyze",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  exportSqlRewriteZip: (files, { taskId = "", signal = undefined } = {}) =>
+    downloadApiFile("/api/modules/standard_migrator/sql-rewrite/export-zip", {
+      method: "POST",
+      body: { files },
+      fallbackName: "DataOG_落标改写SQL脚本包.zip",
+      taskId,
+      signal,
+    }),
 };

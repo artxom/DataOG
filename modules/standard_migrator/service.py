@@ -33,10 +33,14 @@ from core.platform.import_progress import ProgressCallback, noop_progress
 from modules.standard_migrator.bindings_mixin import _StandardBindingsMixin
 from modules.standard_migrator.changelog_mixin import _StandardChangelogMixin
 from modules.standard_migrator.report_mixin import _StandardReportMixin
+from modules.standard_migrator.sql_rewrite_mixin import _StandardSqlRewriteMixin
 
 
 class StandardMigratorService(
-    _StandardBindingsMixin, _StandardReportMixin, _StandardChangelogMixin
+    _StandardBindingsMixin,
+    _StandardReportMixin,
+    _StandardChangelogMixin,
+    _StandardSqlRewriteMixin,
 ):
     """单库贯标执行台核心业务服务."""
 

@@ -88,3 +88,40 @@ class StageMigrationFromBindingsPayload(BaseModel):
     column_names: List[str] = Field(default_factory=list)
     format_profile: str = "AUTO"
     append: bool = True
+
+
+class SqlRewriteScriptItem(BaseModel):
+    filename: str = "script.sql"
+    content: str = ""
+
+
+class SqlRewriteAnalyzePayload(BaseModel):
+    sql_text: str = ""
+    filename: str = "script.sql"
+    scripts: List[SqlRewriteScriptItem] = Field(default_factory=list)
+    connection_id: str = ""
+    since_checkpoint_id: Optional[int] = None
+    external_changelog_json: str = ""
+    default_schema: str = ""
+    cte_alias_policy: str = "propagate"
+    rewrite_ddl_types: bool = True
+    rewrite_comments: bool = False
+    auto_apply_medium: bool = False
+    mode: str = "deterministic"  # deterministic | hybrid
+    provider_id: str = ""
+    model: str = ""
+    llm_audit: bool = False
+    dialect: str = ""
+
+
+class SqlRewriteExportFileItem(BaseModel):
+    filename: str = "script.sql"
+    rewritten_sql: str = ""
+    unified_diff: str = ""
+    changed: bool = False
+    applied_patch_count: int = 0
+    advisory_count: int = 0
+
+
+class SqlRewriteExportZipPayload(BaseModel):
+    files: List[SqlRewriteExportFileItem] = Field(default_factory=list)
