@@ -185,3 +185,42 @@ export async function loadAppInstance(appId) {
   ensureAppStylesheets(manifest.id);
   return await manifest.loader();
 }
+
+const _loadedExternalEntryUrls = new Set();
+
+/**
+ * 动态加载后端已激活的 4.0 外置桌面应用插件入口 (如 /plugins/<id>/register.js)
+ * @param {Array<{plugin_id: string, entry_url: string}>} plugins
+ * @returns {Promise<{loaded: string[], failed: Array<{plugin_id: string, error: string}>}>}
+ */
+export async function loadExternalPluginApps(plugins = []) {
+  const loaded = [];
+  const failed = [];
+  if (!Array.isArray(plugins) || !plugins.length) {
+    return { loaded, failed };
+  }
+  for (const item of plugins) {
+    const pluginId = String(item?.plugin_id || "").trim();
+    const entryUrl = String(item?.entry_url || "").trim();
+    if (!pluginId || !entryUrl) continue;
+    if (!entryUrl.startsWith("/plugins/") || entryUrl.includes("..") || entryUrl.includes("\\")) {
+      failed.push({ plugin_id: pluginId, error: `非法的插件前端入口路径: ${entryUrl}` });
+      continue;
+    }
+    if (_loadedExternalEntryUrls.has(entryUrl)) {
+      loaded.push(pluginId);
+      continue;
+    }
+    try {
+      await import(entryUrl);
+      _loadedExternalEntryUrls.add(entryUrl);
+      loaded.push(pluginId);
+    } catch (err) {
+      failed.push({
+        plugin_id: pluginId,
+        error: err?.message || String(err),
+      });
+    }
+  }
+  return { loaded, failed };
+}

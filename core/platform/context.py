@@ -17,6 +17,7 @@ from core.platform.license_hub import LicenseHub
 from core.platform.llm_hub import LLMHub
 from core.platform.metadata_hub import MetadataHub
 from core.platform.module_registry import ModuleRegistry
+from core.platform.plugin_hub import PluginHub
 from core.platform.query_engine import QueryEngine
 from core.platform.standard_catalog import StandardCatalog
 from core.platform.storage import PlatformStateStore
@@ -52,6 +53,7 @@ class PlatformContext:
             eff_workspaces_dir = layout.workspaces_dir
             eff_tmp_dir = layout.tmp_dir
             eff_updates_dir = layout.updates_dir
+            eff_plugins_dir = layout.plugins_dir
             eff_clock_anchor = layout.clock_anchor_path
             eff_ws_db = (
                 os.path.abspath(workspace_db_path)
@@ -90,6 +92,7 @@ class PlatformContext:
             eff_workspaces_dir = os.path.join(self.data_dir, "workspaces")
             eff_tmp_dir = os.path.join(self.data_dir, "tmp")
             eff_updates_dir = os.path.join(self.data_dir, "rt_upd")
+            eff_plugins_dir = os.path.join(self.data_dir, "rt_plg")
             eff_clock_anchor = os.path.join(self.data_dir, ".chk", "m_anchor.bin")
             os.makedirs(eff_drivers_dir, exist_ok=True)
             os.makedirs(eff_assets_dir, exist_ok=True)
@@ -126,11 +129,18 @@ class PlatformContext:
         self.task_progress = self.import_progress
         self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
-        self.app_version = "3.7.1"
+        self.app_version = "4.0.0"
         self.update_hub = UpdateHub(
             updates_dir=eff_updates_dir,
             running_version=self.app_version,
             base_version=base_version,
+            install_dir=install_dir,
+            verifier_pubkey=verifier_pubkey,
+        )
+        self.plugin_hub = PluginHub(
+            store=self.store,
+            plugins_dir=eff_plugins_dir,
+            platform_version=self.app_version,
             install_dir=install_dir,
             verifier_pubkey=verifier_pubkey,
         )
@@ -196,8 +206,11 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "3.7.1",
+            "version": "4.0.0",
+            "platform_abi": "4.0",
             "update_summary": self.update_hub.get_bootstrap_summary(),
+            "plugin_summary": self.plugin_hub.get_bootstrap_summary(),
+            "plugins": self.plugin_hub.get_active_frontend_plugins(),
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": license_info,
             "active_workspace": active_ws,

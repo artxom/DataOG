@@ -8,6 +8,33 @@
 
 ---
 
+## [4.0.0] - 2026-11-27
+
+> **Data.O.G 4.0 操作系统化插件平台与 Antigravity Init SDK**：将 Data.O.G 微内核底座升级为支持外部独立开发、加密签名封包与零侵入拼插的操作系统级平台；新增 `DGAP` 加密签名 `.dogapp` 插件包格式、Layer 2 `<private_root>/rt_plg/` 插件仓、单插件启动故障隔离自愈、`--dev-plugin` 开发态热挂载、「系统配置 → 应用插件」管理中心，以及零漂移 `tools/export_plugin_sdk.py` 一键生成可独立运行的 Antigravity Init 工作区启动包。
+
+### Added
+- **`.dogapp` (`DGAP`) 插件加密签名协议与合约校验核心 (`core/platform/plugin_package.py`)**：
+  - 采用独立 `DGAP` 魔数头与 `DataOG-Plugin-v1:` 域隔离（严格防止 `DGP2` 系统更新包跨协议重放），复用 Ed25519 双重签名 + BLAKE2b-512-CTR + HMAC-SHA256 加密混淆封装，外层标准 `.zip` 零明文源码/脚本（兼容银行邮件网关）；
+  - 强校验 `plugin.json` (`schema_version=1`, `api_version="4.0"`, 保留 `plugin_id`/表名隔离, SemVer 平台兼容上下限) 并硬拦截 `.pyd`/`.so`/`.dylib`/`.dll`/`.exe` 等二进制扩展。
+- **运行时插件中枢与故障隔离装载器 (`core/platform/plugin_hub.py`)**：
+  - 管理 Layer 2 私有插件仓 (`<private_root>/rt_plg/`)，支持「系统配置 → 应用插件」上传与 `<install_dir>/plugins/` 目录自动吸纳；
+  - 以 `dataog_plugins.<plugin_id>` 隔离命名空间加载插件 `MODULE_SPEC` 与纯 Python `vendor/`；
+  - 启动期单插件异常自动隔离 (`quarantined`) 并回滚脏路由/模块，绝不拖垮底座或五大系统预装应用；支持版本回退、启停控制、开发态免签 `--dev-plugin` 目录热挂（冻结态严格拒绝）与卸载默认保留业务表/可选安全清表 (`PlatformStateStore.drop_plugin_tables`，硬白名单保护平台内建表)。
+- **底座与前端插件生态接入 (`core/platform/routes/plugins.py`, `core/app_kernel.py`, `static/js/views/plugins_view.js`, `static/js/core/app_registry.js`)**：
+  - 新增 `/api/platform/plugins/*` 8 个全量 Gate 2 保护端点及 `/plugins/{plugin_id}/{asset_path}` 安全静态资源路由（`realpath` 防穿越、`no-store` 与 `nosniff`）；
+  - `loadExternalPluginApps` 在登录引导后按需动态挂载外部插件桌面入口；新增「系统配置 → 应用插件」管理面板（100% 安全 DOM 工厂 + `<dialog>` 验签安装确认与卸载清表确认）。
+- **零漂移 Antigravity Init SDK 一键导出器 (`tools/export_plugin_sdk.py`, `tools/sdk_templates.py`, `docs/PLUGIN_SDK_4_0.md`)**：
+  - 直接内省真实底座源码与前端导出生成 `.dataog_sdk/stubs/core/platform/*.pyi`、`frontend_api.d.ts` 与 `CONTRACT.md`；
+  - 内嵌精简版真实 UI 壳 (`ui_shell/`)、零主仓依赖的双库 SQLite + `conn_demo_sqlite` 离线双轨开发宿主 (`dev_host.py`)、AST/XSS/ASGI 强合约校验器 (`validate_plugin.py`)、无内嵌私钥加密签名打包器 (`pack_plugin.py`) 及 Antigravity `AGENTS.md` + `dataog-plugin-dev` Skill。
+- **自动化测试增强 (`tests/test_plugin_platform.py`)**：
+  - 新增 6 项端到端回归测试，覆盖脱离主仓 `PYTHONPATH` 的 Init SDK 导出/校验/单测/打包闭环、真实安装重启与 `.dataog.db` 工作区流转、篡改/DGP2 重放/二进制/保留 ID 拦截、故障隔离自愈与回退清表保护、`--dev-plugin` 与冻结态拦截、以及前端 Node.js 动态加载与零 XSS 检查（总测试数增至 **136 项**）。
+
+### Changed
+- **版本号同步发布 (`v4.0.0`)**：
+  - 同步升级 `3.7.1 -> 4.0.0` 至 `app.py`、`core/app_kernel.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md` 与 `AGENTS.md`（严格维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变；**136 项**自动化单元测试全绿）。
+
+---
+
 ## [3.7.1] - 2026-11-26
 
 > **SQL 脚本自动改写双引擎安全与方言边界深度加固**：封堵轻量模型局部补丁语句/注释/高危 DDL·DML 关键字注入绕过漏洞，修复 MySQL `#` 注释、Oracle `/` 块结束符、SELECT 表达式别名遮蔽、函数/部分索引与跨表外键 `REFERENCES` 漏改缺陷，并修复前端 GB18030/GBK 上传乱码与多标签页状态串扰问题。

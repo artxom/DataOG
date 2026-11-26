@@ -46,6 +46,9 @@ class WorkbenchStore {
       llmProviders: [],
       llmModels: [],
       standardDictSummary: { total_count: 0, filename: "未导入", imported_at: "" },
+      platformAbi: "4.0",
+      plugins: [],
+      pluginSummary: null,
       modules: [],
       logs: [],
 
@@ -126,6 +129,15 @@ class WorkbenchStore {
     this.state.llmModels = data.llm_models || [];
     if (data.standard_dict_summary) {
       this.state.standardDictSummary = data.standard_dict_summary;
+    }
+    if (data.platform_abi) {
+      this.state.platformAbi = String(data.platform_abi);
+    }
+    if (Array.isArray(data.plugins)) {
+      this.state.plugins = data.plugins;
+    }
+    if (data.plugin_summary) {
+      this.state.pluginSummary = data.plugin_summary;
     }
     this.state.modules = data.modules || [];
     this.state.logs = data.logs || [];

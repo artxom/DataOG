@@ -157,6 +157,7 @@ class StorageLayout:
     tmp_dir: str
     legacy_app_data_dir: str
     updates_dir: str = ""
+    plugins_dir: str = ""
     is_env_overridden: bool = False
 
     def ensure_directories(self) -> None:
@@ -179,7 +180,10 @@ class StorageLayout:
             self.assets_dir,
             self.logs_dir,
             self.tmp_dir,
+            self.plugins_dir,
         ):
+            if not sub:
+                continue
             os.makedirs(sub, exist_ok=True)
             _apply_hidden_dir_attrs(sub)
 
@@ -225,6 +229,7 @@ def resolve_private_storage_layout(
         tmp_dir=os.path.join(root, "rt_tmp"),
         legacy_app_data_dir=os.path.join(get_app_install_dir(), "data"),
         updates_dir=os.path.join(root, "rt_upd"),
+        plugins_dir=os.path.join(root, "rt_plg"),
         is_env_overridden=is_overridden,
     )
     if create_dirs:
@@ -233,7 +238,7 @@ def resolve_private_storage_layout(
 
 
 _INTERNAL_STORAGE_SEGMENT_RE = re.compile(
-    r"(?:(?:\\{1,2}|/)(?:ws_store|ext_drv|res_obj|rt_log|rt_tmp|rt_upd|\.chk))(?:(?:\\{1,2}|/)[^'\"\s,;:)\]}]+)?",
+    r"(?:(?:\\{1,2}|/)(?:ws_store|ext_drv|res_obj|rt_log|rt_tmp|rt_upd|rt_plg|\.chk))(?:(?:\\{1,2}|/)[^'\"\s,;:)\]}]+)?",
 )
 _OBFUSCATED_FILE_RE = re.compile(
     r"\b(?:idx_[0-9a-f]{8}\.dat|s_[0-9a-f]{8,10}\.dat|m_[0-9a-f]{10}\.bin|rt_svc\.log)\b"
@@ -304,6 +309,7 @@ def redact_private_storage_paths(
             ("workspace_hub", "workspaces_dir"),
             ("workspace_hub", "tmp_dir"),
             ("update_hub", "updates_dir"),
+            ("plugin_hub", "plugins_dir"),
         ):
             holder = getattr(ctx, attr_holder, None)
             val = str(getattr(holder, attr_name, "") or "") if holder is not None else ""

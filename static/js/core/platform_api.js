@@ -53,6 +53,38 @@ export const platformApi = {
       method: "DELETE",
     }),
 
+  // 4.0 外置应用插件中心 (PluginHub)
+  getPluginStatus: () => requestJson("/api/platform/plugins/status", { cache: "no-store" }),
+  inspectPluginPackage: (file) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFormData("/api/platform/plugins/inspect", fd);
+  },
+  uploadPluginPackage: (file) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFormData("/api/platform/plugins/upload", fd);
+  },
+  scanPluginPackages: () =>
+    requestJson("/api/platform/plugins/scan", { method: "POST" }),
+  enablePlugin: (pluginId) =>
+    requestJson(`/api/platform/plugins/${encodeURIComponent(pluginId)}/enable`, {
+      method: "POST",
+    }),
+  disablePlugin: (pluginId) =>
+    requestJson(`/api/platform/plugins/${encodeURIComponent(pluginId)}/disable`, {
+      method: "POST",
+    }),
+  rollbackPlugin: (pluginId) =>
+    requestJson(`/api/platform/plugins/${encodeURIComponent(pluginId)}/rollback`, {
+      method: "POST",
+    }),
+  uninstallPlugin: (pluginId, { purgeData = false } = {}) =>
+    requestJson(
+      `/api/platform/plugins/${encodeURIComponent(pluginId)}?purge_data=${purgeData ? "true" : "false"}`,
+      { method: "DELETE" }
+    ),
+
   // 外观壁纸与软件/模块图标本地持久化 (AssetStore)
   getAppearance: () => requestJson("/api/platform/appearance"),
   updateAppearance: (payload) =>
