@@ -209,6 +209,16 @@ def tokenize_sql(sql: str) -> Tuple[List[SqlToken], List[int]]:
             i = n if nl == -1 else nl + 1
             continue
 
+        # MySQL / Doris / StarRocks / TiDB 单行注释 #（仅行首或分号后且非 PG JSONB `#>`/`#>>`/`#-` 运算符）
+        if ch == "#" and (i + 1 >= n or sql[i + 1] not in (">", "-")):
+            line_start = sql.rfind("\n", 0, i) + 1
+            is_line_lead = sql[line_start:i].strip() == ""
+            after_semi = bool(tokens and tokens[-1].kind == "SEMI")
+            if is_line_lead or after_semi:
+                nl = sql.find("\n", i + 1)
+                i = n if nl == -1 else nl + 1
+                continue
+
         # 块注释 /* ... */
         if ch == "/" and i + 1 < n and sql[i + 1] == "*":
             end_blk = sql.find("*/", i + 2)
@@ -1005,7 +1015,7 @@ def _split_top_level_by_comma(tokens: Sequence[SqlToken], start: int, end: int) 
 
 
 def _split_statements(tokens: Sequence[SqlToken]) -> List[Tuple[int, int]]:
-    """按 paren_depth == 0 的分号切分顶层及过程体内部语句."""
+    """按 paren_depth == 0 的分号（以及 Oracle/DWS 独立成行的 `/` 块结束符）切分顶层及过程体内部语句."""
     stmts: List[Tuple[int, int]] = []
     depth = 0
     seg_start = 0
@@ -1016,6 +1026,21 @@ def _split_statements(tokens: Sequence[SqlToken]) -> List[Tuple[int, int]]:
         elif tok.kind == "RP":
             depth = max(0, depth - 1)
         elif tok.kind == "SEMI" and depth == 0:
+            if i > seg_start:
+                stmts.append((seg_start, i))
+            seg_start = i + 1
+        elif (
+            depth == 0
+            and tok.kind == "OP"
+            and tok.raw == "/"
+            and (i == 0 or tokens[i - 1].line < tok.line)
+            and (i + 1 >= n or tokens[i + 1].line > tok.line)
+            and (
+                i == 0
+                or tokens[i - 1].kind in ("SEMI", "DOLLAR_DELIM")
+                or (tokens[i - 1].kind == "WORD" and tokens[i - 1].upper == "END")
+            )
+        ):
             if i > seg_start:
                 stmts.append((seg_start, i))
             seg_start = i + 1
@@ -1627,7 +1652,7 @@ class _DeterministicSqlRewriter:
             return
 
         if obj_kw == "INDEX":
-            # CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON [s.]tbl [USING btree] (c1, c2)
+            # CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON [s.]tbl [USING btree] (c1, LOWER(c2)) [INCLUDE (...)] [WHERE ...]
             k = i
             while k < end and not (toks[k].kind == "WORD" and toks[k].upper == "ON"):
                 k += 1
@@ -1637,11 +1662,40 @@ class _DeterministicSqlRewriter:
             spec, _ = self.registry.resolve_table(sch, tbl, self.active_default_schema)
             if spec is None:
                 return
+            idx_binding = _TableBinding(
+                alias=spec.table_name.lower(),
+                raw_alias=spec.table_name,
+                schema_name=spec.schema_name,
+                table_name=spec.table_name,
+                spec=spec,
+            )
+            idx_scope_ctx = {
+                "parent": None,
+                "ctes": {},
+                "tables": [idx_binding],
+                "alias_map": {idx_binding.alias: idx_binding},
+            }
             while nxt < end and toks[nxt].kind != "LP":
                 nxt += 1
             if nxt < end and toks[nxt].kind == "LP":
                 rp = _find_matching_rp(toks, nxt, end)
-                self._rewrite_column_list_for_spec(nxt + 1, rp, spec, "CREATE INDEX")
+                self._resolve_scope_columns(
+                    nxt + 1, rp, scope_ctx=idx_scope_ctx, protected=set(), child_ranges=[]
+                )
+                tail = rp + 1
+                while tail < end:
+                    tk = toks[tail]
+                    if tk.kind == "WORD" and tk.upper == "INCLUDE" and tail + 1 < end and toks[tail + 1].kind == "LP":
+                        inc_rp = _find_matching_rp(toks, tail + 1, end)
+                        self._rewrite_column_list_for_spec(tail + 2, inc_rp, spec, "CREATE INDEX INCLUDE")
+                        tail = inc_rp + 1
+                        continue
+                    if tk.kind == "WORD" and tk.upper == "WHERE":
+                        self._resolve_scope_columns(
+                            tail + 1, end, scope_ctx=idx_scope_ctx, protected=set(), child_ranges=[]
+                        )
+                        break
+                    tail += 1
             return
 
         if obj_kw == "TABLE":
@@ -1677,6 +1731,9 @@ class _DeterministicSqlRewriter:
                 if spec is not None:
                     self._process_create_table_body(k + 1, rp, spec)
                     self._process_create_table_tail(rp + 1, end, spec)
+                else:
+                    # 即使子表本身未改名，也需同步其中 FOREIGN KEY ... REFERENCES <已改名父表> (col) 引用
+                    self._rewrite_references_clauses(k + 1, rp)
                 return
 
             # CREATE TABLE t AS SELECT ... / CREATE TABLE t AS (SELECT ...)
@@ -1738,7 +1795,7 @@ class _DeterministicSqlRewriter:
             if seg_s >= seg_e:
                 continue
             t0 = toks[seg_s]
-            # Table-level constraints: PRIMARY KEY (col), UNIQUE (col), FOREIGN KEY (col), CHECK (expr)
+            # Table-level constraints: PRIMARY KEY (col), UNIQUE (col), FOREIGN KEY (col), CHECK (expr), REFERENCES tbl (col)
             if t0.kind == "WORD" and t0.upper in _DDL_TABLE_CONSTRAINT_STARTS:
                 k = seg_s
                 while k < seg_e:
@@ -1756,6 +1813,9 @@ class _DeterministicSqlRewriter:
                             )
                             k = rp + 1
                             continue
+                    if toks[k].kind == "WORD" and toks[k].upper == "REFERENCES":
+                        k = self._rewrite_single_references_at(k, seg_e)
+                        continue
                     k += 1
                 continue
 
@@ -1826,8 +1886,69 @@ class _DeterministicSqlRewriter:
                             ),
                         )
 
-            # Inline column-level CHECK (...) and GENERATED [ALWAYS] AS (...) expressions
+            # Inline MySQL/Doris/StarRocks column COMMENT '...' sync when rewrite_comments=True
+            if self.options.rewrite_comments:
+                m_cmt = m_ren or spec.all_map.get(col_lower)
+                if m_cmt is not None and m_cmt.comment_changed and m_cmt.current_col_comment:
+                    ck = seg_s + 1
+                    while ck + 1 < seg_e:
+                        if toks[ck].kind == "LP":
+                            ck = _find_matching_rp(toks, ck, seg_e) + 1
+                            continue
+                        if (
+                            toks[ck].kind == "WORD"
+                            and toks[ck].upper == "COMMENT"
+                            and toks[ck + 1].kind == "STRING"
+                        ):
+                            cmt_tok = toks[ck + 1]
+                            new_lit = "'" + m_cmt.current_col_comment.replace("'", "''") + "'"
+                            if cmt_tok.raw != new_lit:
+                                self._emit_patch(
+                                    start=cmt_tok.start,
+                                    end=cmt_tok.end,
+                                    replacement_text=new_lit,
+                                    kind="COMMENT_UPDATE",
+                                    confidence="HIGH",
+                                    schema_name=spec.schema_name,
+                                    table_name=spec.table_name,
+                                    original_col=m_cmt.original_col_name,
+                                    current_col=m_cmt.current_col_name,
+                                    risk_level="L4",
+                                    reason=(
+                                        f"CREATE TABLE 行内字段注释同步更新：{spec.fqn}.{m_cmt.current_col_name}"
+                                    ),
+                                )
+                            break
+                        ck += 1
+
+            # Inline column-level CHECK (...), GENERATED [ALWAYS] AS (...) and REFERENCES tbl (col)
             _rewrite_inline_expr_constraints(seg_s + 1, seg_e)
+            self._rewrite_references_clauses(seg_s + 1, seg_e)
+
+    def _rewrite_single_references_at(self, ref_idx: int, end: int) -> int:
+        """从 REFERENCES 关键字位置起解析 `REFERENCES [schema.]tbl (col1, ...)` 并同步父表已改名列."""
+        toks = self.tokens
+        if ref_idx + 1 >= end:
+            return ref_idx + 1
+        r_sch, r_tbl, nxt, _ = _read_qualified_table_name(toks, ref_idx + 1, end)
+        if not r_tbl:
+            return ref_idx + 1
+        ref_spec, _ = self.registry.resolve_table(r_sch, r_tbl, self.active_default_schema)
+        if nxt < end and toks[nxt].kind == "LP":
+            rp = _find_matching_rp(toks, nxt, end)
+            if ref_spec is not None:
+                self._rewrite_column_list_for_spec(nxt + 1, rp, ref_spec, "FOREIGN KEY REFERENCES")
+            return rp + 1
+        return nxt
+
+    def _rewrite_references_clauses(self, start: int, end: int) -> None:
+        toks = self.tokens
+        k = start
+        while k < end:
+            if toks[k].kind == "WORD" and toks[k].upper == "REFERENCES":
+                k = self._rewrite_single_references_at(k, end)
+                continue
+            k += 1
 
     def _process_create_table_tail(self, start: int, end: int, spec: TableChangeSpec) -> None:
         """处理 DISTRIBUTE BY HASH(...) / PARTITION BY RANGE|LIST|HASH(...) / CLUSTERED BY (...)."""
@@ -2384,6 +2505,7 @@ class _DeterministicSqlRewriter:
         exposed_renames: Dict[str, ColumnChangeMapping] = {}
         exposed_types: Dict[str, ColumnChangeMapping] = {}
         preserve_alias_col_idxs: Dict[int, str] = {}
+        explicit_select_aliases: Set[str] = set()
 
         scope_ctx = {
             "parent": parent_scope,
@@ -2408,6 +2530,7 @@ class _DeterministicSqlRewriter:
                         explicit_alias_idx = k + 1
             if explicit_alias_idx is not None:
                 protected.add(explicit_alias_idx)
+                explicit_select_aliases.add(toks[explicit_alias_idx].ident.lower())
                 expr_end = explicit_alias_idx - 1  # before AS
             else:
                 # Check implicit trailing alias: e.g. `t.old_col my_alias` or `SUM(t.amt) total_amt`
@@ -2419,6 +2542,7 @@ class _DeterministicSqlRewriter:
                     ):
                         protected.add(item_e - 1)
                         explicit_alias_idx = item_e - 1
+                        explicit_select_aliases.add(toks[explicit_alias_idx].ident.lower())
                         expr_end = item_e - 1
 
             # Check `SELECT *` or `SELECT t.*`
@@ -2531,6 +2655,57 @@ class _DeterministicSqlRewriter:
                 if _is_ident_tok(toks[k_into]):
                     protected.add(k_into)
                 k_into += 1
+
+        # Protect unqualified references in GROUP BY / HAVING / ORDER BY that shadow an explicit SELECT output alias
+        if explicit_select_aliases and proj_e < end:
+            sorted_cr = sorted(child_ranges, key=lambda x: x[0])
+            in_alias_clause = False
+            depth_cl = 0
+            ck = proj_e
+            while ck < end:
+                jumped = False
+                for cs, ce in sorted_cr:
+                    if cs <= ck <= ce:
+                        ck = ce + 1
+                        jumped = True
+                        break
+                if jumped:
+                    continue
+                tk = toks[ck]
+                if tk.kind == "LP":
+                    if ck + 1 < end and toks[ck + 1].kind == "WORD" and toks[ck + 1].upper in ("SELECT", "WITH"):
+                        ck = _find_matching_rp(toks, ck, end) + 1
+                        continue
+                    depth_cl += 1
+                    ck += 1
+                    continue
+                if tk.kind == "RP":
+                    depth_cl = max(0, depth_cl - 1)
+                    ck += 1
+                    continue
+                if depth_cl == 0 and tk.kind == "WORD":
+                    u = tk.upper
+                    if u in ("GROUP", "ORDER") and ck + 1 < end and toks[ck + 1].kind == "WORD" and toks[ck + 1].upper == "BY":
+                        in_alias_clause = True
+                        ck += 2
+                        continue
+                    if u == "HAVING":
+                        in_alias_clause = True
+                        ck += 1
+                        continue
+                    if u in ("LIMIT", "OFFSET", "FETCH", "FOR", "WINDOW", "QUALIFY", "WHERE", "FROM", "INTO"):
+                        in_alias_clause = False
+                        ck += 1
+                        continue
+                if (
+                    in_alias_clause
+                    and _is_ident_tok(tk)
+                    and tk.ident.lower() in explicit_select_aliases
+                    and not (ck > start and toks[ck - 1].kind == "DOT")
+                    and not (ck + 1 < end and toks[ck + 1].kind in ("DOT", "LP"))
+                ):
+                    protected.add(ck)
+                ck += 1
 
         # Resolve column references across the entire SELECT scope (skipping child_ranges & protected tokens)
         self._resolve_scope_columns(

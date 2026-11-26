@@ -8,6 +8,33 @@
 
 ---
 
+## [3.7.1] - 2026-11-26
+
+> **SQL 脚本自动改写双引擎安全与方言边界深度加固**：封堵轻量模型局部补丁语句/注释/高危 DDL·DML 关键字注入绕过漏洞，修复 MySQL `#` 注释、Oracle `/` 块结束符、SELECT 表达式别名遮蔽、函数/部分索引与跨表外键 `REFERENCES` 漏改缺陷，并修复前端 GB18030/GBK 上传乱码与多标签页状态串扰问题。
+
+### Security
+- **轻量大模型手术刀反幻觉门禁反注入加固 (`modules/standard_migrator/sql_rewrite_llm.py`)**：
+  - 收缩 `_SAFE_SQL_CAST_WORDS` 白名单，新增 `_FORBIDDEN_LLM_ADDED_KEYWORDS` 强制拦截局部补丁新引入 `DROP` / `TRUNCATE` / `DELETE` / `ALTER` / `CREATE` / `GRANT` / `REVOKE` / `UNION` / `EXECUTE` 等语句级或高危关键字；
+  - 加固 `_check_balanced_syntax()`：同步校验双引号平衡与未闭合 `/*` 块注释，并严禁 AI 局部补丁注入新的语句分隔符 `;` 或 `--` / `/*` SQL 注释截断原脚本。
+
+### Fixed
+- **确定性词法/作用域改写方言与 DDL 边界修复 (`modules/standard_migrator/sql_rewriter.py`)**：
+  - 支持 MySQL / Doris / StarRocks / TiDB 行首及分号后 `#` 单行注释（同时完整保留 PostgreSQL JSONB `#>` / `#>>` / `#-` 运算符），修复 `#` 注释吞噬整条后续 SQL 的问题；
+  - 支持 Oracle / DWS 存储过程块尾独立成行的 `/` 结束符切分，修复 `/` 后紧邻 SQL 语句被忽略的问题；
+  - 保护 `GROUP BY` / `HAVING` / `ORDER BY` 中引用显式 `SELECT` 表达式别名的未限定标识符（`WHERE` 仍正常改名），防止 `SELECT TRIM(a.old_col) AS old_col ... GROUP BY old_col` 被误改为 `GROUP BY new_col` 破坏分组语义；
+  - 补齐函数索引 / `INCLUDE (...)` / 部分索引 `WHERE` 谓词改写、子表 `CREATE TABLE` 跨表 `FOREIGN KEY ... REFERENCES <parent> (col)` 改写，以及 MySQL/Doris 行内 `COMMENT '...'` 在 `rewrite_comments=True` 下的同步更新。
+- **「SQL 脚本改写」前端多标签与编码兼容修复 (`static/js/views/standard_migrator/sql_rewrite_panel.js`)**：
+  - 新增 `decodeFileWithFallback()`：浏览器上传/拖拽 `.sql` 与 `.json` 时优先按严格 UTF-8（自动剥离 BOM）解码，遇到 GB18030/GBK 字节流自动回退解码，消除中文注释乱码，并在文件选择器补全 `.pck,.bdy` 扩展名；
+  - 修复重传非首个已存在同名标签页时焦点错误跳回首个标签页、切至未分析空白新标签页误展示其他脚本 Diff 与下载错文件，以及关闭标签页后 `.zip` 导出仍残留已删脚本结果的缺陷。
+- **自动化测试增强 (`tests/test_sql_script_rewriter.py`)**：
+  - 新增 `test_hardening_mysql_oracle_ddl_alias_shadow_and_llm_injection_defense` 并扩展 Node.js 前端运行时校验，覆盖上述全部后端安全/方言与前端编码/多标签回归场景（总测试数增至 **130 项**）。
+
+### Changed
+- **版本号同步发布 (`v3.7.1`)**：
+  - 同步递增 `3.7.0 -> 3.7.1` 至 `app.py`、`core/app_kernel.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md` 与 `AGENTS.md`（严格维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变；**130 项**自动化单元测试全绿）。
+
+---
+
 ## [3.7.0] - 2026-11-26
 
 > **「2. 落标绑定与贯标」基于字段变更历史的 SQL 脚本自动调整（双引擎：确定性词法作用域底座 + 轻量大模型手术刀增强）**：打通 v3.6.0 共享工作区结构化变更日志与下游存量 SQL 脚本治理闭环，零 Token 精准 Span 改写字段名/DDL 类型/注释并输出 L2 类型冲突与 L3 缩精度影响雷达，同时支持按需调度廉价轻量模型（如 `DeepSeek-v4-flash` / `gemini-flash`）对歧义列、跨类型表达式、动态 SQL 与 `JOIN USING` 微切片给出经五道反幻觉门禁校验的局部手术刀补丁。

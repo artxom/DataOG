@@ -38,7 +38,14 @@ _ALLOWED_LLM_CATEGORIES: Set[str] = {
     "USING_REWRITE",
 }
 
-_SAFE_SQL_CAST_WORDS: Set[str] = _SQL_KEYWORDS | {
+_FORBIDDEN_LLM_ADDED_KEYWORDS: Set[str] = {
+    "DROP", "TRUNCATE", "DELETE", "ALTER", "CREATE", "GRANT", "REVOKE",
+    "EXECUTE", "EXEC", "CALL", "COMMIT", "ROLLBACK", "INSERT", "UPDATE",
+    "MERGE", "UNION", "INTERSECT", "EXCEPT", "COPY", "LOAD", "ATTACH",
+    "DETACH", "VACUUM", "PRAGMA", "SHUTDOWN", "KILL", "DO",
+}
+
+_SAFE_SQL_CAST_WORDS: Set[str] = (_SQL_KEYWORDS - _FORBIDDEN_LLM_ADDED_KEYWORDS) | {
     "COALESCE", "NVL", "IFNULL", "NULLIF", "TO_CHAR", "TO_NUMBER", "TO_DATE",
     "TO_TIMESTAMP", "TRIM", "LTRIM", "RTRIM", "SUBSTR", "SUBSTRING", "LENGTH",
     "UPPER", "LOWER", "REPLACE", "ROUND", "TRUNC", "FLOOR", "CEIL", "ABS",
@@ -122,15 +129,27 @@ def _parse_llm_json_payload(raw_text: str) -> Dict[str, Any]:
 
 
 def _check_balanced_syntax(orig_snippet: str, new_snippet: str) -> Tuple[bool, str]:
-    """校验单引号奇偶性与圆括号平衡，防止截断或破坏 SQL 语法."""
+    """校验引号/括号平衡，并阻断新注入语句分隔符 `;` 或注释符 `--`/`/*` 截断 SQL."""
 
-    def _stats(s: str) -> Tuple[int, bool]:
+    def _stats(s: str) -> Tuple[int, bool, bool, bool, int, int, int]:
         in_sq = False
+        in_dq = False
+        in_blk = False
         depth = 0
+        semis = 0
+        line_cmts = 0
+        blk_cmts = 0
         i = 0
         n = len(s)
         while i < n:
             ch = s[i]
+            if in_blk:
+                if ch == "*" and i + 1 < n and s[i + 1] == "/":
+                    in_blk = False
+                    i += 2
+                    continue
+                i += 1
+                continue
             if in_sq:
                 if ch == "'":
                     if i + 1 < n and s[i + 1] == "'":
@@ -139,21 +158,53 @@ def _check_balanced_syntax(orig_snippet: str, new_snippet: str) -> Tuple[bool, s
                     in_sq = False
                 i += 1
                 continue
+            if in_dq:
+                if ch == '"':
+                    if i + 1 < n and s[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_dq = False
+                i += 1
+                continue
+            if ch == "-" and i + 1 < n and s[i + 1] == "-":
+                line_cmts += 1
+                nl = s.find("\n", i + 2)
+                if nl == -1:
+                    break
+                i = nl + 1
+                continue
+            if ch == "/" and i + 1 < n and s[i + 1] == "*":
+                blk_cmts += 1
+                in_blk = True
+                i += 2
+                continue
             if ch == "'":
                 in_sq = True
+            elif ch == '"':
+                in_dq = True
             elif ch == "(":
                 depth += 1
             elif ch == ")":
                 depth -= 1
+            elif ch == ";":
+                semis += 1
             i += 1
-        return depth, in_sq
+        return depth, in_sq, in_dq, in_blk, semis, line_cmts, blk_cmts
 
-    o_depth, o_in_sq = _stats(orig_snippet)
-    n_depth, n_in_sq = _stats(new_snippet)
-    if o_in_sq != n_in_sq:
+    o_depth, o_sq, o_dq, o_blk, o_semis, o_lcmt, o_bcmt = _stats(orig_snippet)
+    n_depth, n_sq, n_dq, n_blk, n_semis, n_lcmt, n_bcmt = _stats(new_snippet)
+    if o_sq != n_sq:
         return False, "单引号未闭合"
+    if o_dq != n_dq:
+        return False, "双引号未闭合"
+    if n_blk and not o_blk:
+        return False, "块注释未闭合"
     if o_depth != n_depth:
         return False, "圆括号层级不平衡"
+    if n_semis > o_semis:
+        return False, "禁止在局部补丁中注入新的语句分隔符 `;`"
+    if n_lcmt > o_lcmt or n_bcmt > o_bcmt:
+        return False, "禁止在局部补丁中注入新的 SQL 注释"
     return True, ""
 
 
@@ -531,6 +582,16 @@ def enhance_sql_rewrite_with_llm(
         reverted_hits = [w for w in added_idents if w in reverted_old_names]
         if reverted_hits:
             rejected_reasons.append(f"L{actual_ln}: 试图回退已改名旧字段 {reverted_hits}，已拦截")
+            continue
+
+        # Gate 5a-2: Reject if LLM newly introduces destructive/statement-level SQL verbs (e.g. DROP/DELETE/TRUNCATE)
+        forbidden_kw_hits = [
+            w for w in added_idents if w.upper() in _FORBIDDEN_LLM_ADDED_KEYWORDS
+        ]
+        if forbidden_kw_hits:
+            rejected_reasons.append(
+                f"L{actual_ln}: 局部补丁禁止新引入高危/语句级关键字 {forbidden_kw_hits}，已拦截"
+            )
             continue
 
         # Gate 5b: Newly added SQL identifiers must be known target cols, safe SQL keywords/funcs,
