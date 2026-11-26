@@ -18,6 +18,7 @@ import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
 import { ChangelogPanel, createRiskBadge } from "./standard_migrator/changelog_panel.js";
 import { StandardMigratorModalsMixin } from "./standard_migrator/modals.js";
+import { SqlRewritePanel } from "./standard_migrator/sql_rewrite_panel.js";
 
 function makeAbortError() {
   const err = new Error("AbortError");
@@ -133,6 +134,7 @@ export class StandardMigratorView {
     this.maxWorkers = 5;
     this.keepBackup = true;
     this.changelogPanel = new ChangelogPanel(this);
+    this.sqlRewritePanel = new SqlRewritePanel(this);
 
     let initWidth = SIDEBAR_WIDTH_DEFAULT;
     try {
@@ -343,6 +345,7 @@ export class StandardMigratorView {
     this._unsubStore?.();
     this._unsubStore = null;
     this.changelogPanel?.destroy?.();
+    this.sqlRewritePanel?.destroy?.();
     this.activityBar?.destroy();
     this.tree?.destroy();
   }
@@ -521,6 +524,12 @@ export class StandardMigratorView {
     }
     if (this.subMode === "changelog") {
       await this.changelogPanel.load({ silent: true });
+      this.render();
+      this.onStateUpdate?.();
+      return;
+    }
+    if (this.subMode === "sql_rewrite") {
+      await this.sqlRewritePanel.loadContext({ silent: true });
       this.render();
       this.onStateUpdate?.();
       return;
@@ -1707,6 +1716,18 @@ export class StandardMigratorView {
         el("button", {
           type: "button",
           className: "mac-btn mac-btn-sm",
+          title: "基于生效中的字段变更台账，智能自动改写业务 SQL 脚本",
+          text: "SQL 脚本改写",
+          onClick: async () => {
+            this.subMode = "sql_rewrite";
+            this.render();
+            this.onStateUpdate?.();
+            await this.sqlRewritePanel.loadContext({ silent: true });
+          },
+        }),
+        el("button", {
+          type: "button",
+          className: "mac-btn mac-btn-sm",
           text: "导出 Excel",
           onClick: () =>
             this._runExportReportTask(
@@ -1716,6 +1737,11 @@ export class StandardMigratorView {
             ),
         })
       );
+    }
+
+    if (this.subMode === "sql_rewrite") {
+      this._queueExecBatchBtn = null;
+      return this.sqlRewritePanel.renderHeaderActions();
     }
 
     this._queueExecBatchBtn = null;
@@ -2151,6 +2177,10 @@ export class StandardMigratorView {
           id: "changelog",
           label: appliedChangelogCount > 0 ? `变更日志与回滚 (${appliedChangelogCount})` : "变更日志与回滚",
         },
+        {
+          id: "sql_rewrite",
+          label: "SQL 脚本改写",
+        },
       ].map((t) => {
         const btn = el("button", {
           type: "button",
@@ -2174,6 +2204,12 @@ export class StandardMigratorView {
               this.render();
               this.onStateUpdate?.();
               await this.changelogPanel.load({ silent: true });
+              return;
+            }
+            if (t.id === "sql_rewrite") {
+              this.render();
+              this.onStateUpdate?.();
+              await this.sqlRewritePanel.loadContext({ silent: true });
               return;
             }
             this.render();
@@ -2217,6 +2253,10 @@ export class StandardMigratorView {
       this._bindingsGrid = null;
       this._queueGrid = null;
       this.changelogPanel.render();
+    } else if (this.subMode === "sql_rewrite") {
+      this._bindingsGrid = null;
+      this._queueGrid = null;
+      this.sqlRewritePanel.render();
     } else {
       this._renderQueueView();
     }

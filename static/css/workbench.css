@@ -6366,3 +6366,286 @@ dialog::backdrop {
   border: 0.5px solid var(--os-border);
   font-size: 11.5px;
 }
+
+/* =========================================================================
+ * SQL 脚本智能改写工作台 (SqlRewritePanel)
+ * ========================================================================= */
+.sql-rewrite-split {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(300px, 44%) minmax(360px, 56%);
+  gap: 10px;
+  padding: 10px 14px 12px;
+  overflow: hidden;
+}
+.sql-rewrite-pane {
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border-radius: 10px;
+  border: 0.5px solid var(--os-border-strong);
+  background: var(--os-win-bg);
+  overflow: hidden;
+}
+.sql-rewrite-left.is-dragover {
+  border-color: var(--os-accent);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--os-accent) 26%, transparent);
+}
+.sql-rewrite-pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 11px;
+  border-bottom: 0.5px solid var(--os-border);
+  background: var(--os-subtle-bg);
+  flex-shrink: 0;
+}
+.sql-rewrite-file-tabs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border-bottom: 0.5px solid var(--os-border);
+  overflow-x: auto;
+  flex-shrink: 0;
+  background: var(--os-win-bg);
+}
+.sql-rewrite-file-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 0.5px solid var(--os-border);
+  background: var(--os-subtle-bg);
+  font-size: 11.5px;
+  cursor: pointer;
+  flex-shrink: 0;
+  max-width: 210px;
+}
+.sql-rewrite-file-tab.is-active {
+  border-color: var(--os-accent);
+  background: color-mix(in srgb, var(--os-accent) 12%, var(--os-win-bg));
+  color: var(--os-text);
+  font-weight: 600;
+}
+.sql-rewrite-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sql-rewrite-file-close {
+  border: none;
+  background: transparent;
+  color: var(--os-muted);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 13px;
+  line-height: 1;
+}
+.sql-rewrite-file-close:hover {
+  color: var(--status-danger);
+}
+.sql-rewrite-editor {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  resize: none;
+  border: none;
+  outline: none;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.55;
+  background: transparent;
+  color: var(--os-text);
+  tab-size: 2;
+}
+.sql-rewrite-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 28px 20px;
+}
+.sql-rewrite-result-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 0.5px solid var(--os-border);
+  background: var(--os-win-bg);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.sql-rewrite-llm-banner {
+  padding: 6px 11px;
+  font-size: 11.5px;
+  color: var(--os-text-secondary);
+  background: color-mix(in srgb, var(--os-accent) 8%, var(--os-subtle-bg));
+  border-bottom: 0.5px solid var(--os-border);
+  flex-shrink: 0;
+}
+.sql-rewrite-result-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.sql-rewrite-body-pad {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.sql-diff-viewer {
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 6px 0;
+}
+.sql-diff-line {
+  display: grid;
+  grid-template-columns: 40px 40px 18px 1fr;
+  padding: 1px 10px 1px 6px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.sql-diff-line.is-del {
+  background: rgba(255, 59, 48, 0.12);
+}
+.sql-diff-line.is-add {
+  background: rgba(40, 205, 65, 0.13);
+}
+.sql-diff-line.is-hunk {
+  display: block;
+  text-align: center;
+  color: var(--os-muted);
+  background: var(--os-subtle-bg);
+  padding: 2px 0;
+  margin: 2px 0;
+}
+.sql-diff-ln {
+  text-align: right;
+  padding-right: 6px;
+  color: var(--os-muted);
+  user-select: none;
+  font-size: 11px;
+}
+.sql-diff-sign {
+  text-align: center;
+  font-weight: 700;
+  user-select: none;
+}
+.sql-diff-line.is-del .sql-diff-sign { color: #cf222e; }
+.sql-diff-line.is-add .sql-diff-sign { color: #1a7f37; }
+.sql-rewrite-bulk-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.sql-rewrite-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.sql-rewrite-patch-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 0.5px solid var(--os-border);
+  background: var(--os-subtle-bg);
+  cursor: pointer;
+}
+.sql-rewrite-patch-card.is-checked {
+  border-color: color-mix(in srgb, var(--os-accent) 45%, var(--os-border));
+  background: color-mix(in srgb, var(--os-accent) 6%, var(--os-win-bg));
+}
+.sql-rewrite-patch-diff {
+  font-size: 12px;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: var(--os-win-bg);
+  border: 0.5px solid var(--os-border);
+  word-break: break-all;
+}
+.sql-snippet-del {
+  color: #cf222e;
+  background: rgba(255, 59, 48, 0.11);
+  padding: 1px 4px;
+  border-radius: 4px;
+  text-decoration: line-through;
+}
+.sql-snippet-add {
+  color: #1a7f37;
+  background: rgba(40, 205, 65, 0.14);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-weight: 600;
+}
+.sql-rewrite-patch-reason {
+  font-size: 11.5px;
+  color: var(--os-text-secondary);
+}
+.sql-rewrite-adv-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 0.5px solid var(--os-border);
+  background: var(--os-subtle-bg);
+}
+.sql-rewrite-adv-card.is-error {
+  border-color: rgba(255, 59, 48, 0.35);
+  background: rgba(255, 59, 48, 0.06);
+}
+.sql-rewrite-adv-card.is-warn {
+  border-color: rgba(255, 149, 0, 0.35);
+  background: rgba(255, 149, 0, 0.06);
+}
+.sql-rewrite-line-ctx {
+  font-size: 11px;
+  padding: 4px 7px;
+  border-radius: 5px;
+  background: var(--os-win-bg);
+  border: 0.5px solid var(--os-border);
+  color: var(--os-text-secondary);
+  overflow-x: auto;
+  white-space: pre;
+}
+.sql-rewrite-mappings-list {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sql-rewrite-mapping-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 0.5px solid var(--os-border);
+  background: var(--os-subtle-bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  .sql-diff-line.is-del .sql-diff-sign,
+  .sql-snippet-del { color: #ff6961; }
+  .sql-diff-line.is-add .sql-diff-sign,
+  .sql-snippet-add { color: #63e677; }
+}
+:root:has(> head > meta[name="color-scheme"][content="dark"]) .sql-diff-line.is-del .sql-diff-sign,
+:root:has(> head > meta[name="color-scheme"][content="dark"]) .sql-snippet-del { color: #ff6961; }
+:root:has(> head > meta[name="color-scheme"][content="dark"]) .sql-diff-line.is-add .sql-diff-sign,
+:root:has(> head > meta[name="color-scheme"][content="dark"]) .sql-snippet-add { color: #63e677; }

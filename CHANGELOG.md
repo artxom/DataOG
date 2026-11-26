@@ -8,6 +8,32 @@
 
 ---
 
+## [3.7.0] - 2026-11-26
+
+> **「2. 落标绑定与贯标」基于字段变更历史的 SQL 脚本自动调整（双引擎：确定性词法作用域底座 + 轻量大模型手术刀增强）**：打通 v3.6.0 共享工作区结构化变更日志与下游存量 SQL 脚本治理闭环，零 Token 精准 Span 改写字段名/DDL 类型/注释并输出 L2 类型冲突与 L3 缩精度影响雷达，同时支持按需调度廉价轻量模型（如 `DeepSeek-v4-flash` / `gemini-flash`）对歧义列、跨类型表达式、动态 SQL 与 `JOIN USING` 微切片给出经五道反幻觉门禁校验的局部手术刀补丁。
+
+### Added
+- **Stage 1 纯确定性 SQL 词法/作用域改写底座与静态类型影响雷达 (`modules/standard_migrator/sql_rewriter.py`)**：
+  - 零外部依赖、0 Token、100% 精准 Span 替换：完整保留原始缩进、CRLF/LF 换行、注释与双引号/反引号/方括号风格，绝不误改字符串字面量、注释或函数名；支持自动解包 PL/pgSQL / DWS 过程体 `$$...$$` 并识别 `DECLARE` / `FOR LOOP` 局部作用域变量防误改；
+  - 深度嵌套作用域解析：覆盖 `WITH [RECURSIVE]` 多层 CTE（可选 `propagate` 透传或 `preserve_alias` 保留旧列别名）、`FROM/JOIN` 别名、逗号连接、派生表与相关子查询、`UNION/INTERSECT/EXCEPT`（含末段 `ORDER BY`）、`INSERT`/`UPDATE`/`DELETE`/`MERGE`/`UPSERT`/`CREATE TABLE`/`CHECK`/`GENERATED`/`CREATE INDEX`/`COMMENT ON COLUMN`，兼容 `A→B→C` 历史中间名折叠、列互换（`a↔b`）与二次执行幂等性；
+  - 静态 L2/L3 影响雷达：精准识别字面量类型冲突、函数参数不兼容、`NVL/COALESCE` 默认值冲突、`CAST/::` 强转复核、跨类型 JOIN 预警、L3 缩精度写入截断风险、`JOIN USING` 单侧改名冲突、动态 SQL 字符串命中、`SELECT *` 输出结构变化及 `ALTER TABLE` 历史脚本复核。
+- **Stage 2 轻量大模型手术刀级混合增强与五道反幻觉门禁 (`modules/standard_migrator/sql_rewrite_llm.py`)**：
+  - 面向廉价轻量模型（优先推荐已就绪 `lightweight` 档模型如 `DeepSeek-v4-flash`）：无待决热点时 0-Token 短路不发起远端调用；有热点时仅提取周边 ±8 行微切片，以 `temperature=0.0`、`thinking_mode="off"` 输出结构化 JSON 局部补丁（`TYPE_ADAPT` / `AMBIGUOUS_RENAME` / `DYNAMIC_SQL` / `USING_REWRITE` / `ALIAS_FIX`）；
+  - 五道确定性反幻觉门禁：逐条核验原始片段 verbatim 定位、禁止撤回高置信确定性改名、目标列与安全函数白名单校验、引号/括号语法平衡校验及替换膨胀上限校验；全量标注 `source="LLM"` 与改写理由供审校。
+- **服务层混入、API 端点与多文件批量改写/审计包导出 (`modules/standard_migrator/sql_rewrite_mixin.py`, `router.py`, `schemas.py`, `service.py`)**：
+  - 支持直接消费当前共享工作区变更台账、按 Checkpoint 起点增量切片，或导入离线 `changelog.json` 净映射底座；
+  - 新增 `GET /sql-rewrite/context`、`POST /sql-rewrite/analyze`、`POST /sql-rewrite/upload`（单次支持最多 50 份、单文件上限 4MB 的 `.sql`/`.ddl`/`.prc`/`.fnc`/`.vw`/`.hql`/`.plsql` 等多编码脚本）与 `POST /sql-rewrite/export-zip`（一键打包改写后 SQL、Unified Diff 与改写审计清单）。
+- **「2. 落标绑定与贯标」第 4 个子页签「SQL 脚本改写」(`static/js/views/standard_migrator/sql_rewrite_panel.js`, `standard_migrator_view.js`, `migrator_api.js`, `workbench.css`)**：
+  - 提供单脚本粘贴与多文件批量上传双入口、数据源/Checkpoint 起点与「确定性模式 / 轻量 AI 混合增强」切换、置信度/来源/风险筛选、交互式逐条补丁勾选（前端实时重算 Unified Diff 与最终 SQL，零 `innerHTML`）、影响雷达定位及 `.sql` / `.zip` 审计包一键下载。
+- **自动化单元测试 (`tests/test_sql_script_rewriter.py`)**：
+  - 新增 6 项深度自动化测试，覆盖确定性作用域/CTE/DML/DDL/列互换与幂等性、L2/L3 影响雷达与动态 SQL、轻量模型 0-Token 短路与五道反幻觉门禁、工作区/Checkpoint/上传/ZIP 端到端 API、前端安全语法与 Node.js 运行时补丁合成，以及复杂方言/CRLF/对抗性护栏回归（总测试数增至 **129 项**）。
+
+### Changed
+- **版本号同步发布 (`v3.7.0`)**：
+  - 同步递增 `3.6.0 -> 3.7.0` 至 `app.py`、`core/app_kernel.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md` 与 `AGENTS.md`（严格维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变；**129 项**自动化单元测试全绿）。
+
+---
+
 ## [3.6.0] - 2026-11-26
 
 > **「2. 落标绑定与贯标」四级危险程度分级标色、共享工作区结构化变更日志与 Checkpoint 一键回滚（Phase 1）**：为高风险数据库直连贯标操作建立事前分级标色拦截与事后可追溯、可打点、可逆序一键回滚的安全保护体系，并将净列映射变更台账沉淀至 Layer 3 共享工作区作为下期 SQL 智能落标改写底座。

@@ -1,4 +1,4 @@
-# Data.O.G v3.6.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.7.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -62,9 +62,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.6.0，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.7.0，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.6.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.7.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -106,7 +106,7 @@ DataOG/
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 156×162 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 123 项全量自动化测试（四级危险分级标色拦截与共享工作区变更日志/Checkpoint 一键回滚、DGP2 加密混淆增量包与银行邮件网关零明文防线/防降级/信封防篡改、标准字典性能优化与AN-AS栏位对齐、落标绑定侧栏缩放/统计口径双开关/原位防跳顶/跳已落标/执行核验3秒渐隐/Schema模板、确定性 SQL 静态血缘/隐患剖析与语义压缩、四级动态模型能力探查与超时重试减载续写、ExecutionPlanner 与持久化 🎯 /goal 硬验收补救断点续跑闭环、AI 助手长上下文重构/Thinking 深度思考与 SSE 实时流式输出、Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断与全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与大纲按行探索 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
+├── tests/                        # 129 项全量自动化测试（基于变更历史的 SQL 脚本确定性改写与轻量 AI 五道反幻觉门禁、四级危险分级标色拦截与共享工作区变更日志/Checkpoint 一键回滚、DGP2 加密混淆增量包与银行邮件网关零明文防线/防降级/信封防篡改、标准字典性能优化与AN-AS栏位对齐、落标绑定侧栏缩放/统计口径双开关/原位防跳顶/跳已落标/执行核验3秒渐隐/Schema模板、确定性 SQL 静态血缘/隐患剖析与语义压缩、四级动态模型能力探查与超时重试减载续写、ExecutionPlanner 与持久化 🎯 /goal 硬验收补救断点续跑闭环、AI 助手长上下文重构/Thinking 深度思考与 SSE 实时流式输出、Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断与全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与大纲按行探索 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
 ├── build_update_pack.py          # 同二级版本累积增量包 (DataOG-Update-vX.Y.Z.zip) DGP2 加密混淆 + Ed25519 签名构建脚本
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 纯净打包脚本（支持 --skip-tests、内置 static/dataog.ico 图标并严格剔除 tests/）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
@@ -162,7 +162,8 @@ DataOG/
 | **`v3.5.3`** | `fix/v3.5.3-standard-dict-perf-and-an-as-fields` → `main` | **「1. 标准字典」卡顿根治与模板 AN–AS 物理格式栏位对齐**：`search_standards` 无关键词直走主键索引并支持 `include_summary=false` 按需汇总；移除 `dialog::backdrop` 全屏模糊与 `tr` `contain`，重构 `StandardDictView` 常驻 DOM + `DataGrid.setData()` + IME 防抖 + `AbortController` + `destroy()` 及 `StandardView` 惰性实例化；新增/编辑弹窗物理格式严格对齐模板 `AN`–`AS` 六列（`ocenbase-oracle` 至 `仓库DWS数据格式`）并完整保留历史非表单字段（118 项测试全绿） |
 | **`v3.5.4`** | `chore/v3.5.4-gc-and-docs-reorg` → `main` | **全仓垃圾回收、死代码清理、文档重整与演示沙箱闭环修复**：系统性核查并清理底座/模块/前端/沙箱经确认死代码、旧 `static/js/core/api.js` 兼容层、冗余 CSS 及过期字节码；修复 `demo_sandbox/workspace_builder.py` 导出工作区名称/描述覆盖与 `dwd_acct_swap_demo` 保序重建缓存提示；归档 `docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md` 并全仓同步 `MODULE_SDK_3_0.md`、`knowledge_packs/README.md`、`DEMO_PLAYBOOK.md` 与根文档（118 项测试全绿） |
 | **`v3.5.5`** | `feat/v3.5.5-migrator-drawer-schema-refresh` → `main` | **「2. 落标绑定与贯标」可折叠对标设置抽屉 + 全 Schema 刷新与落标比对**：释放左上角侧栏空间，将「当前库落标标准」与目录树统计口径开关迁入默认收起的右侧模块化可扩展「对标设置」抽屉；`check-compliance` 与抽屉新增 `scope=schema`/`all_schemas` + `refresh_catalog` 一键全 Schema 刷新并重算全量落标统计与 `col_count`（119 项测试全绿） |
-| **`v3.6.0`**（当前正式版） | `feat/migration-risk-changelog-rollback` → `main` | **贯标四级危险分级标色拦截、共享工作区结构化变更日志与 Checkpoint 一键回滚**：建立 L1 改名 / L2 转类型 / L3 缩精度 / L4 安全四级分类与队列标色、高危快捷取消/移出及执行前汇总确认；在 Layer 3 共享工作区持久化 `migration_change_logs` 与 `migration_checkpoints`，提供时间线打点、冲突拦截、`_bak_` 备份表无损切回与轻量逆向 DDL 断点续滚，自动逆向还原字段绑标并导出折叠净映射 JSON 底座（123 项测试全绿） |
+| **`v3.6.0`** | `feat/migration-risk-changelog-rollback` → `main` | **贯标四级危险分级标色拦截、共享工作区结构化变更日志与 Checkpoint 一键回滚**：建立 L1 改名 / L2 转类型 / L3 缩精度 / L4 安全四级分类与队列标色、高危快捷取消/移出及执行前汇总确认；在 Layer 3 共享工作区持久化 `migration_change_logs` 与 `migration_checkpoints`，提供时间线打点、冲突拦截、`_bak_` 备份表无损切回与轻量逆向 DDL 断点续滚，自动逆向还原字段绑标并导出折叠净映射 JSON 底座（123 项测试全绿） |
+| **`v3.7.0`**（当前正式版） | `feat/sql-script-rewriter` → `main` | **基于字段变更历史的 SQL 脚本自动调整（确定性词法作用域底座 + 轻量 AI 手术刀增强）**：在「2. 落标绑定与贯标」新增「SQL 脚本改写」工作台，消费共享工作区变更日志 / Checkpoint 增量 / 离线 `changelog.json`，零 Token 精准 Span 改写 CTE/子查询/DML/DDL/PL/pgSQL 过程体并输出 L2/L3 类型影响雷达；支持按需调用廉价轻量模型（如 `DeepSeek-v4-flash`）对歧义列、跨类型表达式、动态 SQL 与 `JOIN USING` 微切片输出经五道反幻觉门禁核验的局部补丁，支持交互式逐条勾选 Diff 预览与多文件 `.sql`/`.zip` 审计包导出（129 项测试全绿） |
 
 ---
 
@@ -173,7 +174,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（123 项，发布前本地执行）
+# 运行全量自动化单元测试（129 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）
