@@ -12,6 +12,7 @@ import { Modal } from "../../ui/modal.js";
 import { SqlCodeBox } from "../../ui/sql_code_box.js";
 import { Toast } from "../../ui/toast.js";
 import { openUploadWizardModal } from "../../ui/upload_wizard_modal.js";
+import { createRiskBadge } from "./changelog_panel.js";
 
 export class StandardMigratorModalsMixin {
   openBindingUploadWizard() {
@@ -560,11 +561,18 @@ export class StandardMigratorModalsMixin {
         el(
           "div",
           { style: { display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" } },
+          createRiskBadge(preview),
           preview.connection_name ? badge(preview.connection_name, "neutral") : null,
           badge(preview.dialect || "DWS", "info"),
           strategyBadge,
           ...diffPills
         ),
+        preview.risk_detail
+          ? el("div", {
+              style: { fontSize: "11.5px", color: "var(--os-muted)" },
+              text: `风险说明：${preview.risk_detail}`,
+            })
+          : null,
         sqlBox.root
       );
 
@@ -635,6 +643,12 @@ export class StandardMigratorModalsMixin {
         checked: this.keepBackup,
         onChange: (e) => (this.keepBackup = e.target.checked),
       });
+      let autoCp = true;
+      const autoCpCb = el("input", {
+        type: "checkbox",
+        checked: autoCp,
+        onChange: (e) => (autoCp = Boolean(e.target.checked)),
+      });
 
       const body = el(
         "div",
@@ -648,10 +662,20 @@ export class StandardMigratorModalsMixin {
         ),
         sqlBox.root,
         el(
-          "label",
-          { style: { display: "flex", alignItems: "center", gap: "7px", fontSize: "12px" } },
-          backupCb,
-          el("span", { text: "保留原表时间戳备份 (_bak_...)" })
+          "div",
+          { style: { display: "flex", gap: "16px", flexWrap: "wrap", alignItems: "center" } },
+          el(
+            "label",
+            { style: { display: "flex", alignItems: "center", gap: "7px", fontSize: "12px" } },
+            backupCb,
+            el("span", { text: "保留原表时间戳备份 (_bak_...)" })
+          ),
+          el(
+            "label",
+            { style: { display: "flex", alignItems: "center", gap: "7px", fontSize: "12px" } },
+            autoCpCb,
+            el("span", { text: "执行前自动创建 Checkpoint 还原点" })
+          )
         )
       );
 
@@ -671,12 +695,14 @@ export class StandardMigratorModalsMixin {
                     table_name: tableName,
                     connection_id: preview.connection_id || connId,
                     keep_backup: this.keepBackup,
+                    auto_checkpoint: autoCp,
                   },
                   { taskId, signal }
                 )
             );
             if (this._destroyed) return;
             Modal.close("done");
+            this.changelogPanel?.load?.({ silent: true });
             this._applyStateResponse(res, { animateCompletedOut: true });
           } catch (err) {
             if (isAbortError(err)) return;

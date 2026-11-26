@@ -23,6 +23,8 @@ class ExecuteBatchPayload(BaseModel):
     item_ids: List[int] = Field(default_factory=list)
     max_workers: int = Field(default=5, ge=1, le=16)
     keep_backup: bool = True
+    auto_checkpoint: bool = False
+    checkpoint_name: str = ""
 
 
 class TableRebuildPayload(BaseModel):
@@ -31,6 +33,20 @@ class TableRebuildPayload(BaseModel):
     connection_id: str = ""
     item_ids: Optional[List[int]] = None
     keep_backup: bool = True
+    auto_checkpoint: bool = False
+    checkpoint_name: str = ""
+
+
+class CreateCheckpointPayload(BaseModel):
+    name: str
+    description: str = ""
+    connection_id: str = ""
+
+
+class RollbackRequestPayload(BaseModel):
+    checkpoint_id: Optional[int] = None
+    change_ids: Optional[List[int]] = None
+    prefer_backup_table: bool = True
 
 
 class DeleteMigrationItemsPayload(BaseModel):

@@ -47,7 +47,7 @@ from core.platform.module_registry import mount_discovered_modules
 from core.platform.router import router as platform_router
 from core.platform.storage_paths import redact_private_storage_paths
 
-APP_VERSION = "3.5.5"
+APP_VERSION = "3.6.0"
 _NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
 _UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
 

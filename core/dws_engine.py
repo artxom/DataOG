@@ -17,14 +17,16 @@ import copy
 import datetime
 import logging
 import threading
+import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import psycopg2
 
 from core.platform.dialects import (
     SYSTEM_SCHEMAS,
     analyze_item_changes,
+    classify_migration_risk,
     clean_identifier_input,
     clean_sql_type_input,
     format_existing_db_ident,
@@ -44,6 +46,18 @@ from core.platform.dialects import (
 from core.platform.storage import PlatformStateStore as StateStore
 
 logger = logging.getLogger("dws_migrator")
+_ACTIVE_COMMIT_CALLBACK = threading.local()
+
+
+@contextlib.contextmanager
+def bind_commit_callback(cb: Optional[Callable[[Dict[str, Any]], None]]):
+    """线程安全地绑定执行提交回调，兼顾历史单测 Mock 方法签名兼容."""
+    prev = getattr(_ACTIVE_COMMIT_CALLBACK, "fn", None)
+    _ACTIVE_COMMIT_CALLBACK.fn = cb
+    try:
+        yield
+    finally:
+        _ACTIVE_COMMIT_CALLBACK.fn = prev
 
 
 @dataclass
@@ -1371,7 +1385,104 @@ class DWSMigratorEngine:
             },
         }
 
-    def execute_single_item_direct(self, item_id: int) -> Dict[str, Any]:
+    @staticmethod
+    def build_reverse_direct_alter_sql(
+        schema_name: str,
+        table_name: str,
+        *,
+        before_col_name: str,
+        before_col_type: str = "",
+        before_col_comment: str = "",
+        after_col_name: str = "",
+        after_col_type: str = "",
+        after_col_comment: str = "",
+        dialect: str = "DWS",
+    ) -> str:
+        """根据执行前后物理列快照生成单字段精确逆向回滚 DDL."""
+        del dialect  # 当前在线直连回滚聚焦 DWS / PGSQL / KINGBASE 原生事务语法
+        schema_q = quote_ident_str(schema_name or "public")
+        table_q = quote_ident_str(table_name)
+        full_table = f"{schema_q}.{table_q}"
+
+        clean_before = clean_identifier_input(before_col_name) or str(before_col_name or "").strip()
+        clean_after = (
+            clean_identifier_input(after_col_name or before_col_name)
+            or str(after_col_name or before_col_name or "").strip()
+        )
+        name_changed = bool(clean_before and clean_after) and (
+            clean_before.lower() != clean_after.lower()
+            or (before_col_name or "") != (after_col_name or "")
+        )
+        type_changed = bool(before_col_type) and (
+            normalize_dws_type(before_col_type) != normalize_dws_type(after_col_type or "")
+        )
+        comment_changed = str(before_col_comment or "") != str(after_col_comment or "")
+
+        if not name_changed and not type_changed and not comment_changed:
+            return f"-- 无需结构回滚: {full_table}.{format_existing_db_ident(clean_after or clean_before)}"
+
+        cur_after_q = format_existing_db_ident(after_col_name or clean_after)
+        target_before_q = (
+            format_existing_db_ident(before_col_name)
+            if (before_col_name and before_col_name != clean_before)
+            else quote_ident_str(clean_before)
+        )
+        eff_col_q = target_before_q if name_changed else cur_after_q
+
+        lines = [
+            f"-- [单字段结构逆向回滚] 目标表: {full_table} | {clean_after} → {clean_before}",
+            "BEGIN;",
+        ]
+        if name_changed:
+            lines.append(
+                f"ALTER TABLE {full_table} RENAME COLUMN {cur_after_q} TO {target_before_q};"
+            )
+        if type_changed:
+            safe_before_type = clean_sql_type_input(before_col_type) or before_col_type
+            lines.append(
+                f"ALTER TABLE {full_table} ALTER COLUMN {eff_col_q} TYPE {safe_before_type} USING {eff_col_q}::{safe_before_type};"
+            )
+        if comment_changed:
+            if str(before_col_comment or "") == "":
+                lines.append(f"COMMENT ON COLUMN {full_table}.{eff_col_q} IS NULL;")
+            else:
+                lines.append(
+                    f"COMMENT ON COLUMN {full_table}.{eff_col_q} IS {quote_literal_str(str(before_col_comment))};"
+                )
+        lines.append("COMMIT;")
+        return "\n".join(lines)
+
+    @staticmethod
+    def build_reverse_backup_swap_sql(
+        schema_name: str,
+        table_name: str,
+        backup_table_name: str,
+    ) -> str:
+        """生成基于 _bak_ 备份表无损原子切回主表的事务回滚脚本."""
+        schema_q = quote_ident_str(schema_name or "public")
+        orig_q = quote_ident_str(table_name)
+        bak_q = quote_ident_str(backup_table_name)
+        tmp_rb_q = quote_ident_str(f"{table_name[:42]}__rb_tmp")
+        full_orig = f"{schema_q}.{orig_q}"
+        full_bak = f"{schema_q}.{bak_q}"
+        full_tmp_rb = f"{schema_q}.{tmp_rb_q}"
+        return "\n".join(
+            [
+                f"-- [备份表无损回滚] 将 {full_bak} 原子切回 {full_orig}",
+                "BEGIN;",
+                f"ALTER TABLE {full_orig} RENAME TO {tmp_rb_q};",
+                f"ALTER TABLE {full_bak} RENAME TO {orig_q};",
+                f"DROP TABLE {full_tmp_rb};",
+                "COMMIT;",
+            ]
+        )
+
+    def execute_single_item_direct(
+        self,
+        item_id: int,
+        *,
+        on_change_committed: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
         """使用模式 1 (原生 ALTER TABLE) 执行单条字段贯标，并严格核验前后字段顺序 attnum 一致."""
         item = self.store.get_item(item_id)
         if not item:
@@ -1498,6 +1609,39 @@ class DWSMigratorEngine:
                 db_current_comment=after_comment,
             )
             self.store.add_log("SUCCESS", target_label, success_msg, sql_preview)
+            eff_cb = on_change_committed or getattr(_ACTIVE_COMMIT_CALLBACK, "fn", None)
+            if callable(eff_cb) and changes["has_any_change"]:
+                rollback_sql = self.build_reverse_direct_alter_sql(
+                    actual_schema,
+                    actual_table,
+                    before_col_name=matched_col.column_name,
+                    before_col_type=matched_col.data_type,
+                    before_col_comment=matched_col.column_comment,
+                    after_col_name=eff_col_name,
+                    after_col_type=after_type,
+                    after_col_comment=after_comment,
+                )
+                eff_cb(
+                    {
+                        "source_item_id": item_id,
+                        "execution_group_id": "",
+                        "schema_name": actual_schema,
+                        "table_name": actual_table,
+                        "ordinal_position": after_ordinal,
+                        "before_col_name": matched_col.column_name,
+                        "before_col_type": matched_col.data_type,
+                        "before_col_comment": matched_col.column_comment,
+                        "after_col_name": eff_col_name,
+                        "after_col_type": after_type,
+                        "after_col_comment": after_comment,
+                        "strategy": "DIRECT_ALTER",
+                        "backup_table_name": "",
+                        "forward_sql": sql_preview,
+                        "rollback_sql": rollback_sql,
+                        "table_orientation": table_meta.orientation,
+                        "is_distribute_key": bool(item.get("is_distribute_key")),
+                    }
+                )
         except Exception as exc:
             err_str = str(exc).strip()
             logger.error("执行失败 [%s]: %s", target_label, err_str)
@@ -1605,6 +1749,8 @@ class DWSMigratorEngine:
         table_name: str,
         item_ids: Optional[List[int]] = None,
         keep_backup: bool = True,
+        *,
+        on_change_committed: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """使用模式 2 (按原表 attnum 顺序重建表并迁移数据) 批量完成指定表下的字段贯标."""
         validate_identifier(schema_name, "模式名")
@@ -1677,7 +1823,24 @@ class DWSMigratorEngine:
         self.store.add_log("INFO", target_label, start_msg)
 
         try:
-            self._run_real_table_rebuild(actual_schema, actual_table, valid_items, keep_backup)
+            rebuild_exec = self._run_real_table_rebuild(
+                actual_schema,
+                actual_table,
+                valid_items,
+                keep_backup,
+                tmp_table_name=plan.get("tmp_table_name", ""),
+                bak_table_name=plan.get("bak_table_name", ""),
+            )
+            actual_bak_name = (
+                str((rebuild_exec or {}).get("bak_table_name") or plan.get("bak_table_name") or "")
+                if keep_backup
+                else ""
+            )
+            execution_group_id = f"grp_{uuid.uuid4().hex[:12]}"
+            comp_by_ord = {
+                int(c.get("ordinal_position") or 0): c
+                for c in (plan.get("column_order_comparison") or [])
+            }
 
             updated_meta = self.inspect_table_metadata(actual_schema, actual_table)
             col_by_lower = {
@@ -1685,6 +1848,8 @@ class DWSMigratorEngine:
                 for c in updated_meta.columns
             }
             for ord_pos, grp in bound_items_by_ordinal.items():
+                primary_it = grp[0]
+                comp_entry = comp_by_ord.get(int(ord_pos), {})
                 for it in grp:
                     clean_new = (
                         clean_identifier_input(it["new_col_name"])
@@ -1696,7 +1861,7 @@ class DWSMigratorEngine:
                     )
                     msg = (
                         f"原序重建表迁移成功！字段固定在第 {final_ord}/{len(updated_meta.columns)} 列"
-                        + (f"（原表已备份为 {plan['bak_table_name']}）" if keep_backup else "")
+                        + (f"（原表已备份为 {actual_bak_name}）" if actual_bak_name else "")
                     )
                     self.store.update_item_execution(
                         it["id"],
@@ -1710,6 +1875,92 @@ class DWSMigratorEngine:
                         db_current_type=new_col_meta.data_type if new_col_meta else it["new_col_type"],
                         db_current_comment=new_col_meta.column_comment if new_col_meta else it["new_col_comment"],
                     )
+                eff_cb = on_change_committed or getattr(_ACTIVE_COMMIT_CALLBACK, "fn", None)
+                if callable(eff_cb):
+                    clean_new_p = (
+                        clean_identifier_input(primary_it["new_col_name"])
+                        or clean_identifier_input(primary_it["old_col_name"])
+                    )
+                    after_meta = col_by_lower.get(clean_new_p.lower())
+                    before_name = str(
+                        comp_entry.get("before_name")
+                        or primary_it.get("db_current_col_name")
+                        or primary_it.get("old_col_name")
+                        or ""
+                    )
+                    before_type = str(
+                        comp_entry.get("before_type")
+                        or primary_it.get("db_current_type")
+                        or primary_it.get("old_col_type")
+                        or ""
+                    )
+                    before_comment = str(
+                        comp_entry.get("before_comment")
+                        if comp_entry
+                        else (primary_it.get("db_current_comment") or primary_it.get("old_col_comment") or "")
+                    )
+                    after_name = (
+                        after_meta.column_name
+                        if after_meta is not None
+                        else str(comp_entry.get("after_name") or clean_new_p)
+                    )
+                    after_type = (
+                        after_meta.data_type
+                        if after_meta is not None
+                        else str(comp_entry.get("after_type") or primary_it.get("new_col_type") or before_type)
+                    )
+                    after_comment = (
+                        after_meta.column_comment
+                        if after_meta is not None
+                        else str(comp_entry.get("after_comment") or primary_it.get("new_col_comment") or before_comment)
+                    )
+                    final_ord_p = (
+                        after_meta.ordinal_position if after_meta is not None else ord_pos
+                    )
+                    changed_any = (
+                        (clean_identifier_input(before_name).lower() != clean_identifier_input(after_name).lower())
+                        or (before_name != after_name)
+                        or (normalize_dws_type(before_type) != normalize_dws_type(after_type))
+                        or (before_comment != after_comment)
+                    )
+                    if changed_any:
+                        rb_sql = (
+                            self.build_reverse_backup_swap_sql(
+                                actual_schema, actual_table, actual_bak_name
+                            )
+                            if actual_bak_name
+                            else self.build_reverse_direct_alter_sql(
+                                actual_schema,
+                                actual_table,
+                                before_col_name=before_name,
+                                before_col_type=before_type,
+                                before_col_comment=before_comment,
+                                after_col_name=after_name,
+                                after_col_type=after_type,
+                                after_col_comment=after_comment,
+                            )
+                        )
+                        eff_cb(
+                            {
+                                "source_item_id": primary_it["id"],
+                                "execution_group_id": execution_group_id,
+                                "schema_name": actual_schema,
+                                "table_name": actual_table,
+                                "ordinal_position": final_ord_p,
+                                "before_col_name": before_name,
+                                "before_col_type": before_type,
+                                "before_col_comment": before_comment,
+                                "after_col_name": after_name,
+                                "after_col_type": after_type,
+                                "after_col_comment": after_comment,
+                                "strategy": "TABLE_REBUILD",
+                                "backup_table_name": actual_bak_name,
+                                "forward_sql": sql_preview,
+                                "rollback_sql": rb_sql,
+                                "table_orientation": updated_meta.orientation,
+                                "is_distribute_key": bool(primary_it.get("is_distribute_key")),
+                            }
+                        )
 
             log_msg = (
                 f"成功完成表 {actual_schema}.{actual_table} 的按原序重建迁移，"
@@ -1722,6 +1973,8 @@ class DWSMigratorEngine:
                 "message": log_msg,
                 "valid_count": len(valid_items),
                 "failed_count": len(missing_items) + len(conflict_items),
+                "bak_table_name": actual_bak_name,
+                "execution_group_id": execution_group_id,
                 "items": self.store.list_items(),
                 "summary": self.store.get_summary(),
             }
@@ -1745,6 +1998,8 @@ class DWSMigratorEngine:
         item_ids: List[int],
         max_workers: int = 5,
         keep_backup: bool = True,
+        *,
+        on_change_committed: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         """以表为单位智能判断执行策略，并通过多线程并发处理不同的表（默认 5 线程）：
         - 若某张表的选中任务中存在分布键/分区键调整要求，或存在字段互换改名环路（A<->B），则该表全部选中任务统一采用「按原表顺序重建表 (TABLE_REBUILD)」执行；
@@ -1783,7 +2038,15 @@ class DWSMigratorEngine:
         logger.info(batch_start_msg)
         self.store.add_log("INFO", "多线程并发调度", batch_start_msg)
 
+        parent_cb = on_change_committed or getattr(_ACTIVE_COMMIT_CALLBACK, "fn", None)
+
         def _process_single_table_group(
+            group_items: List[Dict[str, Any]],
+        ) -> Tuple[str, int, int]:
+            with bind_commit_callback(parent_cb):
+                return _process_single_table_group_impl(group_items)
+
+        def _process_single_table_group_impl(
             group_items: List[Dict[str, Any]],
         ) -> Tuple[str, int, int]:
             t_name_tag = threading.current_thread().name
@@ -2029,20 +2292,27 @@ class DWSMigratorEngine:
         table_name: str,
         table_items: List[Dict[str, Any]],
         keep_backup: bool,
-    ) -> None:
+        *,
+        tmp_table_name: str = "",
+        bak_table_name: str = "",
+    ) -> Dict[str, str]:
         """在真实华为 DWS 事务内执行临时表创建、按原序 CAST 灌数、行数核验、注释还原与表名原子切换."""
         table_meta = self.inspect_table_metadata(schema_name, table_name)
         col_plan = self._plan_table_items_for_columns(table_meta, table_items)
         mod_by_ordinal: Dict[int, Dict[str, Any]] = col_plan["mod_by_ordinal"]
 
         ts_suffix = datetime.datetime.now().strftime("%m%d%H%M%S")
-        tmp_table_name = f"{table_name[:42]}__mig_{ts_suffix}"
-        bak_table_name = f"{table_name[:42]}__bak_{ts_suffix}"
+        eff_tmp_name = str(tmp_table_name or "").strip() or f"{table_name[:42]}__mig_{ts_suffix}"
+        eff_bak_name = (
+            (str(bak_table_name or "").strip() or f"{table_name[:42]}__bak_{ts_suffix}")
+            if keep_backup
+            else ""
+        )
 
         schema_q = quote_ident_str(schema_name)
         orig_table_q = quote_ident_str(table_name)
-        tmp_table_q = quote_ident_str(tmp_table_name)
-        bak_table_q = quote_ident_str(bak_table_name)
+        tmp_table_q = quote_ident_str(eff_tmp_name)
+        bak_table_q = quote_ident_str(eff_bak_name or f"{table_name[:42]}__bak_{ts_suffix}")
 
         full_orig = f"{schema_q}.{orig_table_q}"
         full_tmp = f"{schema_q}.{tmp_table_q}"
@@ -2169,6 +2439,223 @@ class DWSMigratorEngine:
                         f"ALTER TABLE {full_tmp} RENAME TO {orig_table_q};"
                     )
                 conn.commit()
+                return {
+                    "tmp_table_name": eff_tmp_name,
+                    "bak_table_name": eff_bak_name,
+                }
             except Exception:
                 conn.rollback()
                 raise
+
+    def check_table_exists(self, schema_name: str, table_name: str) -> bool:
+        """核验物理表（含重建备份表）在目标库中是否存在."""
+        sch = validate_identifier(schema_name or "public", "模式名")
+        tbl = validate_identifier(table_name, "表名")
+        with contextlib.closing(self._open_dws_connection()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT 1
+                    FROM pg_catalog.pg_class c
+                    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                    WHERE LOWER(n.nspname) = LOWER(%s)
+                      AND LOWER(c.relname) = LOWER(%s)
+                      AND c.relkind IN ('r', 'p')
+                    LIMIT 1;
+                    """,
+                    (sch, tbl),
+                )
+                return cur.fetchone() is not None
+
+    def execute_rollback_direct_alter(
+        self,
+        *,
+        schema_name: str,
+        table_name: str,
+        before_col_name: str,
+        before_col_type: str = "",
+        before_col_comment: str = "",
+        after_col_name: str = "",
+        after_col_type: str = "",
+        after_col_comment: str = "",
+        expected_ordinal: int = 0,
+    ) -> Dict[str, Any]:
+        """单表事务原子执行单字段逆向 ALTER 回滚并校验物理列序不变."""
+        sch = validate_identifier(schema_name or "public", "模式名")
+        tbl = validate_identifier(table_name, "表名")
+        clean_before = validate_identifier(before_col_name, "原字段名")
+        clean_after = validate_identifier(after_col_name or before_col_name, "当前字段名")
+
+        table_meta = self.inspect_table_metadata(sch, tbl)
+        if not table_meta.exists:
+            raise RuntimeError(f"目标表 {sch}.{tbl} 不存在，无法执行逆向回滚")
+
+        actual_schema = table_meta.schema_name
+        actual_table = table_meta.table_name
+        col_map: Dict[str, ColumnMeta] = {}
+        for c in table_meta.columns:
+            col_map.setdefault(clean_identifier_input(c.column_name).lower(), c)
+            col_map[c.column_name.lower()] = c
+
+        cur_col = col_map.get(clean_after.lower())
+        if cur_col is None:
+            raise RuntimeError(
+                f"表 {actual_schema}.{actual_table} 中未找到当前字段 [{clean_after}]，无法回滚至 [{clean_before}]"
+            )
+
+        target_before_col = col_map.get(clean_before.lower())
+        if (
+            target_before_col is not None
+            and target_before_col.ordinal_position != cur_col.ordinal_position
+        ):
+            raise RuntimeError(
+                f"字段名回滚冲突：表 {actual_schema}.{actual_table} 第 {target_before_col.ordinal_position} 列已存在 [{target_before_col.column_name}]，无法将 [{cur_col.column_name}] 回退为 [{clean_before}]"
+            )
+
+        name_changed = (clean_before.lower() != clean_after.lower()) or (
+            cur_col.column_name != before_col_name
+            and clean_identifier_input(cur_col.column_name).lower() != clean_before.lower()
+        )
+        type_changed = bool(before_col_type) and (
+            normalize_dws_type(cur_col.data_type) != normalize_dws_type(before_col_type)
+        )
+        comment_changed = str(cur_col.column_comment or "") != str(before_col_comment or "")
+        exp_ord = int(expected_ordinal or cur_col.ordinal_position)
+
+        rollback_sql = self.build_reverse_direct_alter_sql(
+            actual_schema,
+            actual_table,
+            before_col_name=before_col_name,
+            before_col_type=before_col_type,
+            before_col_comment=before_col_comment,
+            after_col_name=cur_col.column_name,
+            after_col_type=cur_col.data_type,
+            after_col_comment=cur_col.column_comment,
+        )
+
+        with contextlib.closing(self._open_dws_connection()) as conn:
+            conn.autocommit = False
+            try:
+                with conn.cursor() as cur:
+                    full_table = f"{quote_ident_str(actual_schema)}.{quote_ident_str(actual_table)}"
+                    cur_col_q = format_existing_db_ident(cur_col.column_name)
+                    target_before_q = (
+                        format_existing_db_ident(before_col_name)
+                        if (before_col_name and before_col_name != clean_before)
+                        else quote_ident_str(clean_before)
+                    )
+                    eff_col_q = target_before_q if name_changed else cur_col_q
+
+                    if name_changed:
+                        cur.execute(
+                            f"ALTER TABLE {full_table} RENAME COLUMN {cur_col_q} TO {target_before_q};"
+                        )
+                    if type_changed:
+                        safe_before_type = validate_sql_type(before_col_type)
+                        cur.execute(
+                            f"ALTER TABLE {full_table} ALTER COLUMN {eff_col_q} TYPE {safe_before_type} USING {eff_col_q}::{safe_before_type};"
+                        )
+                    if comment_changed:
+                        if str(before_col_comment or "") == "":
+                            cur.execute(f"COMMENT ON COLUMN {full_table}.{eff_col_q} IS NULL;")
+                        else:
+                            cur.execute(
+                                f"COMMENT ON COLUMN {full_table}.{eff_col_q} IS %s;",
+                                (str(before_col_comment),),
+                            )
+
+                    cur.execute(
+                        """
+                        SELECT a.attname
+                        FROM pg_catalog.pg_class c
+                        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                        JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+                        WHERE n.nspname = %s
+                          AND c.relname = %s
+                          AND a.attnum > 0
+                          AND NOT a.attisdropped
+                        ORDER BY a.attnum ASC;
+                        """,
+                        (actual_schema, actual_table),
+                    )
+                    rows = cur.fetchall()
+                    actual_ord = -1
+                    for idx, r in enumerate(rows, start=1):
+                        if clean_identifier_input(r[0]).lower() == clean_before.lower():
+                            actual_ord = idx
+                            break
+                    if actual_ord != exp_ord:
+                        raise RuntimeError(
+                            f"回滚后列序核验异常：期望第 {exp_ord} 列，实际第 {actual_ord} 列，已自动回滚事务"
+                        )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return {
+            "ok": True,
+            "mode": "REVERSE_ALTER",
+            "schema_name": actual_schema,
+            "table_name": actual_table,
+            "restored_col_name": clean_before,
+            "ordinal_position": exp_ord,
+            "executed_sql": rollback_sql,
+        }
+
+    def execute_rollback_from_backup_table(
+        self,
+        *,
+        schema_name: str,
+        table_name: str,
+        backup_table_name: str,
+    ) -> Dict[str, Any]:
+        """单连接事务内原子将重建备份表 (_bak_) 切回主表."""
+        sch = validate_identifier(schema_name or "public", "模式名")
+        tbl = validate_identifier(table_name, "表名")
+        bak = validate_identifier(backup_table_name, "备份表名")
+
+        bak_meta = self.inspect_table_metadata(sch, bak)
+        if not bak_meta.exists:
+            raise RuntimeError(f"备份表 {sch}.{bak} 在数据库中不存在，无法按备份表无损回滚")
+        actual_schema = bak_meta.schema_name
+        actual_bak = bak_meta.table_name
+
+        cur_meta = self.inspect_table_metadata(actual_schema, tbl)
+        actual_tbl = cur_meta.table_name if cur_meta.exists else tbl
+
+        ts_suffix = datetime.datetime.now().strftime("%m%d%H%M%S")
+        tmp_rb_name = f"{actual_tbl[:38]}__rb_{ts_suffix}"
+
+        schema_q = quote_ident_str(actual_schema)
+        orig_q = quote_ident_str(actual_tbl)
+        bak_q = quote_ident_str(actual_bak)
+        tmp_rb_q = quote_ident_str(tmp_rb_name)
+
+        full_orig = f"{schema_q}.{orig_q}"
+        full_bak = f"{schema_q}.{bak_q}"
+        full_tmp_rb = f"{schema_q}.{tmp_rb_q}"
+
+        executed_sql = self.build_reverse_backup_swap_sql(actual_schema, actual_tbl, actual_bak)
+        with contextlib.closing(self._open_dws_connection()) as conn:
+            conn.autocommit = False
+            try:
+                with conn.cursor() as cur:
+                    if cur_meta.exists:
+                        cur.execute(f"ALTER TABLE {full_orig} RENAME TO {tmp_rb_q};")
+                    cur.execute(f"ALTER TABLE {full_bak} RENAME TO {orig_q};")
+                    if cur_meta.exists:
+                        cur.execute(f"DROP TABLE {full_tmp_rb};")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return {
+            "ok": True,
+            "mode": "BACKUP_SWAP",
+            "schema_name": actual_schema,
+            "table_name": actual_tbl,
+            "backup_table_name": actual_bak,
+            "executed_sql": executed_sql,
+        }
