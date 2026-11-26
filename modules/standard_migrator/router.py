@@ -373,16 +373,33 @@ async def api_bindings_check_compliance(
     task_id: str = Query(default=""),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
+    eff_scope = (payload.scope or "").strip().lower()
+    if eff_scope == "all_schemas":
+        task_title = "全库 Schema 刷新并比对落标"
+        start_detail = "正在刷新全部 Schema 目录并批量核验字段落标状态..."
+    elif eff_scope == "schema":
+        sch_lbl = ", ".join(s for s in (payload.schemas or []) if s) or payload.schema_name or "当前 Schema"
+        task_title = f"全 Schema 刷新并比对落标 ({sch_lbl})"
+        start_detail = f"正在刷新 {sch_lbl} 目录并批量核验字段落标状态..."
+    else:
+        task_title = "检查字段落标状态"
+        start_detail = "正在检查目标库表字段绑标与落标合规性..."
+
     return await run_tracked_task(
         request=request,
         task_id=task_id,
         ctx=ctx,
-        title="检查字段落标状态",
-        start_detail="正在检查目标库表字段绑标与落标合规性...",
+        title=task_title,
+        start_detail=start_detail,
         fn=StandardMigratorService(ctx).check_compliance,
         kwargs={
             "connection_id": payload.connection_id,
             "tables": payload.tables,
+            "schemas": payload.schemas,
+            "schema_name": payload.schema_name,
+            "scope": payload.scope,
+            "refresh_catalog": payload.refresh_catalog,
+            "only_bound_tables": payload.only_bound_tables,
             "format_profile": payload.format_profile,
             "force_refresh": payload.force_refresh,
         },

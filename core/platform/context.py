@@ -126,7 +126,7 @@ class PlatformContext:
         self.task_progress = self.import_progress
         self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
-        self.app_version = "3.5.4"
+        self.app_version = "3.5.5"
         self.update_hub = UpdateHub(
             updates_dir=eff_updates_dir,
             running_version=self.app_version,
@@ -196,7 +196,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "3.5.4",
+            "version": "3.5.5",
             "update_summary": self.update_hub.get_bootstrap_summary(),
             "storage_mode": "SEPARATED" if self.store.is_split_storage else "COMPAT",
             "license": license_info,

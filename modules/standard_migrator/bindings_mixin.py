@@ -702,6 +702,11 @@ class _StandardBindingsMixin:
         *,
         connection_id: str,
         tables: Optional[List[Any]] = None,
+        schemas: Optional[Sequence[str]] = None,
+        schema_name: str = "",
+        scope: str = "",
+        refresh_catalog: bool = False,
+        only_bound_tables: bool = False,
         format_profile: str = "AUTO",
         force_refresh: bool = True,
         progress_cb: Optional[ProgressCallback] = noop_progress,
@@ -715,14 +720,114 @@ class _StandardBindingsMixin:
         prof = self.ctx.connection_hub.require_profile(connection_id)
         eff_format = self._resolve_format_profile(prof, format_profile)
         eff_def_schema = prof.effective_default_schema()
+        eff_scope = (scope or "").strip().lower()
+
+        raw_schema_items: List[str] = []
+        if eff_scope != "all_schemas":
+            if isinstance(schemas, str):
+                raw_schema_items.extend(x.strip() for x in schemas.split(",") if x.strip())
+            elif schemas:
+                raw_schema_items.extend(str(x).strip() for x in schemas if str(x).strip())
+            if (schema_name or "").strip():
+                raw_schema_items.append(schema_name.strip())
+            if eff_scope == "schema" and not raw_schema_items:
+                raw_schema_items.append(eff_def_schema)
+
+        if eff_scope == "all_schemas":
+            selected_schemas: List[str] = []
+            _schema_matches: Callable[[str], bool] = lambda _raw: True
+        else:
+            selected_schemas, _selected_schema_set, _schema_matches = self._build_schema_filter(
+                raw_schema_items, eff_def_schema, prof.db_type
+            )
+
+        target_refresh_schema = (
+            selected_schemas[0]
+            if (eff_scope == "schema" and len(selected_schemas) == 1)
+            else None
+        )
+        catalog_data: Optional[Dict[str, Any]] = None
+        if refresh_catalog:
+            scope_label = (
+                f"「{target_refresh_schema}」"
+                if target_refresh_schema
+                else (
+                    "全部 Schema"
+                    if eff_scope == "all_schemas" or not selected_schemas
+                    else f"「{', '.join(selected_schemas)}」"
+                )
+            )
+            report(
+                6.0,
+                "刷新目录元数据",
+                f"正在从数据源 [{prof.name}] 实时刷新 {scope_label} 目录清单...",
+                0,
+                1,
+            )
+
+            def _scaled_cat_cb(
+                pct: float, stage: str, detail: str = "", processed: int = 0, total: int = 0
+            ) -> None:
+                scaled = 6.0 + (min(100.0, max(0.0, float(pct))) / 100.0) * 18.0
+                report(scaled, stage, detail, processed, total)
+
+            catalog_data = self.ctx.metadata_hub.refresh_catalog(
+                prof.connection_id,
+                schema_name=target_refresh_schema,
+                progress_cb=_scaled_cat_cb,
+            )
+
         targets = self._parse_table_targets(
             tables=tables,
             default_schema=eff_def_schema,
         )
+        is_schema_scope = eff_scope in ("schema", "all_schemas") or bool(selected_schemas)
+        if not targets and is_schema_scope:
+            if catalog_data is None:
+                catalog_data = self.ctx.metadata_hub.get_catalog_tree(
+                    prof.connection_id, auto_refresh=False
+                )
+                if not (catalog_data.get("tables") or []) and not refresh_catalog:
+                    catalog_data = self.ctx.metadata_hub.refresh_catalog(
+                        prof.connection_id,
+                        schema_name=target_refresh_schema,
+                    )
+            cat_tables = catalog_data.get("tables") or []
+            bound_tables = self.ctx.standard_catalog.list_bound_tables_for_connection(
+                prof.connection_id
+            )
+            cat_by_key: Dict[Tuple[str, str], Tuple[str, str]] = {}
+            seen_t: Set[Tuple[str, str]] = set()
+            for t in cat_tables:
+                s_c = clean_identifier_input(t.get("schema_name") or eff_def_schema) or eff_def_schema
+                t_c = clean_identifier_input(t.get("table_name") or "")
+                if t_c and _schema_matches(s_c):
+                    k = (s_c.lower(), t_c.lower())
+                    cat_by_key[k] = (s_c, t_c)
+                    if not only_bound_tables and k not in seen_t:
+                        seen_t.add(k)
+                        targets.append((s_c, t_c))
+            for s_b, t_b in bound_tables:
+                s_c = clean_identifier_input(s_b or eff_def_schema) or eff_def_schema
+                t_c = clean_identifier_input(t_b or "")
+                if t_c and _schema_matches(s_c):
+                    k = (s_c.lower(), t_c.lower())
+                    if k not in seen_t:
+                        seen_t.add(k)
+                        targets.append(cat_by_key.get(k, (s_c, t_c)))
+            if not targets:
+                if selected_schemas and eff_scope != "all_schemas":
+                    raise ValueError(
+                        f"目标 Schema（{', '.join(selected_schemas)}）下未发现可核验的库表"
+                    )
+                raise ValueError("当前连接下未发现可核验的库表")
+
         if not targets:
             targets = self.ctx.standard_catalog.list_bound_tables_for_connection(prof.connection_id)
         if not targets:
-            tree = self.ctx.metadata_hub.get_catalog_tree(prof.connection_id, auto_refresh=False)
+            tree = catalog_data or self.ctx.metadata_hub.get_catalog_tree(
+                prof.connection_id, auto_refresh=False
+            )
             targets = [
                 (t["schema_name"], t["table_name"])
                 for t in (tree.get("tables") or [])[:30]
@@ -734,7 +839,8 @@ class _StandardBindingsMixin:
             self.ctx.standard_catalog.purge_invalid_error_bindings(prof.connection_id)
 
         total_targets = len(targets)
-        start_pct = max(12.0, min(85.0, float(progress_start_pct)))
+        base_start = max(26.0, float(progress_start_pct)) if refresh_catalog else float(progress_start_pct)
+        start_pct = max(12.0, min(85.0, base_start))
         probe_end_pct = start_pct + (94.0 - start_pct) * 0.48
 
         report(
@@ -949,6 +1055,34 @@ class _StandardBindingsMixin:
             )
         if len(table_results) == 1:
             out["active_table"] = table_results[0]
+        if refresh_catalog or is_schema_scope:
+            fresh_catalog = self.ctx.metadata_hub.get_catalog_tree(
+                prof.connection_id, auto_refresh=False
+            )
+            out["catalog"] = fresh_catalog
+            out["scope"] = eff_scope or ("all_schemas" if not selected_schemas else "schema")
+            refreshed_schs = sorted(
+                {
+                    str((tr.get("table") or {}).get("schema_name") or "").strip()
+                    for tr in table_results
+                    if str((tr.get("table") or {}).get("schema_name") or "").strip()
+                }
+            )
+            if not refreshed_schs and selected_schemas:
+                refreshed_schs = list(selected_schemas)
+            out["refreshed_schemas"] = refreshed_schs
+            if is_schema_scope:
+                scope_desc = (
+                    "全库 Schema"
+                    if eff_scope == "all_schemas" or not selected_schemas
+                    else f"Schema「{', '.join(selected_schemas)}」"
+                )
+                out["message"] = (
+                    f"{scope_desc}刷新并比对完成：{agg['checked_tables']} 张表共 {agg['total_cols']} 列，"
+                    f"已落标 {agg['compliant_cols']} 列、部分落标 {agg['partial_compliant_cols']} 列、"
+                    f"未落标 {agg['non_compliant_cols']} 列、仅差注释 {agg['comment_only_cols']} 列、"
+                    f"未绑标 {agg['unbound_cols']} 列"
+                )
         return out
 
     def generate_binding_template_bytes(

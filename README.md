@@ -1,4 +1,4 @@
-# Data.O.G v3.5.4 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.5.5 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -43,7 +43,7 @@
 3. **数据标准 (`standard`)**
    - 顶栏分段切换三步递进工作流：**`1. 标准字典` | `2. 落标绑定与贯标` | `3. 跨环境比对`**：
      - **1. 标准字典**：以「数据项编号」为主键统一维护全行最新数据标准，完整支持 46 列多库物理格式数据字典（含 `仓库DWS数据格式`、`数据仓库 集市`、`ArgoDB`、`MySQL`、`Oracle`、`OceanBase`、`达梦` 等），支持先下载系统模板后按编号增量合并导入或在线增删改查。
-     - **2. 落标绑定与贯标**：左侧常驻数据库目录树（实时呈现各表绑标/达标状态徽标，支持按数据库粒度设定并持久化各自的落标标准格式，如 `仓库DWS数据格式`、`数据仓库 集市`、`argodb数据格式` 等，并配备「忽略部分落标」「忽略未绑标字段」统计口径双开关），右侧读取库表字段绑定标准，支持按当前表、当前选中 Schema（`scope=schema`）或全库（`scope=all`）导出预填字段对照模板批量上传及智能预匹配，一键执行三维分级“检查是否落标”（字段名 + 归一化类型 + 中文注释），支持免勾表直接导出**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集再生成，离线网页支持全库/单表交互筛选与一键导出单 Sheet Excel），并可通过统一「纳入贯标」按钮将未达标字段累积纳入**全局持久化贯标队列**（跨表、跨库不覆盖，支持按单字段预览准确的多方言/仅注释 DDL）执行原地 `ALTER` 或 DWS 物理列保序重建（执行完毕自动核验并 3 秒渐隐清出已达标任务）。
+     - **2. 落标绑定与贯标**：左侧常驻完整数据库目录树（实时呈现各表绑标/达标状态徽标，彻底释放左上角空间），顶部标签栏右侧提供可折叠的 **「对标设置」** 抽屉（默认收起、模块化可扩展：支持按数据库粒度设定并持久化各自的落标标准格式，配备「忽略部分落标」「忽略未绑标字段」统计口径双开关，以及一键 **「全 Schema 刷新并比对落标」** 同步最新目录结构、表列缓存并重算全量落标结果），右侧读取库表字段绑定标准，支持按当前表、当前选中 Schema（`scope=schema`）或全库（`scope=all`）导出预填字段对照模板批量上传及智能预匹配，一键执行三维分级“检查是否落标”（字段名 + 归一化类型 + 中文注释），支持免勾表直接导出**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集再生成，离线网页支持全库/单表交互筛选与一键导出单 Sheet Excel），并可通过统一「纳入贯标」按钮将未达标字段累积纳入**全局持久化贯标队列**（跨表、跨库不覆盖，支持按单字段预览准确的多方言/仅注释 DDL）执行原地 `ALTER` 或 DWS 物理列保序重建（执行完毕自动核验并 3 秒渐隐清出已达标任务）。
      - **3. 跨环境比对**：采用 macOS Sequoia 桌面级**五虚拟列防重叠图形化工作台**（`来源表待选字段` | `来源表已绑定数标字段` | `数据标准` | `目标表已绑定数标字段` | `目标表待选字段`），自动沿用第 2 步按库设定的标准格式与两侧字段绑定；顶部配备原生感 `NSPopUpButton` 双端配置甲板与支持关键字检索/输入法保护/矮窗自适应翻转的缓存表浮层，中栏内置吸顶毛玻璃三列表头、平静分段状态筛选栏（`全部`/`一致`/`差异`/`单侧`/`待贯标`/`位长/精度不足`/`类型转换`）与实时搜索；支持拖拽或点选待选字段至中栏标准卡片完成绑标配对，中性卡片与桥接线清晰呈现一致（`UNIFIED`）/ 异标对比（`SPLIT_DIFF`）/ 单侧绑定（`SPLIT_PARTIAL`），按需紧凑展示**目标长度/精度包络**与**是否涉及类型转换**（如 `VARCHAR -> DATE`）；左上角 `.mac-subbar` 集成支持按**来源/目标表名及字段名**秒级检索的 `.cross-pair-picker` 映射表对选择器；支持一键导出含 24 列明细及包络/转换诊断的跨环境**库级离线交互网页报告 (`.html`)** 与**单 Sheet 库级 Excel (`.xlsx`)**（空目录先自动采集，同时输出已保存映射表对五栏看板与「推荐同名未配对表」清单，严格仅推荐不自动触发预比对）。
    - **全流程模板先导与智能公式解析**：全系统所有表格导入均采用统一的「先获取系统模板（含按已选库表导出预填模板）→ 再上传解析」两步导入向导，内置双阶段实时进度条（字节上传进度 + 服务端行级/表级解析核验进度与计时），自动提取 Excel 公式最终计算结果（支持跨表 `VLOOKUP` / `XLOOKUP` / `INDEX+MATCH` / 共享公式 / 超级表引用）并将 `#N/A` 等公式错误标记识别为空值。
 4. **多邻国 (`polyglot`)**
@@ -62,9 +62,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.4，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.5，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.5.4 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.5.5 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -160,7 +160,8 @@ DataOG/
 | **`v3.5.1`** | `fix/v3.5.1-excel-illegal-char-sanitize` → `main` | **全量 Schema 模板及全平台 Excel 导出非法控制字符清洗修复**：在底座 `core/excel_handler.py` 与 `core/platform/excel_io.py` 统一提供 `sanitize_excel_cell`/`sanitize_excel_row`/`sanitize_excel_sheet_title`，彻底清除数据库元数据中夹带的 `PK\x02`/`PK\x0b` 等 XML 1.0 非法控制字符并先清后转义公式注入前缀；全覆盖 Schema 全量映射模板、贯标执行报告、SQL 通用导出、标准字典、单库/跨环境离线 Excel 及跨环境比对导出全链路（116 项测试全绿） |
 | **`v3.5.2`** | `feat/v3.5.2-sidebar-stat-toggles` → `main` | **「2. 落标绑定与贯标」左侧统计口径 macOS 开关**：`get_cached_catalog` 补齐物理表 `col_count`；左侧「当前库落标标准」卡片下方新增默认开启且持久化记忆的 **「忽略部分落标」** 与 **「忽略未绑标字段」** macOS HIG 胶囊开关，支持实时切换左侧表级徽标统计口径（含部分落标归并、0 绑标表 `0/N` 全量物理列展示与未缓存列数提示）（117 项测试全绿） |
 | **`v3.5.3`** | `fix/v3.5.3-standard-dict-perf-and-an-as-fields` → `main` | **「1. 标准字典」卡顿根治与模板 AN–AS 物理格式栏位对齐**：`search_standards` 无关键词直走主键索引并支持 `include_summary=false` 按需汇总；移除 `dialog::backdrop` 全屏模糊与 `tr` `contain`，重构 `StandardDictView` 常驻 DOM + `DataGrid.setData()` + IME 防抖 + `AbortController` + `destroy()` 及 `StandardView` 惰性实例化；新增/编辑弹窗物理格式严格对齐模板 `AN`–`AS` 六列（`ocenbase-oracle` 至 `仓库DWS数据格式`）并完整保留历史非表单字段（118 项测试全绿） |
-| **`v3.5.4`**（当前正式版） | `chore/v3.5.4-gc-and-docs-reorg` → `main` | **全仓垃圾回收、死代码清理、文档重整与演示沙箱闭环修复**：系统性核查并清理底座/模块/前端/沙箱经确认死代码、旧 `static/js/core/api.js` 兼容层、冗余 CSS 及过期字节码；修复 `demo_sandbox/workspace_builder.py` 导出工作区名称/描述覆盖与 `dwd_acct_swap_demo` 保序重建缓存提示；归档 `docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md` 并全仓同步 `MODULE_SDK_3_0.md`、`knowledge_packs/README.md`、`DEMO_PLAYBOOK.md` 与根文档（118 项测试全绿） |
+| **`v3.5.4`** | `chore/v3.5.4-gc-and-docs-reorg` → `main` | **全仓垃圾回收、死代码清理、文档重整与演示沙箱闭环修复**：系统性核查并清理底座/模块/前端/沙箱经确认死代码、旧 `static/js/core/api.js` 兼容层、冗余 CSS 及过期字节码；修复 `demo_sandbox/workspace_builder.py` 导出工作区名称/描述覆盖与 `dwd_acct_swap_demo` 保序重建缓存提示；归档 `docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md` 并全仓同步 `MODULE_SDK_3_0.md`、`knowledge_packs/README.md`、`DEMO_PLAYBOOK.md` 与根文档（118 项测试全绿） |
+| **`v3.5.5`**（当前正式版） | `feat/v3.5.5-migrator-drawer-schema-refresh` → `main` | **「2. 落标绑定与贯标」可折叠对标设置抽屉 + 全 Schema 刷新与落标比对**：释放左上角侧栏空间，将「当前库落标标准」与目录树统计口径开关迁入默认收起的右侧模块化可扩展「对标设置」抽屉；`check-compliance` 与抽屉新增 `scope=schema`/`all_schemas` + `refresh_catalog` 一键全 Schema 刷新并重算全量落标统计与 `col_count`（119 项测试全绿） |
 
 ---
 
@@ -171,7 +172,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（118 项，发布前本地执行）
+# 运行全量自动化单元测试（119 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）

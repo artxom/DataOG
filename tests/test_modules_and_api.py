@@ -6191,11 +6191,20 @@ process.exit(0);
             finally:
                 ctx.close()
 
-        # 2. CSS 校验 macOS 胶囊开关与侧栏统计开关区样式存在
+        # 2. CSS 校验抽屉布局、触发按钮与 macOS 胶囊开关样式存在
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(project_root, "static", "css", "workbench.css"), "r", encoding="utf-8") as fh:
             css_text = fh.read()
-        for cls_name in (".sidebar-stat-toggles", ".mac-switch", ".mac-switch-track", ".mac-switch-thumb"):
+        for cls_name in (
+            ".migrator-drawer",
+            ".migrator-drawer.is-open",
+            ".migrator-drawer-toggle-btn",
+            ".migrator-drawer-section",
+            ".sidebar-stat-toggles",
+            ".mac-switch",
+            ".mac-switch-track",
+            ".mac-switch-thumb",
+        ):
             self.assertIn(cls_name, css_text)
 
         # 3. Node.js 前端 E2E：验证默认开启、4 种开关组合口径、tooltip、0 绑标表徽标显隐与 localStorage 持久化
@@ -6305,10 +6314,78 @@ globalThis.document = {
   addEventListener() {},
   removeEventListener() {},
 };
-globalThis.fetch = async () => ({
-  ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
-  json: async () => ({ ok: true, items: [], summary: {} }),
-});
+const complianceCalls = [];
+globalThis.fetch = async (url, opts = {}) => {
+  const u = String(url || "");
+  if (u.includes("/bindings/check-compliance")) {
+    const body = opts?.body ? JSON.parse(opts.body) : {};
+    complianceCalls.push(body);
+    return {
+      ok: true,
+      status: 200,
+      headers: new Map([["content-type", "application/json"]]),
+      json: async () => ({
+        ok: true,
+        connection_id: body.connection_id || "c1",
+        scope: body.scope || "schema",
+        refreshed_schemas: body.scope === "all_schemas" ? ["dwd", "ods"] : ["dwd"],
+        catalog: {
+          schemas: [{ schema_name: "dwd" }, { schema_name: "ods" }],
+          tables: [
+            { schema_name: "dwd", table_name: "t_mix", object_type: "TABLE", col_count: 10 },
+            { schema_name: "dwd", table_name: "t_unbound", object_type: "TABLE", col_count: 8 },
+            { schema_name: "dwd", table_name: "t_uncached", object_type: "TABLE", col_count: 4 },
+            { schema_name: "ods", table_name: "t_ods", object_type: "TABLE", col_count: 6 },
+          ],
+        },
+        table_stats: {
+          "dwd.t_mix": {
+            bound_count: 7,
+            compliant_count: 6,
+            partial_compliant_count: 1,
+            comment_only_count: 0,
+            non_compliant_count: 0,
+            total_cols: 10,
+          },
+          "dwd.t_uncached": {
+            bound_count: 2,
+            compliant_count: 2,
+            partial_compliant_count: 0,
+            comment_only_count: 0,
+            non_compliant_count: 0,
+            total_cols: 4,
+          },
+        },
+        tables: [
+          {
+            ok: true,
+            table: { schema_name: "dwd", table_name: "t_mix" },
+            summary: { total_cols: 10, bound_cols: 7, compliant_cols: 6, partial_compliant_cols: 1, comment_only_cols: 0, non_compliant_cols: 0, unbound_cols: 3, coverage_pct: 70 },
+            columns: [
+              { ordinal_position: 1, column_name: "c_0", data_type: "VARCHAR(32)", std_code: "STD_1", compliance_status: "COMPLIANT" },
+            ],
+          },
+        ],
+        aggregate: {
+          checked_tables: body.scope === "all_schemas" ? 4 : 3,
+          total_cols: body.scope === "all_schemas" ? 28 : 22,
+          compliant_cols: 8,
+          partial_compliant_cols: 1,
+          comment_only_cols: 0,
+          non_compliant_cols: 0,
+          unbound_cols: body.scope === "all_schemas" ? 19 : 13,
+        },
+        message: body.scope === "all_schemas" ? "全库 Schema 刷新并比对完成" : "Schema「dwd」刷新并比对完成",
+      }),
+    };
+  }
+  return {
+    ok: true,
+    status: 200,
+    headers: new Map([["content-type", "application/json"]]),
+    json: async () => ({ ok: true, items: [], summary: {} }),
+  };
+};
 
 const root = process.argv[1];
 const imp = (rel) => import(pathToFileURL(path.join(root, rel)).href);
@@ -6330,6 +6407,9 @@ store.updateCatalogTree("c1", {
 
 const mv = new StandardMigratorView();
 mv.activeConnId = "c1";
+mv.selectedSchema = "dwd";
+mv.activeSchema = "dwd";
+mv.activeTable = "t_mix";
 mv.tableStats = {
   "dwd.t_mix": {
     bound_count: 7,
@@ -6351,7 +6431,32 @@ mv.tableStats = {
 await mv.tree.setActiveConnection("c1", { expand: true });
 mv.render();
 
-const getSwitch = (key) => mv.sidebarFormatMount.querySelector(`input[data-stat-toggle="${key}"]`);
+if (mv.sidebarMount.children.length !== 1 || mv.sidebarMount.children[0] !== mv.treeMount) {
+  throw new Error("sidebarMount should only contain treeMount after moving settings to drawer");
+}
+if (mv.drawerOpen !== false || mv.settingsDrawerMount.classList.contains("is-open") || mv.settingsDrawerMount.getAttribute("aria-hidden") !== "true") {
+  throw new Error("Settings drawer must be collapsed by default");
+}
+const toggleBtn = mv.tablistMount.querySelector('[data-action="toggle_settings_drawer"]');
+if (!toggleBtn || toggleBtn.getAttribute("aria-expanded") !== "false") {
+  throw new Error("Missing or invalid drawer toggle button in tablist");
+}
+toggleBtn.dispatchEvent({ type: "click" });
+if (!mv.drawerOpen || !mv.settingsDrawerMount.classList.contains("is-open") || mv.settingsDrawerMount.getAttribute("aria-hidden") !== "false") {
+  throw new Error("Clicking toggle button did not open settings drawer");
+}
+if (toggleBtn.getAttribute("aria-expanded") !== "true") {
+  throw new Error("Toggle button aria-expanded should update to true");
+}
+const closeBtn = mv.settingsDrawerMount.querySelector('[data-action="close_settings_drawer"]');
+if (!closeBtn) throw new Error("Missing close button in settings drawer");
+closeBtn.dispatchEvent({ type: "click" });
+if (mv.drawerOpen || mv.settingsDrawerMount.classList.contains("is-open")) {
+  throw new Error("Clicking close button did not collapse settings drawer");
+}
+toggleBtn.dispatchEvent({ type: "click" });
+
+const getSwitch = (key) => mv.settingsDrawerMount.querySelector(`input[data-stat-toggle="${key}"]`);
 const getBadgeFor = (tblName) => {
   const row = mv.tree.treeBody.querySelector(`[data-table-key="c1::dwd::${tblName}"]`);
   if (!row) throw new Error(`Missing tree row for ${tblName}`);
@@ -6361,7 +6466,7 @@ const textOf = (n) => (n ? (n.textContent || "") + (n.children || []).map(textOf
 
 const swPartial = getSwitch("ignore_partial");
 const swUnbound = getSwitch("ignore_unbound");
-if (!swPartial || !swUnbound) throw new Error("Missing sidebar stat switches");
+if (!swPartial || !swUnbound) throw new Error("Missing drawer stat switches");
 if (swPartial.getAttribute("role") !== "switch" || swUnbound.getAttribute("role") !== "switch") {
   throw new Error("Switches must have role='switch'");
 }
@@ -6371,9 +6476,9 @@ if (!swPartial.checked || !swUnbound.checked) {
 if (swPartial.getAttribute("aria-checked") !== "true" || swUnbound.getAttribute("aria-checked") !== "true") {
   throw new Error("Both switches must default aria-checked='true'");
 }
-const cardTxt = textOf(mv.sidebarFormatMount);
-if (!cardTxt.includes("忽略部分落标") || !cardTxt.includes("忽略未绑标字段")) {
-  throw new Error(`Missing Chinese switch labels in sidebar card: ${cardTxt}`);
+const cardTxt = textOf(mv.settingsDrawerMount);
+if (!cardTxt.includes("当前库落标标准") || !cardTxt.includes("忽略部分落标") || !cardTxt.includes("忽略未绑标字段") || !cardTxt.includes("全 Schema 刷新与落标比对")) {
+  throw new Error(`Missing expected sections in settings drawer: ${cardTxt}`);
 }
 
 // State 1: (true, true) 默认态
@@ -6429,16 +6534,45 @@ if (!bUnb || bUnb.textContent !== "0/8") {
   throw new Error(`State(F,F) t_unbound expected 0/8, got ${bUnb?.textContent}`);
 }
 
-// 持久化校验：新建实例自动恢复 localStorage 中的关闭状态
+// 持久化校验：新建实例自动恢复 localStorage 中的关闭状态，且抽屉默认收起
 if (storageMap.get("dataog:standard_migrator:ignore_partial") !== "0" || storageMap.get("dataog:standard_migrator:ignore_unbound") !== "0") {
   throw new Error("Switch states were not persisted to localStorage");
+}
+
+// 验证抽屉内「全 Schema 刷新与落标比对」交互（指定 Schema + 全库 Schema）
+const schemaSelect = mv.settingsDrawerMount.querySelector('select[data-schema-refresh-select="true"]');
+const refreshBtn = mv.settingsDrawerMount.querySelector('button[data-action="refresh_schema_compliance"]');
+if (!schemaSelect || !refreshBtn) throw new Error("Missing schema refresh controls in drawer");
+await mv.runSchemaRefreshCompliance();
+if (complianceCalls.length !== 1 || complianceCalls[0].scope !== "schema" || complianceCalls[0].schema_name !== "dwd" || !complianceCalls[0].refresh_catalog || !complianceCalls[0].force_refresh) {
+  throw new Error(`Unexpected schema refresh payload: ${JSON.stringify(complianceCalls)}`);
+}
+const summaryEl = mv.settingsDrawerMount.querySelector('[data-schema-refresh-summary="true"]');
+if (!summaryEl || !textOf(summaryEl).includes("dwd · 3 表 / 22 列")) {
+  throw new Error(`Missing or invalid schema refresh summary card: ${textOf(summaryEl)}`);
+}
+const updatedCat = store.state.catalogTrees.c1;
+const uncachedAfter = (updatedCat?.tables || []).find((t) => t.table_name === "t_uncached");
+if (!uncachedAfter || uncachedAfter.col_count !== 4) {
+  throw new Error(`Expected catalog col_count to update to 4, got ${JSON.stringify(uncachedAfter)}`);
+}
+if (mv.tableCheck?.summary?.compliant_cols !== 6) {
+  throw new Error(`Expected active tableCheck to sync after schema refresh, got ${JSON.stringify(mv.tableCheck?.summary)}`);
+}
+
+const schemaSelect2 = mv.settingsDrawerMount.querySelector('select[data-schema-refresh-select="true"]');
+schemaSelect2.value = "__ALL__";
+schemaSelect2.dispatchEvent({ type: "change" });
+await mv.runSchemaRefreshCompliance();
+if (complianceCalls.length !== 2 || complianceCalls[1].scope !== "all_schemas" || !complianceCalls[1].refresh_catalog) {
+  throw new Error(`Expected all_schemas refresh payload, got ${JSON.stringify(complianceCalls[1])}`);
 }
 mv.destroy();
 
 const mv2 = new StandardMigratorView();
 mv2.render();
-const swP2 = mv2.sidebarFormatMount.querySelector('input[data-stat-toggle="ignore_partial"]');
-const swU2 = mv2.sidebarFormatMount.querySelector('input[data-stat-toggle="ignore_unbound"]');
+const swP2 = mv2.settingsDrawerMount.querySelector('input[data-stat-toggle="ignore_partial"]');
+const swU2 = mv2.settingsDrawerMount.querySelector('input[data-stat-toggle="ignore_unbound"]');
 if (mv2.ignorePartial !== false || mv2.ignoreUnbound !== false || swP2.checked !== false || swU2.checked !== false) {
   throw new Error("New StandardMigratorView instance did not restore persisted switch states");
 }
@@ -6891,6 +7025,140 @@ process.exit(0);
             f"Node 前端标准字典性能与 AN-AS 栏位验证失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
         )
         self.assertIn("STANDARD_DICT_PERF_AND_AN_AS_OK", proc.stdout)
+
+    def test_schema_refresh_and_compliance_recheck(self) -> None:
+        """验证全 Schema 刷新并比对落标接口：自动刷新目录发现新表、重抓最新列结构并更新 col_count 与落标统计."""
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sqlite_path = os.path.join(tmpdir, "schema_refresh_demo.db")
+            with sqlite3.connect(sqlite_path) as sconn:
+                sconn.execute(
+                    "CREATE TABLE cust_info (cust_no TEXT, acct_amt REAL)"
+                )
+                sconn.commit()
+
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            try:
+                app = create_app(ctx=ctx)
+                client = TestClient(app)
+
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_CUST_NO",
+                        "cn_name": "客户号",
+                        "en_abbr": "cust_no",
+                        "type_dws": "VARCHAR(32)",
+                    }
+                )
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_ACCT_AMT",
+                        "cn_name": "账户金额",
+                        "en_abbr": "acct_amt",
+                        "type_dws": "DECIMAL(18,2)",
+                    }
+                )
+
+                r_conn = client.post(
+                    "/api/platform/connections",
+                    json={
+                        "name": "Schema刷新测试库",
+                        "db_type": "SQLITE",
+                        "sqlite_path": sqlite_path,
+                    },
+                )
+                self.assertEqual(r_conn.status_code, 200)
+                cid = r_conn.json()["connection"]["connection_id"]
+
+                # 先拉取一次旧目录缓存并绑定字段
+                r_cat1 = client.post(f"/api/platform/metadata/{cid}/refresh", json={})
+                self.assertEqual(r_cat1.status_code, 200)
+
+                r_save = client.post(
+                    "/api/modules/standard_migrator/bindings/save",
+                    json={
+                        "connection_id": cid,
+                        "format_profile": "type_dws",
+                        "active_schema": "main",
+                        "active_table": "cust_info",
+                        "bindings": [
+                            {
+                                "schema_name": "main",
+                                "table_name": "cust_info",
+                                "column_name": "cust_no",
+                                "std_code": "STD_CUST_NO",
+                            },
+                            {
+                                "schema_name": "main",
+                                "table_name": "cust_info",
+                                "column_name": "acct_amt",
+                                "std_code": "STD_ACCT_AMT",
+                            },
+                        ],
+                    },
+                )
+                self.assertEqual(r_save.status_code, 200)
+
+                # 在底层库新增第二张表 + 修改第一张表结构（新增一列并重命名 acct_amt）
+                with sqlite3.connect(sqlite_path) as sconn:
+                    sconn.execute("ALTER TABLE cust_info RENAME COLUMN acct_amt TO balance_amt")
+                    sconn.execute("ALTER TABLE cust_info ADD COLUMN branch_code TEXT")
+                    sconn.execute(
+                        "CREATE TABLE order_fact (order_id INTEGER, cust_no TEXT, order_dt TEXT)"
+                    )
+                    sconn.commit()
+
+                # 1. 按 Schema 刷新并全量比对落标
+                r_sch = client.post(
+                    "/api/modules/standard_migrator/bindings/check-compliance",
+                    json={
+                        "connection_id": cid,
+                        "scope": "schema",
+                        "schema_name": "main",
+                        "schemas": ["main"],
+                        "refresh_catalog": True,
+                        "only_bound_tables": False,
+                        "format_profile": "type_dws",
+                        "force_refresh": True,
+                    },
+                )
+                self.assertEqual(r_sch.status_code, 200)
+                d_sch = r_sch.json()
+                self.assertTrue(d_sch["ok"])
+                self.assertEqual(d_sch["scope"], "schema")
+                self.assertIn("main", d_sch["refreshed_schemas"])
+                self.assertEqual(d_sch["aggregate"]["checked_tables"], 2)
+                self.assertEqual(d_sch["aggregate"]["total_cols"], 6)
+                self.assertEqual(d_sch["aggregate"]["bound_cols"], 1)
+                cat_tables = {
+                    t["table_name"]: t for t in (d_sch.get("catalog") or {}).get("tables", [])
+                }
+                self.assertIn("order_fact", cat_tables)
+                self.assertEqual(cat_tables["cust_info"]["col_count"], 3)
+                self.assertEqual(cat_tables["order_fact"]["col_count"], 3)
+                self.assertEqual(d_sch["table_stats"]["main.cust_info"]["bound_count"], 1)
+
+                # 2. 全库 Schema 刷新并比对落标
+                r_all = client.post(
+                    "/api/modules/standard_migrator/bindings/check-compliance",
+                    json={
+                        "connection_id": cid,
+                        "scope": "all_schemas",
+                        "refresh_catalog": True,
+                        "only_bound_tables": False,
+                        "format_profile": "type_dws",
+                        "force_refresh": True,
+                    },
+                )
+                self.assertEqual(r_all.status_code, 200)
+                d_all = r_all.json()
+                self.assertTrue(d_all["ok"])
+                self.assertEqual(d_all["scope"], "all_schemas")
+                self.assertEqual(d_all["aggregate"]["checked_tables"], 2)
+                self.assertEqual(d_all["aggregate"]["total_cols"], 6)
+            finally:
+                ctx.close()
 
 
 if __name__ == "__main__":

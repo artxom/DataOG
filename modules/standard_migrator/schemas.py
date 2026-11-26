@@ -56,6 +56,11 @@ class AutoMatchBindingsPayload(BaseModel):
 class CheckCompliancePayload(BaseModel):
     connection_id: str
     tables: List[Any] = Field(default_factory=list)
+    schemas: List[str] = Field(default_factory=list)
+    schema_name: str = ""
+    scope: str = ""
+    refresh_catalog: bool = False
+    only_bound_tables: bool = False
     format_profile: str = "AUTO"
     force_refresh: bool = True
 

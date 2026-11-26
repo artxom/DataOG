@@ -115,6 +115,12 @@ export class StandardMigratorView {
     this._queueSort = { sortKey: "", sortAsc: true };
     this._clearingCompletedIds = new Set();
     this._clearingBatches = new Set();
+    this.drawerOpen = false;
+    this.schemaRefreshTarget = "__AUTO__";
+    this._schemaRefreshInFlight = false;
+    this._lastSchemaRefreshSummary = null;
+    this._drawerToggleBtn = null;
+    this._drawerToggleTag = null;
 
     // 贯标改造执行队列状态
     this.ws = null;
@@ -163,14 +169,15 @@ export class StandardMigratorView {
       },
       onKeydown: (e) => this._handleSidebarResizerKeydown(e),
     });
-    this.sidebarFormatMount = el("div", { className: "sidebar-format-inspector" });
     this.treeMount = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
     });
-    clearEl(this.sidebarMount, this.sidebarFormatMount, this.treeMount);
+    clearEl(this.sidebarMount, this.treeMount);
 
     this.mainMount = el("section", { className: "mac-pane", style: { overflow: "hidden" } });
     this.tablistMount = el("div", {});
+    this.workspaceBodyMount = el("div", { className: "migrator-workspace-body" });
+    this.contentColMount = el("div", { className: "migrator-content-col" });
     this.subbarMount = el("div", {});
     this.activityBar = new TaskActivityBar();
     this.activityBar.el.style.margin = "8px 14px 0";
@@ -178,8 +185,23 @@ export class StandardMigratorView {
     this.gridMount = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
     });
+    this.settingsDrawerMount = el("aside", {
+      id: "migrator-settings-drawer",
+      className: "migrator-drawer",
+      role: "region",
+      "aria-label": "对标设置",
+      "aria-hidden": "true",
+      onKeydown: (e) => {
+        if (e.key === "Escape" && this.drawerOpen) {
+          e.stopPropagation?.();
+          this.toggleSettingsDrawer(false);
+        }
+      },
+    });
     this._destroyed = false;
-    clearEl(this.mainMount, this.tablistMount, this.subbarMount, this.activityBar.el, this.gridMount);
+    clearEl(this.contentColMount, this.subbarMount, this.activityBar.el, this.gridMount);
+    clearEl(this.workspaceBodyMount, this.contentColMount, this.settingsDrawerMount);
+    clearEl(this.mainMount, this.tablistMount, this.workspaceBodyMount);
 
     this.tree = new DatabaseTree(this.treeMount, {
       selectionMode: "single",
@@ -194,6 +216,8 @@ export class StandardMigratorView {
           this.activeSchema = "";
           this.selectedSchema = "";
           this.activeTable = "";
+          this.schemaRefreshTarget = "__AUTO__";
+          this._lastSchemaRefreshSummary = null;
           this.tableCheck = null;
           this.selectedBindCols.clear();
           this._syncFormatFromConnection(cid);
@@ -206,6 +230,8 @@ export class StandardMigratorView {
           this.activeConnId = connectionId;
           this.activeSchema = "";
           this.activeTable = "";
+          this.schemaRefreshTarget = "__AUTO__";
+          this._lastSchemaRefreshSummary = null;
           this.tableCheck = null;
           this.selectedBindCols.clear();
           this.selectedSchema = schemaName || "";
@@ -214,6 +240,7 @@ export class StandardMigratorView {
           return;
         }
         this.selectedSchema = schemaName || "";
+        this._renderSettingsDrawer();
       },
       onPreviewTable: async ({ connectionId, schemaName, tableName }) => {
         const switchedConn = connectionId !== this.activeConnId;
@@ -226,6 +253,8 @@ export class StandardMigratorView {
           this.subMode = "bindings";
         }
         if (switchedConn) {
+          this.schemaRefreshTarget = "__AUTO__";
+          this._lastSchemaRefreshSummary = null;
           this._syncFormatFromConnection(connectionId);
           await this.loadBindingsOverview({ skipRender: true });
         }
@@ -277,13 +306,16 @@ export class StandardMigratorView {
     });
 
     this._unsubStore = store.subscribe((state, reason) => {
-      if (reason === "connections" || reason === "bootstrap") {
-        if (this.ws && Array.isArray(state.connections)) {
+      if (["connections", "bootstrap", "catalog"].includes(reason)) {
+        if (reason !== "catalog" && this.ws && Array.isArray(state.connections)) {
           this.ws.connections = state.connections;
         }
         if (this.loadedOnce && this.activeConnId) {
-          this._syncFormatFromConnection(this.activeConnId);
-          this._renderSidebarFormatCard();
+          if (reason !== "catalog") {
+            this._syncFormatFromConnection(this.activeConnId);
+          }
+          this._renderSettingsDrawer();
+          this._syncDrawerToggleButton();
         }
       }
     });
@@ -519,7 +551,8 @@ export class StandardMigratorView {
       }
     } catch (err) {
       this.formatProfile = prev;
-      this._renderSidebarFormatCard();
+      this._renderSettingsDrawer();
+      this._syncDrawerToggleButton();
       Toast.error(err.message);
     }
   }
@@ -651,13 +684,111 @@ export class StandardMigratorView {
     );
   }
 
-  _renderSidebarFormatCard() {
+  _syncDrawerToggleButton() {
+    if (!this._drawerToggleBtn) return;
+    this._drawerToggleBtn.classList?.toggle?.("is-active", Boolean(this.drawerOpen));
+    this._drawerToggleBtn.setAttribute?.("aria-expanded", String(Boolean(this.drawerOpen)));
+    if (this._drawerToggleTag) {
+      this._drawerToggleTag.textContent =
+        SHORT_FORMAT_LABELS[this.formatProfile] || this.formatProfile || "自动";
+    }
+  }
+
+  toggleSettingsDrawer(forceState = undefined) {
+    const next = forceState === undefined ? !this.drawerOpen : Boolean(forceState);
+    this.drawerOpen = next;
+    this.settingsDrawerMount.classList?.toggle?.("is-open", next);
+    this.settingsDrawerMount.setAttribute?.("aria-hidden", String(!next));
+    this._syncDrawerToggleButton();
+    if (next) {
+      this._renderSettingsDrawer();
+    }
+  }
+
+  _collectAvailableSchemas(connId = this.activeConnId) {
+    const tree = store.state.catalogTrees?.[connId] || { schemas: [], tables: [] };
+    const conn = this._findConnection(connId);
+    const byLow = new Map();
+    const ensureSch = (rawName) => {
+      const name = String(rawName || "").trim();
+      if (!name) return null;
+      const low = name.toLowerCase();
+      if (!byLow.has(low)) {
+        byLow.set(low, { name, tableCount: 0 });
+      }
+      return byLow.get(low);
+    };
+
+    for (const s of tree.schemas || []) {
+      const sn = typeof s === "string" ? s : s?.schema_name;
+      ensureSch(sn);
+    }
+    let totalTables = 0;
+    const defSch = conn?.effective_default_schema || conn?.default_schema || "public";
+    for (const t of tree.tables || []) {
+      totalTables += 1;
+      const entry = ensureSch(t?.schema_name || defSch);
+      if (entry) entry.tableCount += 1;
+    }
+    ensureSch(this.selectedSchema);
+    ensureSch(this.activeSchema);
+    if (byLow.size === 0 && conn) {
+      ensureSch(defSch);
+    }
+    return {
+      totalTables,
+      schemas: Array.from(byLow.values()),
+    };
+  }
+
+  _resolveSchemaRefreshScope(schemaItems = null) {
+    const target = String(this.schemaRefreshTarget || "__AUTO__").trim();
+    if (target === "__ALL__") return "__ALL__";
+    if (target && target !== "__AUTO__") {
+      if (Array.isArray(schemaItems) && schemaItems.length > 0) {
+        const matched = schemaItems.find((s) => s.name.toLowerCase() === target.toLowerCase());
+        if (matched) return matched.name;
+      } else {
+        return target;
+      }
+    }
+    const preferred = String(this.selectedSchema || this.activeSchema || "").trim();
+    if (preferred) {
+      if (Array.isArray(schemaItems) && schemaItems.length > 0) {
+        const matched = schemaItems.find((s) => s.name.toLowerCase() === preferred.toLowerCase());
+        if (matched) return matched.name;
+      }
+      return preferred;
+    }
+    return "__ALL__";
+  }
+
+  _buildDrawerSection({ key = "", title, badgeEl = null, desc = "", children = [] }) {
+    return el(
+      "section",
+      {
+        className: "migrator-drawer-section",
+        dataset: key ? { drawerSection: key } : undefined,
+      },
+      el(
+        "div",
+        { className: "migrator-drawer-section-head" },
+        el("span", { className: "migrator-drawer-section-title", text: title }),
+        badgeEl
+      ),
+      desc ? el("p", { className: "migrator-drawer-desc", text: desc }) : null,
+      ...children
+    );
+  }
+
+  _renderSettingsDrawer() {
     const conn = this._findConnection(this.activeConnId);
     const fmtSelect = el(
       "select",
       {
         className: "mac-input mac-input-sm",
         "aria-label": "当前库落标标准",
+        dataset: { formatSelect: "true" },
         disabled: !conn,
         style: { width: "100%" },
         onChange: (e) => this._updateActiveConnectionFormat(e.target.value),
@@ -669,43 +800,162 @@ export class StandardMigratorView {
       })
     );
 
-    clearEl(
-      this.sidebarFormatMount,
+    const { totalTables, schemas: schemaItems } = this._collectAvailableSchemas(this.activeConnId);
+    const resolvedScope = this._resolveSchemaRefreshScope(schemaItems);
+    const isAllScope = resolvedScope === "__ALL__";
+
+    const schemaSelect = el(
+      "select",
+      {
+        className: "mac-input mac-input-sm",
+        "aria-label": "刷新比对范围",
+        dataset: { schemaRefreshSelect: "true" },
+        disabled: !conn || this._schemaRefreshInFlight,
+        style: { width: "100%" },
+        onChange: (e) => {
+          this.schemaRefreshTarget = e.target.value || "__ALL__";
+          this._renderSettingsDrawer();
+        },
+      },
+      [
+        el("option", {
+          value: "__ALL__",
+          selected: isAllScope,
+          text: totalTables > 0 ? `全部 Schema（当前库全量 · ${totalTables} 表）` : "全部 Schema（当前库全量）",
+        }),
+        ...schemaItems.map((s) =>
+          el("option", {
+            value: s.name,
+            selected: !isAllScope && resolvedScope.toLowerCase() === s.name.toLowerCase(),
+            text: s.tableCount > 0 ? `${s.name}（${s.tableCount} 表）` : s.name,
+          })
+        ),
+      ]
+    );
+
+    const refreshBtnText = this._schemaRefreshInFlight
+      ? "正在刷新并比对..."
+      : isAllScope
+      ? "全库 Schema 刷新并比对落标"
+      : `刷新并比对「${resolvedScope}」全部表`;
+
+    const summary =
+      this._lastSchemaRefreshSummary &&
+      this._lastSchemaRefreshSummary.connectionId === this.activeConnId
+        ? this._lastSchemaRefreshSummary
+        : null;
+
+    const summaryCard = summary
+      ? el(
+          "div",
+          { className: "migrator-drawer-summary", dataset: { schemaRefreshSummary: "true" } },
+          el(
+            "div",
+            { className: "migrator-drawer-summary-head" },
+            el("strong", { text: `${summary.scopeLabel} · ${summary.checkedTables} 表 / ${summary.totalCols} 列` }),
+            el("span", { style: { fontSize: "10.5px", color: "var(--os-muted)" }, text: summary.finishedAt || "" })
+          ),
+          el(
+            "div",
+            { className: "migrator-drawer-summary-badges" },
+            badge(`已落标 ${summary.compliantCols}`, "success"),
+            summary.partialCols > 0 ? badge(`部分 ${summary.partialCols}`, "warn") : null,
+            summary.commentOnlyCols > 0 ? badge(`仅差注释 ${summary.commentOnlyCols}`, "info") : null,
+            summary.nonCompliantCols > 0 ? badge(`未落标 ${summary.nonCompliantCols}`, "danger") : null,
+            summary.unboundCols > 0 ? badge(`未绑标 ${summary.unboundCols}`, "neutral") : null
+          )
+        )
+      : null;
+
+    const inner = el(
+      "div",
+      { className: "migrator-drawer-inner" },
       el(
         "div",
-        { className: "sidebar-format-card" },
+        { className: "migrator-drawer-header" },
         el(
           "div",
-          { className: "sidebar-format-head" },
-          el("span", { className: "sidebar-format-title", text: "当前库落标标准" }),
+          { style: { display: "flex", alignItems: "center", gap: "6px", minWidth: "0" } },
+          svgIcon("settings", 14),
+          el("span", { className: "migrator-drawer-title", text: "对标设置" }),
           conn ? badge(conn.db_type || "DB", "neutral") : null
         ),
-        el("div", {
-          className: "sidebar-format-dbname",
-          text: conn ? conn.name : "未选择数据源",
-          title: conn ? `${conn.name} (${conn.db_type})` : "",
+        el("button", {
+          type: "button",
+          className: "btn btn-xs btn-ghost",
+          dataset: { action: "close_settings_drawer" },
+          "aria-label": "收起对标设置",
+          title: "收起对标设置",
+          text: "×",
+          onClick: () => this.toggleSettingsDrawer(false),
+        })
+      ),
+      el(
+        "div",
+        { className: "migrator-drawer-body" },
+        this._buildDrawerSection({
+          key: "format",
+          title: "当前库落标标准",
+          desc: "为当前数据源指定物理类型对标档位，仅在需要切换库级标准时调整。",
+          children: [
+            el("div", {
+              className: "migrator-drawer-dbname",
+              text: conn ? conn.name : "未选择数据源",
+              title: conn ? `${conn.name} (${conn.db_type})` : "",
+            }),
+            fmtSelect,
+          ],
         }),
-        fmtSelect,
-        el(
-          "div",
-          { className: "sidebar-stat-toggles", role: "group", "aria-label": "左侧统计口径" },
-          this._buildMacSwitchRow({
-            key: "ignore_partial",
-            label: "忽略部分落标",
-            title: "开启后，已满足其他数据标准格式的「部分落标」字段视作已完成落标",
-            checked: this.ignorePartial,
-            onChange: (v) => this._setIgnorePartial(v),
-          }),
-          this._buildMacSwitchRow({
-            key: "ignore_unbound",
-            label: "忽略未绑标字段",
-            title: "开启后，表右侧统计数字仅计已绑标字段；关闭后按表全部物理字段统计",
-            checked: this.ignoreUnbound,
-            onChange: (v) => this._setIgnoreUnbound(v),
-          })
-        )
+        this._buildDrawerSection({
+          key: "tree_stats",
+          title: "目录树统计口径",
+          desc: "控制左侧目录树表徽标的达标分子与总字段分母统计方式。",
+          children: [
+            el(
+              "div",
+              { className: "sidebar-stat-toggles", role: "group", "aria-label": "左侧统计口径" },
+              this._buildMacSwitchRow({
+                key: "ignore_partial",
+                label: "忽略部分落标",
+                title: "开启后，已满足其他数据标准格式的「部分落标」字段视作已完成落标",
+                checked: this.ignorePartial,
+                onChange: (v) => this._setIgnorePartial(v),
+              }),
+              this._buildMacSwitchRow({
+                key: "ignore_unbound",
+                label: "忽略未绑标字段",
+                title: "开启后，表右侧统计数字仅计已绑标字段；关闭后按表全部物理字段统计",
+                checked: this.ignoreUnbound,
+                onChange: (v) => this._setIgnoreUnbound(v),
+              })
+            ),
+          ],
+        }),
+        this._buildDrawerSection({
+          key: "schema_refresh",
+          title: "全 Schema 刷新与落标比对",
+          desc: "同步目标 Schema 最新目录与表列元数据，并全量重算落标结果与树徽标。",
+          children: [
+            schemaSelect,
+            el(
+              "button",
+              {
+                type: "button",
+                className: "mac-btn mac-btn-sm mac-btn-primary migrator-drawer-full-btn",
+                dataset: { action: "refresh_schema_compliance" },
+                disabled: !conn || this._schemaRefreshInFlight,
+                onClick: () => this.runSchemaRefreshCompliance(),
+              },
+              svgIcon("refresh", 13),
+              el("span", { text: refreshBtnText })
+            ),
+            summaryCard,
+          ],
+        })
       )
     );
+
+    clearEl(this.settingsDrawerMount, inner);
   }
 
   async reloadState() {
@@ -755,7 +1005,8 @@ export class StandardMigratorView {
         this.render();
         this.onStateUpdate?.();
       } else {
-        this._renderSidebarFormatCard();
+        this._renderSettingsDrawer();
+        this._syncDrawerToggleButton();
       }
     } catch (err) {
       Toast.error(err.message);
@@ -805,6 +1056,113 @@ export class StandardMigratorView {
     } catch (err) {
       if (isAbortError(err)) return;
       Toast.error(err.message);
+    }
+  }
+
+  async runSchemaRefreshCompliance() {
+    if (this._schemaRefreshInFlight) return;
+    if (!this.activeConnId) {
+      Toast.warn("请先选择要刷新并比对的数据源");
+      return;
+    }
+    const { schemas: schemaItems } = this._collectAvailableSchemas(this.activeConnId);
+    const resolved = this._resolveSchemaRefreshScope(schemaItems);
+    const isAll = resolved === "__ALL__";
+    const targetSchema = isAll ? "" : resolved;
+    const title = isAll
+      ? "全库 Schema 刷新并比对落标"
+      : `刷新并比对 ${targetSchema} 全 Schema 落标`;
+
+    this._schemaRefreshInFlight = true;
+    this._renderSettingsDrawer();
+    try {
+      const res = await this._runTracked(title, ({ taskId, signal }) =>
+        migratorApi.checkCompliance(
+          {
+            connection_id: this.activeConnId,
+            scope: isAll ? "all_schemas" : "schema",
+            schema_name: targetSchema,
+            schemas: targetSchema ? [targetSchema] : [],
+            refresh_catalog: true,
+            only_bound_tables: false,
+            format_profile: this.formatProfile,
+            force_refresh: true,
+          },
+          { taskId, signal }
+        )
+      );
+      if (this._destroyed) return;
+      if (res.catalog) {
+        store.updateCatalogTree(this.activeConnId, res.catalog);
+      }
+      if (this.tree?.tableColumnsCache) {
+        const prefix = `${this.activeConnId}::`;
+        for (const k of [...this.tree.tableColumnsCache.keys()]) {
+          if (k.startsWith(prefix)) this.tree.tableColumnsCache.delete(k);
+        }
+      }
+      if (Array.isArray(res.tables)) {
+        for (const tr of res.tables) {
+          const schK = String(tr?.table?.schema_name || "public").toLowerCase();
+          const tblK = String(tr?.table?.table_name || "").toLowerCase();
+          const totC = Number(tr?.summary?.total_cols || (tr?.columns || []).length || 0);
+          if (tblK && totC > 0) {
+            this._knownTableColCounts.set(`${this.activeConnId}::${schK}.${tblK}`, totC);
+          }
+        }
+      }
+      if (res.table_stats) this.tableStats = res.table_stats;
+      if (this.activeTable) {
+        const actTblLow = String(this.activeTable || "").trim().toLowerCase();
+        const actSchLow = String(this.activeSchema || "").trim().toLowerCase();
+        const matched = (res.tables || []).find((tr) => {
+          const ts = String(tr?.table?.schema_name || "").trim().toLowerCase();
+          const tt = String(tr?.table?.table_name || "").trim().toLowerCase();
+          return tt === actTblLow && (!actSchLow || ts === actSchLow);
+        });
+        if (matched) {
+          this.tableCheck = matched;
+          if (matched.table) {
+            this.activeSchema = matched.table.schema_name || this.activeSchema;
+            this.selectedSchema = this.activeSchema || this.selectedSchema;
+            this.activeTable = matched.table.table_name || this.activeTable;
+          }
+          this._pruneSelectedBindCols();
+        } else if (res.active_table) {
+          this.tableCheck = res.active_table;
+          this._pruneSelectedBindCols();
+        }
+      }
+      const agg = res.aggregate || {};
+      this._lastSchemaRefreshSummary = {
+        connectionId: this.activeConnId,
+        scopeLabel: isAll ? "全部 Schema" : targetSchema,
+        checkedTables: Number(agg.checked_tables ?? (res.tables || []).length ?? 0),
+        totalCols: Number(agg.total_cols ?? 0),
+        compliantCols: Number(agg.compliant_cols ?? 0),
+        partialCols: Number(agg.partial_compliant_cols ?? 0),
+        commentOnlyCols: Number(agg.comment_only_cols ?? 0),
+        nonCompliantCols: Number(agg.non_compliant_cols ?? 0),
+        unboundCols: Number(agg.unbound_cols ?? 0),
+        finishedAt: new Date().toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }),
+      };
+      if (res.warning) Toast.warn(res.warning);
+      else Toast.success(res.message || "全 Schema 刷新并比对完成");
+      this.tree.renderTreeBody();
+      this.render();
+      this.onStateUpdate?.();
+    } catch (err) {
+      if (isAbortError(err)) return;
+      Toast.error(err.message);
+    } finally {
+      this._schemaRefreshInFlight = false;
+      if (!this._destroyed) {
+        this._renderSettingsDrawer();
+      }
     }
   }
 
@@ -1211,6 +1569,8 @@ export class StandardMigratorView {
           this.activeSchema = "";
           this.selectedSchema = "";
           this.activeTable = "";
+          this.schemaRefreshTarget = "__AUTO__";
+          this._lastSchemaRefreshSummary = null;
           this.tableCheck = null;
           this.selectedBindCols.clear();
           this._syncFormatFromConnection(cid);
@@ -1459,7 +1819,10 @@ export class StandardMigratorView {
   }
 
   render() {
-    this._renderSidebarFormatCard();
+    this.settingsDrawerMount.classList?.toggle?.("is-open", this.drawerOpen);
+    this.settingsDrawerMount.setAttribute?.("aria-hidden", String(!this.drawerOpen));
+    this._renderSettingsDrawer();
+
     const queueCount = (this.ws?.items || []).length;
     this._queueTabBtn = null;
     const tablist = el(
@@ -1495,7 +1858,32 @@ export class StandardMigratorView {
         return btn;
       })
     );
-    clearEl(this.tablistMount, tablist);
+
+    const fmtShort = SHORT_FORMAT_LABELS[this.formatProfile] || this.formatProfile || "自动";
+    this._drawerToggleTag = el("span", {
+      className: "migrator-drawer-toggle-tag",
+      text: fmtShort,
+    });
+    this._drawerToggleBtn = el(
+      "button",
+      {
+        type: "button",
+        className: `migrator-drawer-toggle-btn ${this.drawerOpen ? "is-active" : ""}`.trim(),
+        dataset: { action: "toggle_settings_drawer" },
+        "aria-expanded": String(Boolean(this.drawerOpen)),
+        "aria-controls": "migrator-settings-drawer",
+        title: "展开或收起对标设置抽屉",
+        onClick: () => this.toggleSettingsDrawer(),
+      },
+      svgIcon("settings", 13),
+      el("span", { text: "对标设置" }),
+      this._drawerToggleTag
+    );
+
+    clearEl(
+      this.tablistMount,
+      el("div", { className: "migrator-tablist-bar" }, tablist, this._drawerToggleBtn)
+    );
 
     if (this.subMode === "bindings") {
       this._renderBindingsView();
@@ -1503,15 +1891,30 @@ export class StandardMigratorView {
       this._renderQueueView();
     }
 
+    const contentChildren = this.contentColMount.children;
+    if (
+      contentChildren.length !== 3 ||
+      contentChildren[0] !== this.subbarMount ||
+      contentChildren[1] !== this.activityBar.el ||
+      contentChildren[2] !== this.gridMount
+    ) {
+      clearEl(this.contentColMount, this.subbarMount, this.activityBar.el, this.gridMount);
+    }
+    const bodyChildren = this.workspaceBodyMount.children;
+    if (
+      bodyChildren.length !== 2 ||
+      bodyChildren[0] !== this.contentColMount ||
+      bodyChildren[1] !== this.settingsDrawerMount
+    ) {
+      clearEl(this.workspaceBodyMount, this.contentColMount, this.settingsDrawerMount);
+    }
     const mainChildren = this.mainMount.children;
     if (
-      mainChildren.length !== 4 ||
+      mainChildren.length !== 2 ||
       mainChildren[0] !== this.tablistMount ||
-      mainChildren[1] !== this.subbarMount ||
-      mainChildren[2] !== this.activityBar.el ||
-      mainChildren[3] !== this.gridMount
+      mainChildren[1] !== this.workspaceBodyMount
     ) {
-      clearEl(this.mainMount, this.tablistMount, this.subbarMount, this.activityBar.el, this.gridMount);
+      clearEl(this.mainMount, this.tablistMount, this.workspaceBodyMount);
     }
     if (
       this.root.children.length !== 3 ||
