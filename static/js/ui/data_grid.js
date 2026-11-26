@@ -236,4 +236,12 @@ export class DataGrid {
     );
     clearEl(this.root, table);
   }
+
+  destroy() {
+    this._masterCb = null;
+    this._rowDomMap.clear();
+    this._renderedKeys = [];
+    this.rows = [];
+    clearEl(this.root);
+  }
 }

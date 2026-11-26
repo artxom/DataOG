@@ -25,6 +25,7 @@ def api_list_standards(
     data_category: str = Query(default=""),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=200),
+    include_summary: bool = Query(default=True),
     ctx: PlatformContext = Depends(get_platform_context),
 ):
     page_data = ctx.standard_catalog.search_standards(
@@ -34,12 +35,14 @@ def api_list_standards(
         page=page,
         page_size=page_size,
     )
-    return {
+    resp = {
         "ok": True,
         **page_data,
-        "summary": ctx.standard_catalog.get_summary(),
-        "format_profiles": ctx.standard_catalog.list_format_profiles(),
     }
+    if include_summary:
+        resp["summary"] = ctx.standard_catalog.get_summary()
+        resp["format_profiles"] = ctx.standard_catalog.list_format_profiles()
+    return resp
 
 
 @router.get("/standards/lookup")
