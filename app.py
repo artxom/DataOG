@@ -14,7 +14,7 @@ import sys
 import time
 import traceback
 
-BASE_APP_VERSION = "3.5.1"
+BASE_APP_VERSION = "3.5.2"
 
 
 def disable_windows_console_quick_edit() -> None:

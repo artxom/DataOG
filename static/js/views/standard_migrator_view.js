@@ -28,6 +28,8 @@ const SIDEBAR_WIDTH_STORAGE_KEY = "dataog:standard_migrator:sidebar_width";
 const SIDEBAR_WIDTH_DEFAULT = 248;
 const SIDEBAR_WIDTH_MIN = 180;
 const SIDEBAR_WIDTH_MAX = 560;
+const SIDEBAR_IGNORE_PARTIAL_STORAGE_KEY = "dataog:standard_migrator:ignore_partial";
+const SIDEBAR_IGNORE_UNBOUND_STORAGE_KEY = "dataog:standard_migrator:ignore_unbound";
 
 const MIG_STATUS_META = {
   COMPLETED: { label: "已达标", tone: "success" },
@@ -90,6 +92,9 @@ export class StandardMigratorView {
     this.formatProfile = "AUTO";
     this.formatProfiles = DEFAULT_FORMAT_PROFILES;
     this.tableStats = {};
+    this.ignorePartial = this._loadBoolPref(SIDEBAR_IGNORE_PARTIAL_STORAGE_KEY, true);
+    this.ignoreUnbound = this._loadBoolPref(SIDEBAR_IGNORE_UNBOUND_STORAGE_KEY, true);
+    this._knownTableColCounts = new Map();
     this.tableCheck = null;
     this.bindingFilter = "ALL"; // ALL | COMPLIANT | COMMENT_ONLY | PARTIAL_COMPLIANT | NON_COMPLIANT | UNBOUND
     this.bindingKeyword = "";
@@ -227,21 +232,10 @@ export class StandardMigratorView {
         await this.loadTableCompliance(false);
       },
       renderTableBadge: (cid, schemaName, tbl) => {
-        if (cid !== this.activeConnId) return null;
-        const key = `${String(schemaName || "public").toLowerCase()}.${String(tbl.table_name || "").toLowerCase()}`;
-        const st = this.tableStats[key];
-        if (!st || !st.bound_count) return null;
-        const partialCnt = st.partial_compliant_count || 0;
-        const tone =
-          st.non_compliant_count > 0 || partialCnt > 0
-            ? "warn"
-            : st.compliant_count >= st.bound_count
-            ? "success"
-            : "info";
-        const bEl = badge(`${st.compliant_count}/${st.bound_count}`, tone);
-        const partialHint = partialCnt > 0 ? `，含部分落标 ${partialCnt}` : "";
-        const totalHint = st.total_cols ? `（物理表共 ${st.total_cols} 列）` : "";
-        bEl.title = `已落标 ${st.compliant_count} / 已绑标 ${st.bound_count}${partialHint}${totalHint}`;
+        const metrics = this._computeTableBadgeMetrics(cid, schemaName, tbl);
+        if (!metrics) return null;
+        const bEl = badge(metrics.text, metrics.tone);
+        if (metrics.title) bEl.title = metrics.title;
         return bEl;
       },
     });
@@ -530,6 +524,133 @@ export class StandardMigratorView {
     }
   }
 
+  _loadBoolPref(key, fallback = true) {
+    try {
+      const raw = globalThis.localStorage?.getItem?.(key);
+      if (raw === "0" || raw === "false") return false;
+      if (raw === "1" || raw === "true") return true;
+    } catch (_e) {
+      // ignore storage access errors
+    }
+    return Boolean(fallback);
+  }
+
+  _persistBoolPref(key, val) {
+    try {
+      globalThis.localStorage?.setItem?.(key, val ? "1" : "0");
+    } catch (_e) {
+      // ignore storage access errors
+    }
+  }
+
+  _setIgnorePartial(next) {
+    this.ignorePartial = Boolean(next);
+    this._persistBoolPref(SIDEBAR_IGNORE_PARTIAL_STORAGE_KEY, this.ignorePartial);
+    this.tree?.renderTreeBody?.();
+  }
+
+  _setIgnoreUnbound(next) {
+    this.ignoreUnbound = Boolean(next);
+    this._persistBoolPref(SIDEBAR_IGNORE_UNBOUND_STORAGE_KEY, this.ignoreUnbound);
+    this.tree?.renderTreeBody?.();
+  }
+
+  _computeTableBadgeMetrics(cid, schemaName, tbl) {
+    if (cid !== this.activeConnId) return null;
+    const key = `${String(schemaName || "public").toLowerCase()}.${String(tbl?.table_name || "").toLowerCase()}`;
+    const st = this.tableStats[key] || null;
+    const boundCount = Number(st?.bound_count || 0);
+    const compliantCount = Number(st?.compliant_count || 0);
+    const partialCount = Number(st?.partial_compliant_count || 0);
+    const nonCompliantCount = Number(st?.non_compliant_count || 0);
+    const knownCols = Number(this._knownTableColCounts?.get(`${cid}::${key}`) || 0);
+    const physicalTotalCols = Math.max(
+      Number(st?.total_cols || 0),
+      Number(tbl?.col_count || 0),
+      knownCols
+    );
+    const hasPhysicalTotal = physicalTotalCols > 0;
+
+    let denom = 0;
+    if (this.ignoreUnbound) {
+      if (boundCount <= 0) return null;
+      denom = boundCount;
+    } else {
+      if (boundCount <= 0 && !hasPhysicalTotal) return null;
+      denom = hasPhysicalTotal ? Math.max(physicalTotalCols, boundCount) : boundCount;
+    }
+
+    const effectiveCompliant = Math.min(
+      denom,
+      this.ignorePartial ? compliantCount + partialCount : compliantCount
+    );
+    const unboundCount = hasPhysicalTotal ? Math.max(0, denom - boundCount) : 0;
+    const hasUnresolvedBad =
+      nonCompliantCount > 0 || (!this.ignorePartial && partialCount > 0);
+
+    let tone = "info";
+    if (boundCount === 0) {
+      tone = "neutral";
+    } else if (hasUnresolvedBad) {
+      tone = "warn";
+    } else if (effectiveCompliant >= denom && denom > 0) {
+      tone = !this.ignoreUnbound && !hasPhysicalTotal ? "info" : "success";
+    }
+
+    const numText =
+      this.ignorePartial && partialCount > 0
+        ? `已落标 ${effectiveCompliant}（含部分落标 ${partialCount}）`
+        : `已落标 ${compliantCount}`;
+    let title = "";
+    if (this.ignoreUnbound) {
+      const partialSuffix =
+        !this.ignorePartial && partialCount > 0 ? `，含部分落标 ${partialCount}` : "";
+      const totalSuffix = hasPhysicalTotal ? `（物理表共 ${physicalTotalCols} 列）` : "";
+      title = `${numText} / 已绑标 ${boundCount}${partialSuffix}${totalSuffix}`;
+    } else {
+      const partialSuffix =
+        !this.ignorePartial && partialCount > 0 ? `，部分落标 ${partialCount}` : "";
+      title = hasPhysicalTotal
+        ? `${numText} / 表总字段 ${denom}（已绑标 ${boundCount}，未绑标 ${unboundCount}${partialSuffix}）`
+        : `${numText} / 已绑标 ${boundCount}${partialSuffix}（物理表总列数尚未缓存，暂按已绑标计）`;
+    }
+
+    return { text: `${effectiveCompliant}/${denom}`, tone, title };
+  }
+
+  _buildMacSwitchRow({ key, label, title = "", checked = true, onChange }) {
+    const isChecked = Boolean(checked);
+    const input = el("input", {
+      type: "checkbox",
+      role: "switch",
+      className: "mac-switch-input",
+      checked: isChecked,
+      "aria-checked": String(isChecked),
+      "aria-label": label,
+      dataset: { statToggle: key },
+      onChange: (e) => {
+        const next = Boolean(e.target?.checked);
+        input.setAttribute?.("aria-checked", String(next));
+        onChange?.(next);
+      },
+    });
+    return el(
+      "label",
+      { className: "sidebar-stat-toggle-row", title },
+      el("span", { className: "sidebar-stat-toggle-label", text: label }),
+      el(
+        "span",
+        { className: "mac-switch", "aria-hidden": "true" },
+        input,
+        el(
+          "span",
+          { className: "mac-switch-track" },
+          el("span", { className: "mac-switch-thumb" })
+        )
+      )
+    );
+  }
+
   _renderSidebarFormatCard() {
     const conn = this._findConnection(this.activeConnId);
     const fmtSelect = el(
@@ -564,7 +685,25 @@ export class StandardMigratorView {
           text: conn ? conn.name : "未选择数据源",
           title: conn ? `${conn.name} (${conn.db_type})` : "",
         }),
-        fmtSelect
+        fmtSelect,
+        el(
+          "div",
+          { className: "sidebar-stat-toggles", role: "group", "aria-label": "左侧统计口径" },
+          this._buildMacSwitchRow({
+            key: "ignore_partial",
+            label: "忽略部分落标",
+            title: "开启后，已满足其他数据标准格式的「部分落标」字段视作已完成落标",
+            checked: this.ignorePartial,
+            onChange: (v) => this._setIgnorePartial(v),
+          }),
+          this._buildMacSwitchRow({
+            key: "ignore_unbound",
+            label: "忽略未绑标字段",
+            title: "开启后，表右侧统计数字仅计已绑标字段；关闭后按表全部物理字段统计",
+            checked: this.ignoreUnbound,
+            onChange: (v) => this._setIgnoreUnbound(v),
+          })
+        )
       )
     );
   }
@@ -648,6 +787,12 @@ export class StandardMigratorView {
       if (this._destroyed) return;
       this.tableCheck = res;
       if (res.table_stats) this.tableStats = res.table_stats;
+      const schKey = String(res.table?.schema_name || this.activeSchema || "public").toLowerCase();
+      const tblKey = String(res.table?.table_name || this.activeTable || "").toLowerCase();
+      const totCols = Number(res.summary?.total_cols || (res.columns || []).length || 0);
+      if (this.activeConnId && tblKey && totCols > 0) {
+        this._knownTableColCounts.set(`${this.activeConnId}::${schKey}.${tblKey}`, totCols);
+      }
       if (res.table) {
         this.activeSchema = res.table.schema_name || this.activeSchema;
         this.selectedSchema = this.activeSchema || this.selectedSchema;

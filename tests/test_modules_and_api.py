@@ -6121,6 +6121,342 @@ process.exit(0);
             finally:
                 ctx.close()
 
+    def test_sidebar_stat_toggles_and_catalog_col_count(self) -> None:
+        """验证 get_cached_catalog 返回物理表 col_count 及左侧统计 macOS 开关（忽略部分落标 / 忽略未绑标字段）的联动计算与持久化."""
+        import shutil
+        import subprocess
+        from core.platform.models import ColumnMeta, SchemaMeta, TableMeta
+
+        # 1. 后端 get_cached_catalog 准确返回各表 col_count，且 get_connection_binding_stats 仍仅返回已绑标表
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            try:
+                cid = "conn_stat_toggle"
+                ctx.store.save_catalog_snapshot(
+                    cid,
+                    [SchemaMeta(schema_name="dwd")],
+                    [
+                        {"schema_name": "dwd", "table_name": "t_mix", "object_type": "TABLE"},
+                        {"schema_name": "dwd", "table_name": "t_unbound", "object_type": "TABLE"},
+                        {"schema_name": "dwd", "table_name": "t_uncached", "object_type": "TABLE"},
+                    ],
+                )
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name="dwd",
+                        table_name="t_mix",
+                        columns=[
+                            ColumnMeta(column_name=f"c_{i}", data_type="VARCHAR(32)", ordinal_position=i + 1)
+                            for i in range(10)
+                        ],
+                    ),
+                )
+                ctx.store.save_table_meta(
+                    cid,
+                    TableMeta(
+                        schema_name="dwd",
+                        table_name="t_unbound",
+                        columns=[
+                            ColumnMeta(column_name=f"u_{i}", data_type="VARCHAR(32)", ordinal_position=i + 1)
+                            for i in range(8)
+                        ],
+                    ),
+                )
+                ctx.standard_catalog.upsert_field_bindings(
+                    cid,
+                    [
+                        {"schema_name": "dwd", "table_name": "t_mix", "column_name": f"c_{i}", "std_code": "STD_1"}
+                        for i in range(7)
+                    ],
+                )
+                cat = ctx.store.get_cached_catalog(cid)
+                col_counts = {
+                    f"{t['schema_name']}.{t['table_name']}": t.get("col_count")
+                    for t in cat["tables"]
+                }
+                self.assertEqual(col_counts["dwd.t_mix"], 10)
+                self.assertEqual(col_counts["dwd.t_unbound"], 8)
+                self.assertEqual(col_counts["dwd.t_uncached"], 0)
+                b_stats = ctx.standard_catalog.get_connection_binding_stats(cid)
+                self.assertIn("dwd.t_mix", b_stats)
+                self.assertNotIn("dwd.t_unbound", b_stats)
+            finally:
+                ctx.close()
+
+        # 2. CSS 校验 macOS 胶囊开关与侧栏统计开关区样式存在
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(project_root, "static", "css", "workbench.css"), "r", encoding="utf-8") as fh:
+            css_text = fh.read()
+        for cls_name in (".sidebar-stat-toggles", ".mac-switch", ".mac-switch-track", ".mac-switch-thumb"):
+            self.assertIn(cls_name, css_text)
+
+        # 3. Node.js 前端 E2E：验证默认开启、4 种开关组合口径、tooltip、0 绑标表徽标显隐与 localStorage 持久化
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("Node.js 未安装，跳过前端统计开关端到端验证")
+
+        node_script = r"""
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+class MockNode {
+  constructor(tag = "div") {
+    this.tagName = String(tag).toUpperCase();
+    this.children = [];
+    this.attributes = new Map();
+    this.listeners = new Map();
+    this.style = {};
+    this.dataset = {};
+    this.className = "";
+    this.value = "";
+    this.textContent = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.checked = false;
+    this.indeterminate = false;
+    this.parentNode = null;
+    const self = this;
+    this.classList = {
+      add(...cs) { self.className = [...new Set([...(self.className||"").split(/\s+/).filter(Boolean), ...cs])].join(" "); },
+      remove(...cs) { const s = new Set(cs); self.className = (self.className||"").split(/\s+/).filter(x => x && !s.has(x)).join(" "); },
+      toggle(c, f) { const has = (self.className||"").split(/\s+/).includes(c); const on = f === undefined ? !has : Boolean(f); if (on) this.add(c); else this.remove(c); },
+      contains(c) { return (self.className||"").split(/\s+/).includes(c); },
+    };
+  }
+  appendChild(c) { if (c) { c.parentNode = this; this.children.push(c); } return c; }
+  replaceChildren(...ns) { this.children = ns.filter(Boolean); this.children.forEach(c => c.parentNode = this); }
+  setAttribute(k, v) { this.attributes.set(k, String(v)); }
+  getAttribute(k) { return this.attributes.get(k) ?? null; }
+  addEventListener(e, fn) { (this.listeners.get(e) || this.listeners.set(e, []).get(e)).push(fn); }
+  removeEventListener(e, fn) { const arr = this.listeners.get(e); if (arr) this.listeners.set(e, arr.filter(x => x !== fn)); }
+  dispatchEvent(ev) {
+    const e = { target: this, currentTarget: this, preventDefault() {}, stopPropagation() {}, ...ev };
+    for (const fn of [...(this.listeners.get(e.type) || [])]) fn(e);
+  }
+  _matches(sel) {
+    if (!sel) return false;
+    const tagMatch = sel.match(/^([a-zA-Z0-9_-]+)/);
+    if (tagMatch && this.tagName !== tagMatch[1].toUpperCase()) return false;
+    const attrRe = /\[([^\]=]+)(?:="([^"]*)")?\]/g;
+    let m;
+    while ((m = attrRe.exec(sel)) !== null) {
+      const attr = m[1];
+      const expected = m[2];
+      let actual = this.attributes.get(attr) ?? null;
+      if (actual === null && attr.startsWith("data-")) {
+        const camel = attr.slice(5).replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+        if (camel in this.dataset) actual = String(this.dataset[camel]);
+      }
+      if (actual === null) return false;
+      if (expected !== undefined && actual !== expected) return false;
+    }
+    return true;
+  }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  querySelectorAll(sel) {
+    const out = [];
+    const walk = (node) => {
+      for (const ch of node.children || []) {
+        if (ch._matches?.(sel)) out.push(ch);
+        walk(ch);
+      }
+    };
+    walk(this);
+    return out;
+  }
+  contains(n) { return this === n || this.children.some(c => c.contains?.(n)); }
+}
+
+const byId = new Map();
+for (const id of [
+  "global-modal", "global-modal-title", "global-modal-body", "global-modal-footer", "global-modal-close", "toast-root",
+]) {
+  const n = new MockNode(id === "global-modal" ? "dialog" : "div");
+  n.id = id;
+  byId.set(id, n);
+}
+
+const storageMap = new Map();
+globalThis.Node = MockNode;
+globalThis.HTMLDialogElement = class HTMLDialogElement {};
+globalThis.localStorage = {
+  getItem: (k) => (storageMap.has(k) ? storageMap.get(k) : null),
+  setItem: (k, v) => storageMap.set(k, String(v)),
+};
+globalThis.window = { innerWidth: 1440, innerHeight: 900, addEventListener() {}, removeEventListener() {} };
+globalThis.document = {
+  head: new MockNode("head"),
+  body: new MockNode("body"),
+  activeElement: null,
+  createElement: (tag) => new MockNode(tag),
+  createElementNS: (_ns, tag) => new MockNode(tag),
+  createTextNode: (t) => Object.assign(new MockNode("#text"), { textContent: String(t) }),
+  getElementById: (id) => byId.get(id) || null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener() {},
+  removeEventListener() {},
+};
+globalThis.fetch = async () => ({
+  ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
+  json: async () => ({ ok: true, items: [], summary: {} }),
+});
+
+const root = process.argv[1];
+const imp = (rel) => import(pathToFileURL(path.join(root, rel)).href);
+
+const { store } = await imp("static/js/core/state.js");
+const { StandardMigratorView } = await imp("static/js/views/standard_migrator_view.js");
+
+store.updateConnections([
+  { connection_id: "c1", name: "测试数仓", db_type: "DWS", default_schema: "dwd", effective_default_schema: "dwd" },
+]);
+store.updateCatalogTree("c1", {
+  schemas: [{ schema_name: "dwd" }],
+  tables: [
+    { schema_name: "dwd", table_name: "t_mix", object_type: "TABLE", col_count: 10 },
+    { schema_name: "dwd", table_name: "t_unbound", object_type: "TABLE", col_count: 8 },
+    { schema_name: "dwd", table_name: "t_uncached", object_type: "TABLE", col_count: 0 },
+  ],
+});
+
+const mv = new StandardMigratorView();
+mv.activeConnId = "c1";
+mv.tableStats = {
+  "dwd.t_mix": {
+    bound_count: 7,
+    compliant_count: 5,
+    partial_compliant_count: 2,
+    comment_only_count: 0,
+    non_compliant_count: 0,
+    total_cols: 10,
+  },
+  "dwd.t_uncached": {
+    bound_count: 2,
+    compliant_count: 2,
+    partial_compliant_count: 0,
+    comment_only_count: 0,
+    non_compliant_count: 0,
+    total_cols: 0,
+  },
+};
+await mv.tree.setActiveConnection("c1", { expand: true });
+mv.render();
+
+const getSwitch = (key) => mv.sidebarFormatMount.querySelector(`input[data-stat-toggle="${key}"]`);
+const getBadgeFor = (tblName) => {
+  const row = mv.tree.treeBody.querySelector(`[data-table-key="c1::dwd::${tblName}"]`);
+  if (!row) throw new Error(`Missing tree row for ${tblName}`);
+  return row.children.find((ch) => ch.classList?.contains?.("badge")) || null;
+};
+const textOf = (n) => (n ? (n.textContent || "") + (n.children || []).map(textOf).join("") : "");
+
+const swPartial = getSwitch("ignore_partial");
+const swUnbound = getSwitch("ignore_unbound");
+if (!swPartial || !swUnbound) throw new Error("Missing sidebar stat switches");
+if (swPartial.getAttribute("role") !== "switch" || swUnbound.getAttribute("role") !== "switch") {
+  throw new Error("Switches must have role='switch'");
+}
+if (!swPartial.checked || !swUnbound.checked) {
+  throw new Error("Both switches must default to ON");
+}
+if (swPartial.getAttribute("aria-checked") !== "true" || swUnbound.getAttribute("aria-checked") !== "true") {
+  throw new Error("Both switches must default aria-checked='true'");
+}
+const cardTxt = textOf(mv.sidebarFormatMount);
+if (!cardTxt.includes("忽略部分落标") || !cardTxt.includes("忽略未绑标字段")) {
+  throw new Error(`Missing Chinese switch labels in sidebar card: ${cardTxt}`);
+}
+
+// State 1: (true, true) 默认态
+let bMix = getBadgeFor("t_mix");
+let bUnb = getBadgeFor("t_unbound");
+let bUnc = getBadgeFor("t_uncached");
+if (!bMix || bMix.textContent !== "7/7" || !bMix.classList.contains("badge-success")) {
+  throw new Error(`State(T,T) t_mix expected 7/7 badge-success, got ${bMix?.textContent} ${bMix?.className}`);
+}
+if (bUnb !== null) throw new Error("State(T,T) t_unbound should hide badge");
+if (!bUnc || bUnc.textContent !== "2/2" || !bUnc.classList.contains("badge-success")) {
+  throw new Error(`State(T,T) t_uncached expected 2/2 badge-success, got ${bUnc?.textContent}`);
+}
+
+// State 2: (false, true) 关闭「忽略部分落标」
+swPartial.checked = false;
+swPartial.dispatchEvent({ type: "change" });
+if (swPartial.getAttribute("aria-checked") !== "false") throw new Error("aria-checked did not update to false");
+bMix = getBadgeFor("t_mix");
+bUnb = getBadgeFor("t_unbound");
+if (!bMix || bMix.textContent !== "5/7" || !bMix.classList.contains("badge-warn")) {
+  throw new Error(`State(F,T) t_mix expected 5/7 badge-warn, got ${bMix?.textContent} ${bMix?.className}`);
+}
+if (bUnb !== null) throw new Error("State(F,T) t_unbound should still hide badge");
+
+// State 3: (true, false) 开启「忽略部分落标」，关闭「忽略未绑标字段」
+swPartial.checked = true;
+swPartial.dispatchEvent({ type: "change" });
+swUnbound.checked = false;
+swUnbound.dispatchEvent({ type: "change" });
+bMix = getBadgeFor("t_mix");
+bUnb = getBadgeFor("t_unbound");
+bUnc = getBadgeFor("t_uncached");
+if (!bMix || bMix.textContent !== "7/10" || !bMix.classList.contains("badge-info")) {
+  throw new Error(`State(T,F) t_mix expected 7/10 badge-info, got ${bMix?.textContent} ${bMix?.className}`);
+}
+if (!bUnb || bUnb.textContent !== "0/8" || bUnb.classList.contains("badge-warn") || bUnb.classList.contains("badge-success")) {
+  throw new Error(`State(T,F) t_unbound expected 0/8 neutral badge, got ${bUnb?.textContent} ${bUnb?.className}`);
+}
+if (!bUnc || bUnc.textContent !== "2/2" || !bUnc.classList.contains("badge-info") || !(bUnc.title || "").includes("物理表总列数尚未缓存")) {
+  throw new Error(`State(T,F) t_uncached expected 2/2 badge-info with uncached hint, got ${bUnc?.textContent} ${bUnc?.className} ${bUnc?.title}`);
+}
+
+// State 4: (false, false) 全部关闭
+swPartial.checked = false;
+swPartial.dispatchEvent({ type: "change" });
+bMix = getBadgeFor("t_mix");
+bUnb = getBadgeFor("t_unbound");
+if (!bMix || bMix.textContent !== "5/10" || !bMix.classList.contains("badge-warn")) {
+  throw new Error(`State(F,F) t_mix expected 5/10 badge-warn, got ${bMix?.textContent} ${bMix?.className}`);
+}
+if (!bUnb || bUnb.textContent !== "0/8") {
+  throw new Error(`State(F,F) t_unbound expected 0/8, got ${bUnb?.textContent}`);
+}
+
+// 持久化校验：新建实例自动恢复 localStorage 中的关闭状态
+if (storageMap.get("dataog:standard_migrator:ignore_partial") !== "0" || storageMap.get("dataog:standard_migrator:ignore_unbound") !== "0") {
+  throw new Error("Switch states were not persisted to localStorage");
+}
+mv.destroy();
+
+const mv2 = new StandardMigratorView();
+mv2.render();
+const swP2 = mv2.sidebarFormatMount.querySelector('input[data-stat-toggle="ignore_partial"]');
+const swU2 = mv2.sidebarFormatMount.querySelector('input[data-stat-toggle="ignore_unbound"]');
+if (mv2.ignorePartial !== false || mv2.ignoreUnbound !== false || swP2.checked !== false || swU2.checked !== false) {
+  throw new Error("New StandardMigratorView instance did not restore persisted switch states");
+}
+if (swP2.getAttribute("aria-checked") !== "false" || swU2.getAttribute("aria-checked") !== "false") {
+  throw new Error("Restored switches should preserve aria-checked='false'");
+}
+mv2.destroy();
+console.log("SIDEBAR_STAT_TOGGLES_OK");
+process.exit(0);
+"""
+        proc = subprocess.run(
+            [node_bin, "--input-type=module", "-e", node_script, project_root],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"Node 前端侧栏统计开关验证失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+        )
+        self.assertIn("SIDEBAR_STAT_TOGGLES_OK", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
