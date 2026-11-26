@@ -8,6 +8,26 @@
 
 ---
 
+## [3.5.5] - 2026-11-26
+
+> **「2. 落标绑定与贯标」可折叠对标设置抽屉 + 全 Schema 刷新与落标比对**：将原本固定占据左上角的「当前库落标标准」与目录树统计口径开关迁入右侧按需滑出的可扩展「对标设置」抽屉，同时在抽屉内新增全 Schema（含全库）目录刷新并全量核验落标能力。
+
+### Added
+- **全 Schema 刷新并比对落标能力 (`modules/standard_migrator/`, `static/js/views/standard_migrator_view.js`)**：
+  - 扩展 `CheckCompliancePayload` 与 `POST /api/modules/standard_migrator/bindings/check-compliance`（新增 `scope`、`schema_name`、`schemas`、`refresh_catalog`、`only_bound_tables` 可选参数，向后 100% 兼容）；支持在单次受追踪任务中先实时刷新目标 Schema 或全库目录元数据 (`MetadataHub.refresh_catalog`)，再批量强制抓表/视图最新列结构并落盘更新 `col_count`、执行三维落标核验、自动清理失效绑定，并返回最新 `catalog`、`refreshed_schemas` 与分级汇总；
+  - 抽屉内新增「全 Schema 刷新与落标比对」分段，提供范围下拉选择（自动跟随左侧选中 Schema 或切换「全部 Schema（当前库全量）」/ 任意指定 Schema）、一键触发按钮及最近一次核验分级统计摘要卡片；执行完成后自动同步左侧目录树与当前打开表视图。
+- **自动化单元测试 (`tests/test_modules_and_api.py`)**：
+  - 新增 `test_schema_refresh_and_compliance_recheck`（基于真实临时 SQLite 端到端验证新增表发现、改列重抓、`col_count` 更新及 `scope="schema"` / `scope="all_schemas"` 核验返回），并同步升级 `test_sidebar_stat_toggles_and_catalog_col_count` 覆盖抽屉默认收起、展开/收起切换、统计开关持久化及全 Schema 刷新交互（总测试数增至 **119 项**）。
+
+### Changed
+- **「2. 落标绑定与贯标」可折叠右侧「对标设置」抽屉 (`static/js/views/standard_migrator_view.js`, `static/css/workbench.css`)**：
+  - 释放左上角侧栏空间（`sidebarMount` 仅常驻数据库目录树），在右侧工作区顶部标签栏右端新增紧凑的「对标设置」触发按钮（实时展示当前库格式短标，支持 `Esc` 与点击收起），抽屉默认收起；
+  - 采用可扩展的 `_buildDrawerSection` 模块化分段结构容纳「当前库落标标准」「目录树统计口径」（保留「忽略部分落标」「忽略未绑标字段」macOS 开关与 `localStorage` 持久化）及「全 Schema 刷新与落标比对」，便于后续持续扩展对标配置项。
+- **版本号同步发布 (`v3.5.5`)**：
+  - 同步递增 `3.5.4 -> 3.5.5` 至 `app.py`、`core/app_kernel.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md` 与 `AGENTS.md`（严格维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变；**119 项**自动化单元测试全绿）。
+
+---
+
 ## [3.5.4] - 2026-11-26
 
 > **全仓垃圾回收、死代码清理、文档重整与演示沙箱闭环修复**：按工程领域对照源码逐项核查并清理全仓经引用确认的废弃兼容层、未引用符号与失效样式，修复演示沙箱工作区导出元信息覆盖及 `dwd_acct_swap_demo` 保序重建缓存提示，归档已完成的历史演进文档并全仓对齐文档与代码一致性。
