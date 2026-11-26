@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from core.dws_engine import (
@@ -16,6 +17,8 @@ from core.dws_engine import (
     DWSMigratorEngine,
     TableMeta as EngineTableMeta,
     analyze_item_changes,
+    bind_commit_callback,
+    classify_migration_risk,
     item_requires_table_rebuild,
 )
 from core.platform.context import PlatformContext
@@ -28,15 +31,19 @@ from core.platform.excel_io import (
 )
 from core.platform.import_progress import ProgressCallback, noop_progress
 from modules.standard_migrator.bindings_mixin import _StandardBindingsMixin
+from modules.standard_migrator.changelog_mixin import _StandardChangelogMixin
 from modules.standard_migrator.report_mixin import _StandardReportMixin
 
 
-class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
+class StandardMigratorService(
+    _StandardBindingsMixin, _StandardReportMixin, _StandardChangelogMixin
+):
     """单库贯标执行台核心业务服务."""
 
     def __init__(self, ctx: PlatformContext, engine: Optional[DWSMigratorEngine] = None) -> None:
         self.ctx = ctx
         self.engine = engine or DWSMigratorEngine(ctx.store)
+        self._ensure_changelog_tables()
 
     def get_active_connection_id(self) -> str:
         cid = str(self.ctx.store.get_meta("migrator_connection_id", "") or "")
@@ -140,6 +147,26 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             else {"schemas": [], "tables": []}
         )
         items = self.ctx.store.list_items()
+        dialect_by_cid = {
+            p["connection_id"]: str(p.get("db_type") or "DWS")
+            for p in self.ctx.connection_hub.list_profiles()
+        }
+        default_dialect = prof.db_type if prof else "DWS"
+        risk_counts = {"L1": 0, "L2": 0, "L3": 0, "L4": 0}
+        pending_risk_counts = {"L1": 0, "L2": 0, "L3": 0, "L4": 0}
+        for it in items:
+            it_cid = str(it.get("connection_id") or cid or "").strip()
+            it_dialect = dialect_by_cid.get(it_cid, default_dialect)
+            risk_info = classify_migration_risk(it, dialect=it_dialect)
+            it.update(risk_info)
+            rl = risk_info["risk_level"]
+            if rl in risk_counts:
+                risk_counts[rl] += 1
+                if str(it.get("status") or "").upper() != "COMPLETED":
+                    pending_risk_counts[rl] += 1
+        summary = self.ctx.store.get_summary(items=items)
+        summary["risk_counts"] = risk_counts
+        summary["pending_risk_counts"] = pending_risk_counts
         return {
             "ok": True,
             "active_connection_id": cid,
@@ -148,7 +175,7 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             "catalog": catalog_tree,
             "excel_name": self.ctx.store.get_meta("current_excel_name", "未导入"),
             "imported_at": self.ctx.store.get_meta("imported_at", ""),
-            "summary": self.ctx.store.get_summary(items=items),
+            "summary": summary,
             "items": items,
             "logs": self.ctx.store.list_logs(limit=150),
         }
@@ -689,7 +716,23 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             0,
             1,
         )
-        item = eng.execute_single_item_direct(item_id)
+        std_code_map = self._preload_std_code_map([conn_id] if conn_id else [])
+        batch_id = f"single_{uuid.uuid4().hex[:10]}"
+        recorded_changes: List[Dict[str, Any]] = []
+
+        def _on_committed(evt: Dict[str, Any]) -> None:
+            rec = self._record_committed_change(
+                evt,
+                batch_id=batch_id,
+                conn_id=conn_id,
+                conn_name=prof.name if prof else "",
+                db_type=prof.db_type if prof else "DWS",
+                std_code_map=std_code_map,
+            )
+            recorded_changes.append(rec)
+
+        with bind_commit_callback(_on_committed):
+            item = eng.execute_single_item_direct(item_id)
         sync_meta: Dict[str, Any] = {"table_stats_by_conn": {}, "migrated_tables": []}
         if item.get("status") == "COMPLETED":
             report(
@@ -716,6 +759,8 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         state["item"] = item
         state["auto_verified"] = auto_verified
         state["verified_completed_ids"] = verified_completed_ids
+        if recorded_changes:
+            state["recorded_changes"] = recorded_changes
         self._attach_post_migration_sync_state(state, sync_meta, fallback_cid=conn_id)
         if item.get("status") in ("FAILED", "MISSING_TABLE", "MISSING_COLUMN"):
             state["warning"] = (
@@ -733,6 +778,8 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         item_ids: List[int],
         max_workers: int = 5,
         keep_backup: bool = True,
+        auto_checkpoint: bool = False,
+        checkpoint_name: str = "",
         progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
@@ -766,6 +813,7 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             conn_pending_groups.setdefault(cid, []).append(it)
 
         conn_engines: Dict[str, DWSMigratorEngine] = {}
+        conn_profiles: Dict[str, Any] = {}
         for cid in conn_pending_groups:
             eng, prof = self._get_engine_for_connection(cid)
             if prof is not None and not (
@@ -777,6 +825,42 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
                     f"数据源 [{prof.name}]（{prof.db_type}）暂不支持在线直连批量执行，请取消勾选该数据源任务或点击「SQL」复制语句手工执行"
                 )
             conn_engines[cid] = eng
+            conn_profiles[cid] = prof
+
+        created_checkpoint: Optional[Dict[str, Any]] = None
+        if auto_checkpoint:
+            cp_cid = next(iter(conn_pending_groups.keys())) if len(conn_pending_groups) == 1 else ""
+            cp_res = self.create_checkpoint(
+                checkpoint_name,
+                description=f"批量执行 {len(pending_items)} 项贯标变更前自动创建",
+                connection_id=cp_cid,
+                auto_created=True,
+            )
+            created_checkpoint = cp_res.get("checkpoint")
+
+        std_code_map = self._preload_std_code_map(list(conn_pending_groups.keys()))
+        batch_id = f"batch_{uuid.uuid4().hex[:10]}"
+        recorded_changes: List[Dict[str, Any]] = []
+        recorded_lock = threading.Lock()
+
+        def _make_commit_cb(cid_val: str):
+            prof_val = conn_profiles.get(cid_val)
+            cname = prof_val.name if prof_val else ""
+            dtype = prof_val.db_type if prof_val else "DWS"
+
+            def _cb(evt: Dict[str, Any]) -> None:
+                rec = self._record_committed_change(
+                    evt,
+                    batch_id=batch_id,
+                    conn_id=cid_val,
+                    conn_name=cname,
+                    db_type=dtype,
+                    std_code_map=std_code_map,
+                )
+                with recorded_lock:
+                    recorded_changes.append(rec)
+
+            return _cb
 
         table_groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
         table_labels: Dict[Tuple[str, str, str], str] = {}
@@ -871,9 +955,12 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         try:
             if len(conn_pending_groups) == 1:
                 only_cid = next(iter(conn_pending_groups.keys()))
-                batch_res = conn_engines[only_cid].execute_batch_items(
-                    item_ids=item_ids, max_workers=max_workers, keep_backup=keep_backup
-                )
+                with bind_commit_callback(_make_commit_cb(only_cid)):
+                    batch_res = conn_engines[only_cid].execute_batch_items(
+                        item_ids=item_ids,
+                        max_workers=max_workers,
+                        keep_backup=keep_backup,
+                    )
             else:
                 agg_executed = 0
                 agg_success = 0
@@ -881,11 +968,12 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
                 agg_rebuild_tables = 0
                 agg_direct_tables = 0
                 for cid, grp_items in conn_pending_groups.items():
-                    sub_res = conn_engines[cid].execute_batch_items(
-                        item_ids=[it["id"] for it in grp_items],
-                        max_workers=max_workers,
-                        keep_backup=keep_backup,
-                    )
+                    with bind_commit_callback(_make_commit_cb(cid)):
+                        sub_res = conn_engines[cid].execute_batch_items(
+                            item_ids=[it["id"] for it in grp_items],
+                            max_workers=max_workers,
+                            keep_backup=keep_backup,
+                        )
                     agg_executed += int(sub_res.get("executed_count") or 0)
                     agg_success += int(sub_res.get("success_count") or 0)
                     agg_failed += int(sub_res.get("failed_count") or 0)
@@ -941,6 +1029,9 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         state["batch_result"] = batch_res
         state["auto_verified"] = auto_verified
         state["verified_completed_ids"] = verified_completed_ids
+        state["recorded_changes_count"] = len(recorded_changes)
+        if created_checkpoint is not None:
+            state["created_checkpoint"] = created_checkpoint
         state["message"] = batch_res.get("message", "批量贯标任务执行完毕")
         self._attach_post_migration_sync_state(state, sync_meta)
         if int(batch_res.get("failed_count", 0) or 0) > 0:
@@ -1021,6 +1112,8 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         item_ids: Optional[List[int]] = None,
         keep_backup: bool = True,
         connection_id: str = "",
+        auto_checkpoint: bool = False,
+        checkpoint_name: str = "",
         progress_cb: ProgressCallback = noop_progress,
     ) -> Dict[str, Any]:
         report = progress_cb or noop_progress
@@ -1056,6 +1149,30 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             )
 
         tbl_label = f"{schema_name}.{table_name}"
+        created_checkpoint: Optional[Dict[str, Any]] = None
+        if auto_checkpoint:
+            cp_res = self.create_checkpoint(
+                checkpoint_name or f"重建 {tbl_label} 前自动点",
+                description=f"整表保序重建 {tbl_label} 前自动创建",
+                connection_id=eff_cid,
+                auto_created=True,
+            )
+            created_checkpoint = cp_res.get("checkpoint")
+        std_code_map = self._preload_std_code_map([eff_cid] if eff_cid else [])
+        batch_id = f"rebuild_{uuid.uuid4().hex[:10]}"
+        recorded_changes: List[Dict[str, Any]] = []
+
+        def _on_rebuild_committed(evt: Dict[str, Any]) -> None:
+            rec = self._record_committed_change(
+                evt,
+                batch_id=batch_id,
+                conn_id=eff_cid,
+                conn_name=prof.name if prof else "",
+                db_type=prof.db_type if prof else "DWS",
+                std_code_map=std_code_map,
+            )
+            recorded_changes.append(rec)
+
         report(
             20.0,
             "分析列序与依赖",
@@ -1103,9 +1220,13 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             watcher.start()
 
         try:
-            res = eng.execute_table_rebuild_migration(
-                schema_name, table_name, item_ids=scoped_item_ids, keep_backup=keep_backup
-            )
+            with bind_commit_callback(_on_rebuild_committed):
+                res = eng.execute_table_rebuild_migration(
+                    schema_name,
+                    table_name,
+                    item_ids=scoped_item_ids,
+                    keep_backup=keep_backup,
+                )
         finally:
             stop_evt.set()
             if watcher is not None:
@@ -1152,6 +1273,9 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         state["rebuild_result"] = res
         state["auto_verified"] = auto_verified
         state["verified_completed_ids"] = verified_completed_ids
+        state["recorded_changes_count"] = len(recorded_changes)
+        if created_checkpoint is not None:
+            state["created_checkpoint"] = created_checkpoint
         state["message"] = res.get("message", "整表保序重建完成")
         self._attach_post_migration_sync_state(state, sync_meta, fallback_cid=eff_cid)
         if verify_warn:
@@ -1214,6 +1338,9 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
         needs_rebuild = item_requires_table_rebuild(
             item, matched_col=matched_col, table_meta=eng_meta
         )
+        risk_info = classify_migration_risk(
+            item, matched_col=matched_col, table_meta=eng_meta, dialect=dialect
+        )
         sql_preview = eng.build_direct_alter_sql_preview(
             item, matched_col=matched_col, table_meta=eng_meta, dialect=dialect
         )
@@ -1239,6 +1366,7 @@ class StandardMigratorService(_StandardBindingsMixin, _StandardReportMixin):
             "is_comment_only": bool(changes["is_comment_only"]),
             "has_any_change": bool(changes["has_any_change"]),
             "changes": changes,
+            **risk_info,
             "sql_preview": sql_preview,
             "can_execute_online": can_execute_online,
         }

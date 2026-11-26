@@ -16,6 +16,7 @@ import { Modal } from "../ui/modal.js";
 import { openStandardPickerModal } from "../ui/standard_picker_modal.js";
 import { TaskActivityBar } from "../ui/task_activity_bar.js";
 import { Toast } from "../ui/toast.js";
+import { ChangelogPanel, createRiskBadge } from "./standard_migrator/changelog_panel.js";
 import { StandardMigratorModalsMixin } from "./standard_migrator/modals.js";
 
 function makeAbortError() {
@@ -106,6 +107,7 @@ export class StandardMigratorView {
     this._bindingStageBtn = null;
     this._queueExecBatchBtn = null;
     this._queueRemoveBtn = null;
+    this._queueClearHighRiskBtn = null;
     this._bindingsGrid = null;
     this._bindingsGridTableKey = "";
     this._bindingsSort = { sortKey: "", sortAsc: true };
@@ -125,10 +127,12 @@ export class StandardMigratorView {
     // 贯标改造执行队列状态
     this.ws = null;
     this.statusFilter = "ALL";
+    this.riskFilter = "ALL"; // ALL | L1 | L2 | L3 | L4
     this.searchKeyword = "";
     this.selectedIds = new Set();
     this.maxWorkers = 5;
     this.keepBackup = true;
+    this.changelogPanel = new ChangelogPanel(this);
 
     let initWidth = SIDEBAR_WIDTH_DEFAULT;
     try {
@@ -338,6 +342,7 @@ export class StandardMigratorView {
     }
     this._unsubStore?.();
     this._unsubStore = null;
+    this.changelogPanel?.destroy?.();
     this.activityBar?.destroy();
     this.tree?.destroy();
   }
@@ -512,6 +517,12 @@ export class StandardMigratorView {
     }
     if (this.subMode === "queue") {
       await this.reloadState();
+      return;
+    }
+    if (this.subMode === "changelog") {
+      await this.changelogPanel.load({ silent: true });
+      this.render();
+      this.onStateUpdate?.();
       return;
     }
     await this.loadBindingsOverview({ skipRender: Boolean(this.activeTable) });
@@ -1445,12 +1456,23 @@ export class StandardMigratorView {
 
   async executeSingleItem(itemRow) {
     if (!itemRow?.id) return;
+    const riskLvl = String(itemRow.risk_level || "L4").toUpperCase();
+    if (["L1", "L2", "L3"].includes(riskLvl)) {
+      await this.openExecutionRiskConfirmModal([itemRow], { singleItem: itemRow });
+      return;
+    }
+    await this._runExecuteSingleItemDirect(itemRow);
+  }
+
+  async _runExecuteSingleItemDirect(itemRow) {
+    if (!itemRow?.id) return;
     const label = `${itemRow.schema_name}.${itemRow.table_name}.${itemRow.old_col_name || itemRow.new_col_name || itemRow.id}`;
     try {
       const res = await this._runTracked(`执行单字段贯标 · ${label}`, ({ taskId, signal }) =>
         migratorApi.executeSingle(itemRow.id, { taskId, signal })
       );
       if (this._destroyed) return;
+      this.changelogPanel?.load?.({ silent: true });
       this._applyStateResponse(res, { animateCompletedOut: true });
     } catch (err) {
       if (isAbortError(err)) return;
@@ -1631,7 +1653,68 @@ export class StandardMigratorView {
           text: "实时核验",
           onClick: () => this.runSyncItems(),
         }),
+        el("button", {
+          type: "button",
+          className: "mac-btn mac-btn-sm",
+          title: "在执行危险变更前创建一个可一键回滚的还原点",
+          text: "创建 Checkpoint",
+          onClick: () =>
+            this.changelogPanel.openCreateCheckpointModal(
+              this.ws?.active_connection_id || this.activeConnId || ""
+            ),
+        }),
         this._queueExecBatchBtn
+      );
+    }
+
+    if (this.subMode === "changelog") {
+      this._queueExecBatchBtn = null;
+      const cidFilter = "";
+      return el(
+        "div",
+        { style: { display: "inline-flex", alignItems: "center", gap: "6px" } },
+        el(
+          "button",
+          {
+            type: "button",
+            className: "mac-btn mac-btn-sm mac-btn-primary",
+            onClick: () =>
+              this.changelogPanel.openCreateCheckpointModal(
+                this.ws?.active_connection_id || this.activeConnId || ""
+              ),
+          },
+          svgIcon("plus", 13),
+          el("span", { text: "创建 Checkpoint" })
+        ),
+        el("button", {
+          type: "button",
+          className: "mac-btn mac-btn-sm",
+          text: "刷新日志",
+          onClick: () => this.changelogPanel.load(),
+        }),
+        el("button", {
+          type: "button",
+          className: "mac-btn mac-btn-sm",
+          title: "导出标准结构化 JSON 底座（含生效列净映射，供 SQL 改写使用）",
+          text: "导出 JSON 底座",
+          onClick: () =>
+            this._runExportReportTask(
+              "导出落标变更 JSON 底座",
+              () => migratorApi.exportChangelogJson({ connectionId: cidFilter, onlyApplied: true }),
+              { syncCatalog: false }
+            ),
+        }),
+        el("button", {
+          type: "button",
+          className: "mac-btn mac-btn-sm",
+          text: "导出 Excel",
+          onClick: () =>
+            this._runExportReportTask(
+              "导出落标变更台账 Excel",
+              () => migratorApi.exportChangelogExcel({ connectionId: cidFilter }),
+              { syncCatalog: false }
+            ),
+        })
       );
     }
 
@@ -1676,12 +1759,18 @@ export class StandardMigratorView {
       Toast.warn("请先勾选待执行记录");
       return;
     }
-    const ok = await Modal.confirm({
-      title: "批量执行贯标",
-      message: `将启动 ${this.maxWorkers} 个并发线程执行已选中的 ${ids.length} 条字段规则（涉及分布键或列存表自动采用整表保序重建），确认继续？`,
-      confirmText: "开始执行",
-    });
-    if (!ok) return;
+    const idSet = new Set(ids);
+    const selectedItems = (this.ws?.items || []).filter((it) => idSet.has(Number(it.id)));
+    if (!selectedItems.length) {
+      Toast.warn("未找到选中的有效任务");
+      return;
+    }
+    await this.openExecutionRiskConfirmModal(selectedItems);
+  }
+
+  async _runBatchExecutionRequest(itemIds, { autoCheckpoint = false, checkpointName = "" } = {}) {
+    const ids = (itemIds || []).map((x) => Number(x)).filter((n) => n > 0);
+    if (!ids.length) return;
     try {
       const res = await this._runTracked(`批量并发贯标 (${ids.length} 项)`, ({ taskId, signal }) =>
         migratorApi.executeBatch(
@@ -1689,17 +1778,237 @@ export class StandardMigratorView {
             item_ids: ids,
             max_workers: this.maxWorkers,
             keep_backup: this.keepBackup,
+            auto_checkpoint: Boolean(autoCheckpoint),
+            checkpoint_name: String(checkpointName || ""),
           },
           { taskId, signal }
         )
       );
       if (this._destroyed) return;
-      this.selectedIds.clear();
+      for (const id of ids) this.selectedIds.delete(String(id));
+      this.changelogPanel?.load?.({ silent: true });
       this._applyStateResponse(res, { animateCompletedOut: true });
     } catch (err) {
       if (isAbortError(err)) return;
       Toast.error(err.message);
     }
+  }
+
+  async openExecutionRiskConfirmModal(targetItems, { singleItem = null } = {}) {
+    const list = Array.isArray(targetItems) ? targetItems : [];
+    const counts = { L1: 0, L2: 0, L3: 0, L4: 0 };
+    const highRiskItems = [];
+    const safeItems = [];
+    for (const it of list) {
+      const rl = String(it.risk_level || "L4").toUpperCase();
+      if (rl in counts) counts[rl] += 1;
+      if (["L1", "L2", "L3"].includes(rl)) highRiskItems.push(it);
+      else safeItems.push(it);
+    }
+
+    let autoCheckpoint = !singleItem && list.length > 0;
+    const defaultCpName = singleItem
+      ? `执行高危字段前 · ${singleItem.schema_name}.${singleItem.table_name}.${singleItem.old_col_name}`
+      : `批量贯标前自动点 (${list.length} 项)`;
+    const cpCb = el("input", {
+      type: "checkbox",
+      checked: autoCheckpoint,
+      onChange: (e) => {
+        autoCheckpoint = Boolean(e.target.checked);
+        cpNameInput.disabled = !autoCheckpoint;
+      },
+    });
+    const cpNameInput = el("input", {
+      className: "mac-input mac-input-sm",
+      value: defaultCpName,
+      disabled: !autoCheckpoint,
+      placeholder: "Checkpoint 名称",
+      style: { flex: "1" },
+    });
+
+    const body = el(
+      "div",
+      { style: { display: "flex", flexDirection: "column", gap: "10px" } },
+      el(
+        "div",
+        { style: { display: "flex", gap: "6px", flexWrap: "wrap", alignItems: "center" } },
+        badge(`共选中 ${list.length} 项`, "neutral"),
+        counts.L1 > 0 ? el("span", { className: "risk-badge risk-badge-l1", text: `L1 改名 ${counts.L1}` }) : null,
+        counts.L2 > 0 ? el("span", { className: "risk-badge risk-badge-l2", text: `L2 转类型 ${counts.L2}` }) : null,
+        counts.L3 > 0 ? el("span", { className: "risk-badge risk-badge-l3", text: `L3 缩精度 ${counts.L3}` }) : null,
+        counts.L4 > 0 ? el("span", { className: "risk-badge risk-badge-l4", text: `L4 安全 ${counts.L4}` }) : null
+      ),
+      highRiskItems.length > 0
+        ? el(
+            "div",
+            {
+              style: {
+                padding: "8px 10px",
+                borderRadius: "8px",
+                border: "0.5px solid rgba(255,59,48,0.35)",
+                background: "rgba(255,59,48,0.07)",
+                fontSize: "12px",
+              },
+              text: `检测到 ${highRiskItems.length} 项中高危操作（字段改名 / 类型转换 / 精度或长度缩减），请核对以下危险明细或勾选自动创建 Checkpoint 后再执行：`,
+            }
+          )
+        : el("div", {
+            style: { fontSize: "12px", color: "var(--os-text-secondary)" },
+            text: `将启动 ${this.maxWorkers} 个并发线程执行已选中的 ${list.length} 条安全变更（涉及分布键或列存表自动采用整表保序重建）。`,
+          }),
+      highRiskItems.length > 0
+        ? el(
+            "div",
+            { className: "risk-confirm-list" },
+            highRiskItems.slice(0, 80).map((it) => {
+              const curN = it.db_current_col_name || it.old_col_name;
+              const tgtN = it.new_col_name || curN;
+              const curT = it.db_current_type || it.old_col_type || "?";
+              const tgtT = it.new_col_type || curT;
+              return el(
+                "div",
+                { className: "risk-confirm-item" },
+                el(
+                  "div",
+                  { style: { display: "flex", flexDirection: "column", gap: "2px", minWidth: "0" } },
+                  el("div", {
+                    className: "mono",
+                    style: { fontWeight: "600" },
+                    text: `${it.schema_name}.${it.table_name}.${curN} → ${tgtN} (${curT} → ${tgtT})`,
+                  }),
+                  el("div", {
+                    style: { fontSize: "11px", color: "var(--os-muted)" },
+                    text: (it.risk_factors || []).join("；") || it.risk_detail || "",
+                  })
+                ),
+                createRiskBadge(it)
+              );
+            }),
+            highRiskItems.length > 80
+              ? el("div", {
+                  style: { fontSize: "11px", color: "var(--os-muted)", textAlign: "center", padding: "4px" },
+                  text: `仅展示前 80 条高危项（共 ${highRiskItems.length} 条）`,
+                })
+              : null
+          )
+        : null,
+      el(
+        "div",
+        { style: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" } },
+        el(
+          "label",
+          { style: { display: "inline-flex", alignItems: "center", gap: "6px", fontSize: "12px", cursor: "pointer" } },
+          cpCb,
+          el("span", { text: "执行前自动创建 Checkpoint 还原点" })
+        ),
+        cpNameInput
+      )
+    );
+
+    const footer = [
+      el("button", { type: "button", className: "mac-btn", text: "取消", onClick: () => Modal.close() }),
+    ];
+
+    if (!singleItem && highRiskItems.length > 0 && safeItems.length > 0) {
+      footer.push(
+        el("button", {
+          type: "button",
+          className: "mac-btn",
+          text: `跳过高危，仅执行 ${safeItems.length} 条安全项`,
+          onClick: async () => {
+            Modal.close("safe_only");
+            await this._runBatchExecutionRequest(
+              safeItems.map((x) => x.id),
+              { autoCheckpoint, checkpointName: cpNameInput.value.trim() }
+            );
+          },
+        })
+      );
+    }
+
+    footer.push(
+      el("button", {
+        type: "button",
+        className: highRiskItems.length > 0 ? "mac-btn mac-btn-danger" : "mac-btn mac-btn-primary",
+        text: singleItem
+          ? "确认仍要执行该高危变更"
+          : highRiskItems.length > 0
+          ? `确认执行全部 (${list.length} 项)`
+          : `开始执行 (${list.length} 项)`,
+        onClick: async () => {
+          Modal.close("confirm");
+          if (singleItem) {
+            if (autoCheckpoint) {
+              try {
+                await migratorApi.createCheckpoint({
+                  name: cpNameInput.value.trim() || defaultCpName,
+                  description: "单条高危字段执行前自动打点",
+                  connection_id: singleItem.connection_id || this.ws?.active_connection_id || "",
+                });
+              } catch (_e) {
+                // 不阻断或提示失败
+              }
+            }
+            await this._runExecuteSingleItemDirect(singleItem);
+            return;
+          }
+          await this._runBatchExecutionRequest(
+            list.map((x) => x.id),
+            { autoCheckpoint, checkpointName: cpNameInput.value.trim() }
+          );
+        },
+      })
+    );
+
+    Modal.open({
+      title: singleItem
+        ? `高危贯标操作确认 · ${singleItem.risk_label || singleItem.risk_level}`
+        : highRiskItems.length > 0
+        ? "批量执行风险核查与确认"
+        : "批量执行贯标确认",
+      width: highRiskItems.length > 0 ? "min(760px, 92vw)" : "min(560px, 90vw)",
+      body,
+      footer,
+    });
+  }
+
+  _clearHighRiskSelections() {
+    const itemsById = new Map((this.ws?.items || []).map((it) => [String(it.id), it]));
+    let removed = 0;
+    for (const key of [...this.selectedIds]) {
+      const it = itemsById.get(String(key));
+      if (it && ["L1", "L2", "L3"].includes(String(it.risk_level || "L4").toUpperCase())) {
+        this.selectedIds.delete(key);
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      Toast.info(`已从当前勾选中剔除 ${removed} 条中高危 (L1~L3) 任务`);
+    }
+    this.render();
+  }
+
+  async _removeHighRiskFromQueue() {
+    const candidates = (this.ws?.items || []).filter(
+      (it) =>
+        it.status !== "COMPLETED" &&
+        ["L1", "L2", "L3"].includes(String(it.risk_level || "L4").toUpperCase())
+    );
+    if (!candidates.length) {
+      Toast.info("当前队列中没有待执行的中高危 (L1~L3) 任务");
+      return;
+    }
+    const ok = await Modal.confirm({
+      title: "批量移出高危待改项",
+      message: `确定将队列中 ${candidates.length} 条中高危 (L1 改名 / L2 转类型 / L3 缩精度) 待改任务移出执行队列吗？（不会影响已绑定的字段数据标准）`,
+      confirmText: `移出 ${candidates.length} 条高危项`,
+      danger: true,
+    });
+    if (!ok) return;
+    await this.removeQueueItems(
+      candidates.map((x) => x.id),
+      { skipConfirm: true }
+    );
   }
 
   async removeQueueItems(itemIds, { skipConfirm = false } = {}) {
@@ -1741,6 +2050,10 @@ export class StandardMigratorView {
         } else if (this.statusFilter !== "ALL" && it.status !== this.statusFilter) {
           return false;
         }
+        if (this.riskFilter !== "ALL") {
+          const rl = String(it.risk_level || "L4").toUpperCase();
+          if (rl !== this.riskFilter) return false;
+        }
       }
       if (!kw) return true;
       return [
@@ -1751,6 +2064,8 @@ export class StandardMigratorView {
         it.new_col_name,
         it.old_col_comment,
         it.new_col_comment,
+        it.risk_label,
+        ...(it.risk_factors || []),
       ].some((v) => String(v || "").toLowerCase().includes(kw));
     });
   }
@@ -1824,6 +2139,7 @@ export class StandardMigratorView {
     this._renderSettingsDrawer();
 
     const queueCount = (this.ws?.items || []).length;
+    const appliedChangelogCount = Number(this.changelogPanel?.state?.summary?.applied_count || 0);
     this._queueTabBtn = null;
     const tablist = el(
       "div",
@@ -1831,6 +2147,10 @@ export class StandardMigratorView {
       [
         { id: "bindings", label: "字段落标绑定与核验" },
         { id: "queue", label: `贯标改造执行队列 (${queueCount})` },
+        {
+          id: "changelog",
+          label: appliedChangelogCount > 0 ? `变更日志与回滚 (${appliedChangelogCount})` : "变更日志与回滚",
+        },
       ].map((t) => {
         const btn = el("button", {
           type: "button",
@@ -1838,7 +2158,7 @@ export class StandardMigratorView {
           className: "content-tab",
           "aria-selected": String(this.subMode === t.id),
           text: t.label,
-          onClick: () => {
+          onClick: async () => {
             this.subMode = t.id;
             if (
               t.id === "bindings" &&
@@ -1848,6 +2168,12 @@ export class StandardMigratorView {
             ) {
               this._bindingsDirtyAfterMigration = false;
               this.loadTableCompliance(false);
+              return;
+            }
+            if (t.id === "changelog") {
+              this.render();
+              this.onStateUpdate?.();
+              await this.changelogPanel.load({ silent: true });
               return;
             }
             this.render();
@@ -1887,6 +2213,10 @@ export class StandardMigratorView {
 
     if (this.subMode === "bindings") {
       this._renderBindingsView();
+    } else if (this.subMode === "changelog") {
+      this._bindingsGrid = null;
+      this._queueGrid = null;
+      this.changelogPanel.render();
     } else {
       this._renderQueueView();
     }
@@ -2296,6 +2626,12 @@ export class StandardMigratorView {
 
     const ws = this.ws || { items: [], summary: {} };
     const summary = ws.summary || {};
+    const riskCounts = summary.risk_counts || {
+      L1: (ws.items || []).filter((it) => (it.risk_level || "L4") === "L1").length,
+      L2: (ws.items || []).filter((it) => (it.risk_level || "L4") === "L2").length,
+      L3: (ws.items || []).filter((it) => (it.risk_level || "L4") === "L3").length,
+      L4: (ws.items || []).filter((it) => (it.risk_level || "L4") === "L4").length,
+    };
     const rebuildCount =
       summary.rebuild_required ??
       (ws.items || []).filter((it) => it.status !== "COMPLETED" && this._isRebuildItem(it)).length;
@@ -2309,6 +2645,22 @@ export class StandardMigratorView {
       { key: "COMPLETED", label: `已达标 ${summary.completed ?? 0}` },
       { key: "FAILED", label: `异常 ${failedCount}` },
     ];
+    const riskPills = [
+      { key: "L1", label: `L1 改名 ${riskCounts.L1 ?? 0}` },
+      { key: "L2", label: `L2 转类型 ${riskCounts.L2 ?? 0}` },
+      { key: "L3", label: `L3 缩精度 ${riskCounts.L3 ?? 0}` },
+      { key: "L4", label: `L4 安全 ${riskCounts.L4 ?? 0}` },
+    ];
+    const itemsById = new Map((ws.items || []).map((it) => [String(it.id), it]));
+    const selectedHighRiskCount = [...this.selectedIds].filter((id) => {
+      const it = itemsById.get(String(id));
+      return it && ["L1", "L2", "L3"].includes(String(it.risk_level || "L4").toUpperCase());
+    }).length;
+    const pendingHighRiskCount = (ws.items || []).filter(
+      (it) =>
+        it.status !== "COMPLETED" &&
+        ["L1", "L2", "L3"].includes(String(it.risk_level || "L4").toUpperCase())
+    ).length;
 
     const subbar = el(
       "div",
@@ -2323,6 +2675,17 @@ export class StandardMigratorView {
             text: p.label,
             onClick: () => {
               this.statusFilter = p.key;
+              this._renderQueueView();
+            },
+          })
+        ),
+        riskPills.map((p) =>
+          el("button", {
+            type: "button",
+            className: `filter-pill ${this.riskFilter === p.key ? "is-active" : ""}`,
+            text: p.label,
+            onClick: () => {
+              this.riskFilter = this.riskFilter === p.key ? "ALL" : p.key;
               this._renderQueueView();
             },
           })
@@ -2345,6 +2708,22 @@ export class StandardMigratorView {
             return o;
           })
         ),
+        (this._queueClearHighRiskBtn = el("button", {
+          type: "button",
+          className: "btn btn-xs",
+          text: `取消高危勾选${selectedHighRiskCount > 0 ? ` (${selectedHighRiskCount})` : ""}`,
+          disabled: selectedHighRiskCount === 0,
+          title: "从当前勾选集合中一键取消所有 L1~L3 中高危操作",
+          onClick: () => this._clearHighRiskSelections(),
+        })),
+        el("button", {
+          type: "button",
+          className: "btn btn-xs",
+          text: `移出高危项${pendingHighRiskCount > 0 ? ` (${pendingHighRiskCount})` : ""}`,
+          disabled: pendingHighRiskCount === 0,
+          title: "将队列中所有 L1~L3 中高危待改项移出队列",
+          onClick: () => this._removeHighRiskFromQueue(),
+        }),
         el("button", {
           type: "button",
           className: "btn btn-xs",
@@ -2391,8 +2770,13 @@ export class StandardMigratorView {
       onSortChange: (k, a) => {
         this._queueSort = { sortKey: k, sortAsc: a };
       },
-      rowClassName: (r) =>
-        this._clearingCompletedIds.has(Number(r.id)) ? "queue-row-verified-clearing" : "",
+      rowClassName: (r) => {
+        if (this._clearingCompletedIds.has(Number(r.id))) {
+          return "queue-row-verified-clearing";
+        }
+        const rl = String(r.risk_level || "L4").toLowerCase();
+        return `queue-row-risk-${rl}`;
+      },
       onSelectionChange: (sel) => {
         if (this._queueExecBatchBtn) {
           this._queueExecBatchBtn.textContent = `执行 (${sel.size})`;
@@ -2400,6 +2784,14 @@ export class StandardMigratorView {
         if (this._queueRemoveBtn) {
           this._queueRemoveBtn.textContent = `移除所选 (${sel.size})`;
           this._queueRemoveBtn.disabled = sel.size === 0;
+        }
+        if (this._queueClearHighRiskBtn) {
+          const hrCnt = [...sel].filter((id) => {
+            const it = itemsById.get(String(id));
+            return it && ["L1", "L2", "L3"].includes(String(it.risk_level || "L4").toUpperCase());
+          }).length;
+          this._queueClearHighRiskBtn.textContent = `取消高危勾选${hrCnt > 0 ? ` (${hrCnt})` : ""}`;
+          this._queueClearHighRiskBtn.disabled = hrCnt === 0;
         }
       },
       rowKey: "id",
@@ -2465,6 +2857,11 @@ export class StandardMigratorView {
             }
             return newC || oldC || "-";
           },
+        },
+        {
+          key: "risk_rank",
+          label: "危险等级",
+          render: (r) => createRiskBadge(r),
         },
         {
           key: "strategy",

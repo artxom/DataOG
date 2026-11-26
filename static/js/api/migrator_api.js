@@ -240,4 +240,61 @@ export const migratorApi = {
       "/api/modules/standard_migrator/bindings/stage-migration",
       withRequestOpts({ method: "POST", body: payload }, opts)
     ),
+
+  // 第 3 步：结构化变更日志、Checkpoint 与一键回滚
+  getChangelog: ({
+    connectionId = "",
+    riskLevel = "",
+    status = "",
+    keyword = "",
+    limit = 200,
+    offset = 0,
+  } = {}, opts = {}) => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    if (riskLevel) qs.set("risk_level", riskLevel);
+    if (status) qs.set("status", status);
+    if (keyword) qs.set("keyword", keyword);
+    qs.set("limit", String(limit || 200));
+    qs.set("offset", String(offset || 0));
+    return requestJson(
+      `/api/modules/standard_migrator/changelog?${qs.toString()}`,
+      withRequestOpts({}, opts)
+    );
+  },
+  createCheckpoint: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/checkpoints",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  deleteCheckpoint: (checkpointId, opts = {}) =>
+    requestJson(
+      `/api/modules/standard_migrator/checkpoints/${encodeURIComponent(checkpointId)}`,
+      withRequestOpts({ method: "DELETE" }, opts)
+    ),
+  previewRollback: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/rollback/preview",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  executeRollback: (payload, opts = {}) =>
+    requestJson(
+      "/api/modules/standard_migrator/rollback/execute",
+      withRequestOpts({ method: "POST", body: payload }, opts)
+    ),
+  exportChangelogJson: ({ connectionId = "", onlyApplied = true } = {}) => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    qs.set("only_applied", onlyApplied ? "true" : "false");
+    return downloadApiFile(`/api/modules/standard_migrator/changelog/export.json?${qs.toString()}`, {
+      fallbackName: "DataOG_落标变更台账底座.json",
+    });
+  },
+  exportChangelogExcel: ({ connectionId = "" } = {}) => {
+    const qs = new URLSearchParams();
+    if (connectionId) qs.set("connection_id", connectionId);
+    return downloadApiFile(`/api/modules/standard_migrator/changelog/export.xlsx?${qs.toString()}`, {
+      fallbackName: "DataOG_落标变更台账与Checkpoint.xlsx",
+    });
+  },
 };

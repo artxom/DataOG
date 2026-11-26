@@ -47,6 +47,8 @@ WORKSPACE_BUSINESS_TABLES: Tuple[str, ...] = (
     "cross_table_bindings",
     "cross_column_bindings",
     "migration_items",
+    "migration_change_logs",
+    "migration_checkpoints",
     "meta_schemas",
     "meta_tables",
     "meta_columns",
@@ -344,6 +346,67 @@ CREATE INDEX IF NOT EXISTS idx_fsb_conn_table_nocase
     ON field_standard_bindings (connection_id, schema_name COLLATE NOCASE, table_name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_fsb_std_code
     ON field_standard_bindings (std_code);
+
+CREATE TABLE IF NOT EXISTS migration_change_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    change_uid TEXT NOT NULL UNIQUE,
+    batch_id TEXT NOT NULL DEFAULT '',
+    execution_group_id TEXT NOT NULL DEFAULT '',
+    event_type TEXT NOT NULL DEFAULT 'MIGRATION',
+    status TEXT NOT NULL DEFAULT 'APPLIED',
+    connection_id TEXT NOT NULL DEFAULT '',
+    connection_name TEXT NOT NULL DEFAULT '',
+    db_type TEXT NOT NULL DEFAULT '',
+    schema_name TEXT NOT NULL DEFAULT 'public',
+    table_name TEXT NOT NULL DEFAULT '',
+    source_item_id INTEGER NOT NULL DEFAULT 0,
+    ordinal_position INTEGER NOT NULL DEFAULT 0,
+    std_code TEXT NOT NULL DEFAULT '',
+    before_col_name TEXT NOT NULL DEFAULT '',
+    before_col_type TEXT NOT NULL DEFAULT '',
+    before_col_comment TEXT NOT NULL DEFAULT '',
+    after_col_name TEXT NOT NULL DEFAULT '',
+    after_col_type TEXT NOT NULL DEFAULT '',
+    after_col_comment TEXT NOT NULL DEFAULT '',
+    name_changed INTEGER NOT NULL DEFAULT 0,
+    type_changed INTEGER NOT NULL DEFAULT 0,
+    comment_changed INTEGER NOT NULL DEFAULT 0,
+    risk_level TEXT NOT NULL DEFAULT 'L4',
+    risk_rank INTEGER NOT NULL DEFAULT 4,
+    risk_code TEXT NOT NULL DEFAULT 'SAFE_CHANGE',
+    risk_label TEXT NOT NULL DEFAULT '',
+    risk_factors_json TEXT NOT NULL DEFAULT '[]',
+    is_lossy INTEGER NOT NULL DEFAULT 0,
+    strategy TEXT NOT NULL DEFAULT 'DIRECT_ALTER',
+    backup_table_name TEXT NOT NULL DEFAULT '',
+    forward_sql TEXT NOT NULL DEFAULT '',
+    rollback_sql TEXT NOT NULL DEFAULT '',
+    rollback_of_change_id INTEGER NOT NULL DEFAULT 0,
+    rolled_back_by_id INTEGER NOT NULL DEFAULT 0,
+    rolled_back_at TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mcl_conn_table
+    ON migration_change_logs (connection_id, schema_name, table_name, id DESC);
+CREATE INDEX IF NOT EXISTS idx_mcl_status
+    ON migration_change_logs (event_type, status, id DESC);
+CREATE INDEX IF NOT EXISTS idx_mcl_group
+    ON migration_change_logs (execution_group_id);
+
+CREATE TABLE IF NOT EXISTS migration_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    checkpoint_uid TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    connection_id TEXT NOT NULL DEFAULT '',
+    connection_name TEXT NOT NULL DEFAULT '',
+    anchor_log_id INTEGER NOT NULL DEFAULT 0,
+    auto_created INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_mcp_conn
+    ON migration_checkpoints (connection_id, id DESC);
 """
 
 
@@ -577,6 +640,55 @@ class _SchemaColumnMixin:
                 ("compliance_status", "TEXT NOT NULL DEFAULT 'UNCHECKED'"),
                 ("compliance_detail", "TEXT NOT NULL DEFAULT ''"),
                 ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "migration_change_logs": [
+                ("change_uid", "TEXT NOT NULL DEFAULT ''"),
+                ("batch_id", "TEXT NOT NULL DEFAULT ''"),
+                ("execution_group_id", "TEXT NOT NULL DEFAULT ''"),
+                ("event_type", "TEXT NOT NULL DEFAULT 'MIGRATION'"),
+                ("status", "TEXT NOT NULL DEFAULT 'APPLIED'"),
+                ("connection_id", "TEXT NOT NULL DEFAULT ''"),
+                ("connection_name", "TEXT NOT NULL DEFAULT ''"),
+                ("db_type", "TEXT NOT NULL DEFAULT ''"),
+                ("schema_name", "TEXT NOT NULL DEFAULT 'public'"),
+                ("table_name", "TEXT NOT NULL DEFAULT ''"),
+                ("source_item_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("ordinal_position", "INTEGER NOT NULL DEFAULT 0"),
+                ("std_code", "TEXT NOT NULL DEFAULT ''"),
+                ("before_col_name", "TEXT NOT NULL DEFAULT ''"),
+                ("before_col_type", "TEXT NOT NULL DEFAULT ''"),
+                ("before_col_comment", "TEXT NOT NULL DEFAULT ''"),
+                ("after_col_name", "TEXT NOT NULL DEFAULT ''"),
+                ("after_col_type", "TEXT NOT NULL DEFAULT ''"),
+                ("after_col_comment", "TEXT NOT NULL DEFAULT ''"),
+                ("name_changed", "INTEGER NOT NULL DEFAULT 0"),
+                ("type_changed", "INTEGER NOT NULL DEFAULT 0"),
+                ("comment_changed", "INTEGER NOT NULL DEFAULT 0"),
+                ("risk_level", "TEXT NOT NULL DEFAULT 'L4'"),
+                ("risk_rank", "INTEGER NOT NULL DEFAULT 4"),
+                ("risk_code", "TEXT NOT NULL DEFAULT 'SAFE_CHANGE'"),
+                ("risk_label", "TEXT NOT NULL DEFAULT ''"),
+                ("risk_factors_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("is_lossy", "INTEGER NOT NULL DEFAULT 0"),
+                ("strategy", "TEXT NOT NULL DEFAULT 'DIRECT_ALTER'"),
+                ("backup_table_name", "TEXT NOT NULL DEFAULT ''"),
+                ("forward_sql", "TEXT NOT NULL DEFAULT ''"),
+                ("rollback_sql", "TEXT NOT NULL DEFAULT ''"),
+                ("rollback_of_change_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("rolled_back_by_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("rolled_back_at", "TEXT NOT NULL DEFAULT ''"),
+                ("note", "TEXT NOT NULL DEFAULT ''"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
+            ],
+            "migration_checkpoints": [
+                ("checkpoint_uid", "TEXT NOT NULL DEFAULT ''"),
+                ("name", "TEXT NOT NULL DEFAULT ''"),
+                ("description", "TEXT NOT NULL DEFAULT ''"),
+                ("connection_id", "TEXT NOT NULL DEFAULT ''"),
+                ("connection_name", "TEXT NOT NULL DEFAULT ''"),
+                ("anchor_log_id", "INTEGER NOT NULL DEFAULT 0"),
+                ("auto_created", "INTEGER NOT NULL DEFAULT 0"),
+                ("created_at", "TEXT NOT NULL DEFAULT ''"),
             ],
         }
         for table_name, col_defs in expected_columns.items():

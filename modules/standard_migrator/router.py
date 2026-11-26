@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 from core.platform.context import PlatformContext, get_platform_context
 from core.platform.http_utils import (
     MEDIA_TYPE_HTML,
+    MEDIA_TYPE_JSON,
     MEDIA_TYPE_XLSX,
     file_download_response,
     json_error,
@@ -19,9 +20,11 @@ from modules.standard_migrator.schemas import (
     AutoMatchBindingsPayload,
     BindMigratorConnectionPayload,
     CheckCompliancePayload,
+    CreateCheckpointPayload,
     DeleteMigrationItemsPayload,
     ExecuteBatchPayload,
     LoadDbTablesPayload,
+    RollbackRequestPayload,
     SaveFieldBindingsPayload,
     StageMigrationFromBindingsPayload,
     TableRebuildPayload,
@@ -209,6 +212,8 @@ async def api_migrator_execute_batch(
         kwargs={
             "max_workers": payload.max_workers,
             "keep_backup": payload.keep_backup,
+            "auto_checkpoint": payload.auto_checkpoint,
+            "checkpoint_name": payload.checkpoint_name,
         },
         default_detail="批量贯标任务执行完毕",
         count_fn=lambda r: (
@@ -254,6 +259,8 @@ async def api_migrator_rebuild_execute(
             "item_ids": payload.item_ids,
             "keep_backup": payload.keep_backup,
             "connection_id": payload.connection_id,
+            "auto_checkpoint": payload.auto_checkpoint,
+            "checkpoint_name": payload.checkpoint_name,
         },
         default_detail="整表保序重建完成",
         count_fn=lambda r: (
@@ -599,3 +606,134 @@ def api_bindings_stage_migration(
         )
     except Exception as exc:
         return json_error(str(exc), 400)
+
+
+# =========================================================================
+# 第 3 步：结构化变更日志、Checkpoint 还原点与 LIFO 一键回滚
+# =========================================================================
+
+
+@router.get("/changelog")
+def api_migrator_changelog(
+    connection_id: str = Query(default=""),
+    risk_level: str = Query(default=""),
+    status: str = Query(default=""),
+    keyword: str = Query(default=""),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return StandardMigratorService(ctx).list_changelog_state(
+            connection_id=connection_id,
+            risk_level=risk_level,
+            status=status,
+            keyword=keyword,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+
+@router.get("/changelog/export.json")
+def api_migrator_changelog_export_json(
+    connection_id: str = Query(default=""),
+    only_applied: bool = Query(default=True),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    raw = StandardMigratorService(ctx).export_changelog_json_bytes(
+        connection_id=connection_id,
+        only_applied=only_applied,
+    )
+    return file_download_response(
+        raw,
+        "DataOG_落标变更台账底座.json",
+        media_type=MEDIA_TYPE_JSON,
+        ascii_fallback="migration_changelog.json",
+    )
+
+
+@router.get("/changelog/export.xlsx")
+def api_migrator_changelog_export_excel(
+    connection_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    raw = StandardMigratorService(ctx).export_changelog_excel_bytes(
+        connection_id=connection_id,
+    )
+    return file_download_response(
+        raw,
+        "DataOG_落标变更台账与Checkpoint.xlsx",
+        media_type=MEDIA_TYPE_XLSX,
+        ascii_fallback="migration_changelog.xlsx",
+    )
+
+
+@router.post("/checkpoints")
+def api_migrator_create_checkpoint(
+    payload: CreateCheckpointPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return StandardMigratorService(ctx).create_checkpoint(
+            payload.name,
+            description=payload.description,
+            connection_id=payload.connection_id,
+            auto_created=False,
+        )
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+
+@router.delete("/checkpoints/{checkpoint_id}")
+def api_migrator_delete_checkpoint(
+    checkpoint_id: int,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return StandardMigratorService(ctx).delete_checkpoint(checkpoint_id)
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+
+@router.post("/rollback/preview")
+def api_migrator_rollback_preview(
+    payload: RollbackRequestPayload,
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    try:
+        return StandardMigratorService(ctx).preview_rollback(
+            checkpoint_id=payload.checkpoint_id,
+            change_ids=payload.change_ids,
+            prefer_backup_table=payload.prefer_backup_table,
+        )
+    except Exception as exc:
+        return json_error(str(exc), 400)
+
+
+@router.post("/rollback/execute")
+async def api_migrator_rollback_execute(
+    payload: RollbackRequestPayload,
+    request: Request,
+    task_id: str = Query(default=""),
+    ctx: PlatformContext = Depends(get_platform_context),
+):
+    return await run_tracked_task(
+        request=request,
+        task_id=task_id,
+        ctx=ctx,
+        title="执行落标物理回滚",
+        start_detail="正在按 LIFO 逆序编排并执行贯标变更回滚...",
+        fn=StandardMigratorService(ctx).execute_rollback,
+        kwargs={
+            "checkpoint_id": payload.checkpoint_id,
+            "change_ids": payload.change_ids,
+            "prefer_backup_table": payload.prefer_backup_table,
+        },
+        default_detail="落标回滚执行完毕",
+        count_fn=lambda r: (
+            int(r.get("completed_steps", 0) or 0),
+            int(r.get("total_steps", 0) or 0),
+        ),
+    )

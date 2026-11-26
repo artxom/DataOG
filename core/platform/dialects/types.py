@@ -1564,3 +1564,136 @@ def item_requires_table_rebuild(
     if str(item.get("strategy") or "").upper() == "TABLE_REBUILD":
         return True
     return False
+
+
+_RISK_META_BY_LEVEL: Dict[str, Dict[str, Any]] = {
+    "L1": {
+        "risk_rank": 1,
+        "risk_code": "COLUMN_RENAME",
+        "risk_label": "L1 极高危·改名",
+        "risk_short": "L1 改名",
+        "risk_tone": "critical",
+    },
+    "L2": {
+        "risk_rank": 2,
+        "risk_code": "TYPE_CONVERSION",
+        "risk_label": "L2 高危·转类型",
+        "risk_short": "L2 转类型",
+        "risk_tone": "high",
+    },
+    "L3": {
+        "risk_rank": 3,
+        "risk_code": "PRECISION_SHRINK",
+        "risk_label": "L3 中危·缩精度/长度",
+        "risk_short": "L3 缩精度",
+        "risk_tone": "medium",
+    },
+    "L4": {
+        "risk_rank": 4,
+        "risk_code": "SAFE_CHANGE",
+        "risk_label": "L4 安全·扩容/注释",
+        "risk_short": "L4 安全",
+        "risk_tone": "safe",
+    },
+}
+
+
+def classify_migration_risk(
+    item: Dict[str, Any],
+    matched_col: Optional[Any] = None,
+    table_meta: Optional[Any] = None,
+    dialect: str = "DWS",
+) -> Dict[str, Any]:
+    """对单条落标变更按四级危险程度统一分级（多因素取最高危）.
+
+    分级定义：
+    - L1 (极高危): 字段名称变更（极易破坏下游 SQL/视图/ETL 血缘引用）
+    - L2 (高危): 字段类型转换（跨语义域或整型↔定点↔浮点↔日期时间等隐式/显式 CAST）
+    - L3 (中危): 字段精度缩略或长度缩减（同语义域内长度/整数位/小数位/整型位宽缩减，可能截断或溢出）
+    - L4 (安全): 同族无损扩容、仅更新注释或无结构差异
+    """
+    changes = analyze_item_changes(item, matched_col=matched_col, table_meta=table_meta)
+    requires_rebuild = item_requires_table_rebuild(
+        item, matched_col=matched_col, table_meta=table_meta
+    )
+
+    has_rename = bool(changes["name_changed"])
+    type_changed = bool(changes["type_changed"])
+    comment_changed = bool(changes["comment_changed"])
+    is_comment_only = bool(changes["is_comment_only"])
+
+    has_type_conversion = False
+    has_precision_shrink = False
+    compat: Dict[str, Any] = {}
+    if type_changed and changes["cur_type"] and changes["new_type"]:
+        compat = analyze_cross_column_compatibility(
+            changes["cur_type"],
+            changes["new_type"],
+            source_db_type=dialect,
+            target_db_type=dialect,
+        )
+        conv_status = str(compat.get("type_conv_status") or "").upper()
+        cap_status = str(compat.get("capacity_status") or "").upper()
+        has_type_conversion = bool(compat.get("has_type_conversion")) or (
+            conv_status in ("CAST_REQUIRED", "SAFE_CAST")
+        )
+        has_precision_shrink = cap_status in ("INSUFFICIENT", "RISK")
+
+    risk_factors: List[str] = []
+    if has_rename:
+        risk_factors.append(f"字段改名 ({changes['cur_name']} → {changes['new_name']})")
+    if has_type_conversion:
+        risk_factors.append(f"字段类型转换 ({changes['cur_type']} → {changes['new_type']})")
+    if has_precision_shrink:
+        shrink_hint = str(compat.get("capacity_short") or "").strip()
+        if shrink_hint and shrink_hint not in ("-", "可包住"):
+            risk_factors.append(
+                f"精度/长度缩减 ({changes['cur_type']} → {changes['new_type']} · {shrink_hint})"
+            )
+        else:
+            risk_factors.append(
+                f"精度/长度缩减 ({changes['cur_type']} → {changes['new_type']})"
+            )
+    if type_changed and not has_type_conversion and not has_precision_shrink:
+        risk_factors.append(f"同族无损扩容 ({changes['cur_type']} → {changes['new_type']})")
+    if comment_changed:
+        risk_factors.append("仅更新注释" if is_comment_only else "同步更新注释")
+    if not risk_factors:
+        risk_factors.append("无结构变更")
+
+    if has_rename:
+        level = "L1"
+    elif has_type_conversion:
+        level = "L2"
+    elif has_precision_shrink:
+        level = "L3"
+    else:
+        level = "L4"
+
+    meta = _RISK_META_BY_LEVEL[level]
+    detail_parts = list(risk_factors)
+    if requires_rebuild:
+        detail_parts.append("需整表保序重建")
+    cap_detail = str(compat.get("capacity_detail") or "").strip()
+    conv_detail = str(compat.get("type_conv_detail") or "").strip()
+    if has_type_conversion and conv_detail:
+        detail_parts.append(conv_detail)
+    if has_precision_shrink and cap_detail:
+        detail_parts.append(cap_detail)
+
+    return {
+        "risk_level": level,
+        "risk_rank": meta["risk_rank"],
+        "risk_code": meta["risk_code"],
+        "risk_label": meta["risk_label"],
+        "risk_short": meta["risk_short"],
+        "risk_tone": meta["risk_tone"],
+        "risk_factors": risk_factors,
+        "risk_detail": "；".join(detail_parts),
+        "has_rename": has_rename,
+        "has_type_conversion": has_type_conversion,
+        "has_precision_shrink": has_precision_shrink,
+        "is_comment_only": is_comment_only,
+        "is_lossy": bool(has_type_conversion or has_precision_shrink),
+        "requires_rebuild": bool(requires_rebuild),
+    }

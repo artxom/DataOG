@@ -8,6 +8,29 @@
 
 ---
 
+## [3.6.0] - 2026-11-26
+
+> **「2. 落标绑定与贯标」四级危险程度分级标色、共享工作区结构化变更日志与 Checkpoint 一键回滚（Phase 1）**：为高风险数据库直连贯标操作建立事前分级标色拦截与事后可追溯、可打点、可逆序一键回滚的安全保护体系，并将净列映射变更台账沉淀至 Layer 3 共享工作区作为下期 SQL 智能落标改写底座。
+
+### Added
+- **四级危险程度分类引擎 (`core/platform/dialects/types.py`, `core/dws_engine.py`)**：
+  - 新增 `classify_migration_risk()`：多因素叠加取最高危定级——**L1 极高危·改名**（字段名称变更）、**L2 高危·转类型**（跨语义族/显式类型转换）、**L3 中危·缩精度/长度**（同族内字符/定点/浮点/整型位宽缩减）与 **L4 安全·扩容/注释**（无损扩容、仅注释或无结构差异），透传队列列表、汇总 `risk_counts` 与单条 SQL 预览。
+- **贯标队列四级标色、筛选与风险二次确认 (`static/js/views/standard_migrator_view.js`, `static/js/views/standard_migrator/modals.js`, `static/css/workbench.css`)**：
+  - 队列新增左侧 3.5px 醒目色条 + 柔和行底色（L1 红 / L2 橙 / L3 黄 / L4 绿）、可排序「风险等级」彩色徽章列与 L1~L4 筛选胶囊；
+  - 新增快捷防误触按钮 **「取消高危勾选」**（实时跟随选择状态）与 **「移出高危项」**；批量执行及单条 L1~L3 高危操作触发风险明细二次确认弹窗，支持「跳过高危，仅执行安全项」及勾选「执行前自动创建 Checkpoint 还原点」。
+- **Layer 3 共享工作区结构化变更日志、Checkpoint 还原点与 LIFO 一键回滚 (`modules/standard_migrator/changelog_mixin.py`, `core/platform/storage/schema.py`, `core/platform/workspace_hub.py`, `static/js/views/standard_migrator/changelog_panel.js`)**：
+  - 新增 `migration_change_logs` 与 `migration_checkpoints` 共享工作区表（严守 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 兼容协议，随 `.dataog.db` 无损导出/导入且零密码泄露）；修复重建备份表名时间戳漂移并通过线程安全 `bind_commit_callback` 实时捕获执行前后物理列快照、`std_code`、风险等级与正/逆向 SQL；
+  - 「2. 落标绑定与贯标」新增第 3 个子页签 **「变更日志与回滚」**，提供时间线 Checkpoint 卡片管理、冲突依赖拦截预览、`_bak_` 备份表原子无损切回与轻量 `DIRECT_ALTER` 逆向 DDL 回滚（含空注释 `IS NULL` 还原）、遇错即停断点续滚，以及回滚后自动逆向迁移 `field_standard_bindings` 与同步刷新队列状态；
+  - 新增 `GET /changelog`、`GET /changelog/export.json`（自动折叠 `A→B→C` 为净映射 `effective_column_mappings` 供下期 SQL 改写底座消费）、`GET /changelog/export.xlsx`（双 Sheet）、`POST /checkpoints`、`DELETE /checkpoints/{id}`、`POST /rollback/preview` 与 `POST /rollback/execute`。
+- **自动化单元测试 (`tests/test_migration_risk_and_rollback.py`)**：
+  - 新增 4 项端到端测试，覆盖 L1~L4 分级全矩阵、工作区导入导出保留日志、模拟 DWS 执行/冲突拦截/LIFO 回滚/断点续滚/绑标还原/双格式导出，以及新增前端 ES Modules 语法与零 XSS 校验（总测试数增至 **123 项**）。
+
+### Changed
+- **版本号同步发布 (`v3.6.0`)**：
+  - 同步递增 `3.5.5 -> 3.6.0` 至 `app.py`、`core/app_kernel.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md` 与 `AGENTS.md`（严格维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变；**123 项**自动化单元测试全绿）。
+
+---
+
 ## [3.5.5] - 2026-11-26
 
 > **「2. 落标绑定与贯标」可折叠对标设置抽屉 + 全 Schema 刷新与落标比对**：将原本固定占据左上角的「当前库落标标准」与目录树统计口径开关迁入右侧按需滑出的可扩展「对标设置」抽屉，同时在抽屉内新增全 Schema（含全库）目录刷新并全量核验落标能力。
