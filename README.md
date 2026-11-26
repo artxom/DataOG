@@ -1,4 +1,4 @@
-# Data.O.G v3.7.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.7.1 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -62,9 +62,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.7.0，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.7.1，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.7.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.7.1 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -163,7 +163,8 @@ DataOG/
 | **`v3.5.4`** | `chore/v3.5.4-gc-and-docs-reorg` → `main` | **全仓垃圾回收、死代码清理、文档重整与演示沙箱闭环修复**：系统性核查并清理底座/模块/前端/沙箱经确认死代码、旧 `static/js/core/api.js` 兼容层、冗余 CSS 及过期字节码；修复 `demo_sandbox/workspace_builder.py` 导出工作区名称/描述覆盖与 `dwd_acct_swap_demo` 保序重建缓存提示；归档 `docs/archive/AI_ASSISTANT_LONG_SQL_GOAL_PLAN.md` 并全仓同步 `MODULE_SDK_3_0.md`、`knowledge_packs/README.md`、`DEMO_PLAYBOOK.md` 与根文档（118 项测试全绿） |
 | **`v3.5.5`** | `feat/v3.5.5-migrator-drawer-schema-refresh` → `main` | **「2. 落标绑定与贯标」可折叠对标设置抽屉 + 全 Schema 刷新与落标比对**：释放左上角侧栏空间，将「当前库落标标准」与目录树统计口径开关迁入默认收起的右侧模块化可扩展「对标设置」抽屉；`check-compliance` 与抽屉新增 `scope=schema`/`all_schemas` + `refresh_catalog` 一键全 Schema 刷新并重算全量落标统计与 `col_count`（119 项测试全绿） |
 | **`v3.6.0`** | `feat/migration-risk-changelog-rollback` → `main` | **贯标四级危险分级标色拦截、共享工作区结构化变更日志与 Checkpoint 一键回滚**：建立 L1 改名 / L2 转类型 / L3 缩精度 / L4 安全四级分类与队列标色、高危快捷取消/移出及执行前汇总确认；在 Layer 3 共享工作区持久化 `migration_change_logs` 与 `migration_checkpoints`，提供时间线打点、冲突拦截、`_bak_` 备份表无损切回与轻量逆向 DDL 断点续滚，自动逆向还原字段绑标并导出折叠净映射 JSON 底座（123 项测试全绿） |
-| **`v3.7.0`**（当前正式版） | `feat/sql-script-rewriter` → `main` | **基于字段变更历史的 SQL 脚本自动调整（确定性词法作用域底座 + 轻量 AI 手术刀增强）**：在「2. 落标绑定与贯标」新增「SQL 脚本改写」工作台，消费共享工作区变更日志 / Checkpoint 增量 / 离线 `changelog.json`，零 Token 精准 Span 改写 CTE/子查询/DML/DDL/PL/pgSQL 过程体并输出 L2/L3 类型影响雷达；支持按需调用廉价轻量模型（如 `DeepSeek-v4-flash`）对歧义列、跨类型表达式、动态 SQL 与 `JOIN USING` 微切片输出经五道反幻觉门禁核验的局部补丁，支持交互式逐条勾选 Diff 预览与多文件 `.sql`/`.zip` 审计包导出（129 项测试全绿） |
+| **`v3.7.0`** | `feat/sql-script-rewriter` → `main` | **基于字段变更历史的 SQL 脚本自动调整（确定性词法作用域底座 + 轻量 AI 手术刀增强）**：在「2. 落标绑定与贯标」新增「SQL 脚本改写」工作台，消费共享工作区变更日志 / Checkpoint 增量 / 离线 `changelog.json`，零 Token 精准 Span 改写 CTE/子查询/DML/DDL/PL/pgSQL 过程体并输出 L2/L3 类型影响雷达；支持按需调用廉价轻量模型（如 `DeepSeek-v4-flash`）对歧义列、跨类型表达式、动态 SQL 与 `JOIN USING` 微切片输出经五道反幻觉门禁核验的局部补丁，支持交互式逐条勾选 Diff 预览与多文件 `.sql`/`.zip` 审计包导出（129 项测试全绿） |
+| **`v3.7.1`**（当前正式版） | `fix/sql-rewriter-hardening` → `main` | **SQL 脚本改写双引擎反注入安全与方言/前端多标签深度加固**：封堵轻量模型局部补丁分号语句注入、注释注入与高危 DDL/DML 关键字绕过漏洞；修复 MySQL `#` 注释与 Oracle `/` 块结束符吞噬后续语句、`SELECT` 显式表达式别名在 `GROUP BY`/`ORDER BY` 误改、函数/部分索引与跨表外键 `REFERENCES` 及 MySQL 行内注释同步缺陷；修复前端上传 GB18030/GBK 中文乱码、重传同名标签焦点跳转、未分析新标签误显旧 Diff 与关闭标签残留在 `.zip` 导出问题（130 项测试全绿） |
 
 ---
 
@@ -174,7 +175,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（129 项，发布前本地执行）
+# 运行全量自动化单元测试（130 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）

@@ -295,6 +295,30 @@ function downloadTextFile(filename, content) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/**
+ * 优先按严格 UTF-8 解码上传脚本，若遇 GB18030/GBK 字节流则自动回退解码避免中文注释乱码
+ */
+export async function decodeFileWithFallback(file) {
+  if (!file) return "";
+  if (typeof file.arrayBuffer === "function" && typeof TextDecoder !== "undefined") {
+    const buf = await file.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes).replace(/^\uFEFF/, "");
+    } catch (_utfErr) {
+      for (const enc of ["gb18030", "gbk"]) {
+        try {
+          return new TextDecoder(enc).decode(bytes);
+        } catch (_encErr) {
+          // try next encoding
+        }
+      }
+      return new TextDecoder("utf-8").decode(bytes);
+    }
+  }
+  return await file.text();
+}
+
 export class SqlRewritePanel {
   constructor(parentView) {
     this.view = parentView;
@@ -337,7 +361,7 @@ export class SqlRewritePanel {
     this.sqlFileInput = el("input", {
       type: "file",
       multiple: true,
-      accept: ".sql,.ddl,.prc,.fnc,.vw,.hql,.txt,.plsql",
+      accept: ".sql,.ddl,.prc,.fnc,.vw,.hql,.txt,.plsql,.pck,.bdy",
       style: { display: "none" },
       onChange: (e) => {
         this._handleSqlFilesSelected(e.target.files);
@@ -406,7 +430,7 @@ export class SqlRewritePanel {
   _getActiveResultFile() {
     const active = this._getActiveScript();
     if (!active || !this.result?.files?.length) return null;
-    return this._findResultFileForScript(active) || this.result.files[0] || null;
+    return this._findResultFileForScript(active);
   }
 
   _getSelectedPatchSet(fileRes) {
@@ -451,7 +475,7 @@ export class SqlRewritePanel {
     const loaded = [];
     for (const f of files) {
       try {
-        const text = await f.text();
+        const text = await decodeFileWithFallback(f);
         loaded.push({
           id: `file_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
           filename: f.name || "script.sql",
@@ -462,21 +486,26 @@ export class SqlRewritePanel {
       }
     }
     if (!loaded.length) return;
-    // 若当前只有空白默认草稿，则直接替换为上传文件列表；否则追加
+    let firstTargetId = loaded[0].id;
+    // 若当前只有空白默认草稿，则直接替换为上传文件列表；否则追加或覆盖同名脚本
     if (this.scripts.length === 1 && !this.scripts[0].content.trim() && this.scripts[0].id.startsWith("draft_")) {
       this.scripts = loaded;
+      firstTargetId = loaded[0].id;
     } else {
-      const existingNames = new Set(this.scripts.map((s) => s.filename));
+      firstTargetId = "";
       for (const item of loaded) {
-        if (existingNames.has(item.filename)) {
-          const idx = this.scripts.findIndex((s) => s.filename === item.filename);
-          if (idx >= 0) this.scripts[idx].content = item.content;
+        const lowerName = item.filename.toLowerCase();
+        const idx = this.scripts.findIndex((s) => s.filename.toLowerCase() === lowerName);
+        if (idx >= 0) {
+          this.scripts[idx].content = item.content;
+          if (!firstTargetId) firstTargetId = this.scripts[idx].id;
         } else {
           this.scripts.push(item);
+          if (!firstTargetId) firstTargetId = item.id;
         }
       }
     }
-    this.activeScriptId = loaded[0].id;
+    this.activeScriptId = firstTargetId || this.scripts[0]?.id || "";
     this.result = null;
     this.selectedPatchesByFile.clear();
     Toast.success(`已载入 ${loaded.length} 份 SQL 脚本`);
@@ -487,7 +516,7 @@ export class SqlRewritePanel {
     const f = fileList?.[0];
     if (!f) return;
     try {
-      const txt = await f.text();
+      const txt = await decodeFileWithFallback(f);
       const parsed = JSON.parse(txt);
       const count =
         (parsed.effective_column_mappings || []).length || (parsed.changes || []).length;
@@ -1076,11 +1105,20 @@ export class SqlRewritePanel {
                 text: "×",
                 onClick: (e) => {
                   e.stopPropagation();
+                  const removedRes = this._findResultFileForScript(s);
                   this.scripts = this.scripts.filter((x) => x.id !== s.id);
+                  if (removedRes && this.result?.files) {
+                    this.selectedPatchesByFile.delete(removedRes.filename);
+                    this.result.files = this.result.files.filter((f) => f !== removedRes);
+                    if (!this.result.files.length) {
+                      this.result = null;
+                    }
+                  }
                   if (this.activeScriptId === s.id) {
                     this.activeScriptId = this.scripts[0]?.id || "";
                   }
                   this.render();
+                  this.view.onStateUpdate?.();
                 },
               })
             : null

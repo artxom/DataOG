@@ -736,7 +736,7 @@ globalThis.document = {
 const root = process.argv[1];
 const imp = (rel) => import(pathToFileURL(path.join(root, rel)).href);
 
-const { applySelectedPatchesClient, applySelectedPatchesDetailed, computeLineDiffRows } = await imp(
+const { applySelectedPatchesClient, applySelectedPatchesDetailed, computeLineDiffRows, decodeFileWithFallback } = await imp(
   "static/js/views/standard_migrator/sql_rewrite_panel.js"
 );
 const { StandardMigratorView } = await imp("static/js/views/standard_migrator_view.js");
@@ -805,6 +805,42 @@ const hdr = mv.renderHeaderActions();
 if (!hdr || mv.gridMount.children.length !== 1) {
   throw new Error("SqlRewritePanel failed to render inside StandardMigratorView");
 }
+
+// Verify GBK/GB18030 fallback decoding & UTF-8 BOM stripping
+const utf8BomBytes = new Uint8Array([0xEF, 0xBB, 0xBF, ...Buffer.from("SELECT 1; -- 客户号", "utf-8")]);
+const decodedUtf8 = await decodeFileWithFallback({ arrayBuffer: async () => utf8BomBytes.buffer });
+if (decodedUtf8 !== "SELECT 1; -- 客户号") {
+  throw new Error(`UTF-8 BOM decode failed: ${JSON.stringify(decodedUtf8)}`);
+}
+// GBK bytes for "-- 客户\nSELECT 1;" (客=0xBF 0xCD, 户=0xBB 0xA7)
+const gbkBytes = new Uint8Array([0x2D, 0x2D, 0x20, 0xBF, 0xCD, 0xBB, 0xA7, 0x0A, 0x53, 0x45, 0x4C, 0x45, 0x43, 0x54, 0x20, 0x31, 0x3B]);
+const decodedGbk = await decodeFileWithFallback({ arrayBuffer: async () => gbkBytes.buffer });
+if (!decodedGbk.includes("客户") || !decodedGbk.includes("SELECT 1;")) {
+  throw new Error(`GBK/GB18030 decode failed: ${JSON.stringify(decodedGbk)}`);
+}
+
+// Verify re-uploading non-first tab preserves active tab on that script & un-analyzed new tab returns null result
+const panel = mv.sqlRewritePanel;
+panel.scripts = [
+  { id: "s1", filename: "a.sql", content: "SELECT 1;" },
+  { id: "s2", filename: "b.sql", content: "SELECT 2;" },
+];
+panel.activeScriptId = "s1";
+await panel._handleSqlFilesSelected([{ name: "B.sql", text: async () => "SELECT 22;" }]);
+if (panel.activeScriptId !== "s2" || panel.scripts[1].content !== "SELECT 22;") {
+  throw new Error(`Re-upload existing non-first tab failed: active=${panel.activeScriptId}, content=${panel.scripts[1].content}`);
+}
+
+panel.result = {
+  files: [
+    { filename: "a.sql", original_filename: "a.sql", original_sql: "SELECT 1;", rewritten_sql: "SELECT 1;", patches: [], advisories: [] },
+  ],
+};
+panel.activeScriptId = "s2";
+if (panel._getActiveResultFile() !== null) {
+  throw new Error("Expected un-analyzed tab s2 NOT to inherit result from a.sql");
+}
+
 mv.destroy();
 console.log("SQL_REWRITE_FRONTEND_OK");
 """
@@ -1076,6 +1112,145 @@ console.log("SQL_REWRITE_FRONTEND_OK");
         det_ids = {p.patch_id for p in hyb_evil["patches"] if p.source == "DETERMINISTIC"}
         only_second_nvl = apply_patches(evil_sql, hyb_evil["patches"], det_ids | {nvl_llm[1].patch_id})
         self.assertIn("SELECT NVL(a.tx_amt, ''), NVL(a.tx_amt, 0),", only_second_nvl)
+
+    def test_hardening_mysql_oracle_ddl_alias_shadow_and_llm_injection_defense(self) -> None:
+        """安全与方言加固回归：MySQL # 注释、Oracle / 块结束符、SELECT 别名遮蔽保护、函数/部分索引、跨表外键 REFERENCES、MySQL 行内注释及 LLM 语句/注释/高危关键字注入拦截."""
+        reg = _sample_registry()
+        opts = RewriteOptions(rewrite_ddl_types=True, rewrite_comments=True)
+
+        # 1. MySQL # 单行注释不吞噬后续语句，且 PG JSONB #> / #>> 保持完整
+        mysql_pg_sql = (
+            "# old_cust 顶部注释\n"
+            "SELECT old_cust FROM dwd.t_cust;\n"
+            "# 第二条语句注释\n"
+            "SELECT amt_str, payload #>> '{a,b}' FROM dwd.t_cust WHERE payload #> '{x}' IS NOT NULL;\n"
+        )
+        r_hash = rewrite_sql_deterministic(mysql_pg_sql, reg, opts)
+        self.assertIn("# old_cust 顶部注释\nSELECT cust_no FROM dwd.t_cust;", r_hash["rewritten_sql"])
+        self.assertIn("# 第二条语句注释\nSELECT tx_amt, payload #>> '{a,b}' FROM dwd.t_cust WHERE payload #> '{x}' IS NOT NULL;", r_hash["rewritten_sql"])
+
+        # 2. Oracle / DWS 独立成行的 `/` 块结束符不吞噬后续语句
+        oracle_sql = (
+            "CREATE OR REPLACE PROCEDURE sp_test AS\n"
+            "  v_x VARCHAR2(32);\n"
+            "BEGIN\n"
+            "  SELECT old_cust INTO v_x FROM dwd.t_cust;\n"
+            "END;\n"
+            "/\n"
+            "SELECT old_cust FROM dwd.t_cust;\n"
+        )
+        r_ora = rewrite_sql_deterministic(oracle_sql, reg, opts)
+        self.assertIn("SELECT cust_no INTO v_x FROM dwd.t_cust;", r_ora["rewritten_sql"])
+        self.assertIn("/\nSELECT cust_no FROM dwd.t_cust;", r_ora["rewritten_sql"])
+
+        # 3. SELECT 显式表达式别名遮蔽：WHERE 正常改名，GROUP BY / ORDER BY 保持引用显式别名不被破坏
+        alias_shadow_sql = (
+            "SELECT TRIM(a.old_cust) AS old_cust, COUNT(*) "
+            "FROM dwd.t_cust a "
+            "WHERE old_cust IS NOT NULL "
+            "GROUP BY old_cust "
+            "ORDER BY old_cust;"
+        )
+        r_alias = rewrite_sql_deterministic(alias_shadow_sql, reg, opts)
+        self.assertEqual(
+            r_alias["rewritten_sql"],
+            "SELECT TRIM(a.cust_no) AS old_cust, COUNT(*) "
+            "FROM dwd.t_cust a "
+            "WHERE cust_no IS NOT NULL "
+            "GROUP BY old_cust "
+            "ORDER BY old_cust;",
+        )
+
+        # 4. 函数索引 / INCLUDE / 部分索引 WHERE 谓词 + 跨表 FOREIGN KEY REFERENCES + MySQL 行内 COMMENT
+        ddl_sql = (
+            "CREATE INDEX idx_cust_expr ON dwd.t_cust (LOWER(old_cust), old_cust DESC NULLS LAST) "
+            "INCLUDE (amt_str) WHERE amt_str IS NOT NULL;\n"
+            "CREATE TABLE dwd.t_child (\n"
+            "  id int,\n"
+            "  c_ref varchar(32),\n"
+            "  FOREIGN KEY (c_ref) REFERENCES dwd.t_cust (old_cust)\n"
+            ");\n"
+            "CREATE TABLE dwd.t_cust (\n"
+            "  old_cust varchar(32) COMMENT '旧客户号',\n"
+            "  amt_str varchar(50)\n"
+            ");\n"
+        )
+        r_ddl = rewrite_sql_deterministic(ddl_sql, reg, opts)
+        self.assertIn(
+            "CREATE INDEX idx_cust_expr ON dwd.t_cust (LOWER(cust_no), cust_no DESC NULLS LAST) "
+            "INCLUDE (tx_amt) WHERE tx_amt IS NOT NULL;",
+            r_ddl["rewritten_sql"],
+        )
+        self.assertIn("FOREIGN KEY (c_ref) REFERENCES dwd.t_cust (cust_no)", r_ddl["rewritten_sql"])
+        self.assertIn("cust_no varchar(64) COMMENT '标准客户编号',", r_ddl["rewritten_sql"])
+        self.assertIn("tx_amt numeric(18,2)", r_ddl["rewritten_sql"])
+
+        # 5. LLM 门禁反注入加固：阻断分号语句注入、高危 DDL/DML 关键字、-- / /* 注释注入与 UNION 注入
+        inj_sql = "SELECT NVL(a.amt_str, '') FROM dwd.t_cust a WHERE a.amt_str = '100';"
+        det_inj = rewrite_sql_deterministic(inj_sql, reg)
+
+        class _InjectionHub:
+            def resolve_provider_and_model(self, **kw):
+                return type("P", (), {"provider_id": "ds"})(), "DeepSeek-v4-flash"
+
+            def chat_completion(self, **kw):
+                return {
+                    "content": json.dumps(
+                        {
+                            "patches": [
+                                {
+                                    "line": 1,
+                                    "original_snippet": "a.tx_amt = '100'",
+                                    "rewritten_snippet": "a.tx_amt = 100; DROP TABLE dwd.t_cust --",
+                                    "category": "TYPE_ADAPT",
+                                    "confidence": "HIGH",
+                                },
+                                {
+                                    "line": 1,
+                                    "original_snippet": "a.tx_amt = '100'",
+                                    "rewritten_snippet": "a.tx_amt = 100 -- bypass",
+                                    "category": "TYPE_ADAPT",
+                                    "confidence": "HIGH",
+                                },
+                                {
+                                    "line": 1,
+                                    "original_snippet": "a.tx_amt = '100'",
+                                    "rewritten_snippet": "a.tx_amt = 100 /* SELECT",
+                                    "category": "TYPE_ADAPT",
+                                    "confidence": "HIGH",
+                                },
+                                {
+                                    "line": 1,
+                                    "original_snippet": "a.tx_amt = '100'",
+                                    "rewritten_snippet": "a.tx_amt = 100 UNION SELECT 1",
+                                    "category": "TYPE_ADAPT",
+                                    "confidence": "HIGH",
+                                },
+                                {
+                                    "line": 1,
+                                    "original_snippet": "NVL(a.tx_amt, '')",
+                                    "rewritten_snippet": "NVL(a.tx_amt, 0)",
+                                    "category": "TYPE_ADAPT",
+                                    "confidence": "HIGH",
+                                },
+                            ]
+                        }
+                    )
+                }
+
+        res_inj = enhance_sql_rewrite_with_llm(
+            original_sql=inj_sql,
+            det_result=det_inj,
+            registry=reg,
+            llm_hub=_InjectionHub(),
+        )
+        self.assertEqual(res_inj["llm_meta"]["accepted_patches"], 1)
+        self.assertEqual(res_inj["llm_meta"]["rejected_patches"], 4)
+        self.assertIn("NVL(a.tx_amt, 0)", res_inj["rewritten_sql"])
+        self.assertNotIn("DROP", res_inj["rewritten_sql"])
+        self.assertNotIn("UNION", res_inj["rewritten_sql"])
+        self.assertNotIn("--", res_inj["rewritten_sql"])
+        self.assertNotIn("/*", res_inj["rewritten_sql"])
 
 
 if __name__ == "__main__":
