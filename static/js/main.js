@@ -16,6 +16,7 @@ import {
   getDesktopApp,
   getDesktopApps,
   loadAppInstance,
+  loadExternalPluginApps,
 } from "./core/app_registry.js";
 import {
   badge,
@@ -829,6 +830,10 @@ export async function bootstrapWorkbench() {
     }
     const boot = await platformApi.bootstrap();
     store.applyBootstrap(boot);
+    const plugRes = await loadExternalPluginApps(boot.plugins || []);
+    if (plugRes.failed?.length) {
+      Toast.warn(`部分外置插件前端加载失败 (${plugRes.failed.map((f) => f.plugin_id).join(", ")})`);
+    }
     syncMenubarIndicators();
   };
 

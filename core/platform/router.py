@@ -13,6 +13,7 @@ from core.platform.routes.auth_and_system import router as auth_and_system_route
 from core.platform.routes.data_sources import router as data_sources_router
 from core.platform.routes.diagnostics import router as diagnostics_router
 from core.platform.routes.knowledge import router as knowledge_router
+from core.platform.routes.plugins import router as plugins_router
 from core.platform.routes.standards import router as standards_router
 from core.platform.routes.updates import router as updates_router
 from core.platform.routes.workspaces import router as workspaces_router
@@ -26,5 +27,6 @@ router.include_router(standards_router)
 router.include_router(workspaces_router)
 router.include_router(diagnostics_router)
 router.include_router(updates_router)
+router.include_router(plugins_router)
 
 __all__ = ["extract_task_id", "router"]

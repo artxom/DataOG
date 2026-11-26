@@ -48,7 +48,9 @@ htmlcov/
 build/
 dist/
 updates/
+plugins/
 *.dgp
+*.dogapp
 *.spec
 *.old_*
 

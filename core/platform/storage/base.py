@@ -448,6 +448,110 @@ class _BaseStateStore(_SchemaColumnMixin):
                 if tbl not in builtin and tbl not in private_set and _SAFE_SQL_IDENT_RE.match(tbl)
             ]
 
+    def drop_plugin_tables(
+        self,
+        workspace_tables: Iterable[str] = (),
+        private_tables: Iterable[str] = (),
+        workspace_meta_keys: Iterable[str] = (),
+    ) -> Dict[str, int]:
+        """安全清理已卸载外置插件声明的专属业务表与工作区元键（绝对禁止删除平台内建表）."""
+        protected_tables = (
+            set(PRIVATE_ONLY_TABLES)
+            | set(WORKSPACE_BUSINESS_TABLES)
+            | {
+                "kb_documents",
+                "kb_chunks",
+                "kb_embeddings",
+                "ai_assistant_sessions",
+                "ai_assistant_messages",
+                "ai_assistant_proposals",
+                "ai_assistant_attachments",
+                "ai_assistant_attachment_chunks",
+                "ai_assistant_runs",
+                "ai_assistant_run_events",
+            }
+        )
+        ws_targets: List[str] = []
+        priv_targets: List[str] = []
+        meta_targets: List[str] = []
+
+        for tbl in workspace_tables or ():
+            clean = str(tbl or "").strip()
+            if not clean:
+                continue
+            if not _SAFE_SQL_IDENT_RE.match(clean) or clean.lower().startswith("sqlite_") or clean in protected_tables:
+                raise ValueError(f"拒绝删除受保护或非法的工作区表: {tbl!r}")
+            if clean not in ws_targets:
+                ws_targets.append(clean)
+
+        for tbl in private_tables or ():
+            clean = str(tbl or "").strip()
+            if not clean:
+                continue
+            if not _SAFE_SQL_IDENT_RE.match(clean) or clean.lower().startswith("sqlite_") or clean in protected_tables:
+                raise ValueError(f"拒绝删除受保护或非法的私有表: {tbl!r}")
+            if clean not in priv_targets:
+                priv_targets.append(clean)
+
+        for key in workspace_meta_keys or ():
+            clean = str(key or "").strip()
+            if not clean:
+                continue
+            if clean in WORKSPACE_META_KEYS:
+                raise ValueError(f"拒绝删除受保护的平台工作区元键: {key!r}")
+            if clean not in meta_targets:
+                meta_targets.append(clean)
+
+        dropped_ws = 0
+        dropped_priv = 0
+        deleted_meta = 0
+
+        with self._lock:
+            if ws_targets or meta_targets:
+                with self._get_workspace_conn() as wconn:
+                    for tbl in ws_targets:
+                        exists = wconn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                            (tbl,),
+                        ).fetchone()
+                        if exists:
+                            wconn.execute(f'DROP TABLE IF EXISTS "{tbl}"')
+                            dropped_ws += 1
+                    for mkey in meta_targets:
+                        cur = wconn.execute("DELETE FROM workspace_meta WHERE key = ?", (mkey,))
+                        deleted_meta += int(cur.rowcount or 0)
+                    wconn.commit()
+                self._registered_schemas["workspace"] = [
+                    item for item in self._registered_schemas.get("workspace", []) if item[0] not in ws_targets
+                ]
+                for tbl in ws_targets:
+                    self._plugin_workspace_tables.discard(tbl)
+                for mkey in meta_targets:
+                    self._extra_workspace_meta_keys.discard(mkey)
+
+            if priv_targets:
+                with self._get_private_conn() as pconn:
+                    for tbl in priv_targets:
+                        exists = pconn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                            (tbl,),
+                        ).fetchone()
+                        if exists:
+                            pconn.execute(f'DROP TABLE IF EXISTS "{tbl}"')
+                            dropped_priv += 1
+                    pconn.commit()
+                self._registered_schemas["private"] = [
+                    item for item in self._registered_schemas.get("private", []) if item[0] not in priv_targets
+                ]
+                for tbl in priv_targets:
+                    self._plugin_private_tables.discard(tbl)
+
+        return {
+            "dropped_workspace_tables": dropped_ws,
+            "dropped_private_tables": dropped_priv,
+            "deleted_workspace_meta": deleted_meta,
+        }
+
     # =========================================================================
     # 基础键值配置（按白名单自动分流至私有 app_meta 或工作区 workspace_meta）与日志中心
     # =========================================================================

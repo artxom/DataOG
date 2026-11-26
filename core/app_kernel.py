@@ -14,6 +14,7 @@ import asyncio
 import importlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -47,7 +48,7 @@ from core.platform.module_registry import mount_discovered_modules
 from core.platform.router import router as platform_router
 from core.platform.storage_paths import redact_private_storage_paths
 
-APP_VERSION = "3.7.1"
+APP_VERSION = "4.0.0"
 _NO_CACHE_FRONTEND_EXTS = (".html", ".htm", ".js", ".mjs", ".css")
 _UI_VERSION_META_RE = re.compile(r'<meta\s+name="dataog-ui-version"\s+content="([^"]+)"')
 
@@ -258,6 +259,7 @@ def create_app(
     *,
     private_root: Optional[str] = None,
     extra_modules: Optional[List[Any]] = None,
+    dev_plugin_dirs: Optional[List[str]] = None,
 ) -> FastAPI:
     base_ver = update_bootstrap.get_runtime_base_version(fallback=APP_VERSION)
     if ctx is None:
@@ -453,6 +455,13 @@ def create_app(
     if extra_modules:
         mount_discovered_modules(app, ctx, specs=extra_modules)
 
+    eff_dev_dirs: List[str] = list(dev_plugin_dirs or [])
+    if not eff_dev_dirs and not getattr(sys, "frozen", False):
+        env_dev = (os.environ.get("DATAOG_DEV_PLUGINS") or "").strip()
+        if env_dev:
+            eff_dev_dirs = [p for p in env_dev.split(os.pathsep) if p.strip()]
+    ctx.plugin_hub.apply_pending_and_load_all(app, ctx, dev_plugin_dirs=eff_dev_dirs)
+
     # =========================================================================
     # 向后兼容 v1.0.0 历史 API 路由（共享同一底层 PlatformStateStore）
     # =========================================================================
@@ -546,6 +555,47 @@ def create_app(
     async def route_well_known(rest_of_path: str) -> Response:
         _ = rest_of_path
         return Response(status_code=204)
+
+    _PLUGIN_MIME_MAP = {
+        ".js": "text/javascript; charset=utf-8",
+        ".mjs": "text/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".json": "application/json; charset=utf-8",
+        ".svg": "image/svg+xml",
+        ".html": "text/html; charset=utf-8",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".woff2": "font/woff2",
+        ".woff": "font/woff",
+    }
+
+    @app.api_route("/plugins/{plugin_id}/{asset_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
+    async def route_plugin_frontend_asset(request: Request, plugin_id: str, asset_path: str) -> Response:
+        base_dir = ctx.plugin_hub.get_active_frontend_dir(plugin_id)
+        if not base_dir:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "插件前端目录未就绪"})
+        clean_rel = str(asset_path or "").strip().lstrip("/")
+        if not clean_rel or "\\" in clean_rel or "\x00" in clean_rel:
+            return JSONResponse(status_code=404, content={"ok": False, "error": "非法资源路径"})
+        parts = clean_rel.split("/")
+        if any(not p or p in (".", "..") for p in parts):
+            return JSONResponse(status_code=404, content={"ok": False, "error": "禁止目录穿越"})
+        candidate = os.path.join(base_dir, *parts)
+        real_base = os.path.realpath(base_dir)
+        real_target = os.path.realpath(candidate)
+        if not real_target.startswith(real_base + os.sep) or not os.path.isfile(real_target):
+            return JSONResponse(status_code=404, content={"ok": False, "error": "插件资源不存在"})
+        ext = os.path.splitext(real_target)[1].lower()
+        media_type = _PLUGIN_MIME_MAP.get(ext) or mimetypes.guess_type(real_target)[0] or "application/octet-stream"
+        headers = {"X-Content-Type-Options": "nosniff"}
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type=media_type, headers=headers)
+        with open(real_target, "rb") as fh:
+            raw = fh.read()
+        return Response(content=raw, status_code=200, media_type=media_type, headers=headers)
 
     static_dir = resolve_static_dir()
     if not os.path.isdir(static_dir):
@@ -767,6 +817,12 @@ def main() -> None:
     parser.add_argument(
         "--test", action="store_true", help="运行内置自动化单元测试并退出"
     )
+    parser.add_argument(
+        "--dev-plugin",
+        action="append",
+        default=[],
+        help="开发态热挂载本地未签名插件目录（可重复指定；生产冻结态客户端自动忽略）",
+    )
     args = parser.parse_args()
 
     if args.smoke_test:
@@ -833,7 +889,12 @@ def main() -> None:
         print(f"  [!] 警告: 检测到前端静态资源版本 ({detected}) 与程序版本 (v{APP_VERSION}) 不一致！")
         print("  [!] 提示: 请将压缩包中的 DataOG.exe 与 _internal 文件夹一起完整解压覆盖后重试。")
 
-    app_instance = create_app()
+    if getattr(sys, "frozen", False) and args.dev_plugin:
+        print("  [!] 安全提示: 生产冻结态客户端仅允许加载已签名 .dogapp 插件，已忽略 --dev-plugin 参数。")
+    elif args.dev_plugin:
+        print(f"  [*] 开发态热挂插件目录 : {len(args.dev_plugin)} 个")
+
+    app_instance = create_app(dev_plugin_dirs=args.dev_plugin)
     update_bootstrap.mark_boot_healthy()
 
     if not args.no_browser:

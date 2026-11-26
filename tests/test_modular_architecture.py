@@ -673,6 +673,7 @@ console.log("MODULAR_FRONTEND_REGISTRY_OK");
             "core.platform.routes.data_sources",
             "core.platform.routes.appearance_and_llm",
             "core.platform.routes.knowledge",
+            "core.platform.routes.plugins",
             "core.platform.routes.standards",
             "core.platform.routes.workspaces",
             "core.platform.routes.diagnostics",
