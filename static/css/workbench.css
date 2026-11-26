@@ -1212,6 +1212,20 @@ body.is-col-resizing,
   gap: 10px 12px;
 }
 
+.form-section-title {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--os-border);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--os-text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .form-field {
   display: flex;
   flex-direction: column;
@@ -1393,10 +1407,6 @@ body.is-col-resizing,
   border-bottom: 1px solid var(--os-border);
   color: var(--os-text);
   vertical-align: middle;
-}
-
-.data-grid-table tbody tr {
-  contain: layout style;
 }
 
 .data-grid-table tbody tr:hover {
@@ -1665,9 +1675,7 @@ dialog:modal {
 dialog::backdrop {
   overflow: hidden;
   overscroll-behavior: contain;
-  background: rgba(0, 0, 0, 0.34);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.36);
 }
 
 .mac-dialog {

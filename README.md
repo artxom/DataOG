@@ -1,4 +1,4 @@
-# Data.O.G v3.5.2 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v3.5.3 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -61,9 +61,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.2，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 3.5.3，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 3.5.2 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 3.5.3 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0 模块）
 │   │   ├── http_utils.py         # 平台与插件共享 HTTP / 文件下载 / task_progress & import_progress 任务追踪 SDK
@@ -105,7 +105,7 @@ DataOG/
 ├── knowledge_packs/              # 离线初始化知识库下载中心（DWS 9.1 / Inceptor 9.x / PGSQL 19 的 .md 源码与 .json.gz 包；绝不打入 .exe）
 ├── tools/                        # 独立本地管理员可视化总控台 (`admin_console/`，配合根目录 `DataOG_Console.command` 一键启动) 与零依赖 C 激活码生成器构建器 (`build_keygen.py`；私钥与产物严格隔离不入库)
 ├── demo_sandbox/                 # 独立「启明商业银行」信创数仓治理演示沙箱（Docker 三引擎同源矩阵 + 164 条标准 + 150 表工作区 + 演示剧本；绝不打入 .exe）
-├── tests/                        # 117 项全量自动化测试（DGP2 加密混淆增量包与银行邮件网关零明文防线/防降级/信封防篡改、落标绑定侧栏缩放/统计口径双开关/原位防跳顶/跳已落标/执行核验3秒渐隐/Schema模板、确定性 SQL 静态血缘/隐患剖析与语义压缩、四级动态模型能力探查与超时重试减载续写、ExecutionPlanner 与持久化 🎯 /goal 硬验收补救断点续跑闭环、AI 助手长上下文重构/Thinking 深度思考与 SSE 实时流式输出、Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断与全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与大纲按行探索 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
+├── tests/                        # 118 项全量自动化测试（DGP2 加密混淆增量包与银行邮件网关零明文防线/防降级/信封防篡改、标准字典性能优化与AN-AS栏位对齐、落标绑定侧栏缩放/统计口径双开关/原位防跳顶/跳已落标/执行核验3秒渐隐/Schema模板、确定性 SQL 静态血缘/隐患剖析与语义压缩、四级动态模型能力探查与超时重试减载续写、ExecutionPlanner 与持久化 🎯 /goal 硬验收补救断点续跑闭环、AI 助手长上下文重构/Thinking 深度思考与 SSE 实时流式输出、Ed25519 签名同系列累积增量升级与崩溃自愈回退、部分落标跨标准核验与离线报告展示、全链路性能诊断与全栈 Benchmark、SQLite 长连接复用/Gate1 快速通道/大规模绑标统计回归与严格脱敏导出 / 聊天附件与大纲按行探索 / 防缓存响应头与版本同步校验 / 智能数据助手与离线知识库及写确认门禁 / 模块化插件注册与 3.0 零耦合扩展 / 三层分离存储、混淆私有库、零密钥导出与引导式增量合并 / 核心算法与兼容矩阵 / 离线非对称授权与跨平台 C 原生护盾 / 平台底座与任务进度流 / 按库标准与五虚拟列防重叠比对 / 库级离线报告与 Schema 及表级落标范围筛选 / 只读红队矩阵 / 演示沙箱资产闭环 / 管理员总控台安全与功能回归 / 极速 --smoke-test 冒烟与纯净无测试客户包防线）
 ├── build_update_pack.py          # 同二级版本累积增量包 (DataOG-Update-vX.Y.Z.zip) DGP2 加密混淆 + Ed25519 签名构建脚本
 ├── build_exe.py                  # Windows DataOG.exe PyInstaller 纯净打包脚本（支持 --skip-tests、内置 static/dataog.ico 图标并严格剔除 tests/）
 ├── AGENTS.md                     # 项目架构铁律、会话交接快照与工程协作规范
@@ -157,7 +157,8 @@ DataOG/
 | **`v3.4.2`** | `feat/standard-migrator-ux-refinements` → `main` | **「2. 落标绑定与贯标」交互与执行体验精细化升级**：新增左侧栏拖拽调宽（180px–560px 并持久化记忆、双击复位与键盘微调）；点击「纳入贯标」原位刷新防跳回顶部并保持表格滚动与按钮焦点；未勾选全表纳入及混选自动跳过「已落标」字段；单条/批量/保序重建执行完毕自动实时核验并在 3 秒内通过绿光扫掠渐隐塌缩动画平滑清出已达标任务；按钮更名为「上传字段落标映射关系」并新增「当前选中 Schema 全量模板」导出（112 项测试全绿） |
 | **`v3.5.0`** | `feat/v3.5.0-encrypted-update-pack` → `main` | **DGP2 加密混淆增量更新包架构重构（兼容银行邮件网关传输）**：将增量更新核心载荷由明文嵌套 ZIP 重构为纯标准库 `BLAKE2b-512-CTR + HMAC-SHA256 + Ed25519` 双域签名高熵密文信封 (`DGP2`) 与紧凑二进制载荷 (`DGPB`)；外层标准无密码 `DataOG-Update-vX.Y.Z.zip` 零明文源码/脚本/可执行特征并内置构建期网关安全扫描与 `>=3.5.0` 防降级保护，客户端透明支持 `.zip`/`.dgp`/`.dat` 双渠道验签解密安装（114 项测试全绿） |
 | **`v3.5.1`** | `fix/v3.5.1-excel-illegal-char-sanitize` → `main` | **全量 Schema 模板及全平台 Excel 导出非法控制字符清洗修复**：在底座 `core/excel_handler.py` 与 `core/platform/excel_io.py` 统一提供 `sanitize_excel_cell`/`sanitize_excel_row`/`sanitize_excel_sheet_title`，彻底清除数据库元数据中夹带的 `PK\x02`/`PK\x0b` 等 XML 1.0 非法控制字符并先清后转义公式注入前缀；全覆盖 Schema 全量映射模板、贯标执行报告、SQL 通用导出、标准字典、单库/跨环境离线 Excel 及跨环境比对导出全链路（116 项测试全绿） |
-| **`v3.5.2`**（当前正式版） | `feat/v3.5.2-sidebar-stat-toggles` → `main` | **「2. 落标绑定与贯标」左侧统计口径 macOS 开关**：`get_cached_catalog` 补齐物理表 `col_count`；左侧「当前库落标标准」卡片下方新增默认开启且持久化记忆的 **「忽略部分落标」** 与 **「忽略未绑标字段」** macOS HIG 胶囊开关，支持实时切换左侧表级徽标统计口径（含部分落标归并、0 绑标表 `0/N` 全量物理列展示与未缓存列数提示）（117 项测试全绿） |
+| **`v3.5.2`** | `feat/v3.5.2-sidebar-stat-toggles` → `main` | **「2. 落标绑定与贯标」左侧统计口径 macOS 开关**：`get_cached_catalog` 补齐物理表 `col_count`；左侧「当前库落标标准」卡片下方新增默认开启且持久化记忆的 **「忽略部分落标」** 与 **「忽略未绑标字段」** macOS HIG 胶囊开关，支持实时切换左侧表级徽标统计口径（含部分落标归并、0 绑标表 `0/N` 全量物理列展示与未缓存列数提示）（117 项测试全绿） |
+| **`v3.5.3`**（当前正式版） | `fix/v3.5.3-standard-dict-perf-and-an-as-fields` → `main` | **「1. 标准字典」卡顿根治与模板 AN–AS 物理格式栏位对齐**：`search_standards` 无关键词直走主键索引并支持 `include_summary=false` 按需汇总；移除 `dialog::backdrop` 全屏模糊与 `tr` `contain`，重构 `StandardDictView` 常驻 DOM + `DataGrid.setData()` + IME 防抖 + `AbortController` + `destroy()` 及 `StandardView` 惰性实例化；新增/编辑弹窗物理格式严格对齐模板 `AN`–`AS` 六列（`ocenbase-oracle` 至 `仓库DWS数据格式`）并完整保留历史非表单字段（118 项测试全绿） |
 
 ---
 
@@ -168,7 +169,7 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（117 项，发布前本地执行）
+# 运行全量自动化单元测试（118 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）

@@ -420,13 +420,21 @@ class StandardCatalog:
                 f"SELECT COUNT(*) FROM standard_dictionary {where_sql}",
                 params,
             ).fetchone()[0]
-            rows = conn.execute(
-                f"SELECT * FROM standard_dictionary {where_sql} "
-                "ORDER BY CASE WHEN ? != '' AND LOWER(std_code) = LOWER(?) THEN 0 "
-                "WHEN ? != '' AND LOWER(en_abbr) = LOWER(?) THEN 1 ELSE 2 END, std_code ASC "
-                "LIMIT ? OFFSET ?",
-                [*params, kw, kw, kw, kw, page_size, offset],
-            ).fetchall()
+            if kw:
+                rows = conn.execute(
+                    f"SELECT * FROM standard_dictionary {where_sql} "
+                    "ORDER BY CASE WHEN LOWER(std_code) = LOWER(?) THEN 0 "
+                    "WHEN LOWER(en_abbr) = LOWER(?) THEN 1 ELSE 2 END, std_code ASC "
+                    "LIMIT ? OFFSET ?",
+                    [*params, kw, kw, page_size, offset],
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"SELECT * FROM standard_dictionary {where_sql} "
+                    "ORDER BY std_code ASC "
+                    "LIMIT ? OFFSET ?",
+                    [*params, page_size, offset],
+                ).fetchall()
 
         return {
             "items": [self._row_to_item(r) for r in rows],

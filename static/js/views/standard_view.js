@@ -20,38 +20,62 @@ export class StandardView {
   constructor() {
     this.mode = "dictionary"; // dictionary | migrator | comparator
     this.refreshHeader = null;
-
-    this.dictPane = new StandardDictView({
-      onStateUpdate: () => this.refreshHeader?.(),
-      onGoStep2: async () => {
-        this.mode = "migrator";
-        this.render();
-        this.refreshHeader?.();
-        await this.migratorPane.ensureLoaded();
-      },
-    });
-    this.migratorPane = new StandardMigratorView({
-      onStateUpdate: () => this.refreshHeader?.(),
-    });
-    this.comparatorPane = new CrossComparatorView({
-      onStateUpdate: () => this.refreshHeader?.(),
-      onPushToMigrator: async () => {
-        this.mode = "migrator";
-        this.migratorPane.subMode = "queue";
-        this.render();
-        this.refreshHeader?.();
-        await this.migratorPane.reloadState();
-      },
-    });
+    this._dictPane = null;
+    this._migratorPane = null;
+    this._comparatorPane = null;
 
     this.root = el("div", {
       style: { flex: "1", minHeight: "0", display: "flex", flexDirection: "column", overflow: "hidden" },
     });
   }
 
+  get dictPane() {
+    if (!this._dictPane) {
+      this._dictPane = new StandardDictView({
+        onStateUpdate: () => this.refreshHeader?.(),
+        onGoStep2: async () => {
+          this.mode = "migrator";
+          this.render();
+          this.refreshHeader?.();
+          await this.migratorPane.ensureLoaded();
+        },
+      });
+    }
+    return this._dictPane;
+  }
+
+  get migratorPane() {
+    if (!this._migratorPane) {
+      this._migratorPane = new StandardMigratorView({
+        onStateUpdate: () => this.refreshHeader?.(),
+      });
+    }
+    return this._migratorPane;
+  }
+
+  get comparatorPane() {
+    if (!this._comparatorPane) {
+      this._comparatorPane = new CrossComparatorView({
+        onStateUpdate: () => this.refreshHeader?.(),
+        onPushToMigrator: async () => {
+          this.mode = "migrator";
+          this.migratorPane.subMode = "queue";
+          this.render();
+          this.refreshHeader?.();
+          await this.migratorPane.reloadState();
+        },
+      });
+    }
+    return this._comparatorPane;
+  }
+
   destroy() {
-    this.migratorPane?.destroy?.();
-    this.comparatorPane?.destroy?.();
+    this._dictPane?.destroy?.();
+    this._migratorPane?.destroy?.();
+    this._comparatorPane?.destroy?.();
+    this._dictPane = null;
+    this._migratorPane = null;
+    this._comparatorPane = null;
   }
 
   getHeaderParts() {
@@ -116,15 +140,19 @@ export class StandardView {
   }
 
   render() {
+    let targetPane = null;
     if (this.mode === "dictionary") {
       this.dictPane.render();
-      clearEl(this.root, this.dictPane.root);
+      targetPane = this.dictPane;
     } else if (this.mode === "migrator") {
       this.migratorPane.render();
-      clearEl(this.root, this.migratorPane.root);
+      targetPane = this.migratorPane;
     } else {
       this.comparatorPane.render();
-      clearEl(this.root, this.comparatorPane.root);
+      targetPane = this.comparatorPane;
+    }
+    if (targetPane && (this.root.children.length !== 1 || this.root.children[0] !== targetPane.root)) {
+      clearEl(this.root, targetPane.root);
     }
   }
 }

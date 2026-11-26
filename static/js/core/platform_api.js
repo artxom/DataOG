@@ -230,7 +230,15 @@ export const workspaceApi = {
 };
 
 export const standardsApi = {
-  list: ({ keyword = "", regCategory = "", dataCategory = "", page = 1, pageSize = 50 } = {}) => {
+  list: ({
+    keyword = "",
+    regCategory = "",
+    dataCategory = "",
+    page = 1,
+    pageSize = 50,
+    includeSummary = true,
+    signal = undefined,
+  } = {}) => {
     const qs = new URLSearchParams({
       keyword: keyword || "",
       reg_category: regCategory || "",
@@ -238,7 +246,10 @@ export const standardsApi = {
       page: String(page || 1),
       page_size: String(pageSize || 50),
     });
-    return requestJson(`/api/platform/standards?${qs.toString()}`);
+    if (includeSummary === false) {
+      qs.set("include_summary", "false");
+    }
+    return requestJson(`/api/platform/standards?${qs.toString()}`, { signal });
   },
   lookup: (keyword = "", limit = 30) => {
     const qs = new URLSearchParams({ keyword: keyword || "", limit: String(limit) });

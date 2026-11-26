@@ -8,6 +8,26 @@
 
 ---
 
+## [3.5.3] - 2026-11-26
+
+> **「1. 标准字典」交互卡顿与光标延迟根治及模板 AN–AS 物理格式栏位精准对齐**：全面消除输入检索与编辑弹窗时的浏览器渲染阻塞、DOM 重建失焦、IME/并发请求堆积与 SQLite 全表临时排序开销，同时将新增/编辑弹窗的物理格式维护栏位严格对齐标准字典模板 `AN`–`AS` 列（`ocenbase-oracle数据格式` 至 `仓库DWS数据格式`）并完整保留非表单字段。
+
+### Fixed
+- **「1. 标准字典」前端卡顿、光标延迟与内存回收修复 (`static/js/views/standard_dict_view.js`, `static/js/views/standard_view.js`, `static/js/ui/data_grid.js`, `static/css/workbench.css`)**：
+  - 移除 `dialog::backdrop` 全屏高斯模糊 (`backdrop-filter: blur(4px)`) 与 `.data-grid-table tbody tr` 的行级 `contain: layout style`，消除弹窗输入光标闪烁与表格悬停时的全屏合成重绘卡顿；
+  - 重构 `StandardDictView` 为常驻顶栏/分页栏 + 复用 `DataGrid.setData()` 原位更新，检索与翻页不再卸载 `searchInput` 或重建窗口顶栏，补充输入法组合保护 (`compositionstart`/`compositionend`)、`AbortController` 并发旧请求取消与 `destroy()` 内存释放；
+  - 将 `StandardView` 改造为按需惰性实例化 `migratorPane` / `comparatorPane`，并在关闭销毁时级联调用 `dictPane.destroy()`。
+- **后端索引直出排序与按需汇总查询 (`core/platform/standard_catalog.py`, `core/platform/routes/standards.py`, `static/js/core/platform_api.js`)**：
+  - 优化 `StandardCatalog.search_standards()` 在无关键词浏览时直接走 `ORDER BY std_code ASC` 主键索引，避免 2.6 万+ 条目全表扫描与 `USE TEMP B-TREE FOR ORDER BY`；
+  - `/api/platform/standards` 新增 `include_summary` 可选参数，搜索与翻页传 `include_summary=false` 跳过冗余全表聚合。
+- **弹窗维护栏位对齐标准模板 AN–AS 列 (`static/js/views/standard_dict_view.js`)**：
+  - 将新增/编辑标准弹窗的物理格式栏位精准调整为标准模板 `AN`–`AS` 六列：`ocenbase-oracle数据格式 (AN)`、`ocenbase-mysql数据格式 (AO)`、`argodb数据格式 (AP)`、`ocenbase数据格式 (AQ)`、`数据仓库 集市 (AR)`、`仓库DWS数据格式 (AS)`；编辑保存时完整透传并保留既有 `type_mysql`/`type_oracle`/`type_dameng`/分类及扩展属性，防止静默置空；
+  - 在列表展示格式下拉补充 `type_oceanbase` (`AQ`)，且切换展示列时直接显示真实列值（空值显示 `"-"` 而不再误回退 `type_dws`）。
+- **自动化回归测试与版本发布 (`tests/test_modules_and_api.py`)**：
+  - 新增 `test_standard_dict_perf_and_an_as_fields`，覆盖无临时 B-Tree 索引计划、`include_summary=false`、`PUT` 保留与 AN–AS 六列写入、`dialog::backdrop` CSS 校验及 Node.js 端到端交互验证（全套自动化测试扩充至 **118 项**），并同步发布 `v3.5.3`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变）。
+
+---
+
 ## [3.5.2] - 2026-11-26
 
 > **「2. 落标绑定与贯标」左侧统计口径 macOS 开关升级**：在左侧目录树上方「当前库落标标准」卡片内新增 **「忽略部分落标」** 与 **「忽略未绑标字段」** 两枚默认开启的 macOS HIG 胶囊开关，支持一键切换左侧表级落标徽标的统计口径并持久化记忆，无需改选落标标准或重新扫描数据库。

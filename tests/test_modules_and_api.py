@@ -6457,6 +6457,434 @@ process.exit(0);
         )
         self.assertIn("SIDEBAR_STAT_TOGGLES_OK", proc.stdout)
 
+    def test_standard_dict_perf_and_an_as_fields(self) -> None:
+        """验证「1. 标准字典」性能优化（无关键词索引排序、include_summary=false、CSS 去重绘、DOM/焦点保持、IME 防抖、AbortController、惰性实例化与销毁）及模板 AN–AS 栏位精准对齐."""
+        import shutil
+        import subprocess
+
+        # 1. 后端验证：无关键词走主键索引排序（无 TEMP B-TREE）、include_summary=false 跳过汇总查询、PUT 保存完整 AN-AS 6 列
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctx = PlatformContext(private_root=tmpdir, legacy_data_dir="")
+            try:
+                app = create_app(ctx=ctx)
+                client = TestClient(app)
+
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_AN_AS_01",
+                        "cn_name": "客户号",
+                        "en_abbr": "cust_no",
+                        "cat_l1": "基础信息",
+                        "type_mysql": "VARCHAR(32)",
+                        "type_oracle": "VARCHAR2(32)",
+                        "type_dameng": "VARCHAR(32)",
+                        "type_ob_oracle": "VARCHAR2(40)",
+                        "type_ob_mysql": "VARCHAR(40)",
+                        "type_argodb": "STRING",
+                        "type_oceanbase": "VARCHAR(40)",
+                        "type_dw_mart": "VARCHAR2(40)",
+                        "type_dws": "NVARCHAR2(40)",
+                        "extra_attrs": {"dict_type": "基础标准"},
+                    }
+                )
+                ctx.standard_catalog.upsert_item(
+                    {
+                        "std_code": "STD_AN_AS_02",
+                        "cn_name": "账户金额",
+                        "en_abbr": "acct_amt",
+                        "type_dws": "DECIMAL(18,2)",
+                    }
+                )
+
+                with ctx.store.module_db() as conn:
+                    plan_rows = conn.execute(
+                        "EXPLAIN QUERY PLAN SELECT * FROM standard_dictionary ORDER BY std_code ASC LIMIT ? OFFSET ?",
+                        (50, 0),
+                    ).fetchall()
+                plan_txt = " | ".join(str(dict(r)) for r in plan_rows)
+                self.assertNotIn("USE TEMP B-TREE FOR ORDER BY", plan_txt)
+
+                r_default = client.get("/api/platform/standards?page=1&page_size=50")
+                self.assertEqual(r_default.status_code, 200)
+                d_default = r_default.json()
+                self.assertIn("summary", d_default)
+                self.assertEqual(d_default["summary"]["total_count"], 2)
+
+                r_no_sum = client.get("/api/platform/standards?page=1&page_size=50&include_summary=false")
+                self.assertEqual(r_no_sum.status_code, 200)
+                d_no_sum = r_no_sum.json()
+                self.assertNotIn("summary", d_no_sum)
+                self.assertEqual(d_no_sum["total"], 2)
+
+                r_put = client.put(
+                    "/api/platform/standards/items/STD_AN_AS_01",
+                    json={
+                        "std_code": "STD_AN_AS_01",
+                        "cn_name": "客户号",
+                        "en_abbr": "cust_no",
+                        "cat_l1": "基础信息",
+                        "type_mysql": "VARCHAR(32)",
+                        "type_oracle": "VARCHAR2(32)",
+                        "type_dameng": "VARCHAR(32)",
+                        "type_ob_oracle": "VARCHAR2(64)",
+                        "type_ob_mysql": "VARCHAR(64)",
+                        "type_argodb": "VARCHAR(64)",
+                        "type_oceanbase": "VARCHAR(64)",
+                        "type_dw_mart": "VARCHAR2(64)",
+                        "type_dws": "NVARCHAR2(64)",
+                        "extra_attrs": {"dict_type": "基础标准"},
+                    },
+                )
+                self.assertEqual(r_put.status_code, 200)
+                saved = r_put.json()["item"]
+                self.assertEqual(saved["type_ob_oracle"], "VARCHAR2(64)")
+                self.assertEqual(saved["type_ob_mysql"], "VARCHAR(64)")
+                self.assertEqual(saved["type_argodb"], "VARCHAR(64)")
+                self.assertEqual(saved["type_oceanbase"], "VARCHAR(64)")
+                self.assertEqual(saved["type_dw_mart"], "VARCHAR2(64)")
+                self.assertEqual(saved["type_dws"], "NVARCHAR2(64)")
+                self.assertEqual(saved["type_mysql"], "VARCHAR(32)")
+                self.assertEqual(saved["cat_l1"], "基础信息")
+                self.assertEqual(saved["extra_attrs"].get("dict_type"), "基础标准")
+            finally:
+                ctx.close()
+
+        # 2. CSS 校验：移除 dialog::backdrop 全屏高斯模糊、保留 .form-section-title
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(project_root, "static", "css", "workbench.css"), "r", encoding="utf-8") as fh:
+            css_text = fh.read()
+        backdrop_idx = css_text.index("dialog::backdrop {")
+        backdrop_block = css_text[backdrop_idx : css_text.index("}", backdrop_idx) + 1]
+        self.assertNotIn("backdrop-filter:", backdrop_block)
+        self.assertIn(".form-section-title", css_text)
+
+        # 3. Node.js 前端 E2E 验证：惰性实例化、DOM/光标保持、IME/AbortController、AN-AS 栏位与完整字段保留、预览不串列、销毁回收
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("Node.js 未安装，跳过前端标准字典端到端验证")
+
+        node_script = r"""
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+class MockNode {
+  constructor(tag = "div") {
+    this.tagName = String(tag).toUpperCase();
+    this.children = [];
+    this.attributes = new Map();
+    this.listeners = new Map();
+    this.style = {};
+    this.dataset = {};
+    this.className = "";
+    this.value = "";
+    this.textContent = "";
+    this.hidden = false;
+    this.disabled = false;
+    this.checked = false;
+    this.indeterminate = false;
+    this.open = false;
+    this.returnValue = "";
+    this.scrollTop = 0;
+    this.scrollLeft = 0;
+    this.parentNode = null;
+    const self = this;
+    this.classList = {
+      add(...cs) { self.className = [...new Set([...(self.className||"").split(/\s+/).filter(Boolean), ...cs])].join(" "); },
+      remove(...cs) { const s = new Set(cs); self.className = (self.className||"").split(/\s+/).filter(x => x && !s.has(x)).join(" "); },
+      toggle(c, f) { const has = (self.className||"").split(/\s+/).includes(c); const on = f === undefined ? !has : Boolean(f); if (on) this.add(c); else this.remove(c); },
+      contains(c) { return (self.className||"").split(/\s+/).includes(c); },
+    };
+  }
+  appendChild(c) { if (c) { c.parentNode = this; this.children.push(c); } return c; }
+  replaceChildren(...ns) {
+    for (const old of this.children) old.parentNode = null;
+    this.children = ns.filter(Boolean);
+    this.children.forEach(c => c.parentNode = this);
+  }
+  setAttribute(k, v) { this.attributes.set(k, String(v)); }
+  getAttribute(k) { return this.attributes.get(k) ?? null; }
+  addEventListener(e, fn) { (this.listeners.get(e) || this.listeners.set(e, []).get(e)).push(fn); }
+  removeEventListener(e, fn) { const arr = this.listeners.get(e); if (arr) this.listeners.set(e, arr.filter(x => x !== fn)); }
+  dispatchEvent(ev) {
+    const e = { target: this, currentTarget: this, preventDefault() {}, stopPropagation() {}, ...ev };
+    for (const fn of [...(this.listeners.get(e.type) || [])]) fn(e);
+  }
+  _matches(sel) {
+    if (!sel) return false;
+    const tagMatch = sel.match(/^([a-zA-Z0-9_-]+)/);
+    if (tagMatch && this.tagName !== tagMatch[1].toUpperCase()) return false;
+    const attrRe = /\[([^\]=]+)(?:="([^"]*)")?\]/g;
+    let m;
+    while ((m = attrRe.exec(sel)) !== null) {
+      const attr = m[1];
+      const expected = m[2];
+      const actual = this.attributes.get(attr) ?? null;
+      if (actual === null) return false;
+      if (expected !== undefined && actual !== expected) return false;
+    }
+    return true;
+  }
+  querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  querySelectorAll(sel) {
+    const out = [];
+    const walk = (node) => {
+      for (const ch of node.children || []) {
+        if (ch._matches?.(sel)) out.push(ch);
+        walk(ch);
+      }
+    };
+    walk(this);
+    return out;
+  }
+  focus() { globalThis.document.activeElement = this; }
+  showModal() { this.open = true; }
+  close(v) { this.open = false; this.returnValue = v || ""; }
+  contains(n) { return this === n || this.children.some(c => c.contains?.(n)); }
+}
+
+const byId = new Map();
+for (const id of [
+  "global-modal", "global-modal-title", "global-modal-body", "global-modal-footer", "global-modal-close", "toast-root",
+]) {
+  const n = new MockNode(id === "global-modal" ? "dialog" : "div");
+  n.id = id;
+  byId.set(id, n);
+}
+
+globalThis.Node = MockNode;
+globalThis.HTMLDialogElement = class HTMLDialogElement {};
+globalThis.localStorage = { getItem: () => null, setItem() {} };
+globalThis.window = { innerWidth: 1440, innerHeight: 900, addEventListener() {}, removeEventListener() {} };
+globalThis.document = {
+  head: new MockNode("head"),
+  body: new MockNode("body"),
+  activeElement: null,
+  createElement: (tag) => new MockNode(tag),
+  createElementNS: (_ns, tag) => new MockNode(tag),
+  createTextNode: (t) => Object.assign(new MockNode("#text"), { textContent: String(t) }),
+  getElementById: (id) => byId.get(id) || null,
+  querySelector: () => null,
+  querySelectorAll: () => [],
+  addEventListener() {},
+  removeEventListener() {},
+};
+
+const fetchCalls = [];
+let holdFirstSearch = null;
+const sampleItems = [
+  {
+    std_code: "STD001",
+    cn_name: "客户号",
+    en_abbr: "cust_id",
+    cat_l1: "基础域",
+    reg_category: "业务数据",
+    data_category: "编码类",
+    domain_name: "客户域",
+    type_mysql: "VARCHAR(32)",
+    type_oracle: "VARCHAR2(32)",
+    type_dameng: "VARCHAR(32)",
+    type_ob_oracle: "",
+    type_ob_mysql: "VARCHAR(40)",
+    type_argodb: "STRING",
+    type_oceanbase: "VARCHAR(40)",
+    type_dw_mart: "VARCHAR2(40)",
+    type_dws: "NVARCHAR2(40)",
+    is_standard_dict: "1",
+    extra_attrs: { dict_type: "核心" },
+  },
+];
+
+globalThis.fetch = async (url, init = {}) => {
+  const u = String(url);
+  const rec = { url: u, method: init.method || "GET", body: init.body || "", signal: init.signal || null };
+  fetchCalls.push(rec);
+  if (u.includes("keyword=hold")) {
+    await new Promise((resolve) => { holdFirstSearch = resolve; });
+  }
+  if (u.includes("/api/platform/standards/items/") && rec.method === "PUT") {
+    const parsed = JSON.parse(rec.body || "{}");
+    return {
+      ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
+      json: async () => ({ ok: true, item: parsed, message: "已更新" }),
+    };
+  }
+  const hasSummary = !u.includes("include_summary=false");
+  const payload = {
+    ok: true,
+    items: sampleItems,
+    total: 1,
+    page: 1,
+    page_size: 50,
+    total_pages: 1,
+  };
+  if (hasSummary) {
+    payload.summary = {
+      total_count: 1,
+      filename: "dict.xlsx",
+      reg_categories: [{ value: "业务数据", count: 1 }],
+      data_categories: [{ value: "编码类", count: 1 }],
+    };
+  }
+  return {
+    ok: true, status: 200, headers: new Map([["content-type", "application/json"]]),
+    json: async () => payload,
+  };
+};
+
+const root = process.argv[1];
+const imp = (rel) => import(pathToFileURL(path.join(root, rel)).href);
+
+const { StandardView } = await imp("static/js/views/standard_view.js");
+const { StandardDictView } = await imp("static/js/views/standard_dict_view.js");
+
+// A. StandardView 惰性实例化兄弟页面
+const sv = new StandardView();
+if (sv._migratorPane !== null || sv._comparatorPane !== null) {
+  throw new Error("StandardView should lazily instantiate migratorPane and comparatorPane");
+}
+const host = new MockNode("div");
+await sv.mount(host, { mode: "dictionary" }, () => {});
+if (sv._migratorPane !== null || sv._comparatorPane !== null) {
+  throw new Error("Mounting dictionary mode must NOT instantiate migratorPane or comparatorPane");
+}
+
+// B. StandardDictView 首次加载带 summary，搜索/翻页带 include_summary=false，不触发冗余 onStateUpdate 且不重建 DOM
+fetchCalls.length = 0;
+let stateUpdates = 0;
+const dv = new StandardDictView({ onStateUpdate: () => { stateUpdates += 1; } });
+await dv.ensureLoaded();
+if (fetchCalls.length !== 1 || fetchCalls[0].url.includes("include_summary=false")) {
+  throw new Error(`Initial load should fetch summary once, got ${fetchCalls[0]?.url}`);
+}
+if (stateUpdates !== 1) {
+  throw new Error(`Expected 1 onStateUpdate on initial load, got ${stateUpdates}`);
+}
+
+const initialSubbar = dv.subbarMount;
+const initialInput = dv.searchInput;
+const initialGridRoot = dv._grid.root;
+initialInput.focus();
+
+// IME 输入法保护：compositionstart 期间不触发检索
+initialInput.dispatchEvent({ type: "compositionstart" });
+initialInput.value = "kh";
+initialInput.dispatchEvent({ type: "input" });
+await new Promise((r) => setTimeout(r, 280));
+if (fetchCalls.length !== 1) {
+  throw new Error("IME compositionstart must suppress search requests until compositionend");
+}
+initialInput.value = "客户";
+initialInput.dispatchEvent({ type: "compositionend" });
+await new Promise((r) => setTimeout(r, 280));
+if (fetchCalls.length !== 2 || !fetchCalls[1].url.includes("include_summary=false")) {
+  throw new Error(`Search should pass include_summary=false, got ${fetchCalls[1]?.url}`);
+}
+if (stateUpdates !== 1) {
+  throw new Error(`Search must NOT trigger redundant header rebuild onStateUpdate, got ${stateUpdates}`);
+}
+if (dv.subbarMount !== initialSubbar || dv.searchInput !== initialInput || dv._grid.root !== initialGridRoot || globalThis.document.activeElement !== initialInput) {
+  throw new Error("Search must preserve subbarMount, searchInput focus, and _grid.root instance");
+}
+
+// C. AbortController 取消并发旧请求
+initialInput.value = "hold";
+initialInput.dispatchEvent({ type: "input" });
+await new Promise((r) => setTimeout(r, 260));
+const heldReq = fetchCalls.find((c) => c.url.includes("keyword=hold"));
+if (!heldReq || !heldReq.signal) throw new Error("Missing AbortSignal on search request");
+initialInput.value = "next";
+initialInput.dispatchEvent({ type: "input" });
+await new Promise((r) => setTimeout(r, 260));
+if (!heldReq.signal.aborted) {
+  throw new Error("Rapid search did not abort previous in-flight request");
+}
+holdFirstSearch?.();
+
+// D. 预览下拉包含 type_oceanbase (AQ)，切到 type_ob_oracle (AN) 空值显示 "-" 而非误显示 type_dws
+const optValues = dv.typeColSelect.querySelectorAll("option").map((o) => o.value);
+if (!optValues.includes("type_oceanbase")) {
+  throw new Error(`PREVIEW_TYPE_COLS missing type_oceanbase, got ${JSON.stringify(optValues)}`);
+}
+dv.typeColSelect.value = "type_ob_oracle";
+dv.typeColSelect.dispatchEvent({ type: "change" });
+const firstRowTds = dv._grid.root.querySelectorAll("tbody tr")[0].querySelectorAll("td");
+const cellText = (n) => (n ? (n.textContent || "") + (n.children || []).map(cellText).join("") : "");
+if (cellText(firstRowTds[3]) !== "-") {
+  throw new Error(`Empty type_ob_oracle cell should display '-', got ${cellText(firstRowTds[3])}`);
+}
+
+// E. 弹窗仅维护模板 AN-AS 6 列且保留未在表单中的历史字段
+dv.openEditItemModal(sampleItems[0]);
+const modalBody = byId.get("global-modal-body");
+const labels = modalBody.querySelectorAll("label").map((l) => l.textContent);
+const expectedAnAs = [
+  "ocenbase-oracle数据格式 (AN)",
+  "ocenbase-mysql数据格式 (AO)",
+  "argodb数据格式 (AP)",
+  "ocenbase数据格式 (AQ)",
+  "数据仓库 集市 (AR)",
+  "仓库DWS数据格式 (AS)",
+];
+const foundAnAs = labels.filter((l) => expectedAnAs.includes(l));
+if (JSON.stringify(foundAnAs) !== JSON.stringify(expectedAnAs)) {
+  throw new Error(`Modal AN-AS labels mismatch.\nExpected: ${JSON.stringify(expectedAnAs)}\nActual: ${JSON.stringify(labels)}`);
+}
+for (const forbidden of ["MySQL 物理类型", "Oracle 物理类型", "达梦 DM8 格式"]) {
+  if (labels.includes(forbidden)) {
+    throw new Error(`Modal must NOT render legacy type field: ${forbidden}`);
+  }
+}
+
+// 修改 AQ (ocenbase数据格式) 并保存，验证 AN-AS 全 6 列与历史 type_mysql/cat_l1/extra_attrs 一并保留
+const aqLabel = modalBody.querySelectorAll("label").find((l) => l.textContent === "ocenbase数据格式 (AQ)");
+const aqInput = aqLabel.parentNode.querySelector("input");
+aqInput.value = "VARCHAR(128)";
+aqInput.dispatchEvent({ type: "input" });
+const saveBtn = byId.get("global-modal-footer").querySelectorAll("button").find((b) => b.textContent === "保存修改");
+saveBtn.dispatchEvent({ type: "click" });
+await new Promise((r) => setTimeout(r, 30));
+
+const putCall = fetchCalls.find((c) => c.method === "PUT");
+if (!putCall) throw new Error("Expected PUT /standards/items/STD001 on save");
+const putBody = JSON.parse(putCall.body);
+if (
+  putBody.type_oceanbase !== "VARCHAR(128)" ||
+  putBody.type_ob_mysql !== "VARCHAR(40)" ||
+  putBody.type_argodb !== "STRING" ||
+  putBody.type_dw_mart !== "VARCHAR2(40)" ||
+  putBody.type_dws !== "NVARCHAR2(40)" ||
+  putBody.type_mysql !== "VARCHAR(32)" ||
+  putBody.cat_l1 !== "基础域" ||
+  putBody.extra_attrs?.dict_type !== "核心"
+) {
+  throw new Error(`Saved payload lost fields or failed AN-AS edit: ${JSON.stringify(putBody)}`);
+}
+
+// F. destroy 彻底释放内存引用
+sv.destroy();
+dv.destroy();
+if (!dv._destroyed || dv._grid !== null || dv.items.length !== 0) {
+  throw new Error("destroy() did not release items or _grid");
+}
+
+console.log("STANDARD_DICT_PERF_AND_AN_AS_OK");
+process.exit(0);
+"""
+        proc = subprocess.run(
+            [node_bin, "--input-type=module", "-e", node_script, project_root],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"Node 前端标准字典性能与 AN-AS 栏位验证失败:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+        )
+        self.assertIn("STANDARD_DICT_PERF_AND_AN_AS_OK", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
