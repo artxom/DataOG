@@ -698,10 +698,34 @@ class _PlatformReposMixin:
                 """,
                 (connection_id,),
             ).fetchall()
+            c_rows = conn.execute(
+                """
+                SELECT LOWER(schema_name) AS s_low, LOWER(table_name) AS t_low, COUNT(*) AS col_count
+                FROM meta_columns
+                WHERE connection_id = ?
+                GROUP BY LOWER(schema_name), LOWER(table_name)
+                """,
+                (connection_id,),
+            ).fetchall()
+            col_count_map = {
+                (str(r["s_low"] or ""), str(r["t_low"] or "")): int(r["col_count"] or 0)
+                for r in c_rows
+            }
+            tables_out = []
+            for r in t_rows:
+                d = dict(r)
+                d["col_count"] = col_count_map.get(
+                    (
+                        str(d.get("schema_name") or "").lower(),
+                        str(d.get("table_name") or "").lower(),
+                    ),
+                    0,
+                )
+                tables_out.append(d)
             return {
                 "connection_id": connection_id,
                 "schemas": [dict(r) for r in s_rows],
-                "tables": [dict(r) for r in t_rows],
+                "tables": tables_out,
             }
 
     def get_cached_table_meta(

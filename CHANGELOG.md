@@ -8,6 +8,21 @@
 
 ---
 
+## [3.5.2] - 2026-11-26
+
+> **「2. 落标绑定与贯标」左侧统计口径 macOS 开关升级**：在左侧目录树上方「当前库落标标准」卡片内新增 **「忽略部分落标」** 与 **「忽略未绑标字段」** 两枚默认开启的 macOS HIG 胶囊开关，支持一键切换左侧表级落标徽标的统计口径并持久化记忆，无需改选落标标准或重新扫描数据库。
+
+### Added
+- **左侧表级统计口径双开关与物理总列数支撑 (`static/js/views/standard_migrator_view.js`, `static/css/workbench.css`, `core/platform/storage/platform_repos.py`)**：
+  - `PlatformStateStore.get_cached_catalog` 补充返回各表已缓存物理字段数 `col_count`（基于 `meta_columns` 索引聚合，不污染 `get_connection_binding_stats` 已绑表契约）；
+  - 在「2. 落标绑定与贯标」左侧「当前库落标标准」卡片下新增 macOS HIG 原生风格胶囊开关组 `.sidebar-stat-toggles` / `.mac-switch`（亮暗主题自适应、`role="switch"` + `aria-checked` 无障碍语义、零 `innerHTML` 与 `localStorage` 持久化）：
+    - **忽略部分落标**（默认开启）：开启时将满足其他物理格式档的 `PARTIAL_COMPLIANT` 字段计入已完成落标并同步更新徽标状态色与 Tooltip；关闭后按严格当前所选标准口径统计；
+    - **忽略未绑标字段**（默认开启）：开启时分母仅计已绑标字段并隐藏零绑标表徽标；关闭后分母切换为物理表总字段数（含 0 绑标表 `0/N` 中性徽标展示；物理列尚未缓存时在 Tooltip 明确提示）。
+- **自动化回归测试与版本发布 (`tests/test_modules_and_api.py`)**：
+  - 新增 `test_sidebar_stat_toggles_and_catalog_col_count`，覆盖后端 `col_count` 聚合与前端 4 种开关组合口径、`0/N` 显隐、CSS 样式及 `localStorage` 持久化端到端验证（全套自动化测试扩充至 **117 项**），并同步发布 `v3.5.2`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变）。
+
+---
+
 ## [3.5.1] - 2026-11-25
 
 > **全量 Schema 模板及全平台 Excel 导出非法控制字符清洗修复**：彻底解决数据库元数据注释/名称包含 `PK\x02`、`PK\x0b` 等 XML 1.0 禁用控制字符（界面展示为 `PK□`）时，导出全量 Schema 字段映射模板与全平台 Excel 报告触发 `openpyxl.utils.exceptions.IllegalCharacterError ("... cannot be used in worksheets.")` 的阻断缺陷。
