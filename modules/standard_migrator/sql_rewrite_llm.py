@@ -51,6 +51,11 @@ _SAFE_SQL_CAST_WORDS: Set[str] = (_SQL_KEYWORDS - _FORBIDDEN_LLM_ADDED_KEYWORDS)
     "UPPER", "LOWER", "REPLACE", "ROUND", "TRUNC", "FLOOR", "CEIL", "ABS",
     "STR_TO_DATE", "DATE_FORMAT", "DATE_TRUNC", "TRY_CAST", "SAFE_CAST",
     "CONCAT", "CONCAT_WS", "LPAD", "RPAD", "SPLIT_PART", "REGEXP_REPLACE",
+    "DECIMAL", "NUMERIC", "INTEGER", "INT", "BIGINT", "SMALLINT",
+    "VARCHAR", "CHAR", "CHARACTER", "VARYING", "DATE", "TIMESTAMP", "TIME",
+    "BOOLEAN", "BOOL", "DOUBLE", "PRECISION", "REAL", "FLOAT",
+    "CAST", "AS", "IS", "NOT", "NULL", "TRUE", "FALSE",
+    "CASE", "WHEN", "THEN", "ELSE", "END",
 }
 
 
@@ -328,10 +333,10 @@ def _build_surgical_messages(
 
     sys_prompt = (
         "你是 Data.O.G 企业级数据治理 SQL 手术刀改写审核引擎。"
-        "前置确定性规则引擎已完成全部明确字段的精准改名；你只需针对下方提供的少量热点微切片，处理以下四类问题：\n"
-        "1. TYPE_ADAPT：字段发生 L2 类型转换（如 varchar→numeric/bigint/date 或反向）导致的表达式报错修复"
-        "（例如 `NVL(t.amt, '')` → `NVL(t.amt, 0)`、`WHERE t.id = '1001'` → `WHERE t.id = 1001`、"
-        "`TRIM(t.num_col)` → `TRIM(CAST(t.num_col AS VARCHAR))`、`col = ''` → `col IS NULL`）；\n"
+        "前置确定性规则引擎已完成全部明确字段的精准改名及常规类型转换改写；你只需针对下方提供的少量剩余热点微切片，处理以下四类问题：\n"
+        "1. TYPE_ADAPT：复杂跨类型表达式报错修复——**必须优先采用通用 ANSI 标准 SQL**（例如 `CAST(t.num_col AS VARCHAR)`、"
+        "`CAST('2026-01-01' AS DATE)`、`COALESCE(t.amt, 0)`、`t.amt IS NULL`、`CASE WHEN ... THEN ... ELSE ... END`），"
+        "除原语句已显式使用外，避免引入 `::`、`NVL`、`IFNULL`、`TO_NUMBER` 等强方言绑定语法；\n"
         "2. AMBIGUOUS_RENAME：多表联查未加前缀的歧义字段或未写 Schema 的歧义表，根据语义与上下文确认应改名时给出极简替换；\n"
         "3. USING_REWRITE：`JOIN ... USING (old_col)` 仅一侧改名时，改写为显式 `ON` 关联条件；\n"
         "4. DYNAMIC_SQL：动态 SQL 字符串字面量（如 EXECUTE IMMEDIATE '...'）内部引用已改名旧字段的精准替换。\n\n"

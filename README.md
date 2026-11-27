@@ -1,4 +1,4 @@
-# Data.O.G v4.0.0 — macOS 桌面级多功能数据工程与治理一体化系统
+# Data.O.G v4.1.0 — macOS 桌面级多功能数据工程与治理一体化系统
 
 **Data.O.G** 是一款基于 Python Web（`FastAPI` + `Pydantic` + 零构建原生 ES Modules 模块化前端）打造的 **macOS 桌面级数据工程与数据治理“瑞士军刀”系统**。
 
@@ -63,9 +63,9 @@
 ```text
 DataOG/
 ├── update_bootstrap.py           # 纯标准库增量更新引导器（DGP2 解密认证、Ed25519 双域验签、SHA-256 核验、sys.meta_path zipimport 挂载与崩溃自动回退）
-├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 4.0.0，引导增量加载并重导出内核公开入口）
+├── app.py                        # 冻结态极薄启动壳（BASE_APP_VERSION = 4.1.0，引导增量加载并重导出内核公开入口）
 ├── core/
-│   ├── app_kernel.py             # FastAPI 4.0.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing、--dev-plugin 与 --smoke-test）
+│   ├── app_kernel.py             # FastAPI 4.1.0 可热更新微内核（安全/防缓存头、版本校验、Gate 1 快速通道、Server-Timing、--dev-plugin 与 --smoke-test）
 │   ├── platform/                 # 全局共享底座（挂载于 /api/platform）
 │   │   ├── module_registry.py    # 后端插件声明式清单 (ModuleSpec) 与自动发现挂载中心（零改 app.py 接入 3.0/4.0 模块）
 │   │   ├── plugin_package.py     # 4.0 外置插件 DGAP 加密混淆封装、Ed25519 双重验签与契约强校验核心
@@ -168,7 +168,8 @@ DataOG/
 | **`v3.6.0`** | `feat/migration-risk-changelog-rollback` → `main` | **贯标四级危险分级标色拦截、共享工作区结构化变更日志与 Checkpoint 一键回滚**：建立 L1 改名 / L2 转类型 / L3 缩精度 / L4 安全四级分类与队列标色、高危快捷取消/移出及执行前汇总确认；在 Layer 3 共享工作区持久化 `migration_change_logs` 与 `migration_checkpoints`，提供时间线打点、冲突拦截、`_bak_` 备份表无损切回与轻量逆向 DDL 断点续滚，自动逆向还原字段绑标并导出折叠净映射 JSON 底座（123 项测试全绿） |
 | **`v3.7.0`** | `feat/sql-script-rewriter` → `main` | **基于字段变更历史的 SQL 脚本自动调整（确定性词法作用域底座 + 轻量 AI 手术刀增强）**：在「2. 落标绑定与贯标」新增「SQL 脚本改写」工作台，消费共享工作区变更日志 / Checkpoint 增量 / 离线 `changelog.json`，零 Token 精准 Span 改写 CTE/子查询/DML/DDL/PL/pgSQL 过程体并输出 L2/L3 类型影响雷达；支持按需调用廉价轻量模型（如 `DeepSeek-v4-flash`）对歧义列、跨类型表达式、动态 SQL 与 `JOIN USING` 微切片输出经五道反幻觉门禁核验的局部补丁，支持交互式逐条勾选 Diff 预览与多文件 `.sql`/`.zip` 审计包导出（129 项测试全绿） |
 | **`v3.7.1`** | `fix/sql-rewriter-hardening` → `main` | **SQL 脚本改写双引擎反注入安全与方言/前端多标签深度加固**：封堵轻量模型局部补丁分号语句注入、注释注入与高危 DDL/DML 关键字绕过漏洞；修复 MySQL `#` 注释与 Oracle `/` 块结束符吞噬后续语句、`SELECT` 显式表达式别名在 `GROUP BY`/`ORDER BY` 误改、函数/部分索引与跨表外键 `REFERENCES` 及 MySQL 行内注释同步缺陷；修复前端上传 GB18030/GBK 中文乱码、重传同名标签焦点跳转、未分析新标签误显旧 Diff 与关闭标签残留在 `.zip` 导出问题（130 项测试全绿） |
-| **`v4.0.0`**（当前正式版） | `feat/os-plugin-platform-v4` → `main` | **操作系统化外置插件平台与零漂移 Antigravity Init SDK**：引入 `DGAP` 加密混淆签名 `.dogapp` 插件协议、Layer 2 `<private_root>/rt_plg/` 插件仓、单插件故障隔离自愈 (`quarantined`)、`--dev-plugin` 开发态热挂载、「系统配置 → 应用插件」管理中心与 `drop_plugin_tables` 安全卸载清表；新增 `tools/export_plugin_sdk.py` 从主仓源码自动内省生成 `.pyi` 类型桩、`.d.ts`、精简 UI 壳、双库 SQLite 离线双轨 `dev_host.py`、强合约校验器与签名打包器，支持在完全独立的工作区开发并无缝拼插新应用模块（136 项测试全绿） |
+| **`v4.0.0`** | `feat/os-plugin-platform-v4` → `main` | **操作系统化外置插件平台与零漂移 Antigravity Init SDK**：引入 `DGAP` 加密混淆签名 `.dogapp` 插件协议、Layer 2 `<private_root>/rt_plg/` 插件仓、单插件故障隔离自愈 (`quarantined`)、`--dev-plugin` 开发态热挂载、「系统配置 → 应用插件」管理中心与 `drop_plugin_tables` 安全卸载清表；新增 `tools/export_plugin_sdk.py` 从主仓源码自动内省生成 `.pyi` 类型桩、`.d.ts`、精简 UI 壳、双库 SQLite 离线双轨 `dev_host.py`、强合约校验器与签名打包器，支持在完全独立的工作区开发并无缝拼插新应用模块（136 项测试全绿） |
+| **`v4.1.0`**（当前正式版） | `feat/sql-type-conversion-rewrite` → `main` | **SQL 脚本改写引擎补齐通用 ANSI 标准 SQL 类型转换自动改写能力**：在既有字段改名引擎上新增双向确定性类型适配与 Phase-1/Phase-2a 组合改写机制，优先输出 `CAST(... AS VARCHAR|INTEGER|BIGINT|DECIMAL(p,s)|DATE|TIMESTAMP|BOOLEAN)`、`IS NULL` / `IS NOT NULL`、`= NULL`、`CAST('...' AS DATE|TIMESTAMP)` 等通用标准 SQL；全面覆盖字面量比较、`IN`/`BETWEEN`/`LIKE`/`||`/字符串与数值函数、`COALESCE`/`NVL`、显式强转简化与精度同步、跨类型 `JOIN`、`INSERT VALUES`、`CREATE TABLE DEFAULT` 及 PL/SQL `DECLARE` 变量类型同步，并保持 100% 幂等与 0-Token LLM 短路（137 项测试全绿） |
 
 ---
 
@@ -179,14 +180,14 @@ DataOG/
 # 安装依赖
 python3 -m pip install -r requirements.txt
 
-# 运行全量自动化单元测试（136 项，发布前本地执行）
+# 运行全量自动化单元测试（137 项，发布前本地执行）
 python3 -m unittest discover -s tests -p "test_*.py" -v
 
 # 运行 2 秒极速启动冒烟自检（验证依赖、原生护盾、静态资源、插件挂载与 ASGI 路由）
 python3 app.py --smoke-test
 
 # 一键导出 4.0 独立插件开发 Antigravity Init 工作区启动包
-python3 tools/export_plugin_sdk.py --out dist/DataOG-Plugin-Init-v4.0.0 --zip dist/DataOG-Plugin-Init-v4.0.0.zip
+python3 tools/export_plugin_sdk.py --out dist/DataOG-Plugin-Init-v4.1.0 --zip dist/DataOG-Plugin-Init-v4.1.0.zip
 
 # 启动本地 Data.O.G 桌面工作台（严格监听 http://127.0.0.1:18080）
 python3 app.py

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import bisect
+import datetime
 import difflib
 import json
 import re
@@ -152,6 +153,162 @@ def _is_numeric_family(fam: str) -> bool:
 
 def _is_temporal_family(fam: str) -> bool:
     return fam in ("DATE", "TIMESTAMP")
+
+
+_PARAM_TYPE_RE = re.compile(r"^([a-z0-9_ ]+?)\s*\(([^)]+)\)\s*$", re.I)
+_NUM_LIT_STR_RE = re.compile(r"^([+-]?)(\d+)(?:\.(\d+))?$")
+_DATE_DASH_RE = re.compile(r"^(\d{4})[-/](\d{2})[-/](\d{2})$")
+_DATE_COMPACT_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})$")
+_TS_DASH_RE = re.compile(r"^(\d{4})[-/](\d{2})[-/](\d{2})[T ](\d{2}):(\d{2}):(\d{2})(\.\d{1,6})?$")
+_TS_COMPACT_RE = re.compile(r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$")
+
+
+def to_ansi_cast_type(sql_type: str, target_family: str = "") -> str:
+    """将数据库物理类型归一化为通用 ANSI 标准 SQL 目标类型（用于 CAST(expr AS TYPE)）."""
+    raw = str(sql_type or "").strip()
+    fam = (target_family or classify_type_family(raw)).upper()
+    norm = normalize_dws_type(raw).strip().lower()
+    if fam == "STRING":
+        return "VARCHAR"
+    if fam == "DATE":
+        return "DATE"
+    if fam == "TIMESTAMP":
+        return "TIMESTAMP"
+    if fam == "BOOL":
+        return "BOOLEAN"
+    if fam == "INT":
+        base = re.sub(r"\(.*\)", "", norm).strip()
+        if any(k in base for k in ("bigint", "int8", "bigserial")):
+            return "BIGINT"
+        if any(k in base for k in ("smallint", "int2", "tinyint")):
+            return "SMALLINT"
+        return "INTEGER"
+    if fam == "FLOAT":
+        base = re.sub(r"\(.*\)", "", norm).strip()
+        if any(k in base for k in ("real", "float4")):
+            return "REAL"
+        return "DOUBLE PRECISION"
+    if fam == "DECIMAL":
+        m = _PARAM_TYPE_RE.match(norm) or _PARAM_TYPE_RE.match(raw.lower())
+        if m:
+            params = ",".join(p.strip() for p in m.group(2).split(",") if p.strip())
+            if params:
+                return f"DECIMAL({params})"
+        return "DECIMAL"
+    if raw:
+        return raw.upper()
+    return "VARCHAR"
+
+
+def _unquote_sql_string(raw: str) -> Optional[str]:
+    if len(raw) >= 2 and raw.startswith("'") and raw.endswith("'"):
+        return raw[1:-1].replace("''", "'")
+    return None
+
+
+def _parse_numeric_str_literal(raw: str, target_family: str) -> Tuple[Optional[str], bool]:
+    """解析单引号数字字符串，返回 (标准数字字面量, 是否含前导零编码风险)."""
+    inner = _unquote_sql_string(raw)
+    if inner is None:
+        return None, False
+    s = inner.strip()
+    m = _NUM_LIT_STR_RE.fullmatch(s)
+    if not m:
+        return None, False
+    sign, int_part, frac_part = m.group(1), m.group(2), m.group(3)
+    sign_out = "-" if sign == "-" else ""
+    is_leading_zero = len(int_part) >= 2 and int_part.startswith("0")
+    clean_int = str(int(int_part)) if is_leading_zero else int_part
+    if target_family == "INT":
+        if frac_part is not None:
+            if any(ch != "0" for ch in frac_part):
+                return None, False
+            return f"{sign_out}{clean_int}", is_leading_zero
+        return f"{sign_out}{clean_int}", is_leading_zero
+    if frac_part is not None:
+        return f"{sign_out}{clean_int}.{frac_part}", is_leading_zero
+    return f"{sign_out}{clean_int}", is_leading_zero
+
+
+def _parse_temporal_literal(raw: str, tok_kind: str, target_family: str) -> Optional[str]:
+    """解析日期/时间戳字面量并输出通用 ANSI 标准 SQL `CAST('...' AS DATE|TIMESTAMP)`."""
+    if tok_kind == "STRING":
+        inner = _unquote_sql_string(raw)
+        if inner is None:
+            return None
+        s = inner.strip()
+    elif tok_kind == "NUMBER":
+        s = raw.strip()
+        if not _DATE_COMPACT_RE.fullmatch(s):
+            return None
+    else:
+        return None
+
+    y = mo = d = 0
+    hh = mm = ss = 0
+    frac = ""
+    has_time = False
+
+    m = _DATE_DASH_RE.fullmatch(s) or _DATE_COMPACT_RE.fullmatch(s)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        if tok_kind != "STRING":
+            return None
+        m2 = _TS_DASH_RE.fullmatch(s)
+        if m2:
+            y, mo, d = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
+            hh, mm, ss = int(m2.group(4)), int(m2.group(5)), int(m2.group(6))
+            frac = m2.group(7) or ""
+            has_time = True
+        else:
+            m3 = _TS_COMPACT_RE.fullmatch(s)
+            if not m3:
+                return None
+            y, mo, d = int(m3.group(1)), int(m3.group(2)), int(m3.group(3))
+            hh, mm, ss = int(m3.group(4)), int(m3.group(5)), int(m3.group(6))
+            has_time = True
+
+    if not (1900 <= y <= 2999):
+        return None
+    try:
+        datetime.date(y, mo, d)
+    except ValueError:
+        return None
+    if has_time and not (0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59):
+        return None
+
+    date_iso = f"{y:04d}-{mo:02d}-{d:02d}"
+    if target_family == "DATE":
+        if has_time and (hh != 0 or mm != 0 or ss != 0 or bool(frac)):
+            return None
+        return f"CAST('{date_iso}' AS DATE)"
+    if target_family == "TIMESTAMP":
+        return f"CAST('{date_iso} {hh:02d}:{mm:02d}:{ss:02d}{frac}' AS TIMESTAMP)"
+    return None
+
+
+def _parse_bool_literal(raw: str, tok_kind: str) -> Optional[str]:
+    if tok_kind == "STRING":
+        inner = _unquote_sql_string(raw)
+        if inner is None:
+            return None
+        s = inner.strip().lower()
+        if s in ("true", "t", "1", "yes", "y"):
+            return "TRUE"
+        if s in ("false", "f", "0", "no", "n"):
+            return "FALSE"
+        return None
+    if tok_kind == "NUMBER":
+        s = raw.strip()
+        if s == "1":
+            return "TRUE"
+        if s == "0":
+            return "FALSE"
+        return None
+    if tok_kind == "WORD" and raw.upper() in ("TRUE", "FALSE"):
+        return raw.upper()
+    return None
 
 
 def _build_line_offsets(text: str) -> List[int]:
@@ -826,6 +983,7 @@ class RewriteOptions:
     default_schema: str = ""
     cte_alias_policy: str = "propagate"  # propagate | preserve_alias
     rewrite_ddl_types: bool = True
+    rewrite_type_expressions: bool = True
     rewrite_comments: bool = False
     auto_apply_medium_confidence: bool = False
     preserve_quote_style: bool = True
@@ -1134,11 +1292,13 @@ class _DeterministicSqlRewriter:
         self.tokens, self.offsets = tokenize_sql(sql)
         self.active_default_schema = options.default_schema
         self._proc_local_var_ranges: List[Tuple[int, int, Set[str]]] = []
+        self._proc_var_decls: List[Tuple[int, int, str, int, int, str]] = []
 
         self._patch_seq = 0
         self._adv_seq = 0
         self.patches: List[RewritePatch] = []
         self._patches_by_span: Dict[Tuple[int, int], RewritePatch] = {}
+        self._p2_spans: List[Tuple[int, int]] = []
         self.advisories: List[RewriteAdvisory] = []
         self._adv_dedup: Set[Tuple[int, str, str]] = set()
         self.touched_tables: Set[str] = set()
@@ -1209,6 +1369,328 @@ class _DeterministicSqlRewriter:
             fqn = f"{schema_name}.{table_name}" if schema_name else table_name
             self.touched_tables.add(fqn)
         return patch
+
+    def _render_span_after_phase1(self, span_start: int, span_end: int) -> Tuple[str, bool]:
+        """渲染 [span_start, span_end] 区间在已生成 Phase-1 补丁应用后的局部文本."""
+        inner = sorted(
+            (
+                p
+                for (ps, pe), p in self._patches_by_span.items()
+                if p.phase == 1 and ps >= span_start and pe <= span_end
+            ),
+            key=lambda x: x.start,
+            reverse=True,
+        )
+        if not inner:
+            return self.sql[span_start:span_end], False
+        seg = self.sql[span_start:span_end]
+        for p in inner:
+            rel_s = p.start - span_start
+            rel_e = p.end - span_start
+            if 0 <= rel_s <= rel_e <= len(seg):
+                seg = seg[:rel_s] + p.replacement_text + seg[rel_e:]
+        return seg, True
+
+    def _emit_span_or_phase2_patch(
+        self,
+        *,
+        start: int,
+        end: int,
+        build_replacement: Any,
+        kind: str,
+        confidence: str,
+        schema_name: str,
+        table_name: str,
+        original_col: str,
+        current_col: str,
+        risk_level: str,
+        reason: str,
+        selected: Optional[bool] = None,
+    ) -> Optional[RewritePatch]:
+        """若区间与 Phase-1 补丁不重叠则发 Phase 1；若包含已完成改名的列则自动升降为 Phase-2 确定性补丁."""
+        overlapping_p1 = [
+            p
+            for (ps, pe), p in self._patches_by_span.items()
+            if p.phase == 1 and not (end <= ps or start >= pe)
+        ]
+        if not overlapping_p1:
+            post_text = self.sql[start:end]
+            repl = build_replacement(post_text)
+            if repl == post_text:
+                return None
+            return self._emit_patch(
+                start=start,
+                end=end,
+                replacement_text=repl,
+                kind=kind,
+                confidence=confidence,
+                schema_name=schema_name,
+                table_name=table_name,
+                original_col=original_col,
+                current_col=current_col,
+                risk_level=risk_level,
+                reason=reason,
+                selected=selected,
+            )
+
+        # Ensure all overlapping phase-1 patches fit inside [start, end]
+        if any(p.start < start or p.end > end for p in overlapping_p1):
+            return None
+        # Prevent nested/duplicate phase-2 wrapping on the same span
+        for p2s, p2e in self._p2_spans:
+            if not (end <= p2s or start >= p2e):
+                return None
+
+        post_text, _ = self._render_span_after_phase1(start, end)
+        repl = build_replacement(post_text)
+        if repl == post_text:
+            return None
+
+        ln, cl = _offset_to_line_col(self.offsets, start)
+        end_ln, _ = _offset_to_line_col(self.offsets, max(start, end - 1))
+        eff_selected = (
+            bool(selected)
+            if selected is not None
+            else (
+                confidence == "HIGH"
+                or (confidence == "MEDIUM" and self.options.auto_apply_medium_confidence)
+            )
+        )
+        self._patch_seq += 1
+        patch = RewritePatch(
+            patch_id=f"p_{self._patch_seq}",
+            start=start,
+            end=end,
+            line=ln,
+            col=cl,
+            end_line=end_ln,
+            original_text=post_text,
+            replacement_text=repl,
+            kind=kind,
+            confidence=confidence,
+            source="DETERMINISTIC",
+            selected=eff_selected,
+            schema_name=schema_name,
+            table_name=table_name,
+            original_col=original_col,
+            current_col=current_col,
+            risk_level=risk_level,
+            reason=reason,
+            line_context=_get_line_text(self.lines, ln),
+            phase=2,
+        )
+        self.patches.append(patch)
+        self._p2_spans.append((start, end))
+        if table_name:
+            fqn = f"{schema_name}.{table_name}" if schema_name else table_name
+            self.touched_tables.add(fqn)
+        return patch
+
+    def _adapt_literal_token_span(
+        self,
+        tok_s: int,
+        tok_e: int,
+        mapping: ColumnChangeMapping,
+        *,
+        is_write_target: bool = False,
+        is_coalesce: bool = False,
+        is_ddl_default_not_null: bool = False,
+        is_between: bool = False,
+    ) -> Optional[Tuple[int, int, str, str, str, str]]:
+        """计算单字面量区间面向新字段类型的通用标准 SQL 替换方案.
+
+        Returns `(char_start, char_end, replacement_text, confidence, kind, detail_reason)` or `None`.
+        """
+        toks = self.tokens
+        if tok_s >= tok_e:
+            return None
+        bf = mapping.before_family
+        af = mapping.after_family
+        if bf == af:
+            return None
+
+        t0 = toks[tok_s]
+        lit_kind = ""
+        raw_val = t0.raw
+        if tok_e - tok_s == 1:
+            if t0.kind == "STRING":
+                lit_kind = "STRING"
+            elif t0.kind == "NUMBER":
+                lit_kind = "NUMBER"
+            elif t0.kind == "WORD" and t0.upper in ("TRUE", "FALSE"):
+                lit_kind = "BOOL"
+                raw_val = t0.upper
+        elif tok_e - tok_s == 2:
+            t1 = toks[tok_s + 1]
+            if t0.kind == "OP" and t0.raw == "-" and t1.kind == "NUMBER":
+                lit_kind = "NUMBER"
+                raw_val = "-" + t1.raw
+            elif t0.kind == "WORD" and t0.upper in ("DATE", "TIMESTAMP") and t1.kind == "STRING":
+                lit_kind = "TEMPORAL_TYPED"
+                raw_val = t1.raw
+
+        if not lit_kind:
+            return None
+        c_start = t0.start
+        c_end = toks[tok_e - 1].end
+
+        # 1. Empty string '' -> NULL / 0
+        if lit_kind == "STRING" and raw_val == "''":
+            if _is_numeric_family(af):
+                if is_coalesce:
+                    return (
+                        c_start,
+                        c_end,
+                        "0",
+                        "HIGH",
+                        "TYPE_COALESCE_REWRITE",
+                        "数值型字段 COALESCE/NVL 空字符串默认值 '' 自动转为 0",
+                    )
+                if is_ddl_default_not_null:
+                    return (
+                        c_start,
+                        c_end,
+                        "0",
+                        "MEDIUM",
+                        "TYPE_DEFAULT_REWRITE",
+                        "NOT NULL 数值列 DEFAULT '' 转为 DEFAULT 0（请确认业务零值语义）",
+                    )
+                if is_write_target:
+                    return (
+                        c_start,
+                        c_end,
+                        "NULL",
+                        "HIGH",
+                        "TYPE_NULL_REWRITE",
+                        "写入/默认值由空字符串 '' 转为标准 SQL NULL（数值列不可写入空串）",
+                    )
+            elif _is_temporal_family(af) or af == "BOOL":
+                if is_coalesce:
+                    return (
+                        c_start,
+                        c_end,
+                        "NULL",
+                        "MEDIUM",
+                        "TYPE_COALESCE_REWRITE",
+                        "日期/布尔字段 COALESCE/NVL 空字符串 '' 改为 NULL",
+                    )
+                if is_write_target:
+                    return (
+                        c_start,
+                        c_end,
+                        "NULL",
+                        "HIGH",
+                        "TYPE_NULL_REWRITE",
+                        "日期/布尔字段空字符串 '' 自动转为标准 SQL NULL",
+                    )
+            return None
+
+        # 2. STRING literal -> NUMERIC column
+        if lit_kind == "STRING" and _is_numeric_family(af):
+            num_str, leading_zero = _parse_numeric_str_literal(raw_val, af)
+            if num_str is not None:
+                kind = "TYPE_COALESCE_REWRITE" if is_coalesce else "TYPE_LITERAL_REWRITE"
+                if leading_zero:
+                    return (
+                        c_start,
+                        c_end,
+                        num_str,
+                        "MEDIUM",
+                        kind,
+                        f"含前导零数字字符串 {raw_val} 转为数值 {num_str}（请核查是否为编号类字段）",
+                    )
+                return (
+                    c_start,
+                    c_end,
+                    num_str,
+                    "HIGH",
+                    kind,
+                    f"字符串数值字面量 {raw_val} 去除引号转为标准数值 {num_str}",
+                )
+            return None
+
+        # 3. NUMBER literal -> STRING column (when migrated from numeric)
+        if lit_kind == "NUMBER" and af == "STRING" and _is_numeric_family(bf):
+            quoted = "'" + raw_val + "'"
+            kind = "TYPE_COALESCE_REWRITE" if is_coalesce else "TYPE_LITERAL_REWRITE"
+            if is_between:
+                return (
+                    c_start,
+                    c_end,
+                    quoted,
+                    "MEDIUM",
+                    kind,
+                    f"BETWEEN 数值边界 {raw_val} 转为字符 {quoted}（请注意字符字典序与数值序差异）",
+                )
+            return (
+                c_start,
+                c_end,
+                quoted,
+                "HIGH",
+                kind,
+                f"数值字面量 {raw_val} 按目标字符列加引号转为 {quoted}",
+            )
+
+        # 4. STRING or compact YYYYMMDD NUMBER -> DATE / TIMESTAMP column (CAST('...' AS DATE|TIMESTAMP))
+        if lit_kind in ("STRING", "NUMBER") and _is_temporal_family(af):
+            ansi_dt = _parse_temporal_literal(raw_val, lit_kind, af)
+            if ansi_dt is not None:
+                kind = "TYPE_COALESCE_REWRITE" if is_coalesce else "TYPE_LITERAL_REWRITE"
+                return (
+                    c_start,
+                    c_end,
+                    ansi_dt,
+                    "HIGH",
+                    kind,
+                    f"字面量 {raw_val} 规范化为通用标准 SQL `{ansi_dt}`",
+                )
+            return None
+
+        # 5. Typed DATE '...' / TIMESTAMP '...' -> STRING column
+        if lit_kind == "TEMPORAL_TYPED" and af == "STRING" and _is_temporal_family(bf):
+            return (
+                c_start,
+                c_end,
+                raw_val,
+                "HIGH",
+                "TYPE_LITERAL_REWRITE",
+                f"字段已由日期时间型转为字符型，去除 `{t0.raw}` 前缀保留 {raw_val}",
+            )
+
+        # 6. STRING / NUMBER <-> BOOL column
+        if af == "BOOL" and lit_kind in ("STRING", "NUMBER"):
+            b_lit = _parse_bool_literal(raw_val, lit_kind)
+            if b_lit is not None:
+                return (
+                    c_start,
+                    c_end,
+                    b_lit,
+                    "MEDIUM",
+                    "TYPE_COALESCE_REWRITE" if is_coalesce else "TYPE_LITERAL_REWRITE",
+                    f"字面量 {raw_val} 转为通用标准布尔 `{b_lit}`",
+                )
+        if lit_kind == "BOOL" and bf == "BOOL":
+            if af == "STRING":
+                repl = "'true'" if raw_val == "TRUE" else "'false'"
+                return (
+                    c_start,
+                    c_end,
+                    repl,
+                    "MEDIUM",
+                    "TYPE_LITERAL_REWRITE",
+                    f"布尔字面量 {raw_val} 转为字符 {repl}",
+                )
+            if af == "INT":
+                repl = "1" if raw_val == "TRUE" else "0"
+                return (
+                    c_start,
+                    c_end,
+                    repl,
+                    "MEDIUM",
+                    "TYPE_LITERAL_REWRITE",
+                    f"布尔字面量 {raw_val} 转为整数 {repl}",
+                )
+        return None
 
     def _emit_advisory(
         self,
@@ -1369,10 +1851,14 @@ class _DeterministicSqlRewriter:
             if t.kind == "WORD" and t.upper == "DECLARE":
                 j = i + 1
                 decl_vars: Set[str] = set()
+                pending_var_decls: List[Tuple[str, int, int, str]] = []
                 while j < n and not (toks[j].kind == "WORD" and toks[j].upper == "BEGIN"):
                     # Each var decl starts after DECLARE or SEMI
-                    if _is_non_kw_ident(toks[j]):
-                        decl_vars.add(toks[j].ident.lower())
+                    var_tok = toks[j] if _is_non_kw_ident(toks[j]) else None
+                    if var_tok is not None:
+                        decl_vars.add(var_tok.ident.lower())
+                    stmt_s = j
+                    has_pct_type = False
                     # Advance to next SEMI or BEGIN
                     while j < n and toks[j].kind != "SEMI" and not (
                         toks[j].kind == "WORD" and toks[j].upper == "BEGIN"
@@ -1384,13 +1870,39 @@ class _DeterministicSqlRewriter:
                             and toks[j + 1].kind == "WORD"
                             and toks[j + 1].upper == "TYPE"
                         ):
+                            has_pct_type = True
                             self._check_percent_type_ref(j)
                         j += 1
+                    stmt_e = j
+                    if var_tok is not None and not has_pct_type and stmt_s + 1 < stmt_e:
+                        ts = stmt_s + 1
+                        if toks[ts].kind == "WORD" and toks[ts].upper == "CONSTANT":
+                            ts += 1
+                        te = ts
+                        while te < stmt_e:
+                            tk = toks[te]
+                            if tk.kind == "LP":
+                                te = _find_matching_rp(toks, te, stmt_e) + 1
+                                continue
+                            if (tk.kind == "OP" and tk.raw in (":=", "=")) or (
+                                tk.kind == "WORD" and tk.upper in ("DEFAULT", "NOT", "NULL", "COLLATE")
+                            ):
+                                break
+                            te += 1
+                        if te > ts:
+                            t_cs = toks[ts].start
+                            t_ce = toks[te - 1].end
+                            pending_var_decls.append(
+                                (var_tok.ident.lower(), t_cs, t_ce, self.sql[t_cs:t_ce].strip())
+                            )
                     if j < n and toks[j].kind == "SEMI":
                         j += 1
-                if decl_vars:
+                if decl_vars or pending_var_decls:
                     blk_end = self._find_proc_block_end(j)
-                    self._proc_local_var_ranges.append((i, blk_end, decl_vars))
+                    if decl_vars:
+                        self._proc_local_var_ranges.append((i, blk_end, decl_vars))
+                    for v_low, t_cs, t_ce, t_raw in pending_var_decls:
+                        self._proc_var_decls.append((i, blk_end, v_low, t_cs, t_ce, t_raw))
                 i = j
                 continue
             i += 1
@@ -1885,6 +2397,68 @@ class _DeterministicSqlRewriter:
                                 f"({cur_ddl_type} → {m_type.current_col_type})"
                             ),
                         )
+
+            # Inline DDL column DEFAULT literal sync when rewrite_type_expressions=True
+            if self.options.rewrite_type_expressions and m_type is not None and m_type.type_changed:
+                has_not_null = False
+                chk_nn = seg_s + 1
+                while chk_nn + 1 < seg_e:
+                    if toks[chk_nn].kind == "LP":
+                        chk_nn = _find_matching_rp(toks, chk_nn, seg_e) + 1
+                        continue
+                    if (
+                        toks[chk_nn].kind == "WORD"
+                        and toks[chk_nn].upper == "NOT"
+                        and toks[chk_nn + 1].kind == "WORD"
+                        and toks[chk_nn + 1].upper == "NULL"
+                    ):
+                        has_not_null = True
+                        break
+                    chk_nn += 1
+                dk = seg_s + 1
+                while dk < seg_e:
+                    if toks[dk].kind == "LP":
+                        dk = _find_matching_rp(toks, dk, seg_e) + 1
+                        continue
+                    if toks[dk].kind == "WORD" and toks[dk].upper == "DEFAULT" and dk + 1 < seg_e:
+                        ls = dk + 1
+                        le = ls + 1
+                        if toks[ls].kind == "OP" and toks[ls].raw == "-" and ls + 1 < seg_e and toks[ls + 1].kind == "NUMBER":
+                            le = ls + 2
+                        elif (
+                            toks[ls].kind == "WORD"
+                            and toks[ls].upper in ("DATE", "TIMESTAMP")
+                            and ls + 1 < seg_e
+                            and toks[ls + 1].kind == "STRING"
+                        ):
+                            le = ls + 2
+                        adapt = self._adapt_literal_token_span(
+                            ls,
+                            le,
+                            m_type,
+                            is_write_target=True,
+                            is_ddl_default_not_null=has_not_null,
+                        )
+                        if adapt is not None:
+                            c_s, c_e, repl, conf, _k, detail = adapt
+                            self._emit_patch(
+                                start=c_s,
+                                end=c_e,
+                                replacement_text=repl,
+                                kind="TYPE_DEFAULT_REWRITE",
+                                confidence=conf,
+                                schema_name=spec.schema_name,
+                                table_name=spec.table_name,
+                                original_col=m_type.original_col_name,
+                                current_col=m_type.current_col_name,
+                                risk_level="L2",
+                                reason=(
+                                    f"CREATE TABLE 默认值类型对齐：{spec.fqn}.{m_type.current_col_name} "
+                                    f"({m_type.original_col_type} → {m_type.current_col_type})：{detail}"
+                                ),
+                            )
+                        break
+                    dk += 1
 
             # Inline MySQL/Doris/StarRocks column COMMENT '...' sync when rewrite_comments=True
             if self.options.rewrite_comments:
@@ -2506,6 +3080,7 @@ class _DeterministicSqlRewriter:
         exposed_types: Dict[str, ColumnChangeMapping] = {}
         preserve_alias_col_idxs: Dict[int, str] = {}
         explicit_select_aliases: Set[str] = set()
+        proj_col_type_mappings: List[Optional[ColumnChangeMapping]] = []
 
         scope_ctx = {
             "parent": parent_scope,
@@ -2516,7 +3091,9 @@ class _DeterministicSqlRewriter:
 
         for item_s, item_e in select_items:
             if item_s >= item_e:
+                proj_col_type_mappings.append(None)
                 continue
+            item_typ_map: Optional[ColumnChangeMapping] = None
             # Check explicit alias: ... AS alias_tok
             explicit_alias_idx: Optional[int] = None
             depth = 0
@@ -2568,6 +3145,7 @@ class _DeterministicSqlRewriter:
                             ),
                             needs_llm=False,
                         )
+                proj_col_type_mappings.append(None)
                 continue
 
             if (
@@ -2599,6 +3177,7 @@ class _DeterministicSqlRewriter:
                             ),
                             needs_llm=False,
                         )
+                proj_col_type_mappings.append(None)
                 continue
 
             # Bare column projection (no explicit alias) OR aliased single column (propagate type-change metadata)
@@ -2612,6 +3191,7 @@ class _DeterministicSqlRewriter:
                 col_tok = toks[item_s + 2]
                 if tb is not None:
                     m_typ = tb.get_type_change(col_tok.ident.lower())
+                    item_typ_map = m_typ
                     if explicit_alias_idx is None:
                         m_ren = tb.get_rename(col_tok.ident.lower())
                         if m_ren is not None:
@@ -2631,6 +3211,7 @@ class _DeterministicSqlRewriter:
                 tb_hit, _amb = self._resolve_unqualified_table_for_col(col_tok.ident.lower(), tables)
                 if tb_hit is not None:
                     m_typ = tb_hit.get_type_change(col_tok.ident.lower())
+                    item_typ_map = m_typ
                     if explicit_alias_idx is None:
                         m_ren = tb_hit.get_rename(col_tok.ident.lower())
                         if m_ren is not None:
@@ -2643,18 +3224,53 @@ class _DeterministicSqlRewriter:
                             exposed_types[m_typ.current_col_name.lower()] = m_typ
                     elif m_typ is not None:
                         exposed_types[toks[explicit_alias_idx].ident.lower()] = m_typ
+            proj_col_type_mappings.append(item_typ_map)
 
-        # Protect PL/SQL `SELECT ... INTO var1, var2 FROM ...` target variables
+        # Protect PL/SQL `SELECT ... INTO var1, var2 FROM ...` target variables + sync declared var types
         if proj_e < end and toks[proj_e].kind == "WORD" and toks[proj_e].upper == "INTO":
             k_into = proj_e + 1
             if k_into < end and toks[k_into].kind == "WORD" and toks[k_into].upper == "STRICT":
                 k_into += 1
+            into_var_idxs: List[int] = []
             while k_into < end:
                 if toks[k_into].kind == "WORD" and toks[k_into].upper in ("FROM", "WHERE", "GROUP", "ORDER", "LIMIT"):
                     break
                 if _is_ident_tok(toks[k_into]):
                     protected.add(k_into)
+                    into_var_idxs.append(k_into)
                 k_into += 1
+            if (
+                self.options.rewrite_type_expressions
+                and into_var_idxs
+                and len(into_var_idxs) == len(proj_col_type_mappings)
+            ):
+                for v_tok_idx, m_typ in zip(into_var_idxs, proj_col_type_mappings):
+                    if m_typ is None or not m_typ.type_changed or not m_typ.current_col_type:
+                        continue
+                    v_low = toks[v_tok_idx].ident.lower()
+                    for b_s, b_e, dv_low, t_cs, t_ce, t_raw in self._proc_var_decls:
+                        if b_s <= v_tok_idx < b_e and dv_low == v_low:
+                            if (
+                                normalize_dws_type(t_raw) == normalize_dws_type(m_typ.original_col_type)
+                                and normalize_dws_type(t_raw) != normalize_dws_type(m_typ.current_col_type)
+                            ):
+                                self._emit_patch(
+                                    start=t_cs,
+                                    end=t_ce,
+                                    replacement_text=m_typ.current_col_type,
+                                    kind="TYPE_VAR_REWRITE",
+                                    confidence="MEDIUM",
+                                    schema_name=m_typ.schema_name,
+                                    table_name=m_typ.table_name,
+                                    original_col=m_typ.original_col_name,
+                                    current_col=m_typ.current_col_name,
+                                    risk_level="L2",
+                                    reason=(
+                                        f"PL/SQL 接收变量 `{toks[v_tok_idx].ident}` 声明类型 `{t_raw}` "
+                                        f"建议同步更新为字段新类型 `{m_typ.current_col_type}`"
+                                    ),
+                                )
+                            break
 
         # Protect unqualified references in GROUP BY / HAVING / ORDER BY that shadow an explicit SELECT output alias
         if explicit_select_aliases and proj_e < end:
@@ -2741,11 +3357,18 @@ class _DeterministicSqlRewriter:
             nxt += 2 if nxt + 1 < end else 1
 
         # Optional target column list `(c1, c2, ...)` (must NOT start with SELECT/WITH)
+        target_col_types: List[Optional[ColumnChangeMapping]] = []
         if nxt < end and toks[nxt].kind == "LP":
             rp = _find_matching_rp(toks, nxt, end)
             if not (nxt + 1 < rp and toks[nxt + 1].kind == "WORD" and toks[nxt + 1].upper in ("SELECT", "WITH")):
                 if spec is not None:
                     self._rewrite_column_list_for_spec(nxt + 1, rp, spec, "INSERT 目标列")
+                    for cs, ce in _split_top_level_by_comma(toks, nxt + 1, rp):
+                        m_col: Optional[ColumnChangeMapping] = None
+                        if cs < ce and _is_ident_tok(toks[cs]):
+                            c_l = toks[cs].ident.lower()
+                            m_col = spec.type_map.get(c_l)
+                        target_col_types.append(m_col)
                 nxt = rp + 1
 
         # Locate trailing ON CONFLICT / ON DUPLICATE KEY UPDATE / RETURNING at depth == 0
@@ -2782,6 +3405,60 @@ class _DeterministicSqlRewriter:
                     },
                 )
             else:
+                if (
+                    self.options.rewrite_type_expressions
+                    and spec is not None
+                    and target_col_types
+                    and toks[nxt].kind == "WORD"
+                    and toks[nxt].upper in ("VALUES", "VALUE")
+                ):
+                    for tup_s, tup_e in _split_top_level_by_comma(toks, nxt + 1, tail_idx):
+                        if tup_s < tup_e and toks[tup_s].kind == "LP":
+                            tup_rp = _find_matching_rp(toks, tup_s, tup_e)
+                            val_items = _split_top_level_by_comma(toks, tup_s + 1, tup_rp)
+                            if len(val_items) == len(target_col_types):
+                                for m_col, (vs, ve) in zip(target_col_types, val_items):
+                                    if m_col is None or not m_col.type_changed:
+                                        continue
+                                    if m_col.risk_level == "L3" and m_col.before_family == m_col.after_family:
+                                        self._emit_advisory(
+                                            start=toks[vs].start,
+                                            end=toks[ve - 1].end,
+                                            severity="WARN",
+                                            category="PRECISION_SHRINK_WRITE",
+                                            schema_name=spec.schema_name,
+                                            table_name=spec.table_name,
+                                            column_name=m_col.current_col_name,
+                                            before_spec=m_col.original_col_type,
+                                            after_spec=m_col.current_col_type,
+                                            risk_level="L3",
+                                            message=(
+                                                f"INSERT VALUES 向已缩减精度/长度的列 {spec.fqn}.{m_col.current_col_name} "
+                                                f"({m_col.original_col_type} → {m_col.current_col_type}) 写入字面量，请确认不会触发截断"
+                                            ),
+                                            needs_llm=False,
+                                        )
+                                    adapt = self._adapt_literal_token_span(
+                                        vs, ve, m_col, is_write_target=True
+                                    )
+                                    if adapt is not None:
+                                        c_s, c_e, repl, conf, kind, detail = adapt
+                                        self._emit_patch(
+                                            start=c_s,
+                                            end=c_e,
+                                            replacement_text=repl,
+                                            kind=kind,
+                                            confidence=conf,
+                                            schema_name=spec.schema_name,
+                                            table_name=spec.table_name,
+                                            original_col=m_col.original_col_name,
+                                            current_col=m_col.current_col_name,
+                                            risk_level="L2",
+                                            reason=(
+                                                f"INSERT VALUES 字面量类型对齐：{spec.fqn}.{m_col.current_col_name} "
+                                                f"({m_col.original_col_type} → {m_col.current_col_type})：{detail}"
+                                            ),
+                                        )
                 self._scan_embedded_subqueries(nxt, tail_idx, parent_scope=parent_scope)
 
         # Handle ON CONFLICT (...) DO UPDATE SET ... / ON DUPLICATE KEY UPDATE ... / RETURNING ...
@@ -3038,7 +3715,7 @@ class _DeterministicSqlRewriter:
                     reason=f"UPDATE SET 目标列改名：{eff_target.spec.fqn}.{col_tok.ident} → {m_ren.current_col_name}",
                 )
             m_typ = m_ren if (m_ren and m_ren.type_changed) else eff_target.spec.type_map.get(col_l)
-            if m_typ is not None and m_typ.risk_level in ("L2", "L3"):
+            if m_typ is not None and (m_typ.type_changed or m_typ.risk_level in ("L2", "L3")):
                 # Inspect RHS literal/expression for type mismatch or precision shrink
                 self._check_type_impact_around_col(
                     col_idx,
@@ -3679,6 +4356,113 @@ class _DeterministicSqlRewriter:
                 scope_ctx=scope_ctx,
             )
 
+    def _scan_pg_cast_type_span(self, op_idx: int, scope_end: int) -> Tuple[int, str]:
+        """扫描 `col::type` 中从 op_idx + 1 起的类型说明符，返回 (end_tok_idx, raw_type_str)."""
+        toks = self.tokens
+        ts = op_idx + 1
+        te = ts
+        if ts >= scope_end:
+            return ts, ""
+        # Multi-word standard type forms: double precision, character varying, timestamp [with|without time zone]
+        while te < scope_end:
+            tk = toks[te]
+            if te == ts:
+                if tk.kind not in ("WORD", "QIDENT"):
+                    break
+                te += 1
+                continue
+            if tk.kind == "WORD" and tk.upper in ("VARYING", "PRECISION", "WITH", "WITHOUT", "TIME", "ZONE"):
+                te += 1
+                continue
+            if tk.kind == "LP":
+                te = _find_matching_rp(toks, te, scope_end) + 1
+                continue
+            break
+        if te <= ts:
+            return ts, ""
+        return te, self.sql[toks[ts].start : toks[te - 1].end].strip()
+
+    def _is_already_cast_to_family(
+        self, ref_start: int, col_idx: int, scope_start: int, scope_end: int, target_family: str
+    ) -> bool:
+        """幂等性守卫：若列已被显式 CAST/::/TO_CHAR/TO_NUMBER 转为目标家族，则返回 True 防二次包裹."""
+        toks = self.tokens
+        tgt = target_family.upper()
+
+        def _same_fam(cast_fam: str) -> bool:
+            if not cast_fam or cast_fam == "OTHER":
+                return False
+            if cast_fam == tgt:
+                return True
+            if _is_numeric_family(cast_fam) and _is_numeric_family(tgt):
+                return True
+            return False
+
+        # 1. Explicit `col::target`
+        if col_idx + 2 < scope_end and toks[col_idx + 1].kind == "OP" and toks[col_idx + 1].raw == "::":
+            _te, t_str = self._scan_pg_cast_type_span(col_idx + 1, scope_end)
+            if _same_fam(classify_type_family(t_str)):
+                return True
+
+        # 2. Enclosing CAST(col AS type) / TO_CHAR(col) / TO_NUMBER(col) / TO_DATE(col)
+        fn_idx = self._find_enclosing_function(ref_start, scope_start)
+        if fn_idx is not None:
+            fn_u = toks[fn_idx].upper
+            lp_idx = fn_idx + 1
+            rp_idx = _find_matching_rp(toks, lp_idx, scope_end)
+            if fn_u in ("CAST", "TRY_CAST", "SAFE_CAST", "CONVERT"):
+                depth = 0
+                as_idx = -1
+                for k in range(lp_idx + 1, rp_idx):
+                    if toks[k].kind == "LP":
+                        depth += 1
+                    elif toks[k].kind == "RP":
+                        depth = max(0, depth - 1)
+                    elif depth == 0 and toks[k].kind == "WORD" and toks[k].upper == "AS":
+                        as_idx = k
+                        break
+                if as_idx != -1 and as_idx + 1 < rp_idx:
+                    t_str = self.sql[toks[as_idx + 1].start : toks[rp_idx - 1].end].strip()
+                    if _same_fam(classify_type_family(t_str)):
+                        return True
+            elif fn_u == "TO_CHAR" and tgt == "STRING":
+                return True
+            elif fn_u == "TO_NUMBER" and _is_numeric_family(tgt):
+                return True
+            elif fn_u == "TO_DATE" and tgt == "DATE":
+                return True
+        return False
+
+    def _emit_cast_wrap_for_col(
+        self,
+        *,
+        ref_start: int,
+        col_idx: int,
+        target_ansi_type: str,
+        confidence: str,
+        mapping: ColumnChangeMapping,
+        schema_name: str,
+        table_name: str,
+        reason: str,
+    ) -> Optional[RewritePatch]:
+        """用通用标准 SQL `CAST(col_ref AS <ANSI_TYPE>)` 包裹列引用（自动兼容 Phase-1 改名组合）."""
+        toks = self.tokens
+        span_s = toks[ref_start].start
+        span_e = toks[col_idx].end
+        return self._emit_span_or_phase2_patch(
+            start=span_s,
+            end=span_e,
+            build_replacement=lambda col_ref: f"CAST({col_ref} AS {target_ansi_type})",
+            kind="TYPE_CAST_WRAP",
+            confidence=confidence,
+            schema_name=schema_name,
+            table_name=table_name,
+            original_col=mapping.original_col_name,
+            current_col=mapping.current_col_name,
+            risk_level="L2",
+            reason=reason,
+        )
+
     def _check_type_impact_around_col(
         self,
         col_idx: int,
@@ -3691,13 +4475,14 @@ class _DeterministicSqlRewriter:
         is_write_target: bool = False,
         scope_ctx: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """L2 类型转换 & L3 精度缩减表达式级静态影响雷达."""
+        """L2 类型转换 & L3 精度缩减静态雷达 + 通用标准 SQL 双向自动改写."""
         toks = self.tokens
         col_tok = toks[col_idx]
         bf = mapping.before_family
         af = mapping.after_family
         fqn = f"{schema_name}.{table_name}.{mapping.current_col_name}"
         spec_desc = f"{mapping.original_col_type} → {mapping.current_col_type}"
+        do_rw = bool(self.options.rewrite_type_expressions)
 
         # Helper to find the start of the qualified reference (e.g. `t.col` -> `t`)
         ref_start = col_idx
@@ -3706,10 +4491,141 @@ class _DeterministicSqlRewriter:
             if ref_start >= scope_start + 2 and toks[ref_start - 1].kind == "DOT" and _is_ident_tok(toks[ref_start - 2]):
                 ref_start -= 2
 
-        def _check_literal_comparison(lit_tok: SqlToken, span_s: int, span_e: int, is_negative_num: bool = False) -> None:
-            lit_disp = f"-{lit_tok.raw}" if is_negative_num else lit_tok.raw
-            if lit_tok.kind == "STRING" and _is_numeric_family(af):
-                extra = "（空字符串 '' 无法隐式转为数值！）" if lit_tok.raw == "''" else ""
+        def _handle_literal_cmp(
+            lit_s: int,
+            lit_e: int,
+            span_s: int,
+            span_e: int,
+            *,
+            op_tok: Optional[SqlToken] = None,
+            is_reversed: bool = False,
+        ) -> None:
+            if lit_s >= lit_e:
+                return
+            # Skip complex compound expressions like `col = '100' || '_x'` or `'a' || 'b' = col`
+            if not is_reversed and lit_e < scope_end and toks[lit_e].kind == "OP":
+                return
+            if is_reversed and lit_s > scope_start and toks[lit_s - 1].kind == "OP":
+                return
+
+            lit_disp = self.sql[toks[lit_s].start : toks[lit_e - 1].end]
+
+            # Empty string '' predicate vs equality/assignment
+            if (
+                lit_e - lit_s == 1
+                and toks[lit_s].kind == "STRING"
+                and toks[lit_s].raw == "''"
+                and (_is_numeric_family(af) or _is_temporal_family(af) or af == "BOOL")
+                and not is_write_target
+                and op_tok is not None
+                and op_tok.kind == "OP"
+                and op_tok.raw in ("=", "<>", "!=")
+            ):
+                pred = "IS NULL" if op_tok.raw == "=" else "IS NOT NULL"
+                if do_rw:
+                    if not is_reversed:
+                        self._emit_patch(
+                            start=op_tok.start,
+                            end=toks[lit_e - 1].end,
+                            replacement_text=pred,
+                            kind="TYPE_NULL_REWRITE",
+                            confidence="HIGH",
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            original_col=mapping.original_col_name,
+                            current_col=mapping.current_col_name,
+                            risk_level="L2",
+                            reason=f"标准 SQL 空值谓词改写：{fqn} ({spec_desc}) `{op_tok.raw} ''` → `{pred}`",
+                        )
+                    else:
+                        eq_sym = op_tok.raw
+                        self._emit_span_or_phase2_patch(
+                            start=span_s,
+                            end=col_tok.end,
+                            build_replacement=lambda s: f"{s.split(eq_sym, 1)[1].strip()} {pred}",
+                            kind="TYPE_NULL_REWRITE",
+                            confidence="HIGH",
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            original_col=mapping.original_col_name,
+                            current_col=mapping.current_col_name,
+                            risk_level="L2",
+                            reason=f"标准 SQL 反向空值谓词改写：'' {eq_sym} {fqn} → `{pred}`",
+                        )
+                    self._emit_advisory(
+                        start=span_s,
+                        end=span_e,
+                        severity="INFO",
+                        category="TYPE_LITERAL_MISMATCH",
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        column_name=mapping.current_col_name,
+                        before_spec=mapping.original_col_type,
+                        after_spec=mapping.current_col_type,
+                        risk_level="L2",
+                        message=f"列 {fqn} 已转为 {mapping.current_col_type}，已将与 `''` 的比较自动改写为 `{pred}`",
+                        needs_llm=False,
+                    )
+                else:
+                    self._emit_advisory(
+                        start=span_s,
+                        end=span_e,
+                        severity="ERROR",
+                        category="TYPE_LITERAL_MISMATCH",
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        column_name=mapping.current_col_name,
+                        before_spec=mapping.original_col_type,
+                        after_spec=mapping.current_col_type,
+                        risk_level="L2",
+                        message=f"列 {fqn} 已转为 {mapping.current_col_type} ({spec_desc})，与空字符串 `''` 比较存在报错风险",
+                        needs_llm=True,
+                    )
+                return
+
+            # Adapt literal token via universal standard SQL helper
+            adapt = (
+                self._adapt_literal_token_span(
+                    lit_s, lit_e, mapping, is_write_target=is_write_target
+                )
+                if do_rw
+                else None
+            )
+            if adapt is not None:
+                c_s, c_e, repl, conf, kind, detail = adapt
+                self._emit_patch(
+                    start=c_s,
+                    end=c_e,
+                    replacement_text=repl,
+                    kind=kind,
+                    confidence=conf,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    original_col=mapping.original_col_name,
+                    current_col=mapping.current_col_name,
+                    risk_level="L2",
+                    reason=f"标准 SQL 字面量类型对齐：{fqn} ({spec_desc})：{detail}",
+                )
+                self._emit_advisory(
+                    start=span_s,
+                    end=span_e,
+                    severity="INFO" if conf == "HIGH" else "WARN",
+                    category="TYPE_LITERAL_MISMATCH",
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    column_name=mapping.current_col_name,
+                    before_spec=mapping.original_col_type,
+                    after_spec=mapping.current_col_type,
+                    risk_level="L2",
+                    message=f"列 {fqn} ({spec_desc}) 字面量 `{lit_disp}` {'已自动改写为 `' + repl + '`' if conf == 'HIGH' else '已生成待审改写建议 `' + repl + '`'}",
+                    needs_llm=(conf != "HIGH"),
+                )
+                return
+
+            # Unconvertible mismatch -> keep advisory
+            t_lit = toks[lit_s]
+            if lit_e - lit_s == 1 and t_lit.kind == "STRING" and _is_numeric_family(af):
+                extra = "（空字符串 '' 无法隐式转为数值！）" if t_lit.raw == "''" else ""
                 self._emit_advisory(
                     start=span_s,
                     end=span_e,
@@ -3724,7 +4640,7 @@ class _DeterministicSqlRewriter:
                     message=f"列 {fqn} 已转为数值型 ({spec_desc})，与字符串字面量 `{lit_disp}` 比较存在风险{extra}",
                     needs_llm=True,
                 )
-            elif lit_tok.kind == "STRING" and _is_temporal_family(af) and lit_tok.raw == "''":
+            elif lit_e - lit_s == 1 and t_lit.kind == "STRING" and _is_temporal_family(af):
                 self._emit_advisory(
                     start=span_s,
                     end=span_e,
@@ -3736,10 +4652,10 @@ class _DeterministicSqlRewriter:
                     before_spec=mapping.original_col_type,
                     after_spec=mapping.current_col_type,
                     risk_level="L2",
-                    message=f"列 {fqn} 已转为日期/时间型 ({spec_desc})，与空字符串 `''` 比较在 DWS/PG 中会直接报错",
+                    message=f"列 {fqn} 已转为日期/时间型 ({spec_desc})，与字符串 `{lit_disp}` 比较可能失效或报错",
                     needs_llm=True,
                 )
-            elif lit_tok.kind == "NUMBER" and af == "STRING" and _is_numeric_family(bf):
+            elif (t_lit.kind == "NUMBER" or (lit_e - lit_s == 2 and toks[lit_s].raw == "-")) and af == "STRING" and _is_numeric_family(bf):
                 self._emit_advisory(
                     start=span_s,
                     end=span_e,
@@ -3772,27 +4688,102 @@ class _DeterministicSqlRewriter:
                 needs_llm=False,
             )
 
-        # 1b. Reversed LHS binary comparison / concat: `'100' = col`, `'' <> col`, `'prefix' || col`
+        # 1b. Reversed LHS binary comparison / concat / arithmetic: `'100' = col`, `'' <> col`, `DATE '...' = col`, `'prefix' || col`, `1 + col`
         if ref_start - 2 >= scope_start:
             prev_op = toks[ref_start - 1]
             lhs_tok = toks[ref_start - 2]
             if prev_op.kind == "OP" and prev_op.raw in _COMPARISON_OPS:
-                if lhs_tok.kind in ("STRING", "NUMBER"):
-                    is_neg = (
-                        lhs_tok.kind == "NUMBER"
-                        and ref_start - 3 >= scope_start
-                        and toks[ref_start - 3].kind == "OP"
-                        and toks[ref_start - 3].raw == "-"
-                    )
-                    _check_literal_comparison(
-                        lhs_tok,
-                        toks[ref_start - 3].start if is_neg else lhs_tok.start,
+                if (
+                    ref_start - 3 >= scope_start
+                    and lhs_tok.kind == "STRING"
+                    and toks[ref_start - 3].kind == "WORD"
+                    and toks[ref_start - 3].upper in ("DATE", "TIMESTAMP")
+                ):
+                    _handle_literal_cmp(
+                        ref_start - 3,
+                        ref_start - 1,
+                        toks[ref_start - 3].start,
                         col_tok.end,
-                        is_negative_num=is_neg,
+                        op_tok=prev_op,
+                        is_reversed=True,
+                    )
+                elif (
+                    lhs_tok.kind == "NUMBER"
+                    and ref_start - 3 >= scope_start
+                    and toks[ref_start - 3].kind == "OP"
+                    and toks[ref_start - 3].raw == "-"
+                ):
+                    _handle_literal_cmp(
+                        ref_start - 3,
+                        ref_start - 1,
+                        toks[ref_start - 3].start,
+                        col_tok.end,
+                        op_tok=prev_op,
+                        is_reversed=True,
+                    )
+                elif lhs_tok.kind in ("STRING", "NUMBER") or (lhs_tok.kind == "WORD" and lhs_tok.upper in ("TRUE", "FALSE")):
+                    _handle_literal_cmp(
+                        ref_start - 2,
+                        ref_start - 1,
+                        lhs_tok.start,
+                        col_tok.end,
+                        op_tok=prev_op,
+                        is_reversed=True,
                     )
             elif prev_op.kind == "OP" and prev_op.raw == "||" and bf == "STRING" and af != "STRING":
+                fixed = False
+                if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    p = self._emit_cast_wrap_for_col(
+                        ref_start=ref_start,
+                        col_idx=col_idx,
+                        target_ansi_type="VARCHAR",
+                        confidence="HIGH",
+                        mapping=mapping,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        reason=f"`||` 拼接列 {fqn} 已转为 {mapping.current_col_type}，自动补充标准 SQL `CAST(... AS VARCHAR)`",
+                    )
+                    fixed = p is not None
+                elif self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    fixed = True
                 self._emit_advisory(
                     start=lhs_tok.start,
+                    end=col_tok.end,
+                    severity="INFO" if fixed else "WARN",
+                    category="TYPE_FUNCTION_MISMATCH",
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    column_name=mapping.current_col_name,
+                    before_spec=mapping.original_col_type,
+                    after_spec=mapping.current_col_type,
+                    risk_level="L2",
+                    message=(
+                        f"列 {fqn} 已由字符型转为 {mapping.current_col_type}，"
+                        + ("已自动补充 `CAST(... AS VARCHAR)` 适配 `||` 拼接" if fixed else "参与 `||` 拼接时可能需要显式 CAST 为字符")
+                    ),
+                    needs_llm=not fixed,
+                )
+            elif (
+                prev_op.kind == "OP"
+                and prev_op.raw in ("+", "-", "*", "/")
+                and af == "STRING"
+                and _is_numeric_family(bf)
+                and not (col_idx > scope_start and toks[col_idx - 1].kind == "OP" and toks[col_idx - 1].raw == "*")
+            ):
+                orig_ansi = to_ansi_cast_type(mapping.original_col_type, bf)
+                if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, bf):
+                    self._emit_cast_wrap_for_col(
+                        ref_start=ref_start,
+                        col_idx=col_idx,
+                        target_ansi_type=orig_ansi,
+                        confidence="MEDIUM",
+                        mapping=mapping,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        reason=f"算术表达式中的 {fqn} 已由数值型转为 {mapping.current_col_type}，建议补充标准 SQL `CAST(... AS {orig_ansi})`",
+                    )
+                self._emit_advisory(
+                    start=prev_op.start,
                     end=col_tok.end,
                     severity="WARN",
                     category="TYPE_FUNCTION_MISMATCH",
@@ -3802,11 +4793,11 @@ class _DeterministicSqlRewriter:
                     before_spec=mapping.original_col_type,
                     after_spec=mapping.current_col_type,
                     risk_level="L2",
-                    message=f"列 {fqn} 已由字符型转为 {mapping.current_col_type}，参与 `||` 拼接时可能需要显式 CAST 为字符",
+                    message=f"列 {fqn} 已转为字符型 ({mapping.current_col_type})，参与 `{prev_op.raw}` 算术运算需显式 CAST 为 `{orig_ansi}`",
                     needs_llm=True,
                 )
 
-        # 2. Direct binary comparison: `col = '123'` / `col [NOT] IN ('a','b')` / `col [NOT] LIKE '...'` / `col BETWEEN '1' AND '2'`
+        # 2. Direct RHS operator / comparison / PG cast / predicate
         if col_idx + 1 < scope_end:
             op_idx = col_idx + 1
             op_tok = toks[op_idx]
@@ -3824,9 +4815,54 @@ class _DeterministicSqlRewriter:
 
             # 2a. Explicit Postgres cast `col::type`
             if not negated and op_tok.kind == "OP" and op_tok.raw == "::" and op_idx + 1 < scope_end:
+                te, pg_cast_type = self._scan_pg_cast_type_span(op_idx, scope_end)
+                cast_fam = classify_type_family(pg_cast_type)
+                simplified_or_synced = False
+                if do_rw and te > op_idx + 1:
+                    if bf != af and (
+                        cast_fam == af
+                        or (_is_numeric_family(cast_fam) and _is_numeric_family(af))
+                    ) and (
+                        "(" not in pg_cast_type
+                        or normalize_dws_type(pg_cast_type) == normalize_dws_type(mapping.current_col_type)
+                    ):
+                        self._emit_span_or_phase2_patch(
+                            start=toks[ref_start].start,
+                            end=toks[te - 1].end,
+                            build_replacement=lambda seg: seg.split("::", 1)[0].strip(),
+                            kind="TYPE_CAST_SIMPLIFY",
+                            confidence="MEDIUM",
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            original_col=mapping.original_col_name,
+                            current_col=mapping.current_col_name,
+                            risk_level="L2",
+                            reason=f"字段 {fqn} 已变更至目标类型 {mapping.current_col_type}，可移除冗余强转 `::{pg_cast_type}`",
+                        )
+                        simplified_or_synced = True
+                    elif (
+                        cast_fam == af
+                        and normalize_dws_type(pg_cast_type) != normalize_dws_type(mapping.current_col_type)
+                        and "(" in pg_cast_type
+                    ):
+                        new_ansi = to_ansi_cast_type(mapping.current_col_type, af)
+                        self._emit_span_or_phase2_patch(
+                            start=toks[ref_start].start,
+                            end=toks[te - 1].end,
+                            build_replacement=lambda seg: f"CAST({seg.split('::', 1)[0].strip()} AS {new_ansi})",
+                            kind="TYPE_CAST_SIMPLIFY",
+                            confidence="MEDIUM",
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            original_col=mapping.original_col_name,
+                            current_col=mapping.current_col_name,
+                            risk_level="L2",
+                            reason=f"字段 {fqn} 类型更新为 {mapping.current_col_type}，同步显式强转为标准 SQL `CAST(... AS {new_ansi})`",
+                        )
+                        simplified_or_synced = True
                 self._emit_advisory(
                     start=toks[ref_start].start,
-                    end=toks[op_idx + 1].end,
+                    end=toks[max(op_idx + 1, te - 1)].end,
                     severity="INFO",
                     category="TYPE_CAST_REVIEW",
                     schema_name=schema_name,
@@ -3835,7 +4871,10 @@ class _DeterministicSqlRewriter:
                     before_spec=mapping.original_col_type,
                     after_spec=mapping.current_col_type,
                     risk_level=mapping.risk_level,
-                    message=f"列 {fqn} 已变更类型 ({spec_desc})，请核查显式强转 `::{toks[op_idx + 1].raw}` 是否冗余或失效",
+                    message=(
+                        f"列 {fqn} 已变更类型 ({spec_desc})，"
+                        + ("已生成强转简化/同步待审补丁，请核查" if simplified_or_synced else f"请核查显式强转 `::{pg_cast_type or toks[op_idx + 1].raw}` 是否冗余或失效")
+                    ),
                     needs_llm=(bf != af),
                 )
             # 2b. [NOT] LIKE / ILIKE on non-string column
@@ -3846,10 +4885,25 @@ class _DeterministicSqlRewriter:
                 and af != "STRING"
             ):
                 op_lbl = f"NOT {op_tok.raw}" if negated else op_tok.raw
+                fixed = False
+                if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    p = self._emit_cast_wrap_for_col(
+                        ref_start=ref_start,
+                        col_idx=col_idx,
+                        target_ansi_type="VARCHAR",
+                        confidence="HIGH",
+                        mapping=mapping,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        reason=f"字段 {fqn} 已由字符型转为 {mapping.current_col_type}，`{op_lbl}` 左侧自动补充标准 SQL `CAST(... AS VARCHAR)`",
+                    )
+                    fixed = p is not None
+                elif self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    fixed = True
                 self._emit_advisory(
                     start=toks[ref_start].start,
                     end=op_tok.end,
-                    severity="ERROR",
+                    severity="INFO" if fixed else "ERROR",
                     category="TYPE_FUNCTION_MISMATCH",
                     schema_name=schema_name,
                     table_name=table_name,
@@ -3857,10 +4911,13 @@ class _DeterministicSqlRewriter:
                     before_spec=mapping.original_col_type,
                     after_spec=mapping.current_col_type,
                     risk_level="L2",
-                    message=f"列 {fqn} 已由字符型转为 {mapping.current_col_type}，直接使用 `{op_lbl}` 会引发类型错误",
-                    needs_llm=True,
+                    message=(
+                        f"列 {fqn} 已由字符型转为 {mapping.current_col_type}，"
+                        + (f"已自动补充 `CAST(... AS VARCHAR)` 以适配 `{op_lbl}`" if fixed else f"直接使用 `{op_lbl}` 会引发类型错误")
+                    ),
+                    needs_llm=not fixed,
                 )
-            # 2c. [NOT] IN ('1', '2') on now-numeric column (or IN (1, 2) on now-string column)
+            # 2c. [NOT] IN (...) literal list rewrite
             elif (
                 op_tok.kind == "WORD"
                 and op_tok.upper == "IN"
@@ -3869,11 +4926,47 @@ class _DeterministicSqlRewriter:
             ):
                 rp = _find_matching_rp(toks, op_idx + 1, scope_end)
                 op_lbl = "NOT IN" if negated else "IN"
-                if _is_numeric_family(af) and any(toks[k].kind == "STRING" for k in range(op_idx + 2, rp)):
+                in_items = _split_top_level_by_comma(toks, op_idx + 2, rp)
+                rewrote_high = 0
+                rewrote_med = 0
+                unresolved_mismatch = False
+                for es, ee in in_items:
+                    adapt = (
+                        self._adapt_literal_token_span(es, ee, mapping)
+                        if do_rw
+                        else None
+                    )
+                    if adapt is not None:
+                        c_s, c_e, repl, conf, kind, detail = adapt
+                        self._emit_patch(
+                            start=c_s,
+                            end=c_e,
+                            replacement_text=repl,
+                            kind=kind,
+                            confidence=conf,
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            original_col=mapping.original_col_name,
+                            current_col=mapping.current_col_name,
+                            risk_level="L2",
+                            reason=f"`{op_lbl}` 列表项标准 SQL 类型对齐：{fqn}：{detail}",
+                        )
+                        if conf == "HIGH":
+                            rewrote_high += 1
+                        else:
+                            rewrote_med += 1
+                    elif ee - es == 1 and (
+                        (toks[es].kind == "STRING" and (_is_numeric_family(af) or _is_temporal_family(af)))
+                        or (toks[es].kind == "NUMBER" and af == "STRING" and _is_numeric_family(bf))
+                    ):
+                        unresolved_mismatch = True
+                if rewrote_high > 0 or rewrote_med > 0 or unresolved_mismatch:
+                    all_high = (rewrote_high > 0 and rewrote_med == 0 and not unresolved_mismatch)
+                    sev = "INFO" if all_high else ("ERROR" if _is_numeric_family(af) or _is_temporal_family(af) else "WARN")
                     self._emit_advisory(
                         start=toks[ref_start].start,
                         end=toks[rp].end,
-                        severity="ERROR",
+                        severity=sev,
                         category="TYPE_LITERAL_MISMATCH",
                         schema_name=schema_name,
                         table_name=table_name,
@@ -3881,62 +4974,96 @@ class _DeterministicSqlRewriter:
                         before_spec=mapping.original_col_type,
                         after_spec=mapping.current_col_type,
                         risk_level="L2",
-                        message=f"列 {fqn} 已转为数值型 ({spec_desc})，但 `{op_lbl} (...)` 列表仍包含字符串字面量",
-                        needs_llm=True,
+                        message=(
+                            f"列 {fqn} 类型已变更为 {mapping.current_col_type} ({spec_desc})，`{op_lbl} (...)` 列表"
+                            + ("已自动完成标准 SQL 类型改写" if all_high else "包含需适配或人工确认的字面量")
+                        ),
+                        needs_llm=not all_high,
                     )
-                elif af == "STRING" and _is_numeric_family(bf) and any(toks[k].kind == "NUMBER" for k in range(op_idx + 2, rp)):
-                    self._emit_advisory(
-                        start=toks[ref_start].start,
-                        end=toks[rp].end,
-                        severity="WARN",
-                        category="TYPE_LITERAL_MISMATCH",
-                        schema_name=schema_name,
-                        table_name=table_name,
-                        column_name=mapping.current_col_name,
-                        before_spec=mapping.original_col_type,
-                        after_spec=mapping.current_col_type,
-                        risk_level="L2",
-                        message=f"列 {fqn} 已转为字符型 ({spec_desc})，但 `{op_lbl} (...)` 列表仍包含纯数字字面量",
-                        needs_llm=True,
-                    )
-            # 2c2. [NOT] BETWEEN lit1 AND lit2
+            # 2c2. [NOT] BETWEEN e1 AND e2
             elif op_tok.kind == "WORD" and op_tok.upper == "BETWEEN" and op_idx + 3 < scope_end:
-                b1 = toks[op_idx + 1]
-                b_end_idx = min(scope_end - 1, op_idx + 3)
-                b_lits = [b1]
-                if toks[op_idx + 2].kind == "WORD" and toks[op_idx + 2].upper == "AND":
-                    b_lits.append(toks[op_idx + 3])
-                if _is_numeric_family(af) and any(x.kind == "STRING" for x in b_lits):
-                    self._emit_advisory(
-                        start=toks[ref_start].start,
-                        end=toks[b_end_idx].end,
-                        severity="ERROR",
-                        category="TYPE_LITERAL_MISMATCH",
-                        schema_name=schema_name,
-                        table_name=table_name,
-                        column_name=mapping.current_col_name,
-                        before_spec=mapping.original_col_type,
-                        after_spec=mapping.current_col_type,
-                        risk_level="L2",
-                        message=f"列 {fqn} 已转为数值型 ({spec_desc})，但 `BETWEEN` 边界仍使用字符串字面量",
-                        needs_llm=True,
-                    )
-                elif af == "STRING" and _is_numeric_family(bf) and any(x.kind == "NUMBER" for x in b_lits):
-                    self._emit_advisory(
-                        start=toks[ref_start].start,
-                        end=toks[b_end_idx].end,
-                        severity="WARN",
-                        category="TYPE_LITERAL_MISMATCH",
-                        schema_name=schema_name,
-                        table_name=table_name,
-                        column_name=mapping.current_col_name,
-                        before_spec=mapping.original_col_type,
-                        after_spec=mapping.current_col_type,
-                        risk_level="L2",
-                        message=f"列 {fqn} 已转为字符型 ({spec_desc})，但 `BETWEEN` 边界仍使用纯数字字面量",
-                        needs_llm=True,
-                    )
-            # 2d. Binary comparison operator
+                depth_b = 0
+                and_idx = -1
+                for k in range(op_idx + 1, scope_end):
+                    if toks[k].kind == "LP":
+                        depth_b += 1
+                    elif toks[k].kind == "RP":
+                        if depth_b == 0:
+                            break
+                        depth_b -= 1
+                    elif depth_b == 0 and toks[k].kind == "WORD" and toks[k].upper == "AND":
+                        and_idx = k
+                        break
+                if and_idx != -1 and and_idx + 1 < scope_end:
+                    b1_s, b1_e = op_idx + 1, and_idx
+                    b2_s = and_idx + 1
+                    b2_e = b2_s + 1
+                    if toks[b2_s].kind == "OP" and toks[b2_s].raw == "-" and b2_s + 1 < scope_end and toks[b2_s + 1].kind == "NUMBER":
+                        b2_e = b2_s + 2
+                    elif (
+                        toks[b2_s].kind == "WORD"
+                        and toks[b2_s].upper in ("DATE", "TIMESTAMP")
+                        and b2_s + 1 < scope_end
+                        and toks[b2_s + 1].kind == "STRING"
+                    ):
+                        b2_e = b2_s + 2
+                    elif toks[b2_s].kind == "WORD" and toks[b2_s].upper == "CAST" and b2_s + 1 < scope_end and toks[b2_s + 1].kind == "LP":
+                        b2_e = _find_matching_rp(toks, b2_s + 1, scope_end) + 1
+
+                    rewrote_high = 0
+                    rewrote_med = 0
+                    unresolved = False
+                    for bs, be in ((b1_s, b1_e), (b2_s, b2_e)):
+                        adapt = (
+                            self._adapt_literal_token_span(bs, be, mapping, is_between=True)
+                            if do_rw
+                            else None
+                        )
+                        if adapt is not None:
+                            c_s, c_e, repl, conf, kind, detail = adapt
+                            self._emit_patch(
+                                start=c_s,
+                                end=c_e,
+                                replacement_text=repl,
+                                kind=kind,
+                                confidence=conf,
+                                schema_name=schema_name,
+                                table_name=table_name,
+                                original_col=mapping.original_col_name,
+                                current_col=mapping.current_col_name,
+                                risk_level="L2",
+                                reason=f"BETWEEN 边界标准 SQL 类型对齐：{fqn}：{detail}",
+                            )
+                            if conf == "HIGH":
+                                rewrote_high += 1
+                            else:
+                                rewrote_med += 1
+                        elif be - bs == 1 and (
+                            (toks[bs].kind == "STRING" and (_is_numeric_family(af) or _is_temporal_family(af)))
+                            or (toks[bs].kind == "NUMBER" and af == "STRING" and _is_numeric_family(bf))
+                        ):
+                            unresolved = True
+                    if rewrote_high > 0 or rewrote_med > 0 or unresolved:
+                        all_high = (rewrote_high > 0 and rewrote_med == 0 and not unresolved)
+                        sev = "INFO" if all_high else ("ERROR" if _is_numeric_family(af) or _is_temporal_family(af) else "WARN")
+                        self._emit_advisory(
+                            start=toks[ref_start].start,
+                            end=toks[b2_e - 1].end,
+                            severity=sev,
+                            category="TYPE_LITERAL_MISMATCH",
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            column_name=mapping.current_col_name,
+                            before_spec=mapping.original_col_type,
+                            after_spec=mapping.current_col_type,
+                            risk_level="L2",
+                            message=(
+                                f"列 {fqn} 类型已变更 ({spec_desc})，`BETWEEN` 范围边界"
+                                + ("已自动完成标准 SQL 改写" if all_high else "已生成边界适配建议，请确认范围排序语义")
+                            ),
+                            needs_llm=not all_high,
+                        )
+            # 2d. Binary comparison operator (`col = '123'`, `col = DATE '...'`, `a.col = b.col`)
             elif not negated and op_tok.kind == "OP" and op_tok.raw in _COMPARISON_OPS and op_idx + 1 < scope_end:
                 rhs = toks[op_idx + 1]
                 if (
@@ -3945,19 +5072,65 @@ class _DeterministicSqlRewriter:
                     and op_idx + 2 < scope_end
                     and toks[op_idx + 2].kind == "NUMBER"
                 ):
-                    _check_literal_comparison(toks[op_idx + 2], toks[ref_start].start, toks[op_idx + 2].end, is_negative_num=True)
-                elif rhs.kind in ("STRING", "NUMBER"):
-                    _check_literal_comparison(rhs, toks[ref_start].start, rhs.end)
+                    _handle_literal_cmp(
+                        op_idx + 1, op_idx + 3, toks[ref_start].start, toks[op_idx + 2].end, op_tok=op_tok
+                    )
                 elif (
-                    bf != af
+                    rhs.kind == "WORD"
+                    and rhs.upper in ("DATE", "TIMESTAMP")
+                    and op_idx + 2 < scope_end
+                    and toks[op_idx + 2].kind == "STRING"
+                ):
+                    _handle_literal_cmp(
+                        op_idx + 1, op_idx + 3, toks[ref_start].start, toks[op_idx + 2].end, op_tok=op_tok
+                    )
+                elif rhs.kind in ("STRING", "NUMBER") or (rhs.kind == "WORD" and rhs.upper in ("TRUE", "FALSE")):
+                    _handle_literal_cmp(
+                        op_idx + 1, op_idx + 2, toks[ref_start].start, rhs.end, op_tok=op_tok
+                    )
+                elif (
+                    rhs.kind == "WORD"
+                    and rhs.upper in ("CURRENT_DATE", "CURRENT_TIMESTAMP", "LOCALTIMESTAMP", "SYSDATE")
+                    and af == "STRING"
+                    and _is_temporal_family(bf)
+                ):
+                    if do_rw:
+                        self._emit_patch(
+                            start=rhs.start,
+                            end=rhs.end,
+                            replacement_text=f"CAST({rhs.raw} AS VARCHAR)",
+                            kind="TYPE_CAST_WRAP",
+                            confidence="MEDIUM",
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            original_col=mapping.original_col_name,
+                            current_col=mapping.current_col_name,
+                            risk_level="L2",
+                            reason=f"列 {fqn} 已转为字符型，时间关键字 `{rhs.raw}` 建议改为 `CAST({rhs.raw} AS VARCHAR)`",
+                        )
+                    self._emit_advisory(
+                        start=toks[ref_start].start,
+                        end=rhs.end,
+                        severity="WARN",
+                        category="TYPE_LITERAL_MISMATCH",
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        column_name=mapping.current_col_name,
+                        before_spec=mapping.original_col_type,
+                        after_spec=mapping.current_col_type,
+                        risk_level="L2",
+                        message=f"列 {fqn} 已转为字符型 ({spec_desc})，与 `{rhs.raw}` 比较建议使用 `CAST({rhs.raw} AS VARCHAR)`",
+                        needs_llm=True,
+                    )
+                elif (
+                    not is_write_target
+                    and bf != af
                     and op_tok.raw == "="
                     and _is_ident_tok(rhs)
                     and op_idx + 3 < scope_end
                     and toks[op_idx + 2].kind == "DOT"
                     and _is_ident_tok(toks[op_idx + 3])
                 ):
-                    # Cross-column equality (likely JOIN ON a.col = b.other_col):
-                    # Suppress false positive if peer column ALSO migrated to the exact same type family!
                     peer_same_family = False
                     if scope_ctx is not None:
                         peer_b = self._resolve_qualifier(rhs.ident, scope_ctx)
@@ -3966,6 +5139,24 @@ class _DeterministicSqlRewriter:
                             if peer_typ is not None and peer_typ.after_family == af:
                                 peer_same_family = True
                     if not peer_same_family:
+                        orig_ansi = to_ansi_cast_type(mapping.original_col_type, bf)
+                        if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, bf):
+                            self._emit_span_or_phase2_patch(
+                                start=toks[ref_start].start,
+                                end=col_tok.end,
+                                build_replacement=lambda col_ref: f"CAST({col_ref} AS {orig_ansi})",
+                                kind="TYPE_JOIN_CAST",
+                                confidence="MEDIUM",
+                                schema_name=schema_name,
+                                table_name=table_name,
+                                original_col=mapping.original_col_name,
+                                current_col=mapping.current_col_name,
+                                risk_level="L2",
+                                reason=(
+                                    f"跨类型等值关联待审补丁：{fqn} ({spec_desc}) 与 `{rhs.ident}.{toks[op_idx + 3].ident}` "
+                                    f"可通过 `CAST(... AS {orig_ansi})` 消除跨类型比较异常"
+                                ),
+                            )
                         self._emit_advisory(
                             start=toks[ref_start].start,
                             end=toks[op_idx + 3].end,
@@ -3979,12 +5170,58 @@ class _DeterministicSqlRewriter:
                             risk_level="L2",
                             message=(
                                 f"等值关联/比较列 {fqn} 发生了跨类型转换 ({spec_desc})，"
-                                f"请核查对端字段 `{rhs.ident}.{toks[op_idx + 3].ident}` 类型是否一致"
+                                f"请核查对端字段 `{rhs.ident}.{toks[op_idx + 3].ident}` 类型是否一致（已提供标准 SQL CAST 待审补丁）"
                             ),
                             needs_llm=True,
                         )
             # 2e. String concatenation `||` on non-string
             elif not negated and op_tok.kind == "OP" and op_tok.raw == "||" and bf == "STRING" and af != "STRING":
+                fixed = False
+                if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    p = self._emit_cast_wrap_for_col(
+                        ref_start=ref_start,
+                        col_idx=col_idx,
+                        target_ansi_type="VARCHAR",
+                        confidence="HIGH",
+                        mapping=mapping,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        reason=f"`||` 拼接列 {fqn} 已转为 {mapping.current_col_type}，自动补充标准 SQL `CAST(... AS VARCHAR)`",
+                    )
+                    fixed = p is not None
+                elif self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    fixed = True
+                self._emit_advisory(
+                    start=toks[ref_start].start,
+                    end=op_tok.end,
+                    severity="INFO" if fixed else "WARN",
+                    category="TYPE_FUNCTION_MISMATCH",
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    column_name=mapping.current_col_name,
+                    before_spec=mapping.original_col_type,
+                    after_spec=mapping.current_col_type,
+                    risk_level="L2",
+                    message=(
+                        f"列 {fqn} 已由字符型转为 {mapping.current_col_type}，"
+                        + ("已自动补充 `CAST(... AS VARCHAR)` 适配 `||` 拼接" if fixed else "参与 `||` 拼接时可能需要显式 CAST 为字符")
+                    ),
+                    needs_llm=not fixed,
+                )
+            # 2f. Arithmetic operator `+ - * /` on now-string column
+            elif not negated and op_tok.kind == "OP" and op_tok.raw in ("+", "-", "*", "/") and af == "STRING" and _is_numeric_family(bf):
+                orig_ansi = to_ansi_cast_type(mapping.original_col_type, bf)
+                if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, bf):
+                    self._emit_cast_wrap_for_col(
+                        ref_start=ref_start,
+                        col_idx=col_idx,
+                        target_ansi_type=orig_ansi,
+                        confidence="MEDIUM",
+                        mapping=mapping,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        reason=f"算术表达式中的 {fqn} 已由数值型转为 {mapping.current_col_type}，建议补充标准 SQL `CAST(... AS {orig_ansi})`",
+                    )
                 self._emit_advisory(
                     start=toks[ref_start].start,
                     end=op_tok.end,
@@ -3996,22 +5233,36 @@ class _DeterministicSqlRewriter:
                     before_spec=mapping.original_col_type,
                     after_spec=mapping.current_col_type,
                     risk_level="L2",
-                    message=f"列 {fqn} 已由字符型转为 {mapping.current_col_type}，参与 `||` 拼接时可能需要显式 CAST 为字符",
+                    message=f"列 {fqn} 已转为字符型 ({mapping.current_col_type})，参与 `{op_tok.raw}` 算术运算需显式 CAST 为 `{orig_ansi}`",
                     needs_llm=True,
                 )
 
         # 3. Enclosing function call check: FUNC(col, ...)
-        # Walk backwards from ref_start to find enclosing `FUNC(` at immediate depth
         fn_idx = self._find_enclosing_function(ref_start, scope_start)
         if fn_idx is not None:
             fn_name = toks[fn_idx].upper
             lp_idx = fn_idx + 1
             rp_idx = _find_matching_rp(toks, lp_idx, scope_end)
             if fn_name in _STRING_ONLY_FUNCS and bf == "STRING" and af != "STRING":
+                fixed = False
+                if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    p = self._emit_cast_wrap_for_col(
+                        ref_start=ref_start,
+                        col_idx=col_idx,
+                        target_ansi_type="VARCHAR",
+                        confidence="HIGH",
+                        mapping=mapping,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        reason=f"字符串函数 `{toks[fn_idx].raw}(...)` 入参 {fqn} 已转为 {mapping.current_col_type}，自动补充标准 SQL `CAST(... AS VARCHAR)`",
+                    )
+                    fixed = p is not None
+                elif self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, "STRING"):
+                    fixed = True
                 self._emit_advisory(
                     start=toks[fn_idx].start,
                     end=toks[rp_idx].end,
-                    severity="ERROR",
+                    severity="INFO" if fixed else "ERROR",
                     category="TYPE_FUNCTION_MISMATCH",
                     schema_name=schema_name,
                     table_name=table_name,
@@ -4019,14 +5270,33 @@ class _DeterministicSqlRewriter:
                     before_spec=mapping.original_col_type,
                     after_spec=mapping.current_col_type,
                     risk_level="L2",
-                    message=f"字符串函数 `{toks[fn_idx].raw}(...)` 作用于已转为 {mapping.current_col_type} 的列 {fqn}，可能报错",
-                    needs_llm=True,
+                    message=(
+                        f"字符串函数 `{toks[fn_idx].raw}(...)` 作用于已转为 {mapping.current_col_type} 的列 {fqn}"
+                        + ("，已自动包裹 `CAST(... AS VARCHAR)`" if fixed else "，可能报错")
+                    ),
+                    needs_llm=not fixed,
                 )
             elif fn_name in _NUMERIC_AGG_FUNCS and af == "STRING" and _is_numeric_family(bf):
+                orig_ansi = to_ansi_cast_type(mapping.original_col_type, bf)
+                fixed = False
+                if do_rw and not self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, bf):
+                    p = self._emit_cast_wrap_for_col(
+                        ref_start=ref_start,
+                        col_idx=col_idx,
+                        target_ansi_type=orig_ansi,
+                        confidence="HIGH",
+                        mapping=mapping,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        reason=f"数值函数 `{toks[fn_idx].raw}(...)` 入参 {fqn} 已由 {mapping.original_col_type} 转为字符型，自动补充标准 SQL `CAST(... AS {orig_ansi})`",
+                    )
+                    fixed = p is not None
+                elif self._is_already_cast_to_family(ref_start, col_idx, scope_start, scope_end, bf):
+                    fixed = True
                 self._emit_advisory(
                     start=toks[fn_idx].start,
                     end=toks[rp_idx].end,
-                    severity="ERROR",
+                    severity="INFO" if fixed else "ERROR",
                     category="TYPE_FUNCTION_MISMATCH",
                     schema_name=schema_name,
                     table_name=table_name,
@@ -4034,15 +5304,52 @@ class _DeterministicSqlRewriter:
                     before_spec=mapping.original_col_type,
                     after_spec=mapping.current_col_type,
                     risk_level="L2",
-                    message=f"数值函数 `{toks[fn_idx].raw}(...)` 作用于已转为字符型 ({mapping.current_col_type}) 的列 {fqn}",
-                    needs_llm=True,
+                    message=(
+                        f"数值函数 `{toks[fn_idx].raw}(...)` 作用于已转为字符型 ({mapping.current_col_type}) 的列 {fqn}"
+                        + (f"，已自动包裹 `CAST(... AS {orig_ansi})`" if fixed else "")
+                    ),
+                    needs_llm=not fixed,
                 )
             elif fn_name in _COALESCE_FUNCS and bf != af:
-                # Check ALL sibling literal arguments inside COALESCE/NVL/IFNULL(arg1, arg2, ...)
                 args = _split_top_level_by_comma(toks, lp_idx + 1, rp_idx)
                 for arg_s, arg_e in args:
                     if arg_s <= col_idx < arg_e or arg_s >= arg_e:
                         continue
+                    adapt = (
+                        self._adapt_literal_token_span(arg_s, arg_e, mapping, is_coalesce=True)
+                        if do_rw
+                        else None
+                    )
+                    if adapt is not None:
+                        c_s, c_e, repl, conf, kind, detail = adapt
+                        self._emit_patch(
+                            start=c_s,
+                            end=c_e,
+                            replacement_text=repl,
+                            kind=kind,
+                            confidence=conf,
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            original_col=mapping.original_col_name,
+                            current_col=mapping.current_col_name,
+                            risk_level="L2",
+                            reason=f"`{toks[fn_idx].raw}(...)` 默认参数类型对齐：{fqn}：{detail}",
+                        )
+                        self._emit_advisory(
+                            start=toks[fn_idx].start,
+                            end=toks[rp_idx].end,
+                            severity="INFO" if conf == "HIGH" else "WARN",
+                            category="TYPE_COALESCE_MISMATCH",
+                            schema_name=schema_name,
+                            table_name=table_name,
+                            column_name=mapping.current_col_name,
+                            before_spec=mapping.original_col_type,
+                            after_spec=mapping.current_col_type,
+                            risk_level="L2",
+                            message=f"`{toks[fn_idx].raw}(..., {self.sql[c_s:c_e]})` 已按 {mapping.current_col_type} 对齐为 `{repl}`",
+                            needs_llm=(conf != "HIGH"),
+                        )
+                        break
                     a_tok = toks[arg_s]
                     if a_tok.kind == "STRING" and (_is_numeric_family(af) or _is_temporal_family(af)):
                         self._emit_advisory(
@@ -4082,21 +5389,114 @@ class _DeterministicSqlRewriter:
                             needs_llm=True,
                         )
                         break
-            elif fn_name in _TYPE_CONVERSION_FUNCS and bf != af:
-                self._emit_advisory(
-                    start=toks[fn_idx].start,
-                    end=toks[rp_idx].end,
-                    severity="WARN",
-                    category="TYPE_CAST_REVIEW",
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    column_name=mapping.current_col_name,
-                    before_spec=mapping.original_col_type,
-                    after_spec=mapping.current_col_type,
-                    risk_level="L2",
-                    message=f"列 {fqn} 类型已变更为 {mapping.current_col_type}，请核查显式转换 `{toks[fn_idx].raw}(...)` 是否仍需保留或调整",
-                    needs_llm=True,
-                )
+            elif fn_name in _TYPE_CONVERSION_FUNCS:
+                # Simplify / sync redundant explicit CAST / TO_NUMBER / single-arg TO_CHAR / TO_DATE
+                simplified_or_synced = False
+                is_compat_cast = False
+                if fn_name in ("CAST", "TRY_CAST", "SAFE_CAST"):
+                    depth_c = 0
+                    as_idx = -1
+                    for k in range(lp_idx + 1, rp_idx):
+                        if toks[k].kind == "LP":
+                            depth_c += 1
+                        elif toks[k].kind == "RP":
+                            depth_c = max(0, depth_c - 1)
+                        elif depth_c == 0 and toks[k].kind == "WORD" and toks[k].upper == "AS":
+                            as_idx = k
+                            break
+                    if as_idx != -1 and as_idx + 1 < rp_idx:
+                        cast_t_s = toks[as_idx + 1].start
+                        cast_t_e = toks[rp_idx - 1].end
+                        cast_type_str = self.sql[cast_t_s:cast_t_e].strip()
+                        cast_fam = classify_type_family(cast_type_str)
+                        if cast_fam == bf or normalize_dws_type(cast_type_str) == normalize_dws_type(mapping.original_col_type):
+                            if bf != af:
+                                is_compat_cast = True
+                        if do_rw and lp_idx + 1 == ref_start and as_idx == col_idx + 1:
+                            if bf != af and (
+                                cast_fam == af
+                                or (_is_numeric_family(cast_fam) and _is_numeric_family(af))
+                            ) and (
+                                "(" not in cast_type_str
+                                or normalize_dws_type(cast_type_str) == normalize_dws_type(mapping.current_col_type)
+                            ):
+                                self._emit_span_or_phase2_patch(
+                                    start=toks[fn_idx].start,
+                                    end=toks[rp_idx].end,
+                                    build_replacement=lambda _seg, rs=toks[ref_start].start, ce=col_tok.end: self._render_span_after_phase1(rs, ce)[0],
+                                    kind="TYPE_CAST_SIMPLIFY",
+                                    confidence="MEDIUM",
+                                    schema_name=schema_name,
+                                    table_name=table_name,
+                                    original_col=mapping.original_col_name,
+                                    current_col=mapping.current_col_name,
+                                    risk_level="L2",
+                                    reason=f"字段 {fqn} 已变更为 {mapping.current_col_type}，可简化冗余 `{toks[fn_idx].raw}(... AS {cast_type_str})`",
+                                )
+                                simplified_or_synced = True
+                            elif (
+                                cast_fam == af
+                                and normalize_dws_type(cast_type_str) != normalize_dws_type(mapping.current_col_type)
+                                and "(" in cast_type_str
+                            ):
+                                new_ansi = to_ansi_cast_type(mapping.current_col_type, af)
+                                if new_ansi != cast_type_str.upper():
+                                    self._emit_patch(
+                                        start=cast_t_s,
+                                        end=cast_t_e,
+                                        replacement_text=new_ansi,
+                                        kind="TYPE_CAST_SIMPLIFY",
+                                        confidence="MEDIUM",
+                                        schema_name=schema_name,
+                                        table_name=table_name,
+                                        original_col=mapping.original_col_name,
+                                        current_col=mapping.current_col_name,
+                                        risk_level="L2",
+                                        reason=f"同步更新 `{toks[fn_idx].raw}(...)` 目标精度/长度为标准 SQL `{new_ansi}`",
+                                    )
+                                    simplified_or_synced = True
+                elif fn_name in ("TO_NUMBER", "TO_CHAR", "TO_DATE") and do_rw and bf != af:
+                    fn_args = _split_top_level_by_comma(toks, lp_idx + 1, rp_idx)
+                    if len(fn_args) == 1 and fn_args[0] == (ref_start, col_idx + 1):
+                        matches_target = (
+                            (fn_name == "TO_NUMBER" and _is_numeric_family(af))
+                            or (fn_name == "TO_CHAR" and af == "STRING")
+                            or (fn_name == "TO_DATE" and af == "DATE")
+                        )
+                        if matches_target:
+                            self._emit_span_or_phase2_patch(
+                                start=toks[fn_idx].start,
+                                end=toks[rp_idx].end,
+                                build_replacement=lambda _seg, rs=toks[ref_start].start, ce=col_tok.end: self._render_span_after_phase1(rs, ce)[0],
+                                kind="TYPE_CAST_SIMPLIFY",
+                                confidence="MEDIUM",
+                                schema_name=schema_name,
+                                table_name=table_name,
+                                original_col=mapping.original_col_name,
+                                current_col=mapping.current_col_name,
+                                risk_level="L2",
+                                reason=f"字段 {fqn} 已改为 {mapping.current_col_type}，可移除单参冗余转换 `{toks[fn_idx].raw}(...)`",
+                            )
+                            simplified_or_synced = True
+
+                if bf != af and not is_compat_cast:
+                    self._emit_advisory(
+                        start=toks[fn_idx].start,
+                        end=toks[rp_idx].end,
+                        severity="INFO" if simplified_or_synced else "WARN",
+                        category="TYPE_CAST_REVIEW",
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        column_name=mapping.current_col_name,
+                        before_spec=mapping.original_col_type,
+                        after_spec=mapping.current_col_type,
+                        risk_level="L2",
+                        message=(
+                            f"列 {fqn} 类型已变更为 {mapping.current_col_type}，"
+                            + ("已生成显式强转简化/同步待审补丁" if simplified_or_synced else f"请核查显式转换 `{toks[fn_idx].raw}(...)` 是否仍需保留或调整")
+                        ),
+                        needs_llm=not simplified_or_synced,
+                    )
 
     def _find_enclosing_function(self, ref_start: int, scope_start: int) -> Optional[int]:
         toks = self.tokens
@@ -4160,6 +5560,22 @@ class _DeterministicSqlRewriter:
                         break
 
     def _finalize(self) -> Dict[str, Any]:
+        # Adjust deterministic phase=2 (line, col) to post-phase-1 coordinates for exact snippet placement
+        p1_list = sorted([p for p in self.patches if p.phase == 1], key=lambda x: x.start)
+        p2_det = [p for p in self.patches if p.phase == 2 and p.source == "DETERMINISTIC"]
+        if p2_det and p1_list:
+            p1_applied = apply_patches(self.sql, self.patches, {p.patch_id for p in p1_list})
+            p1_offsets = _build_line_offsets(p1_applied)
+            for p in p2_det:
+                delta = sum(
+                    len(q.replacement_text) - (q.end - q.start)
+                    for q in p1_list
+                    if q.end <= p.start
+                )
+                adj_pos = max(0, min(len(p1_applied), p.start + delta))
+                ln, cl = _offset_to_line_col(p1_offsets, adj_pos)
+                p.line = ln
+                p.col = cl
         # Sort patches & advisories by document position
         self.patches.sort(key=lambda p: (p.start, p.end))
         self.advisories.sort(key=lambda a: (a.line, a.col))
@@ -4202,12 +5618,16 @@ def apply_patches(
         result = result[: p.start] + p.replacement_text + result[p.end :]
         last_start = p.start
 
-    # Phase 2: LLM / post-rename surgical patches anchored on phase-1 output
-    p2 = [p for p in active if p.phase == 2]
-    if p2:
+    # Phase 2: post-rename deterministic & LLM surgical patches anchored on phase-1 output
+    for p2_group in (
+        [p for p in active if p.phase == 2 and p.source != "LLM"],
+        [p for p in active if p.phase == 2 and p.source == "LLM"],
+    ):
+        if not p2_group:
+            continue
         # Apply from bottom line / rightmost column to top line so earlier offsets stay stable
-        p2.sort(key=lambda x: (x.line, x.col, x.start), reverse=True)
-        for p in p2:
+        p2_group.sort(key=lambda x: (x.line, x.col, x.start), reverse=True)
+        for p in p2_group:
             if not p.original_text or p.original_text == p.replacement_text:
                 continue
             result = _apply_snippet_near_line(

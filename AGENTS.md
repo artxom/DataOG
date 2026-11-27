@@ -48,18 +48,18 @@
    - **分支清理**：合并与打标推送完成后及时删除已使命终结的临时工作分支，确认远端 `main` 与新标签就位。
 
 ## 5. 当前代码基线快照
-- **当前主干最新正式版本**：**`v4.0.0`**（**操作系统化外置插件平台与零漂移 Antigravity Init SDK**：引入 `DGAP` 加密签名 `.dogapp` 插件协议、Layer 2 `rt_plg/` 插件仓、单插件故障隔离自愈、开发态 `--dev-plugin` 热挂载、「系统配置 → 应用插件」管理面板与 `tools/export_plugin_sdk.py` 独立工作区 Init 包生成器，5 大内置应用平权共存）。
+- **当前主干最新正式版本**：**`v4.1.0`**（在 `v4.0.0` `DGAP` 外置插件与 Init SDK 之上，补齐 SQL 脚本改写引擎基于通用 ANSI 标准 SQL 的 L2/L3 双向确定性类型转换自动改写与前后端策略/三步合成）。
 - **核心入口、脚本与工具**：
-  - `update_bootstrap.py`（纯标准库 `DGP2` 解密认证 + `zipimport` 增量验签装载器）、`app.py`（`BASE_APP_VERSION = "4.0.0"`）、`core/app_kernel.py`（FastAPI `4.0.0` 微内核、`/plugins/{id}/{path}` 静态路由、`--dev-plugin`、`--smoke-test`）、`build_update_pack.py`、`build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`、`docs/PLUGIN_SDK_4_0.md`、`docs/MODULE_SDK_3_0.md`、`knowledge_packs/`。
+  - `update_bootstrap.py`（纯标准库 `DGP2` 解密认证 + `zipimport` 增量验签装载器）、`app.py`（`BASE_APP_VERSION = "4.1.0"`）、`core/app_kernel.py`（FastAPI `4.1.0` 微内核、`/plugins/{id}/{path}` 静态路由、`--dev-plugin`、`--smoke-test`）、`build_update_pack.py`、`build_exe.py` / `build_windows.bat` / `.github/workflows/ci.yml`、`requirements.txt`、`docs/PLUGIN_SDK_4_0.md`、`docs/MODULE_SDK_3_0.md`、`knowledge_packs/`。
   - `tools/export_plugin_sdk.py` & `tools/sdk_templates.py`（零漂移 Init SDK 导出器）、`tools/admin_console/` & `DataOG_Console.command`、`tools/keygen_src/` & `tools/build_keygen.py`、`demo_sandbox/`：全部严格排除于客户安装包之外。
 - **全局共享底座 (`core/platform/`，前缀 `/api/platform`) & 核心引擎 (`core/`)**：
-  - `module_registry.py`、`plugin_package.py`（`DGAP` 加密混淆 + Ed25519 双重验签 + 契约校验 + 禁二进制扩展）、`plugin_hub.py`（`rt_plg/` 仓、目录吸纳、单插件故障隔离、启停/回退/安全卸载清表）、`http_utils.py`、`context.py`（`version="4.0.0"`、`platform_abi="4.0"`、Gate 2 复核与 `close()`）、`router.py` + `routes/`（9 领域子路由含 `plugins.py`、`updates.py`、`knowledge.py`、`diagnostics.py`）、`schemas.py`、`models.py`、`diagnostics_hub.py`、`update_hub.py`。
+  - `module_registry.py`、`plugin_package.py`（`DGAP` 加密混淆 + Ed25519 双重验签 + 契约校验 + 禁二进制扩展）、`plugin_hub.py`（`rt_plg/` 仓、目录吸纳、单插件故障隔离、启停/回退/安全卸载清表）、`http_utils.py`、`context.py`（`version="4.1.0"`、`platform_abi="4.0"`、Gate 2 复核与 `close()`）、`router.py` + `routes/`（9 领域子路由含 `plugins.py`、`updates.py`、`knowledge.py`、`diagnostics.py`）、`schemas.py`、`models.py`、`diagnostics_hub.py`、`update_hub.py`。
   - `storage_paths.py`（含 `rt_upd`/`rt_plg` 脱敏防线）、`storage/`（含 `drop_plugin_tables` 硬保护清表）、`workspace_hub.py`（维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"`）、`license_hub.py` & `_license_native_src/`、`asset_store.py`、`standard_catalog.py`、`offline_report/`、`import_progress.py`、`excel_io.py` & `core/excel_formula.py`、`readonly_guard.py`、`knowledge_hub.py` & `builtin_dialect_kb.py`、`sql_risk_guard.py`、`llm_hub.py`、`driver_manager.py` & `inceptor_client.py`、`connection_hub.py`、`metadata_hub.py`、`query_engine.py`、`dialects/`、`core/dws_engine.py`。
 - **五大系统预装模块 (`modules/`, 导出 `MODULE_SPEC`, 严格零互引) & 外部 `.dogapp` 插件**：
   - `modules/standard_migrator/`（含 `sql_rewriter.py`/`sql_rewrite_llm.py`/`changelog_mixin.py`）、`modules/cross_comparator/`、`modules/ddl_translator/`、`modules/data_explorer/`、`modules/ai_assistant/`（含 `sql_static_analyzer.py`/`goal_runner.py`）；外置插件以 `dataog_plugins.<id>` 隔离加载，与预装应用平权共享桌面与底座。
 - **前端 ES Modules 工作台 (`static/`)**：
   - `index.html`、`css/tokens.css` & `workbench.css`、`js/main.js`（启动加载 `loadExternalPluginApps`）、`js/core/`（7 个零耦合底座模块，`app_registry.js` 含动态外部插件加载）、`js/apps/`、`js/api/`、`js/ui/`、`js/views/`（含 `plugins_view.js`、「应用插件」集成至 `settings_view.js` 等）。
-- **自动化测试套件 (`tests/`，共 136 项全绿)**：`test_core.py` (17)、`test_platform.py` (22)、`test_modules_and_api.py` (28)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (7)、`test_ai_assistant_and_kb.py` (10)、`test_diagnostics_benchmark.py` (6)、`test_incremental_updates.py` (8)、`test_migration_risk_and_rollback.py` (4)、`test_sql_script_rewriter.py` (7)、`test_plugin_platform.py` (6)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
+- **自动化测试套件 (`tests/`，共 137 项全绿)**：`test_core.py` (17)、`test_platform.py` (22)、`test_modules_and_api.py` (28)、`test_workspace_separation.py` (9)、`test_license_auth.py` (7)、`test_modular_architecture.py` (7)、`test_ai_assistant_and_kb.py` (10)、`test_diagnostics_benchmark.py` (6)、`test_incremental_updates.py` (8)、`test_migration_risk_and_rollback.py` (4)、`test_sql_script_rewriter.py` (8)、`test_plugin_platform.py` (6)、`test_admin_console.py` (3)、`test_demo_sandbox.py` (2)。
 
 ## 6. AI 只读探查四道硬隔离铁律
 涉及 AI 自动查询必须复用 `QueryEngine.execute_readonly_sql`，严禁仅靠 Prompt 软约束：

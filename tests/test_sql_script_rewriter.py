@@ -382,7 +382,9 @@ EXECUTE IMMEDIATE 'SELECT old_cust FROM dwd.t_cust WHERE amt_str = 1';
             "WHERE a.amt_str = '0';\n"
             "EXECUTE IMMEDIATE 'SELECT old_cust FROM dwd.t_cust';\n"
         )
-        det_risky = rewrite_sql_deterministic(risky_sql, reg)
+        det_risky = rewrite_sql_deterministic(
+            risky_sql, reg, RewriteOptions(rewrite_type_expressions=False)
+        )
         # 构造包含 2 条合法手术刀补丁 + 4 条恶意幻觉补丁的响应
         mock_resp = {
             "patches": [
@@ -1051,7 +1053,9 @@ console.log("SQL_REWRITE_FRONTEND_OK");
         self.assertIn("JOIN dwd.t_other b\r\nON a.cust_no = b.old_cust;", hyb_crlf["rewritten_sql"])
 
         evil_sql = "SELECT NVL(a.amt_str, ''), NVL(a.amt_str, ''), a.old_cust, a.date FROM dwd.t_cust a WHERE a.date = '';\n"
-        det_evil = rewrite_sql_deterministic(evil_sql, reg)
+        det_evil = rewrite_sql_deterministic(
+            evil_sql, reg, RewriteOptions(rewrite_type_expressions=False)
+        )
         hyb_evil = enhance_sql_rewrite_with_llm(
             original_sql=evil_sql,
             det_result=det_evil,
@@ -1187,7 +1191,9 @@ console.log("SQL_REWRITE_FRONTEND_OK");
 
         # 5. LLM 门禁反注入加固：阻断分号语句注入、高危 DDL/DML 关键字、-- / /* 注释注入与 UNION 注入
         inj_sql = "SELECT NVL(a.amt_str, '') FROM dwd.t_cust a WHERE a.amt_str = '100';"
-        det_inj = rewrite_sql_deterministic(inj_sql, reg)
+        det_inj = rewrite_sql_deterministic(
+            inj_sql, reg, RewriteOptions(rewrite_type_expressions=False)
+        )
 
         class _InjectionHub:
             def resolve_provider_and_model(self, **kw):
@@ -1250,7 +1256,340 @@ console.log("SQL_REWRITE_FRONTEND_OK");
         self.assertNotIn("DROP", res_inj["rewritten_sql"])
         self.assertNotIn("UNION", res_inj["rewritten_sql"])
         self.assertNotIn("--", res_inj["rewritten_sql"])
-        self.assertNotIn("/*", res_inj["rewritten_sql"])
+        self.assertNotIn("/* SELECT", res_inj["rewritten_sql"])
+
+    def test_ansi_standard_sql_type_conversion_rewriting(self) -> None:
+        """全面验证基于通用 ANSI 标准 SQL 的 L2/L3 类型转换双向自动改写、幂等性、0-Token 短路与前后端一致合成."""
+        reg = ChangeRegistry.from_effective_mappings(
+            [
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "old_cust",
+                    "current_col_name": "cust_no",
+                    "original_col_type": "varchar(32)",
+                    "current_col_type": "varchar(64)",
+                    "name_changed": True,
+                    "type_changed": True,
+                    "highest_risk_level": "L1",
+                    "highest_risk_rank": 1,
+                },
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "amt_str",
+                    "current_col_name": "tx_amt",
+                    "original_col_type": "varchar(50)",
+                    "current_col_type": "numeric(18,2)",
+                    "name_changed": True,
+                    "type_changed": True,
+                    "highest_risk_level": "L1",
+                    "highest_risk_rank": 1,
+                },
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "acct_id",
+                    "current_col_name": "acct_id",
+                    "original_col_type": "bigint",
+                    "current_col_type": "varchar(32)",
+                    "name_changed": False,
+                    "type_changed": True,
+                    "highest_risk_level": "L2",
+                    "highest_risk_rank": 2,
+                },
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "dt_str",
+                    "current_col_name": "biz_dt",
+                    "original_col_type": "varchar(20)",
+                    "current_col_type": "date",
+                    "name_changed": True,
+                    "type_changed": True,
+                    "highest_risk_level": "L1",
+                    "highest_risk_rank": 1,
+                },
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "ts_str",
+                    "current_col_name": "ts_at",
+                    "original_col_type": "varchar(32)",
+                    "current_col_type": "timestamp without time zone",
+                    "name_changed": False,
+                    "type_changed": False,
+                },
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "orig_ts_str",
+                    "current_col_name": "event_ts",
+                    "original_col_type": "varchar(32)",
+                    "current_col_type": "timestamp",
+                    "name_changed": True,
+                    "type_changed": True,
+                    "highest_risk_level": "L1",
+                    "highest_risk_rank": 1,
+                },
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "legacy_dt",
+                    "current_col_name": "legacy_dt",
+                    "original_col_type": "date",
+                    "current_col_type": "varchar(10)",
+                    "name_changed": False,
+                    "type_changed": True,
+                    "highest_risk_level": "L2",
+                    "highest_risk_rank": 2,
+                },
+                {
+                    "schema_name": "dwd",
+                    "table_name": "t_cust",
+                    "original_col_name": "scale_amt",
+                    "current_col_name": "scale_amt",
+                    "original_col_type": "numeric(10,2)",
+                    "current_col_type": "numeric(18,4)",
+                    "name_changed": False,
+                    "type_changed": True,
+                    "highest_risk_level": "L4",
+                    "highest_risk_rank": 4,
+                },
+            ]
+        )
+
+        # 1. STRING -> NUMERIC/DATE/TIMESTAMP + NUMERIC -> STRING + DATE -> STRING 综合脚本（默认 HIGH 自动应用）
+        sql_high = """SELECT
+  TRIM(a.amt_str) AS s1,
+  UPPER(a.amt_str) AS s2,
+  SUM(a.acct_id) AS s3,
+  COALESCE(a.amt_str, '') AS s4,
+  NVL(a.acct_id, 0) AS s5,
+  'RMB:' || a.amt_str AS s6,
+  TO_CHAR(a.dt_str, 'YYYY-MM') AS s7
+FROM dwd.t_cust a
+WHERE a.amt_str = ''
+  AND '' <> a.amt_str
+  AND a.amt_str = '100.50'
+  AND a.amt_str IN ('1', '-2', '3.5')
+  AND a.amt_str BETWEEN '10' AND '20'
+  AND a.amt_str LIKE '9%'
+  AND a.acct_id = 1001
+  AND a.acct_id IN (1, 2)
+  AND a.dt_str = '20260115'
+  AND a.dt_str <> ''
+  AND a.orig_ts_str = '2026-01-15 08:30:00'
+  AND a.legacy_dt = DATE '2026-01-15';
+
+UPDATE dwd.t_cust SET amt_str = '', old_cust = 'X' WHERE amt_str = '';
+UPDATE dwd.t_cust SET amt_str = '250' WHERE acct_id = 99;
+INSERT INTO dwd.t_cust (old_cust, amt_str, dt_str, acct_id) VALUES ('A', '100', '20260115', 77), ('B', '', '', 88);
+
+CREATE TABLE dwd.t_cust (
+  old_cust varchar(32) NOT NULL,
+  amt_str varchar(50) DEFAULT '12.50',
+  acct_id bigint DEFAULT 0,
+  dt_str varchar(20) DEFAULT ''
+);
+"""
+        res = rewrite_sql_deterministic(sql_high, reg)
+        out = res["rewritten_sql"]
+
+        self.assertIn("TRIM(CAST(a.tx_amt AS VARCHAR)) AS s1,", out)
+        self.assertIn("UPPER(CAST(a.tx_amt AS VARCHAR)) AS s2,", out)
+        self.assertIn("SUM(CAST(a.acct_id AS BIGINT)) AS s3,", out)
+        self.assertIn("COALESCE(a.tx_amt, 0) AS s4,", out)
+        self.assertIn("NVL(a.acct_id, '0') AS s5,", out)
+        self.assertIn("'RMB:' || CAST(a.tx_amt AS VARCHAR) AS s6,", out)
+        # 带格式掩码的多参 TO_CHAR 绝不能破坏
+        self.assertIn("TO_CHAR(a.biz_dt, 'YYYY-MM') AS s7", out)
+        self.assertIn("WHERE a.tx_amt IS NULL", out)
+        self.assertIn("AND a.tx_amt IS NOT NULL", out)
+        self.assertIn("AND a.tx_amt = 100.50", out)
+        self.assertIn("AND a.tx_amt IN (1, -2, 3.5)", out)
+        self.assertIn("AND a.tx_amt BETWEEN 10 AND 20", out)
+        self.assertIn("AND CAST(a.tx_amt AS VARCHAR) LIKE '9%'", out)
+        self.assertIn("AND a.acct_id = '1001'", out)
+        self.assertIn("AND a.acct_id IN ('1', '2')", out)
+        self.assertIn("AND a.biz_dt = CAST('2026-01-15' AS DATE)", out)
+        self.assertIn("AND a.biz_dt IS NOT NULL", out)
+        self.assertIn("AND a.event_ts = CAST('2026-01-15 08:30:00' AS TIMESTAMP)", out)
+        self.assertIn("AND a.legacy_dt = '2026-01-15'", out)
+        # CRITICAL: UPDATE SET = '' must become = NULL, NEVER IS NULL!
+        self.assertIn("UPDATE dwd.t_cust SET tx_amt = NULL, cust_no = 'X' WHERE tx_amt IS NULL;", out)
+        self.assertIn("UPDATE dwd.t_cust SET tx_amt = 250 WHERE acct_id = '99';", out)
+        self.assertIn(
+            "INSERT INTO dwd.t_cust (cust_no, tx_amt, biz_dt, acct_id) "
+            "VALUES ('A', 100, CAST('2026-01-15' AS DATE), '77'), ('B', NULL, NULL, '88');",
+            out,
+        )
+        self.assertIn("tx_amt numeric(18,2) DEFAULT 12.50,", out)
+        self.assertIn("acct_id varchar(32) DEFAULT '0',", out)
+        self.assertIn("biz_dt date DEFAULT NULL", out)
+
+        # 幂等性校验：对已改写文本再次运行必须 0 补丁、文本零变化
+        res_idem = rewrite_sql_deterministic(out, reg)
+        self.assertEqual(len(res_idem["patches"]), 0)
+        self.assertEqual(res_idem["rewritten_sql"], out)
+
+        # 0-Token 短路校验：纯确定性已完全修复时混合模式跳过 LLM
+        class _NeverCallHub:
+            def resolve_provider_and_model(self, **kw):
+                raise AssertionError("Should not invoke LLM")
+
+            def chat_completion(self, **kw):
+                raise AssertionError("Should not invoke LLM")
+
+        clean_type_sql = "SELECT TRIM(a.amt_str), COALESCE(a.amt_str, '') FROM dwd.t_cust a WHERE a.amt_str = '10' AND a.dt_str = '';"
+        det_clean = rewrite_sql_deterministic(clean_type_sql, reg)
+        hyb_clean = enhance_sql_rewrite_with_llm(
+            original_sql=clean_type_sql,
+            det_result=det_clean,
+            registry=reg,
+            llm_hub=_NeverCallHub(),
+        )
+        self.assertFalse(hyb_clean["llm_meta"]["used"])
+        self.assertIn("0 Token", hyb_clean["llm_meta"]["skipped_reason"])
+
+        # 2. 中置信风险/审校场景（前导零编号、STRING BETWEEN 字典序、算术、冗余强转简化、精度 CAST 同步、跨类型 JOIN、PL/SQL 变量同步）
+        sql_med = """CREATE OR REPLACE PROCEDURE dwd.sp_t() LANGUAGE plpgsql AS $$
+DECLARE
+  v_amt varchar(50);
+BEGIN
+  SELECT a.amt_str INTO v_amt
+  FROM dwd.t_cust a
+  JOIN dwd.t_other b ON a.amt_str = b.other_str
+  WHERE a.amt_str = '00123'
+    AND a.amt_str = 'INVALID_TXT'
+    AND a.acct_id BETWEEN 10 AND 20
+    AND TO_NUMBER(a.amt_str) > 0
+    AND CAST(a.scale_amt AS DECIMAL(10,2)) > 0
+    AND (a.acct_id + 1) > 0;
+END;
+$$;
+"""
+        res_med_off = rewrite_sql_deterministic(sql_med, reg)
+        out_default = res_med_off["rewritten_sql"]
+        # 默认不自动应用 MEDIUM，保留待审；但 INVALID_TXT 仍发 ERROR 预警不盲改
+        self.assertIn("a.tx_amt = '00123'", out_default)
+        self.assertIn("a.acct_id BETWEEN 10 AND 20", out_default)
+        self.assertIn("ON a.tx_amt = b.other_str", out_default)
+        self.assertTrue(
+            any(
+                a.category == "TYPE_LITERAL_MISMATCH" and a.severity == "ERROR" and a.needs_llm
+                for a in res_med_off["advisories"]
+            )
+        )
+
+        res_med_on = rewrite_sql_deterministic(
+            sql_med, reg, RewriteOptions(auto_apply_medium_confidence=True)
+        )
+        out_med = res_med_on["rewritten_sql"]
+        self.assertIn("v_amt numeric(18,2);", out_med)
+        self.assertIn("ON CAST(a.tx_amt AS VARCHAR) = b.other_str", out_med)
+        self.assertIn("WHERE a.tx_amt = 123", out_med)
+        self.assertIn("AND a.tx_amt = 'INVALID_TXT'", out_med)
+        self.assertIn("AND a.acct_id BETWEEN '10' AND '20'", out_med)
+        self.assertIn("AND a.tx_amt > 0", out_med)
+        self.assertIn("AND CAST(a.scale_amt AS DECIMAL(18,4)) > 0", out_med)
+        self.assertIn("AND (CAST(a.acct_id AS BIGINT) + 1) > 0;", out_med)
+
+        # 3. 显式关闭 rewrite_type_expressions=False 时只改名不改写类型表达式
+        res_no_typ = rewrite_sql_deterministic(
+            "SELECT TRIM(a.amt_str) FROM dwd.t_cust a WHERE a.amt_str = '10';",
+            reg,
+            RewriteOptions(rewrite_type_expressions=False),
+        )
+        self.assertEqual(
+            res_no_typ["rewritten_sql"],
+            "SELECT TRIM(a.tx_amt) FROM dwd.t_cust a WHERE a.tx_amt = '10';",
+        )
+
+        # 4. 前后端 Phase-1 + Phase-2a 补丁合成严格一致性校验（Node.js）
+        node_bin = shutil.which("node")
+        if node_bin:
+            combo_sql = "SELECT TRIM(a.amt_str), UPPER(a.amt_str), a.acct_id + 1 FROM dwd.t_cust a WHERE a.amt_str = '';"
+            combo_res = rewrite_sql_deterministic(
+                combo_sql, reg, RewriteOptions(auto_apply_medium_confidence=True)
+            )
+            payload_json = json.dumps(
+                {
+                    "original_sql": combo_sql,
+                    "patches": [p.to_dict() for p in combo_res["patches"]],
+                    "selected_ids": [p.patch_id for p in combo_res["patches"] if p.selected],
+                    "expected": combo_res["rewritten_sql"],
+                },
+                ensure_ascii=False,
+            )
+            root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            node_cmd = (
+                "import path from 'node:path'; import { pathToFileURL } from 'node:url';"
+                "const root = process.argv[1]; const d = JSON.parse(process.argv[2]);"
+                "const { applySelectedPatchesClient } = await import(pathToFileURL(path.join(root, 'static/js/views/standard_migrator/sql_rewrite_panel.js')).href);"
+                "const got = applySelectedPatchesClient(d.original_sql, d.patches, new Set(d.selected_ids));"
+                "if (got !== d.expected) { throw new Error('Mismatch:\\n' + got + '\\n!==\\n' + d.expected); }"
+            )
+            proc = subprocess.run(
+                [node_bin, "--input-type=module", "-e", node_cmd, root_dir, payload_json],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, f"前端合成不一致: {proc.stderr}\n{proc.stdout}")
+
+        # 5. API 层 rewrite_type_expressions 开关透传测试
+        with tempfile.TemporaryDirectory() as tmp:
+            app = create_app(private_root=tmp)
+            ctx: PlatformContext = app.state.platform_ctx
+            try:
+                client = TestClient(app)
+                ext_json = json.dumps(
+                    {
+                        "effective_column_mappings": [
+                            {
+                                "schema_name": "dwd",
+                                "table_name": "t_api",
+                                "original_col_name": "amt_str",
+                                "current_col_name": "tx_amt",
+                                "original_col_type": "varchar(50)",
+                                "current_col_type": "numeric(18,2)",
+                                "name_changed": True,
+                                "type_changed": True,
+                                "highest_risk_level": "L1",
+                            }
+                        ]
+                    }
+                )
+                r_on = client.post(
+                    "/api/modules/standard_migrator/sql-rewrite/analyze",
+                    json={
+                        "sql_text": "SELECT TRIM(a.amt_str) FROM dwd.t_api a WHERE a.amt_str = '12.34';",
+                        "external_changelog_json": ext_json,
+                        "rewrite_type_expressions": True,
+                    },
+                )
+                self.assertEqual(r_on.status_code, 200)
+                self.assertEqual(
+                    r_on.json()["files"][0]["rewritten_sql"],
+                    "SELECT TRIM(CAST(a.tx_amt AS VARCHAR)) FROM dwd.t_api a WHERE a.tx_amt = 12.34;",
+                )
+
+                r_off = client.post(
+                    "/api/modules/standard_migrator/sql-rewrite/analyze",
+                    json={
+                        "sql_text": "SELECT TRIM(a.amt_str) FROM dwd.t_api a WHERE a.amt_str = '12.34';",
+                        "external_changelog_json": ext_json,
+                        "rewrite_type_expressions": False,
+                    },
+                )
+                self.assertEqual(r_off.status_code, 200)
+                self.assertEqual(
+                    r_off.json()["files"][0]["rewritten_sql"],
+                    "SELECT TRIM(a.tx_amt) FROM dwd.t_api a WHERE a.tx_amt = '12.34';",
+                )
+            finally:
+                ctx.close()
 
 
 if __name__ == "__main__":
