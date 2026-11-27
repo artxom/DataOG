@@ -8,6 +8,37 @@
 
 ---
 
+## [4.1.0] - 2026-11-27
+
+> **SQL 脚本改写引擎补齐基于通用 ANSI 标准 SQL 的 L2/L3 类型转换自动改写能力**：在原有字段改名精准底座之上，全面实现跨类型字段变更（字符 ↔ 数值 / 日期 / 时间戳 / 布尔及精度调整）的十大高发场景确定性双向改写，优先输出跨库通用的标准 SQL（`CAST(... AS VARCHAR|INTEGER|BIGINT|DECIMAL(p,s)|DATE|TIMESTAMP|BOOLEAN)`、`IS NULL` / `IS NOT NULL`、`= NULL`、`CAST('YYYY-MM-DD' AS DATE)` 等），并同步支持前端策略开关、交互合成与自动化校验。
+
+### Added
+- **通用 ANSI 标准 SQL 类型转换确定性改写引擎 (`modules/standard_migrator/sql_rewriter.py`)**：
+  - 新增 `RewriteOptions.rewrite_type_expressions: bool = True` 与 `to_ansi_cast_type()` 通用标准类型归一化器（输出 `VARCHAR`、`INTEGER`、`BIGINT`、`SMALLINT`、`DECIMAL(p,s)`、`REAL`、`DOUBLE PRECISION`、`DATE`、`TIMESTAMP`、`BOOLEAN`）；
+  - 新增 Phase-1 / Phase-2a 确定性组合发射器 (`_emit_span_or_phase2_patch`)，支持同一列同时发生「改名 + 类型表达式包裹」时先改名后包裹且 0 字节错位、二次运行 100% 幂等；
+  - 全面覆盖十大类型转换场景：
+    1. 正/反向字面量比较与空字符串谓词（`WHERE col = ''` → `IS NULL`、`'' <> col` → `col IS NOT NULL`，严格区分 `UPDATE SET col = ''` → `= NULL`；数字/字符串互转、`'YYYYMMDD'`/`'YYYY-MM-DD HH:MM:SS'` 转标准 `CAST(... AS DATE|TIMESTAMP)`、`DATE 'YYYY-MM-DD'` 转字符串及 `MEDIUM` 前导零/布尔/非数字保护）；
+    2. `[NOT] IN (...)` 与 `[NOT] BETWEEN e1 AND e2` 列表/范围边界逐项改写（`NUMERIC → STRING` 的 `BETWEEN` 因字典序语义变化标为 `MEDIUM` 待审）；
+    3. `COALESCE` / `NVL` / `IFNULL` / `ISNULL` 同伴默认参数自动对齐（如 `COALESCE(col, '')` → `0`、`NVL(col, 0)` → `'0'`）；
+    4. 字符串函数（`TRIM`/`UPPER`/`SUBSTR`/`CONCAT` 等）、`[NOT] LIKE`/`ILIKE` 与 `||` 拼接自动包裹 `CAST(col AS VARCHAR)`；
+    5. 数值聚合/数学函数（`SUM`/`AVG`/`ROUND` 等）与算术运算自动包裹 `CAST(col AS <ANSI_NUMERIC>)`；
+    6. 显式强转简化与精度同步（`TYPE_CAST_SIMPLIFY`, `MEDIUM`：简化单参 `TO_NUMBER`/`TO_CHAR`/`CAST`/`::`，同步陈旧 `CAST(col AS DECIMAL(10,2))`，严格保护带格式掩码双参 `TO_CHAR(dt, 'YYYY-MM')`）；
+    7. 跨类型 `JOIN ON` 等值对齐（`TYPE_JOIN_CAST`, `MEDIUM`）与 PL/pgSQL `DECLARE` 局部变量类型同步（`TYPE_VAR_REWRITE`, `MEDIUM`）；
+    8. `INSERT INTO tbl (cols) VALUES (...)` 按列位对齐字面量改写（`UPDATE SET` 亦修复 L1+L2 复合变更漏触发缺陷）；
+    9. `CREATE TABLE ... DEFAULT <lit>` 默认值字面量同步（`TYPE_DEFAULT_REWRITE`）。
+- **轻量大模型热点提示词协同与接口开关 (`modules/standard_migrator/sql_rewrite_llm.py`, `schemas.py`, `router.py`, `sql_rewrite_mixin.py`)**：
+  - 全链路透传 `rewrite_type_expressions` 选项，Stage 2 提示词约束模型优先采用通用 ANSI 标准 SQL，并扩充 `_SAFE_SQL_CAST_WORDS` 标准 SQL 类型与 `CASE`/`IS`/`NULL` 白名单；已由 Stage 1 `HIGH` 置信度完全修复的热点自动标为 `needs_llm=False`（继续保持 0-Token 短路）。
+- **前端工作台与双端合成对齐 (`static/js/views/standard_migrator/sql_rewrite_panel.js`)**：
+  - 新增 8 种类型改写补丁标签、「改写策略」弹窗内标准 SQL 类型转换自动改写开关，以及 Phase 1 → Phase 2a（确定性类型包裹）→ Phase 2b（LLM 微切片）三步严格同序前端补丁合成器。
+- **自动化测试 (`tests/test_sql_script_rewriter.py`)**：
+  - 新增 `test_ansi_standard_sql_type_conversion_rewriting`，端到端覆盖十大类型转换场景、幂等性、0-Token 短路、`rewrite_type_expressions` 开关、Node.js 前后端合成一致性及 API 透传，总自动化测试增至 **137 项**。
+
+### Changed
+- **版本号同步发布 (`v4.1.0`)**：
+  - 同步升级 `4.0.0 -> 4.1.0` 至 `app.py`、`core/app_kernel.py`、`core/platform/context.py`、`static/index.html`、`CHANGELOG.md`、`README.md` 与 `AGENTS.md`（严格维持 `WORKSPACE_FORMAT_VERSION = "2.7.0"` 不变；**137 项**自动化单元测试全绿）。
+
+---
+
 ## [4.0.0] - 2026-11-27
 
 > **Data.O.G 4.0 操作系统化插件平台与 Antigravity Init SDK**：将 Data.O.G 微内核底座升级为支持外部独立开发、加密签名封包与零侵入拼插的操作系统级平台；新增 `DGAP` 加密签名 `.dogapp` 插件包格式、Layer 2 `<private_root>/rt_plg/` 插件仓、单插件启动故障隔离自愈、`--dev-plugin` 开发态热挂载、「系统配置 → 应用插件」管理中心，以及零漂移 `tools/export_plugin_sdk.py` 一键生成可独立运行的 Antigravity Init 工作区启动包。

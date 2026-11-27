@@ -105,6 +105,7 @@ class SqlRewriteAnalyzePayload(BaseModel):
     default_schema: str = ""
     cte_alias_policy: str = "propagate"
     rewrite_ddl_types: bool = True
+    rewrite_type_expressions: bool = True
     rewrite_comments: bool = False
     auto_apply_medium: bool = False
     mode: str = "deterministic"  # deterministic | hybrid

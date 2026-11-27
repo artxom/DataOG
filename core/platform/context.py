@@ -129,7 +129,7 @@ class PlatformContext:
         self.task_progress = self.import_progress
         self.module_registry = ModuleRegistry()
         self._registered_modules: List[Dict[str, str]] = []
-        self.app_version = "4.0.0"
+        self.app_version = "4.1.0"
         self.update_hub = UpdateHub(
             updates_dir=eff_updates_dir,
             running_version=self.app_version,
@@ -206,7 +206,7 @@ class PlatformContext:
         return {
             "app_name": "Data.O.G",
             "brand_name": "Data.O.G",
-            "version": "4.0.0",
+            "version": "4.1.0",
             "platform_abi": "4.0",
             "update_summary": self.update_hub.get_bootstrap_summary(),
             "plugin_summary": self.plugin_hub.get_bootstrap_summary(),

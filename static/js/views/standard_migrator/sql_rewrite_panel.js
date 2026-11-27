@@ -28,6 +28,14 @@ const PATCH_KIND_LABELS = {
   RENAME_CTE_PROPAGATED: "CTE/子查询透传",
   RENAME_DDL_COL: "DDL 列名同步",
   DDL_TYPE_UPDATE: "DDL 类型同步",
+  TYPE_LITERAL_REWRITE: "标准 SQL 字面量转换",
+  TYPE_NULL_REWRITE: "标准 SQL 空值谓词改写",
+  TYPE_COALESCE_REWRITE: "默认值参数类型对齐",
+  TYPE_CAST_WRAP: "标准 SQL CAST 包裹",
+  TYPE_CAST_SIMPLIFY: "显式强转简化/同步",
+  TYPE_JOIN_CAST: "跨类型关联 CAST 对齐",
+  TYPE_DEFAULT_REWRITE: "DDL DEFAULT 默认值同步",
+  TYPE_VAR_REWRITE: "过程变量声明类型同步",
   COMMENT_UPDATE: "注释同步",
   ALIAS_PRESERVE: "保留旧列别名",
   TYPE_ADAPT: "AI 类型表达式修复",
@@ -140,21 +148,24 @@ export function applySelectedPatchesDetailed(originalSql, patches, selectedIds) 
     appliedIds.add(p.patch_id);
   }
 
-  // Phase 2: LLM surgical patches anchored on phase-1 output
-  const p2 = active
-    .filter((p) => p.phase === 2)
-    .sort((a, b) => b.line - a.line || (b.col || 0) - (a.col || 0) || b.start - a.start);
-  for (const p of p2) {
-    const out = applySnippetNearLine(
-      res,
-      Number(p.line || 1),
-      p.original_text,
-      p.replacement_text,
-      Number(p.col || 0)
-    );
-    res = out.sql;
-    if (out.applied) appliedIds.add(p.patch_id);
-    else skippedPhase2Ids.add(p.patch_id);
+  // Phase 2: post-rename deterministic & LLM surgical patches anchored on phase-1 output
+  for (const p2Group of [
+    active.filter((p) => p.phase === 2 && p.source !== "LLM"),
+    active.filter((p) => p.phase === 2 && p.source === "LLM"),
+  ]) {
+    p2Group.sort((a, b) => b.line - a.line || (b.col || 0) - (a.col || 0) || b.start - a.start);
+    for (const p of p2Group) {
+      const out = applySnippetNearLine(
+        res,
+        Number(p.line || 1),
+        p.original_text,
+        p.replacement_text,
+        Number(p.col || 0)
+      );
+      res = out.sql;
+      if (out.applied) appliedIds.add(p.patch_id);
+      else skippedPhase2Ids.add(p.patch_id);
+    }
   }
   return { sql: res, appliedIds, skippedPhase2Ids };
 }
@@ -338,6 +349,7 @@ export class SqlRewritePanel {
     this.defaultSchema = "";
     this.cteAliasPolicy = "propagate"; // propagate | preserve_alias
     this.rewriteDdlTypes = true;
+    this.rewriteTypeExpressions = true;
     this.rewriteComments = false;
     this.autoApplyMedium = false;
     this.llmAudit = false;
@@ -549,14 +561,17 @@ export class SqlRewritePanel {
     const colSelects = tblMappings.slice(0, 4).map((m) => `    a.${m.original_col_name}`).join(",\n");
     const firstRename = tblMappings.find((m) => m.name_changed) || first;
     const firstType = tblMappings.find((m) => m.type_changed);
+    const extraSelect = firstType
+      ? `,\n    TRIM(a.${firstType.original_col_name}) AS formatted_${firstType.current_col_name},\n    COALESCE(a.${firstType.original_col_name}, '') AS safe_${firstType.current_col_name}`
+      : "";
     const extraWhere = firstType
-      ? `\n  AND NVL(a.${firstType.original_col_name}, '') <> ''`
+      ? `\n  AND a.${firstType.original_col_name} <> ''`
       : "";
     const sample = [
       `-- 示例脚本：基于工作区变更表 ${fqn} 自动生成`,
       `WITH base_cte AS (`,
       `  SELECT`,
-      colSelects,
+      `${colSelects}${extraSelect}`,
       `  FROM ${fqn} a`,
       `  WHERE a.${firstRename.original_col_name} IS NOT NULL${extraWhere}`,
       `)`,
@@ -645,6 +660,7 @@ export class SqlRewritePanel {
         default_schema: this.defaultSchema.trim(),
         cte_alias_policy: this.cteAliasPolicy,
         rewrite_ddl_types: this.rewriteDdlTypes,
+        rewrite_type_expressions: this.rewriteTypeExpressions,
         rewrite_comments: this.rewriteComments,
         auto_apply_medium: this.autoApplyMedium,
         mode: this.mode,
@@ -791,6 +807,7 @@ export class SqlRewritePanel {
       })
     );
     const ddlCb = el("input", { type: "checkbox", checked: this.rewriteDdlTypes });
+    const typeExprCb = el("input", { type: "checkbox", checked: this.rewriteTypeExpressions });
     const cmtCb = el("input", { type: "checkbox", checked: this.rewriteComments });
     const medCb = el("input", { type: "checkbox", checked: this.autoApplyMedium });
     const auditCb = el("input", { type: "checkbox", checked: this.llmAudit });
@@ -818,6 +835,14 @@ export class SqlRewritePanel {
           { style: { display: "inline-flex", alignItems: "center", gap: "7px", fontSize: "12px", cursor: "pointer" } },
           ddlCb,
           el("span", { text: "同步更新 CREATE TABLE DDL 中的字段物理类型（如 varchar(32) → varchar(64)）" })
+        ),
+        el(
+          "label",
+          { style: { display: "inline-flex", alignItems: "center", gap: "7px", fontSize: "12px", cursor: "pointer" } },
+          typeExprCb,
+          el("span", {
+            text: "按通用 ANSI 标准 SQL 自动改写类型转换表达式（CAST / 字面量 / IS NULL / COALESCE / INSERT VALUES / DEFAULT）",
+          })
         ),
         el(
           "label",
@@ -853,6 +878,7 @@ export class SqlRewritePanel {
             this.defaultSchema = schemaInput.value.trim();
             this.cteAliasPolicy = policySelect.value;
             this.rewriteDdlTypes = Boolean(ddlCb.checked);
+            this.rewriteTypeExpressions = Boolean(typeExprCb.checked);
             this.rewriteComments = Boolean(cmtCb.checked);
             this.autoApplyMedium = Boolean(medCb.checked);
             this.llmAudit = Boolean(auditCb.checked);
